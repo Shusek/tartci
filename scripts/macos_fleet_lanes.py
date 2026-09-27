@@ -78,6 +78,7 @@ LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
+    "ccache_write_isolation",
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
@@ -711,6 +712,11 @@ def load(path: Path) -> dict:
                 "non-negative integer on a lane with yield_to_workflow and "
                 "without event-class-v2"
             )
+        # Per-job ccache write layers, promoted into the shared store only on a
+        # green job (providers/tart-macos/ccache-layer.lib.sh). Off unless true.
+        ccache_isolation = lane.get("ccache_write_isolation")
+        if ccache_isolation is not None and type(ccache_isolation) is not bool:
+            fail(f"lane {lane_id}: ccache_write_isolation must be a boolean")
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
                 or not all(isinstance(value, str) and LABEL.fullmatch(value)
@@ -2240,6 +2246,8 @@ def lane_plist(
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
     if lane.get("yield_max_wait_seconds"):
         env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
+    if lane.get("ccache_write_isolation"):
+        env["TARTCI_CCACHE_WRITE_ISOLATION"] = "1"
     launch = str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci")
     helper = data.get("launch_helper")
     program_arguments = (

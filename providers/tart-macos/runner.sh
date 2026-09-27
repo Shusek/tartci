@@ -422,6 +422,8 @@ source "$TARTCI_ROOT/providers/tart-macos/lease-fit.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/pip-wheelhouse.lib.sh"
+# shellcheck source=providers/tart-macos/ccache-layer.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -1546,7 +1548,18 @@ printf 'TARTCI_DIAG actions-runner-version=%s\n' "$actual"
 GUEST
 }
 
+# The per-job ccache write layer (ccache-layer.lib.sh) brackets the listener:
+# attached as the job starts in the guest, settled as soon as it ends. Both
+# hooks are no-ops unless TARTCI_CCACHE_WRITE_ISOLATION=1.
 run_runner_until_done(){
+  local layer_rc=0
+  tartci_ccache_layer_attach "$1" || return 1
+  run_runner_until_done_unlayered "$@" || layer_rc=$?
+  tartci_ccache_layer_settle "$1" "$layer_rc" "$STATE_DIR/$1.actions-runner.log"
+  return "$layer_rc"
+}
+
+run_runner_until_done_unlayered(){
   local vm="$1" ip="$2" jit="$3" selected_tier="${4:-0}"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
   local aqua_label="com.tartci.aqua.$vm"
@@ -1566,7 +1579,7 @@ run_runner_until_done(){
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
-     export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
+     ${CCACHE_LAYER_GUEST_PREP}export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      fetchcontent_hydrated=false && \
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
@@ -1579,7 +1592,7 @@ run_runner_until_done(){
      if [ -n '$CURRENT_GUEST_CORES' ]; then printf 'TARTCI_GUEST_CORES=%s\n' '$CURRENT_GUEST_CORES' >> .env.tartci; fi && \
      if [ -n '$CURRENT_GUEST_MEM_MB' ]; then printf 'TARTCI_GUEST_MEM_MB=%s\n' '$CURRENT_GUEST_MEM_MB' >> .env.tartci; fi && \
      if [ '$CURRENT_PIP_WHEELHOUSE' = 1 ]; then printf 'TARTCI_PIP_WHEELHOUSE=%s\n' '$GUEST_PIP_WHEELHOUSE' >> .env.tartci; fi && \
-     mv .env.tartci .env && \
+     ${CCACHE_LAYER_GUEST_ENV}mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
     >"$runner_log" 2>&1 & ssh_pid=$!
