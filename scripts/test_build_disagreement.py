@@ -278,9 +278,11 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out)["state"], "disabled")
 
-    def test_no_checked_in_profile_enables_it(self):
-        for path in (HERE.parent / "profiles").glob("*.toml"):
-            self.assertFalse(bd.profile_settings(path.stem).get("enabled", False), path.name)
+    def test_only_the_m3_canary_profile_enables_it(self):
+        # The watch reads GitHub fleet-wide, so one host is enough; m3 is the canary.
+        enabled = sorted(path.stem for path in (HERE.parent / "profiles").glob("*.toml")
+                         if bd.profile_settings(path.stem).get("enabled", False))
+        self.assertEqual(enabled, ["m3-macos-fleet"])
 
     def test_replay_fires_and_exits_nonzero(self):
         records = [rec(1, "m5", "green", "aaa", 100), rec(2, "m3", "build_failure", "aaa", 110)]

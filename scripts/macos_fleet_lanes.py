@@ -41,7 +41,15 @@ PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
 DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
-    "launch_helper", "worktree_cleanup", "lane",
+    "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
+}
+# Report-only cross-host build disagreement check, run by the launchd watchdog
+# (scripts/build_disagreement_watch.py). Keys mirror the detector's profile
+# table plus the watch's own cadence and dedup knobs.
+BUILD_DISAGREEMENT_KEYS = {
+    "enabled", "repo", "workflow", "hours", "streak", "max_api_calls",
+    "max_log_fetches", "job_names", "build_step", "interval_minutes",
+    "timeout_seconds", "realert_hours",
 }
 HOST_KEYS = {
     "id", "home", "tart_home", "cache_root", "log_root",
@@ -410,6 +418,15 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    disagreement = data.get("build_disagreement")
+    if disagreement is not None:
+        if not isinstance(disagreement, dict):
+            fail("build_disagreement must be a table")
+        unknown = set(disagreement) - BUILD_DISAGREEMENT_KEYS
+        if unknown:
+            fail(f"unknown build_disagreement keys: {sorted(unknown)}")
+        if type(disagreement.get("enabled", False)) is not bool:
+            fail("build_disagreement.enabled must be a boolean")
     github_app = data.get("github_app")
     if github_app is not None:
         if not isinstance(github_app, dict):

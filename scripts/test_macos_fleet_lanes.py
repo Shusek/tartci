@@ -103,6 +103,18 @@ class MacosFleetLaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "reviewed M3"):
                 fleet.load(path)
 
+    def test_build_disagreement_table_is_accepted_and_policed(self) -> None:
+        self.assertIs(fleet.load(HOST_CONFIGS["studio"])["build_disagreement"]["enabled"], True)
+        body = HOST_CONFIGS["studio"].read_text()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m3.toml"
+            for bad, pattern in (("enabled = true\nreset = true", "unknown build_disagreement"),
+                                 ('enabled = "yes"', "must be a boolean")):
+                path.write_text(body.replace("[build_disagreement]\nenabled = true",
+                                             "[build_disagreement]\n" + bad))
+                with self.assertRaisesRegex(ValueError, pattern):
+                    fleet.load(path)
+
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         rendered = fleet.rendered_plists(data)
