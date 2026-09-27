@@ -23,6 +23,10 @@
   refresh but does not respawn is healed after a short bounded grace rather than
   waiting for the generic stale-log threshold. Exact labels reported disabled by
   launchd are never healed; an unreadable enablement map fails closed.
+  When the installed fleet profile sets `[build_disagreement] enabled = true`,
+  each pass also runs the report-only cross-host build disagreement check (at
+  most every 15 minutes; see docs/build-disagreement.md). It logs alarms and
+  never resets a cache or changes scheduling.
 
   Install shape:
 

@@ -889,6 +889,36 @@ def config_problem(value: dict) -> str | None:
     return "; ".join(parts) or None
 
 
+def build_disagreement_pass(fleet_config: str, timeout_s: float = 300) -> dict:
+    """One report-only cross-host build disagreement cycle. Never raises.
+
+    `scripts/build_disagreement_watch.py` owns enablement (the fleet profile's
+    `[build_disagreement] enabled = true`), the 15-minute floor, the detector's
+    budgets and the per-(host, fingerprint) alarm dedup. This pass only runs it
+    under a tomllib-capable interpreter and hands back its report; nothing it
+    returns can heal, reset or reschedule anything.
+    """
+    if not os.path.isfile(fleet_config):
+        return {"state": "disabled", "ran": False, "reason": "no installed fleet profile"}
+    python = _toml_python()
+    if python is None:
+        return {"state": "unknown", "ran": False, "code": "no_tomllib",
+                "detail": "no Python 3.11+ interpreter with tomllib"}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        proc = subprocess.run(
+            [python, os.path.join(root, "scripts", "build_disagreement_watch.py"),
+             "cycle", "--profile-file", fleet_config, "--json"],
+            capture_output=True, text=True, timeout=timeout_s)
+        value = json.loads(proc.stdout)
+        if not isinstance(value, dict):
+            raise ValueError("not an object")
+        return value
+    except Exception as exc:  # noqa: BLE001 - an unread cycle is unknown
+        return {"state": "unknown", "ran": False, "code": "watch_unreadable",
+                "detail": f"{type(exc).__name__}: {exc}"}
+
+
 def should_warn_config(summary: str | None, state: dict, now: float,
                        interval_s: int) -> bool:
     if summary is None:
@@ -1061,6 +1091,16 @@ def main(argv: list[str] | None = None) -> int:
                 os.replace(path + ".tmp", path)
             except OSError:
                 pass
+    # Cross-host build disagreement: report only, after every heal so a slow
+    # GitHub read can never delay one. Status and dry-run never run it.
+    if not args.status and not args.dry_run:
+        disagreement = build_disagreement_pass(args.fleet_config)
+    else:
+        import build_disagreement_watch as bdw
+        last = bdw.load_state(bdw.default_state_path())
+        disagreement = {"state": "not_run", "ran": False,
+                        "last_state": last.get("last_state"),
+                        "open_alarms": len(last.get("alarms") or {})}
     if args.json:
         print(json.dumps({
             "ts": _iso(now),
@@ -1075,6 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "agents": results,
             "config": config,
+            "build_disagreement": disagreement,
         }, indent=2))
     else:
         if not results:
@@ -1090,6 +1131,16 @@ def main(argv: list[str] | None = None) -> int:
             # Report only: the watchdog never acts on configuration drift.
             print(f"{_iso(now)} launchd-watchdog: WARN config: {config_summary} "
                   "(report only; see `tartci fleet-macos verify-supply` / `profile-drift`)")
+        # no_tomllib is already covered by the config WARN; printing it here
+        # would repeat every pass rather than every due cycle.
+        if disagreement.get("ran") or (disagreement.get("state") == "unknown"
+                                       and disagreement.get("code") != "no_tomllib"):
+            import build_disagreement_watch as bdw
+            for line in bdw.render(disagreement, now):
+                print(line)
+        elif args.status and disagreement.get("open_alarms"):
+            print(f"{_iso(now)} build-disagreement: last={disagreement.get('last_state')} "
+                  f"open_alarms={disagreement['open_alarms']} (report only)")
     # Status reports unresolved wedges. Healing reports failure only when a
     # reload failed its postcondition; successful recovery exits zero.
     if args.status and unhealthy:
