@@ -16,6 +16,12 @@
 # always allowed. The real launchctl is allowed only when HOME is the account's
 # home and the plist lives in that home's LaunchAgents directory.
 #
+# TARTCI_LAUNCHD_GUARD_TREAT_AS_REAL=1 makes the guard judge a double exactly
+# as it judges /bin/launchctl. Tests of the refusal use it, so that a guard
+# broken on purpose (a break-confirmation run) calls a recording double rather
+# than the host's real domain; breaking the guard against the real launchctl
+# reproduces the very leak it prevents.
+#
 # Usage (sourced):  tartci_launchd_domain_guard TARGET_PLIST LAUNCHCTL
 # Returns 0 when registering is safe; prints why and returns 1 otherwise.
 
@@ -25,7 +31,8 @@ tartci_account_home() {
 
 tartci_launchd_domain_guard() {
   local target="$1" launchctl="${2:-/bin/launchctl}" account resolved_home agents
-  if [ "$launchctl" != "/bin/launchctl" ] && [ "$launchctl" != "launchctl" ]; then
+  if [ "$launchctl" != "/bin/launchctl" ] && [ "$launchctl" != "launchctl" ] &&
+     [ "${TARTCI_LAUNCHD_GUARD_TREAT_AS_REAL:-0}" != 1 ]; then
     return 0
   fi
   account="$(tartci_account_home)"

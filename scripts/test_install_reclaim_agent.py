@@ -46,17 +46,27 @@ class SetupWiresTheReclaimer(unittest.TestCase):
 
 
 def launchctl_double(directory: Path) -> tuple[Path, Path]:
-    """A launchctl stand-in that records every call and holds no real domain."""
+    """A launchctl stand-in that records every call and holds no real domain.
+
+    `print` succeeds while something is "loaded" and reports the plist path it
+    was bootstrapped from (the file `loaded` holds it), like launchd does.
+    """
     calls = directory / "launchctl.calls"
     double = directory / "launchctl-double"
+    loaded = directory / "loaded"
     double.write_text(
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$*\" >> '{calls}'\n"
-        f"case \"$1\" in print) [ -f '{directory}/loaded' ] ;; "
-        f"bootstrap) touch '{directory}/loaded' ;; bootout) rm -f '{directory}/loaded' ;; "
+        f"case \"$1\" in print) [ -f '{loaded}' ] && printf '\\tpath = %s\\n' \"$(cat '{loaded}')\" ;; "
+        f"bootstrap) printf '%s' \"$3\" > '{loaded}' ;; bootout) rm -f '{loaded}' ;; "
         "esac\n")
     double.chmod(0o755)
     return double, calls
+
+
+def as_real(double: Path) -> dict:
+    """Env that makes the guard judge `double` as if it were /bin/launchctl."""
+    return {"TARTCI_LAUNCHCTL_BIN": str(double), "TARTCI_LAUNCHD_GUARD_TREAT_AS_REAL": "1"}
 
 
 class InstallerIsSafeToRepeat(unittest.TestCase):
@@ -106,33 +116,62 @@ class NeverTouchesTheRealDomainFromATempHome(unittest.TestCase):
     now reachable only from the account's own home and LaunchAgents dir.
     """
 
-    def real_registration(self) -> str | None:
-        probe = subprocess.run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{LABEL}"],
-                               capture_output=True, text=True, check=False) \
-            if Path("/bin/launchctl").exists() else None
-        if probe is None or probe.returncode != 0:
-            return None
-        return next((line.strip() for line in probe.stdout.splitlines()
-                     if line.strip().startswith("path = ")), None)
+    # Every refusal below runs against a recording double that the guard
+    # judges as the real launchctl. If the guard is ever broken, the install
+    # lands in the double (and the test fails on its call log) instead of in
+    # this machine's real gui/<uid> domain.
 
-    def test_temp_home_with_the_real_launchctl_is_refused_before_any_write(self):
-        before = self.real_registration()
+    def test_temp_home_is_refused_before_any_launchctl_call_or_write(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "home"
             home.mkdir()
-            res = run([str(INSTALLER), "--install"], {"HOME": str(home)})
+            double, calls = launchctl_double(Path(td))
+            res = run([str(INSTALLER), "--install"], {"HOME": str(home), **as_real(double)})
             self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
             self.assertIn("is not this account's home", res.stderr)
             self.assertFalse((home / "Library" / "LaunchAgents" / f"{LABEL}.plist").exists())
-        self.assertEqual(self.real_registration(), before,
-                         "the real domain's reclaim registration changed")
+            self.assertFalse(calls.exists(), "launchctl was called despite the refusal")
+
+    def test_the_default_launchctl_is_the_real_one(self):
+        # The refusal tests above rely on the guard treating the default as
+        # real; pin that the default IS /bin/launchctl.
+        body = INSTALLER.read_text()
+        self.assertIn('LAUNCHCTL="${TARTCI_LAUNCHCTL_BIN:-/bin/launchctl}"', body)
 
     def test_real_home_but_foreign_agents_dir_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
+            double, calls = launchctl_double(Path(td))
             res = run([str(INSTALLER), "--install"],
-                      {"TARTCI_AGENTS_DIR": str(Path(td) / "agents")})
+                      {"TARTCI_AGENTS_DIR": str(Path(td) / "agents"), **as_real(double)})
             self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
             self.assertIn("is not under", res.stderr)
+            self.assertFalse(calls.exists())
+
+    def test_a_shadowing_registration_is_booted_out_and_replaced(self):
+        # m3 after the leak: the label was loaded, from a temp plist. The old
+        # installer saw "loaded" + "plist current" and did nothing.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir()
+            double, calls = launchctl_double(Path(td))
+            env = {"HOME": str(home), "TARTCI_LAUNCHCTL_BIN": str(double)}
+            self.assertEqual(run([str(INSTALLER), "--install"], env).returncode, 0)
+            leaked = "/private/var/folders/x/T/tmp.leak/home/Library/LaunchAgents/r.plist"
+            (Path(td) / "loaded").write_text(leaked)
+            calls.unlink()
+            res = run([str(INSTALLER), "--install"], env)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("leaked registration", res.stdout)
+            target = home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+            log = calls.read_text()
+            self.assertIn(f"bootout gui/{os.getuid()}/{LABEL}", log)
+            self.assertIn(f"bootstrap gui/{os.getuid()} {target}", log)
+            self.assertEqual((Path(td) / "loaded").read_text(), str(target))
+            # Control: run again, now held from the target, and nothing changes.
+            calls.unlink()
+            again = run([str(INSTALLER), "--install"], env)
+            self.assertIn("already installed and loaded", again.stdout)
+            self.assertNotIn("bootstrap", calls.read_text())
 
     def test_a_test_double_installs_into_the_temp_home(self):
         # Control: the guard refuses the real domain, not installation. With a
@@ -152,10 +191,13 @@ class NeverTouchesTheRealDomainFromATempHome(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / "home"
             home.mkdir()
+            double, calls = launchctl_double(Path(td))
             res = run([str(ROOT / "scripts" / "install_self_update_agent.sh"), "--install"],
-                      {"HOME": str(home), "TARTCI_SELF_UPDATE_SKIP_PEERS": "1"})
+                      {"HOME": str(home), "TARTCI_SELF_UPDATE_SKIP_PEERS": "1",
+                       **as_real(double)})
             self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
             self.assertIn("is not this account's home", res.stderr)
+            self.assertFalse(calls.exists())
 
     def test_shell_suites_that_run_setup_cannot_reach_the_real_domain(self):
         # tests/test_tart_channel.sh runs `tartci setup` with a temp HOME. It

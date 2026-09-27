@@ -6,6 +6,18 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/bin" "$tmp/home"
+# Every `tartci setup` below runs with a temp HOME and can reach the reclaim
+# installer. Route launchctl to a recording double that the installer's guard
+# judges as the real one: a correct guard refuses before calling it, and a
+# broken guard registers into this double, never into the host's gui/<uid>.
+cat >"$tmp/bin/launchctl-double" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$tmp/launchctl.calls"
+exit 1
+SH
+chmod +x "$tmp/bin/launchctl-double"
+export TARTCI_LAUNCHCTL_BIN="$tmp/bin/launchctl-double"
+export TARTCI_LAUNCHD_GUARD_TREAT_AS_REAL=1
 cat >"$tmp/bin/sw_vers" <<'SH'
 #!/usr/bin/env bash
 printf '%s.0\n' "${OS_MAJOR:-26}"
@@ -70,6 +82,11 @@ grep -q 'retaining existing Tart on macOS 14' "$tmp/stderr"
 grep -q 'launchd guard: HOME=' "$tmp/stderr"
 if [ -f "$tmp/home/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist" ]; then
   echo "setup wrote a reclaim agent into the temp HOME" >&2
+  exit 1
+fi
+if [ -s "$tmp/launchctl.calls" ]; then
+  echo "setup reached launchctl from a temp HOME:" >&2
+  cat "$tmp/launchctl.calls" >&2
   exit 1
 fi
 if grep -q 'openai/tools' "$tmp/brew.calls"; then
