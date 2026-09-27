@@ -1822,7 +1822,7 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_slot_tier_order_renders_only_on_the_m3_pr_first_slot(self) -> None:
         """Only m3 (host id studio) pulp-gate slot 2 prefers PR-head and only
-        m5 pulp-gate slot 2 prefers tagged releases; every other slot keeps the
+        m5 pulp-gate slot 2 prefers the release classes; every other slot keeps the
         configured merge-group-first order."""
         env_key = "TARTCI_ASSIGNMENT_V2_TIER_ORDER"
         seen = 0
@@ -1835,8 +1835,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                         seen += 1
                         self.assertEqual(
                             env.get(env_key),
-                            "pulp-release-tagged,pulp-build-merge-group,"
-                            "pulp-build-pr-head,pulp-release-pr-gate",
+                            "pulp-release-tagged,pulp-release-pr-gate,"
+                            "pulp-build-merge-group,pulp-build-pr-head",
                         )
                     elif name.endswith(".studio.pulp-gate.slot2.plist"):
                         seen += 1
@@ -2483,7 +2483,7 @@ replaces_launchd_labels=REPLACEMENT
 
 
     # The m5 pulp-gate lane with the Pulp release classes declared after the two
-    # gate tiers and slot 2 preferring tagged releases. This is the enable
+    # gate tiers and slot 2 preferring the release classes. This is the enable
     # change, applied to the shipped m5 profile in memory only.
     RELEASE_TIERS = (
         '\n[[lane.tier]]\nlabel = "pulp-release-tagged"\nworkflow = "Release CLI"\nrunner_group_id = 1\n'
@@ -2492,7 +2492,7 @@ replaces_launchd_labels=REPLACEMENT
     )
     RELEASE_FIRST = (
         'assignment_slot_tier_order = { 2 = ["pulp-release-tagged", '
-        '"pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }'
+        '"pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }'
     )
     M5_PR_HEAD_TIER = (
         '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n'
@@ -2601,8 +2601,8 @@ replaces_launchd_labels=REPLACEMENT
             self.assertNotIn("TARTCI_ASSIGNMENT_V2_TIER_ORDER", slot1)
             self.assertEqual(
                 slot2["TARTCI_ASSIGNMENT_V2_TIER_ORDER"],
-                "pulp-release-tagged,pulp-build-merge-group,"
-                "pulp-build-pr-head,pulp-release-pr-gate",
+                "pulp-release-tagged,pulp-release-pr-gate,"
+                "pulp-build-merge-group,pulp-build-pr-head",
             )
             regs = [
                 row for row in fleet.advertised_labels_snapshot([path], None)["registrations"]

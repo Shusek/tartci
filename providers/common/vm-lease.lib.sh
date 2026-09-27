@@ -325,8 +325,10 @@ tartci_vm_lease_priority(){
   # pulp-build-vm-release instead and keeps its gate/vm classes below). Tagged
   # releases sort above merge-group (120 > 110) so a release boot is admitted
   # from gate-reserved capacity ahead of queued gate work. The release-path PR
-  # gate stays non-gate VM work (90 < 100, as the legacy lane's `vm`) and so
-  # never outranks PR-head.
+  # gate leases exactly like PR-head (100): a slot that boots it holds what a
+  # gate guest on that slot would, so it is never the class locked out while
+  # an ordinary build holds the host's whole non-gate budget. Each supervisor
+  # slot holds at most one lease, so this cannot take a second slot's reserve.
   case ",$labels," in
     *,pulp-release-tagged,*pulp-release-pr-gate,*|*,pulp-release-pr-gate,*pulp-release-tagged,*) ;;
     *,pulp-build-vm,*)
@@ -336,7 +338,7 @@ tartci_vm_lease_priority(){
           return 0
           ;;
         *,pulp-release-pr-gate,*)
-          printf '%s' 90
+          printf '%s' 100
           return 0
           ;;
       esac

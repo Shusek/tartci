@@ -1031,6 +1031,45 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(fields[0], "1", fields)
         return fields[2]
 
+    def _pre_mint(self, slot: int, tier: str, **queue: bool) -> str:
+        self._on_slot(slot)
+        self._state(**queue)
+        result = self._runner("--print-pre-mint-selection", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_release_pr_gate_is_minted_while_gate_work_waits(self) -> None:
+        """The 2026-09-26 shape: merge-group and PR-head work queued without a
+        gap for hours beside a `Release-path PR gate` job. m5's pulp-gate lane
+        is the only registration serving that class, so some m5 slot must both
+        select it and admit it at pre-mint while gate work is still queued, or
+        the job waits until the gate queue drains."""
+        busy = {"merge": True, "pr": True, "release_pr": True}
+        served = [slot for slot in (1, 2)
+                  if self._selected_tier(slot, **busy) == "3"
+                  and self._pre_mint(slot, "3", **busy) == "1"]
+        self.assertEqual(served, [2])
+        # Control: slot 1 on the identical queue keeps gate-first order, and
+        # the instrument does admit tier 3 on slot 1 once the gate queue drains.
+        self.assertEqual(self._selected_tier(1, **busy), "0")
+        self.assertEqual(self._pre_mint(1, "3", release_pr=True), "1")
+        # A tagged release still outranks the release PR gate on slot 2.
+        self.assertEqual(self._selected_tier(2, release=True, **busy), "2")
+        # Work-conserving: with no release waiting slot 2 serves gate work.
+        self.assertEqual(self._selected_tier(2, merge=True, pr=True), "0")
+        # No slot idles while an eligible job waits: with only the release PR
+        # gate queued both slots select and admit it.
+        for slot in (1, 2):
+            with self.subTest(slot=slot):
+                self.assertEqual(self._selected_tier(slot, release_pr=True), "3")
+                self.assertEqual(self._pre_mint(slot, "3", release_pr=True), "1")
+        # A slot-2 gate runner left idle beside a waiting release PR gate is
+        # retargeted to it rather than held; slot 1 goes to the gate class.
+        self.assertEqual(self._decide(2, "0", pr=True, release_pr=True),
+                         ("1", "pulp-release-pr-gate"))
+        self.assertEqual(self._decide(1, "0", pr=True, release_pr=True),
+                         ("1", "pulp-build-pr-head"))
+
     def test_idle_gate_runner_on_slot2_retargets_to_a_waiting_release_first(self) -> None:
         """A parked gate runner whose own class emptied retargets to the tagged
         release before the other gate class, and the slot then boots it. Slot 1,
