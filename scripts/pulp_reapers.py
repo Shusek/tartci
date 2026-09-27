@@ -296,6 +296,71 @@ def run_reaper(script: pathlib.Path, *, fix: bool, worktrees_root: str,
     return record
 
 
+# Pulp's rule (CLAUDE.md, "Parallel Work via Worktrees"). Quoted by every report
+# so the finding says what is wrong, not only where.
+TMP_WORKTREE_RULE = ("Pulp worktrees must live under PULP_WORKTREES_ROOT or a sibling "
+                     "of the primary checkout, never /tmp")
+TMP_PREFIXES = ("/tmp/", "/private/tmp/")
+TMP_DU_TIMEOUT_S = 60
+TMP_LIST_LIMIT = 20
+
+
+def _is_under_tmp(path: str) -> bool:
+    return any(path.startswith(prefix) for prefix in TMP_PREFIXES)
+
+
+def tmp_worktrees(repo: pathlib.Path, runner: Runner = subprocess.run,
+                  du_timeout_s: float = TMP_DU_TIMEOUT_S) -> dict[str, Any]:
+    """REPORT ONLY: git worktrees of `repo` that live under /tmp or /private/tmp.
+
+    They are outside every reaper root, and /tmp is shared scratch on the same
+    volume, so they fill the disk invisibly (m5 had 162 on 2026-09-27). Nothing
+    here deletes or moves them: a worktree may be live, and only its owner can
+    say it is finished. Size is one bounded `du`; a timeout reads "unknown",
+    never 0.
+    """
+    out: dict[str, Any] = {"rule": TMP_WORKTREE_RULE, "count": None,
+                           "total_bytes": None, "size": "unknown",
+                           "oldest_mtime": None, "paths": []}
+    try:
+        proc = runner(["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                      capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        out["error"] = f"git worktree list failed: {exc}"
+        return out
+    if proc.returncode != 0:
+        out["error"] = f"git worktree list failed: {proc.stderr.strip()[:200]}"
+        return out
+    listed = [line[len("worktree "):] for line in proc.stdout.splitlines()
+              if line.startswith("worktree ")]
+    found = sorted(path for path in listed if _is_under_tmp(path)
+                   or _is_under_tmp(os.path.realpath(path)))
+    out["count"] = len(found)
+    out["paths"] = found[:TMP_LIST_LIMIT]
+    existing = [path for path in found if os.path.isdir(path)]
+    mtimes = []
+    for path in existing:
+        try:
+            mtimes.append(os.stat(path).st_mtime)
+        except OSError:
+            continue
+    out["oldest_mtime"] = min(mtimes) if mtimes else None
+    if not existing:
+        out.update(total_bytes=0, size="0")
+        return out
+    try:
+        du = runner(["du", "-sk", *existing], capture_output=True, text=True,
+                    timeout=du_timeout_s, check=False)
+        total = sum(int(line.split()[0]) for line in du.stdout.splitlines()
+                    if line.split() and line.split()[0].isdigit()) * 1024
+        out.update(total_bytes=total, size=f"{total / GIB:.1f} GiB")
+    except subprocess.TimeoutExpired:
+        out["size"] = f"unknown (du did not finish in {du_timeout_s:g}s)"
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        out["size"] = f"unknown ({exc})"
+    return out
+
+
 def run(*, fix: bool, profile: pathlib.Path | None = None,
         state_dir: pathlib.Path | None = None,
         runner: Runner = subprocess.run, stream: Any = None,
@@ -312,6 +377,7 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         "worktree_build_idle_hours": settings["worktree_build_idle_hours"], "runs": [],
         "reclaimed_bytes": 0,
     }
+    report["worktrees_in_tmp"] = tmp_worktrees(pathlib.Path(settings["repo"]), runner=runner)
     if not root.is_dir():
         report["error"] = f"worktrees_root {root} is not a directory"
         return report

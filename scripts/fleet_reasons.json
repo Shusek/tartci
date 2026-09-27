@@ -264,6 +264,21 @@
       "why": "The record is malformed or unreadable, so whether a VM is parked is unknown.",
       "remedy": "Inspect ~/.tartci/state/warm-vm/parked.json and `tart list`.",
       "do_not": "Do not read an unreadable record as no warm VM."
+    },
+    "worktrees_in_tmp": {
+      "summary": "Git worktrees of the configured Pulp repo live under /tmp or /private/tmp.",
+      "why": "Pulp worktrees must live under PULP_WORKTREES_ROOT or a sibling of the primary checkout, never /tmp. /tmp worktrees are outside every reaper root, so their build dirs fill the volume unseen (m5 had 162 on 2026-09-27).",
+      "remedy": "Have the owning sessions land or abandon them and `git worktree remove` them; recreate live work under the host's worktree root.",
+      "do_not": "Do not delete or move them automatically: a worktree under /tmp may be live."
+    },
+    "worktrees_in_tmp_none": {
+      "summary": "No worktree of the configured Pulp repo lives under /tmp.",
+      "why": "Every Pulp worktree is where the reapers and host policy expect it."
+    },
+    "worktrees_in_tmp_not_checked": {
+      "summary": "Worktrees under /tmp were not checked.",
+      "why": "The check needs the [reclaim] table (for the Pulp repo path) and a readable repo; without one this host has no configured Pulp checkout to ask.",
+      "remedy": "Enable [reclaim] in the fleet profile, or run `git -C <pulp> worktree list` by hand."
     }
   }
 }
