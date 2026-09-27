@@ -1612,6 +1612,33 @@ def launchd_managed_pids() -> set[int]:
     return managed
 
 
+def disk_denial_during_streak(receipt_dir: str, runner: str,
+                              blocked_at: dt.datetime) -> str | None:
+    """The lane's disk denial reason when its LATEST lease attempt was refused
+    for disk at or after blocked_at, else None.
+
+    The runner rewrites <receipt_dir>/<runner>.disk-admission.json on every
+    lease attempt (scripts/disk_denial_receipt.py), so a later successful
+    acquisition replaces a denial and this reads None again.
+    """
+    if not receipt_dir or not runner:
+        return None
+    try:
+        receipt = json.loads((Path(receipt_dir) / f"{runner}.disk-admission.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(receipt, dict) or receipt.get("status") != "denied":
+        return None
+    try:
+        observed = dt.datetime.fromisoformat(
+            str(receipt.get("observed_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed.tzinfo is None or observed < blocked_at:
+        return None
+    return str(receipt.get("reason") or "disk_denied")
+
+
 def fleet_readiness(
     receipt_path: Path,
     config: Path,
@@ -1862,6 +1889,31 @@ def fleet_readiness(
                             })
                             continue
                     blocked_for = (now - blocked_at).total_seconds()
+                    # A disk-capacity denial is host-local and deterministic,
+                    # not an upstream blip, so it needs no transience gate:
+                    # while the lane's latest lease attempt was refused for
+                    # disk inside the current blocked streak, the lane is
+                    # blocked now. Without this, a full disk read as
+                    # "serving: ok" for the first 90 minutes of an outage.
+                    disk_reason = disk_denial_during_streak(
+                        (plist.get("EnvironmentVariables") or {}).get(
+                            "TARTCI_DISK_DENIAL_RECEIPT_DIR", ""),
+                        str(matching_state.get("runner", "") or ""),
+                        blocked_at,
+                    )
+                    if disk_reason is not None:
+                        serving_blocked_lanes.append({
+                            "label": label,
+                            "blocked_seconds": int(blocked_for),
+                            "streak": streak,
+                            "last_phase": str(
+                                matching_state.get("serving_blocked_last_phase", "") or ""
+                            ),
+                            "cause": "disk",
+                            "reason": disk_reason,
+                        })
+                        verified_running += 1
+                        continue
                     # Two gates doing two jobs. The streak is the SHAPE gate: it
                     # counts consecutive work entries that served nothing, so a
                     # lane whose failures are interleaved with served jobs never
@@ -1879,6 +1931,7 @@ def fleet_readiness(
                             "last_phase": str(
                                 matching_state.get("serving_blocked_last_phase", "") or ""
                             ),
+                            "cause": "unserved",
                         })
                 verified_running += 1
 
