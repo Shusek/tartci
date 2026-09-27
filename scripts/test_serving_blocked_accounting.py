@@ -343,6 +343,20 @@ class PoolStatusRenderingTests(unittest.TestCase):
         self.assertIn("streak=143", out)
         self.assertIn("last_phase=admission-error", out)
 
+    def test_a_disk_blocked_lane_names_the_disk(self) -> None:
+        out = self.render(self._fleet({
+            "blocked": True,
+            "blocked_lanes": [{
+                "label": "studio.pulp-gate", "blocked_seconds": 1200,
+                "streak": 4, "last_phase": "vm-lease-denied",
+                "cause": "disk", "reason": "disk_capacity_insufficient",
+            }],
+            "unmeasurable_lanes": [],
+        }))
+        self.assertIn("serving: BLOCKED (disk: disk_capacity_insufficient", out)
+        self.assertIn("cause=disk reason=disk_capacity_insufficient", out)
+        self.assertNotIn("serving: ok", out)
+
     def test_a_serving_lane_prints_ok(self) -> None:
         out = self.render(self._fleet({
             "blocked": False, "blocked_lanes": [], "unmeasurable_lanes": [],
