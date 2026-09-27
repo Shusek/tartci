@@ -61,6 +61,22 @@ registry_username_file = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackben
 registry_token_file = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
 flat_rollback = "pulp-build-runner:latest"
 
+# Opt-in: `tartci reclaim` (hourly) also runs Pulp's own reapers from a fresh
+# origin/main checkout of `repo`: clean_build_cov.sh every pass, and
+# clean_worktree_builds.sh while the worktrees_root volume is below
+# pressure_free_gb. Their merged / idle / not-in-use / lineage gates are the
+# safety; tartci adds none and relaxes none (scripts/pulp_reapers.py).
+# m3 keeps its Pulp worktrees on Workshop (CLAUDE.md host policy), and that is
+# the volume that filled on 2026-09-27: 19 GiB free, every gate VM lease refused
+# disk_capacity_exceeded for ~6 h, while 1,330 GB sat in 40 merged worktrees'
+# build dirs that only Pulp's own reaper can prove dead.
+# Remove this table to turn it off.
+[reclaim]
+pulp_worktree_builds = true
+repo = "/Volumes/Workshop/Code/pulp"
+worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+pressure_free_gb = 200
+
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
