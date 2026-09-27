@@ -1835,6 +1835,36 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   deletes generated build output that carries no source marker, never a
   checkout.
 
+  Pulp worktrees need Pulp's knowledge to be reclaimed, not an age gate: on m3
+  on 2026-09-27 the pass above ran under pressure and reclaimed 0 bytes while
+  1,330 GB sat in 40 merged worktrees' build dirs, and one 2-day-old 40 GB
+  build-cov alone exceeded the 21 GiB left (a gate VM lease needs about 49).
+  A host opts in with a fleet-profile table, off unless present:
+
+      [reclaim]
+      pulp_worktree_builds = true
+      repo = "/Volumes/Workshop/Code/pulp"
+      worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+      pressure_free_gb = 200          # optional
+      worktree_build_idle_hours = 2   # optional, 2..24
+
+  Each pass then materializes a sparse origin/main worktree of `repo`
+  (tools/scripts + tools/ci) under `~/.tartci/state/reclaim/pulp-reapers` and
+  runs Pulp's `clean_build_cov.sh --yes` every pass and
+  `clean_worktree_builds.sh --yes` while the `worktrees_root` volume is below
+  `pressure_free_gb`, both with `PULP_WORKTREES_ROOT=worktrees_root`. Their own
+  gates (merged and proven, idle, no process using it, lineage not `active`,
+  a fresh path check) are the safety; tartci adds and relaxes none.
+
+  Every pass writes `~/.tartci/state/reclaim/last-run.json` and appends a
+  `reclaim_pass` event (and one `pulp_reaper` event per reaper run, with free
+  space before and after) to `~/.tartci/state/reclaim/events.jsonl`. `tartci
+  pool status`, `tartci status` and `tartci doctor fleet` report that
+  receipt's age and result, so a reclaim agent that stopped running reads as
+  STALE rather than "installed and loaded"; `doctor fleet` also flags any
+  loaded tartci LaunchAgent registered from a plist outside
+  `~/Library/LaunchAgents` (a leaked test registration shadowing the real one).
+
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
   exceeds the approximately 19 GiB store growth observed during a Pulp full
