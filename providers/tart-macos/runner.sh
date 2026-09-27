@@ -731,12 +731,34 @@ print("status=%s quarantined=%s zero_include=%s suspect=%s consistent=%s uninspe
 }
 
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
+# event KIND DETAIL [key=value ...]
+# DETAIL stays the human-readable line. Each key=value after it is also
+# written as a typed member of a "fields" object, so a reader can select on
+# a value without parsing DETAIL. A value that is a JSON number is written as
+# one; anything else is a string. Keys outside [a-z_][a-z0-9_]* are dropped.
 event(){
-  local kind="$1" detail="${2:-}" ts
+  local kind="$1" detail="${2:-}" ts fields="" sep="" pair key value
+  shift
+  [ "$#" -eq 0 ] || shift
+  for pair in "$@"; do
+    case "$pair" in *=*) ;; *) continue ;; esac
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    [[ "$key" =~ ^[a-z_][a-z0-9_]*$ ]] || continue
+    [ -n "$value" ] || continue
+    if [[ "$value" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+      fields+="$sep\"$key\":$value"
+    else
+      value="${value//\\/\\\\}"
+      fields+="$sep\"$key\":\"$(json_sanitize "$value")\""
+    fi
+    sep=","
+  done
+  [ -z "$fields" ] || fields=",\"fields\":{$fields}"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  printf '{"ts":"%s","event":"%s","runner":"%s","vm":"%s","detail":"%s"}\n' \
+  printf '{"ts":"%s","event":"%s","runner":"%s","vm":"%s","detail":"%s"%s}\n' \
     "$ts" "$(json_sanitize "$kind")" "$(json_sanitize "$RUNNER_NAME")" \
-    "$(json_sanitize "${CURRENT_VM:-}")" "$(json_sanitize "$detail")" >>"$EVENT_LOG"
+    "$(json_sanitize "${CURRENT_VM:-}")" "$(json_sanitize "$detail")" "$fields" >>"$EVENT_LOG"
 }
 
 heartbeat(){
@@ -1172,6 +1194,10 @@ cleanup(){
   CURRENT_SCAN_PID=""
   CURRENT_SCAN_TMP=""
   local teardown_terminal=1
+  # A parked warm VM is never serving anything: always discard it on exit.
+  if [ -n "${WARM_VM:-}" ] && [ -z "$CURRENT_VM" ]; then
+    tartci_warm_discard supervisor_exit || teardown_terminal=0
+  fi
   discard_current_vm || teardown_terminal=0
   if [ "$teardown_terminal" = 1 ]; then
     tartci_release_vm_lease
@@ -1666,6 +1692,111 @@ install_and_preflight_aqua_runner(){
   fi
 }
 
+# Lease, clone, size and boot one VM, and wait until it answers SSH. Shared by
+# the per-job boot and the warm-VM park. On success CURRENT_VM, CURRENT_RPID,
+# CURRENT_IP and CURRENT_GUEST_{CORES,MEM_MB} describe the VM and its lease is
+# active; on failure nothing is left behind and BOOT_LEASE_DENIED says whether
+# the lease store refused it. TARTCI_VM_LEASE_MEMORY_ONLY=1 in the caller's
+# environment makes the lease memory-only (a parked warm VM).
+boot_vm_to_ssh(){
+  local i="$1" vm="$2" labels="$3" lease_priority="$4" logdir="${5:-}" boot_phase="${6:-booting}"
+  local proof_group="${7:-}"
+  local lease_cores lease_mem lease_rc boot_log rpid ip=""
+  BOOT_LEASE_DENIED=0
+  lease_cores="$(tartci_vm_lease_cores tart-macos)"
+  lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
+  lease_rc=0
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$labels" "$lease_mem" "$TART_HOME" \
+    tart-macos "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || lease_rc=$?
+  if [ "$lease_rc" -ne 0 ]; then
+    BOOT_LEASE_DENIED=1
+    return "$lease_rc"
+  fi
+  lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
+  # The admission verdict and the repository-access proof do not read the VM,
+  # so a job boot (proof_group set) runs them beside the clone and boot and the
+  # boundary consumes them. See providers/tart-macos/boundary-proof.lib.sh for
+  # why this cannot admit anything the sequential boundary would have refused.
+  # A warm-VM park has no job and no class yet, so it starts none.
+  [ -z "$proof_group" ] || tartci_boundary_proof_start "$vm" "$labels" "$proof_group"
+
+  note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
+  event clone_start "golden=$GOLDEN"
+  # Own the unique per-boot name before the foreground clone so signal cleanup
+  # cannot miss a clone completed immediately before the trap is delivered.
+  CURRENT_VM="$vm"
+  if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    return 1
+  fi
+  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
+    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    return 1
+  fi
+  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
+  tartci_ccache_guard "$CACHE_ROOT/ccache"
+  if ! tartci_prepare_disk_root "$FETCHCONTENT_SOURCE_ROOT"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
+  CURRENT_GUEST_CORES="$lease_cores"
+  CURRENT_GUEST_MEM_MB="$lease_mem"
+  boot_log="$(mktemp -t "tart-run-$vm")"
+  local tart_dirs=(
+    --dir="ccache:$CACHE_ROOT/ccache"
+    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
+  )
+  [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
+  CURRENT_PIP_WHEELHOUSE=0
+  if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
+    tart_dirs+=(--dir="pip-wheelhouse:$PIP_WHEELHOUSE_ROOT:ro")
+    CURRENT_PIP_WHEELHOUSE=1
+  fi
+  tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
+    "$vm" >"$boot_log" 2>&1 & rpid=$!
+  CURRENT_RPID="$rpid"
+  heartbeat "$boot_phase"
+
+  for _ in $(seq 1 60); do ip="$(tart ip "$vm" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
+  if [ -z "$ip" ]; then
+    note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
+    rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
+  fi
+  CURRENT_IP="$ip"
+  rm -f "$boot_log"
+  local sshok=0
+  for _ in $(seq 1 90); do
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
+      && { sshok=1; break; }
+    sleep 2
+  done
+  if [ "$sshok" != 1 ]; then
+    note "[$i] no SSH after 180s — discarding unregistered VM"
+    event boot_failed "no_ssh"
+    runtime_emit_complete fail ssh_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
+  fi
+  return 0
+}
+
 run_one(){
   # Per-boot EPHEMERAL registration name (see ephemeral_boot_name) — never the bare
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
@@ -1676,9 +1807,9 @@ run_one(){
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
   vm="$(ephemeral_boot_name "$i")"
-  local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
+  local jit="" label_args=() labels_split=() l ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
-  local lease_cores lease_mem lease_priority lease_rc
+  local lease_priority lease_rc
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   selected_group_id="$(runner_group_id_for_tier "$selected_tier")" \
@@ -1729,6 +1860,7 @@ run_one(){
     # this is a fallback copy and must not grow a file per attempt.
     [ -z "$precheck_json" ] \
       || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
+    tartci_admission_contention_event "$precheck_json" precheck
     if [ "$precheck_rc" -ne 0 ]; then
       local precheck_detail
       precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
@@ -1764,104 +1896,48 @@ run_one(){
   CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0
   CURRENT_ASSIGNMENT_QUARANTINE="none"
   CURRENT_LABELS="$selected_labels"
-  reclaim_runner_name "$vm" "$selected_runner_api_root"
-  sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
-  lease_cores="$(tartci_vm_lease_cores tart-macos)"
-  lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
-  lease_rc=0
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" \
-    tart-macos "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || lease_rc=$?
-  if [ "$lease_rc" -ne 0 ]; then
-    # The only loop path that reaches work and then fails before any heartbeat.
-    # Without this the supervisor is silent while healthy, and a checker that
-    # can only see heartbeat age has no choice but to call it stale.
-    [ -n "$SERVING_BLOCKED_SINCE" ] \
-      || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    heartbeat vm-lease-denied
-    return "$lease_rc"
+  # A parked warm VM (opt-in, warm-vm.lib.sh) replaces the lease, clone and
+  # boot below: its memory-only lease is upgraded to this class's core lease
+  # in place, and the admission check and JIT mint that follow run exactly as
+  # for a cold VM. 75 means the upgrade was denied and the VM stays parked;
+  # any other failure has discarded it and the cold path boots instead.
+  if [ -n "$WARM_VM" ]; then
+    local handoff_rc=0
+    tartci_warm_handoff "$i" "$selected_labels" "$lease_priority" "$selected_runner_api_root" \
+      || handoff_rc=$?
+    if [ "$handoff_rc" -eq 75 ]; then
+      [ -n "$SERVING_BLOCKED_SINCE" ] \
+        || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      heartbeat vm-lease-denied
+      return 75
+    fi
+    if [ "$handoff_rc" -eq 0 ]; then
+      vm="$CURRENT_VM"
+      # No clone or boot to overlap with; start the boundary proofs now so the
+      # boundary consumes them exactly as for a cold VM.
+      tartci_boundary_proof_start "$vm" "$selected_labels" "$selected_group_id"
+    fi
   fi
-  lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
-  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
-  # The admission verdict and the repository-access proof do not read the VM,
-  # so they run beside the clone and boot and are consumed at the boundary.
-  # See providers/tart-macos/boundary-proof.lib.sh for why this cannot admit
-  # anything the sequential boundary would have refused.
-  tartci_boundary_proof_start "$vm" "$selected_labels" "$selected_group_id"
-
-  note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
-  event clone_start "golden=$GOLDEN"
-  # Own the unique per-boot name before the foreground clone so signal cleanup
-  # cannot miss a clone completed immediately before the trap is delivered.
-  CURRENT_VM="$vm"
-  if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail boot_failed 1 "" "$logdir"
-    return 1
+  if [ -z "$CURRENT_VM" ]; then
+    reclaim_runner_name "$vm" "$selected_runner_api_root"
+    sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
+    lease_rc=0
+    boot_vm_to_ssh "$i" "$vm" "$selected_labels" "$lease_priority" "$logdir" booting \
+      "$selected_group_id" || lease_rc=$?
+    if [ "$lease_rc" -ne 0 ] && [ "$BOOT_LEASE_DENIED" = 1 ]; then
+      # The only loop path that reaches work and then fails before any heartbeat.
+      # Without this the supervisor is silent while healthy, and a checker that
+      # can only see heartbeat age has no choice but to call it stale.
+      [ -n "$SERVING_BLOCKED_SINCE" ] \
+        || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      heartbeat vm-lease-denied
+      tartci_warm_note_lease_denial
+      return "$lease_rc"
+    fi
+    [ "$lease_rc" -eq 0 ] || return "$lease_rc"
   fi
-  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
-    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail boot_failed 1 "" "$logdir"
-    return 1
-  fi
-  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  tartci_ccache_guard "$CACHE_ROOT/ccache"
-  if ! tartci_prepare_disk_root "$FETCHCONTENT_SOURCE_ROOT"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  CURRENT_GUEST_CORES="$lease_cores"
-  CURRENT_GUEST_MEM_MB="$lease_mem"
-  boot_log="$(mktemp -t "tart-run-$vm")"
-  local tart_dirs=(
-    --dir="ccache:$CACHE_ROOT/ccache"
-    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
-  )
-  [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
-  CURRENT_PIP_WHEELHOUSE=0
-  if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
-    tart_dirs+=(--dir="pip-wheelhouse:$PIP_WHEELHOUSE_ROOT:ro")
-    CURRENT_PIP_WHEELHOUSE=1
-  fi
-  tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
-    "$vm" >"$boot_log" 2>&1 & rpid=$!
-  CURRENT_RPID="$rpid"
-  heartbeat booting
-
-  for _ in $(seq 1 60); do ip="$(tart ip "$vm" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
-  if [ -z "$ip" ]; then
-    note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
-    rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
-    discard_current_vm
-    tartci_release_vm_lease
-    return 1
-  fi
-  CURRENT_IP="$ip"
-  rm -f "$boot_log"
-  local sshok=0
-  for _ in $(seq 1 90); do
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
-      && { sshok=1; break; }
-    sleep 2
-  done
-  if [ "$sshok" != 1 ]; then
-    note "[$i] no SSH after 180s — discarding unregistered VM"
-    event boot_failed "no_ssh"
-    runtime_emit_complete fail ssh_failed 1 "" "$logdir"
-    discard_current_vm
-    tartci_release_vm_lease
-    return 1
-  fi
+  ip="$CURRENT_IP"
   t_booted="$(now_epoch)"
   if [ "$ASSIGNMENT_MODE" != event-class-v2 ] && higher_priority_demand "$selected_tier"; then
     note "[$i] higher-priority workflow demand appeared during boot — discarding unregistered tier-$selected_tier VM"
@@ -1921,6 +1997,7 @@ run_one(){
     fi
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
+    tartci_admission_contention_event "$admission_json" boundary
     if [ "$admission_rc" -ne 0 ]; then
       local admission_detail
       admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
@@ -1977,8 +2054,7 @@ run_one(){
      && ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM"
-    event assignment_v2_pre_mint_denied \
-      "selected_tier=$selected_tier labels=$selected_labels"
+    tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
     discard_current_vm
     tartci_release_vm_lease
     return 75
@@ -2083,7 +2159,8 @@ i=0
   exit 0
 }
 [ -n "$PRINT_PRE_MINT_SELECTION" ] && {
-  if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'; else printf '0\n'; fi
+  if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'
+  else printf '0\n'; printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2; fi
   exit 0
 }
 [ -n "$PRINT_IDLE_RETARGET" ] && {
@@ -2130,6 +2207,10 @@ tartci_lease_fit_validate || die "invalid lease-fit configuration"
 # Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
 # shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
+# Warm pre-booted VM (opt-in, TARTCI_WARM_VM=1; off by default).
+# shellcheck source=providers/tart-macos/warm-vm.lib.sh
+source "${BASH_SOURCE[0]%/*}/warm-vm.lib.sh"
+tartci_warm_configure
 
 if [ "$LOOP" = 1 ]; then
   note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} tier_order=${ASSIGNMENT_V2_TIER_ORDER:-<configured>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} yield_max_wait=${YIELD_MAX_WAIT}s host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
@@ -2164,6 +2245,11 @@ if [ "$LOOP" = 1 ]; then
       fi
       heartbeat loop
     fi
+    # A parked warm VM expires, yields or follows the pool before anything
+    # else. A warm teardown that did not complete is now CURRENT_VM, which the
+    # block above reconciles (pending delete) or exits on, on the next pass.
+    tartci_warm_tick || true
+    [ -z "$CURRENT_VM" ] || continue
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
@@ -2260,12 +2346,18 @@ if [ "$LOOP" = 1 ]; then
     # Cheap local check (no gh call), fail-open, and 0 when the feature is off.
     hh=0
     [ "${q:-0}" -gt 0 ] && hh="$(tartci_host_health_yield)"
+    # A sibling supervisor's parked warm VM serves this repository's next job:
+    # defer this poll and ask it to hand off, rather than boot a second VM.
+    ws=0
+    if [ "${q:-0}" -gt 0 ] && [ -z "$WARM_VM" ] && tartci_warm_sibling_defer; then
+      ws=1
+    fi
     # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
     # (3) no higher-priority lane is waiting/running, and (4) the host is healthy.
     # (3) is always satisfied when the priority feature is off (priority_demand
     # returns 0) and (4) when host-health yield is off (host_health_yield returns
     # 0), so this is a no-op for a runner with neither feature enabled.
-    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap" "$r")" && [ -n "$resv" ]; then
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
@@ -2307,7 +2399,15 @@ if [ "$LOOP" = 1 ]; then
       # job-running) reads as busy for the whole sleep.
       if [ "$run_rc" = 0 ]; then heartbeat loop; else heartbeat backoff; sleep "$POLL"; fi
       CURRENT_LABELS="$LABELS"
-      rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
+      # A denied warm hand-off leaves the VM parked on its own reservation.
+      if [ -z "$WARM_VM" ] || [ "$resv" != "$WARM_RESV" ]; then
+        rm -f "$resv" 2>/dev/null || true
+      fi
+      CURRENT_RESV=""
+    elif [ "$ws" -eq 1 ]; then
+      note "deferring ${POLL}s (queued=$q) — a sibling supervisor's warm VM is parked for $REPO; asked it to hand off"
+      heartbeat waiting
+      sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
       note "yielding ${POLL}s (queued=$q host_health_yield=$hh running_macos_vms=$r/$cap) — host saturated, deferring new VM boot"
       event yielded_host_health "queued=$q host_health_yield=$hh running=$r/$cap"
@@ -2328,9 +2428,21 @@ if [ "$LOOP" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
+      else
+        # Demand this lane could not place (no VM slot): a parked warm VM on
+        # this host, if any, yields to it.
+        tartci_warm_note_demand slot_full
       fi
-      heartbeat waiting
-      sleep "$POLL"
+      if [ -n "$WARM_VM" ]; then
+        heartbeat warm-parked
+      else
+        heartbeat waiting
+        [ "${q:-0}" -gt 0 ] || tartci_warm_try_park || true
+      fi
+      # A park whose boot failed and whose teardown did not complete left
+      # CURRENT_VM; the loop top reconciles it or exits fail-closed.
+      [ -z "$CURRENT_VM" ] || continue
+      tartci_warm_sleep "$POLL"
     fi
   done
 else

@@ -1929,6 +1929,16 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   shows the resolved role + capacity. Onboarding persists the role and verifies
   the host is governed — see [Onboarding a new host](#onboarding-a-new-host).
 
+### Warm pre-booted gate VM (opt-in, off by default)
+
+A host with RAM and cores to spare can keep one gate VM booted and parked under
+a memory-only lease (`leases.py acquire --memory-only`), upgraded in place to
+its core lease at hand-off (`leases.py resize`). It yields to other lanes,
+expires, and is reported by `tartci pool status` and `tartci doctor`. No host
+enables it. Design, events, and the runbook for trying it on a new high-RAM
+host (prerequisites, exact profile lines, idle-cost and minutes-saved
+measurement, turning it off): [warm-vm.md](warm-vm.md).
+
 ## Fleet scheduling boundary
 
 GitHub Actions is the only fleet scheduler. Shipyard supervises queue ordering,
@@ -2219,3 +2229,10 @@ verified. Any ambiguity stops the batch; admission remains denied. The atomic
 receipt under the disk-admission state directory records bounds, before/after
 capacity, fetched main SHA, dispositions, removals, branch proofs, and whether
 one exact admission retry is eligible.
+
+## Cross-host build disagreement (probable cache poisoning)
+
+`tartci doctor build-disagreement` flags a gate host whose Build step fails to
+compile or link what another gate host builds green: the signature of a
+poisoned shared compiler cache. Read-only, never schedules, default off. Rules,
+detection floor, enablement and remedy: [build-disagreement.md](build-disagreement.md).

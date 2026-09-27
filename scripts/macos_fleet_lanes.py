@@ -76,6 +76,7 @@ LANE_KEYS = {
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
+    "warm_vm", "warm_vm_max_park_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -475,6 +476,8 @@ def load(path: Path) -> dict:
             fail("stacked_images.flat_rollback must name the retained flat golden")
     if not lanes:
         fail("at least one [[lane]] is required")
+    if sum(1 for lane in lanes if isinstance(lane, dict) and lane.get("warm_vm") is True) > 1:
+        fail("at most one lane per host may set warm_vm = true (one parked VM per host)")
     generated_labels: set[str] = set()
     for lane in lanes:
         if not isinstance(lane, dict):
@@ -624,6 +627,18 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: fallback_peer_max_age_seconds must be an "
                 "integer from 30 through 300 beside fallback_preferred_hosts"
+            )
+        warm_vm = lane.get("warm_vm")
+        if warm_vm is not None and type(warm_vm) is not bool:
+            fail(f"lane {lane_id}: warm_vm must be a boolean")
+        warm_age = lane.get("warm_vm_max_park_seconds")
+        if warm_age is not None and (
+                warm_vm is not True
+                or type(warm_age) is not int
+                or not 300 <= warm_age <= 14400):
+            fail(
+                f"lane {lane_id}: warm_vm_max_park_seconds must be an integer "
+                "from 300 through 14400 beside warm_vm = true"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -2185,6 +2200,13 @@ def lane_plist(
             env["TARTCI_FALLBACK_PEER_MAX_AGE_SECS"] = str(
                 lane["fallback_peer_max_age_seconds"]
             )
+    # One parked VM per host at most: only supervisor slot 1 of the one lane
+    # that opted in parks (validation refuses a second warm lane).
+    if lane.get("warm_vm") and slot == 1:
+        env["TARTCI_WARM_VM"] = "1"
+        env["TARTCI_WARM_VM_DIR"] = f"{host['home']}/.tartci/state/warm-vm"
+        if "warm_vm_max_park_seconds" in lane:
+            env["TARTCI_WARM_VM_MAX_PARK_SECS"] = str(lane["warm_vm_max_park_seconds"])
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)

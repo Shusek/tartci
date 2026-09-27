@@ -13,27 +13,36 @@ inspects what the cache holds before a job reads it.
 
 What is flagged
 ---------------
-Every direct-mode manifest that lists zero include files. That is the only
-shape that can serve a foreign object unconditionally.
+Direct-mode manifests that list zero include files, the only shape that can
+serve a foreign object unconditionally. Each is classified by the result it
+names:
 
-A zero-include manifest is also what a translation unit with no includes
-legitimately produces (Pulp compiles about a hundred: generated
-control-shipping markers, placeholder.cpp). The guard cannot tell a legitimate
-one from a poisoned one that points at another include-less TU's object, so by
-default it quarantines them all: the cost is one preprocessor-mode lookup for
-each of those trivial TUs on the next build. Each flagged manifest is also
-classified by the result it names, and the counts are logged separately, so
-the log still carries the poison signal:
+  zero_include_suspect     the result's dependency file lists headers (the
+                           manifest cannot be describing that object), or the
+                           result is missing, or it cannot be checked
+  zero_include_consistent  the result's dependency file lists only a source,
+                           which is what a legitimate include-less TU produces
+                           (Pulp compiles about a hundred: generated
+                           control-shipping markers, placeholder.cpp)
 
-  zero_include_consistent  the result's dependency file lists only a source
-                           (what a legitimate include-less TU produces)
-  zero_include_suspect     the result lists headers (the manifest cannot be
-                           describing that object), is missing, or cannot be
-                           checked
+By default only suspects are quarantined; consistent ones stay and are
+counted. A proven-consistent manifest is remembered in
+<quarantine-root>/verdicts.json by (size, mtime), so it costs one
+`--extract-result` once rather than on every boot.
 
-`--keep-consistent` leaves the consistent ones in place and quarantines only
-suspects. It is weaker: it misses a poisoned manifest that happens to point at
-another include-less TU's object.
+Residual blind spot of the default: a poisoned manifest that names ANOTHER
+include-less TU's object is indistinguishable from a legitimate one (a
+real-ccache test reproduces it) and is kept. `--all-zero-include` closes that
+by quarantining every zero-include manifest, at the cost of one
+preprocessor-mode lookup per include-less TU on the next build; `reset` always
+runs that way.
+
+Which roots
+-----------
+The host cache directory itself, plus <cache>/tartci-layers-v1/shared when
+per-job write isolation is in use. Only the single-hex-digit fan-out
+directories of a root hold entries, so the per-job jobs/, green/ and discard/
+layers (other VMs, possibly mid-build) are never scanned or moved.
 
 Quarantine, never delete
 ------------------------
@@ -58,15 +67,15 @@ which directory a job reads.
 
 Commands
 --------
-  ccache_guard.py scan       --cache DIR [--keep-consistent] [--json]
+  ccache_guard.py scan       --cache DIR [--all-zero-include] [--json]
   ccache_guard.py quarantine --cache DIR [--quarantine-root DIR]
-                             [--keep-consistent] [--budget SECS] [--json]
+                             [--all-zero-include] [--budget SECS] [--json]
   ccache_guard.py reset      --cache DIR [--quarantine-root DIR] [--reset]
                              [--force] [--plan] [--json]
 
 `reset` is the operator command (`tartci ccache reset`). It refuses while a
 Tart VM runs or a VM lease is held on the host (exit 3) unless --force.
-Without --reset it runs the quarantine; with --reset it also moves every
+Without --reset it runs the quarantine in --all-zero-include mode; with --reset it also moves every
 remaining cache entry into the quarantine batch, leaving an empty cache
 (ccache's config and stats files stay). It logs before and after entry counts.
 --plan reports what it would do and changes nothing.
@@ -97,8 +106,11 @@ ENTRY_TYPE_MANIFEST = 1
 # include path is far larger. The cap only limits which files the guard
 # bothers to --inspect, which is most of its cost on a 450k-entry cache.
 DEFAULT_SIZE_CAP = 1024
-# Top-level names ccache keeps beside its entry fan-out directories.
-SKIP_TOP = {"tmp", "lock"}
+# ccache's entry fan-out: one hex digit per top-level directory.
+FANOUT = set("0123456789abcdef")
+# Per-job write isolation keeps its layers here, beside the fan-out.
+LAYER_DIR = "tartci-layers-v1"
+VERDICT_CACHE = "verdicts.json"
 INSPECT_TIMEOUT = 20
 # Dependency-file inputs that are not includes (see result_verdict).
 IMPLICIT_DEP_SUFFIXES = (".json", ".modulemap")
@@ -125,15 +137,17 @@ def resolve_ccache(explicit: str | None = None) -> str | None:
 
 
 def iter_entries(cache: Path):
-    """Every cache entry file under ccache's fan-out directories."""
+    """Every cache entry file under ONE ccache root's fan-out directories.
+
+    Only the single-hex-digit fan-out directories hold entries, so anything
+    else at the top (tmp, lock, and the per-job layer tree) is never walked.
+    """
     try:
         tops = sorted(os.scandir(cache), key=lambda e: e.name)
     except OSError:
         return
     for top in tops:
-        if top.name in SKIP_TOP or top.name.startswith("."):
-            continue
-        if not top.is_dir(follow_symlinks=False):
+        if top.name not in FANOUT or not top.is_dir(follow_symlinks=False):
             continue
         for dirpath, dirnames, filenames in os.walk(top.path):
             dirnames[:] = sorted(d for d in dirnames if d != "tmp")
@@ -141,6 +155,28 @@ def iter_entries(cache: Path):
                 if name.startswith(".") or name in ("stats", "CACHEDIR.TAG"):
                     continue
                 yield Path(dirpath) / name
+
+
+def cache_roots(cache: Path) -> list[Path]:
+    """The ccache roots a job can READ under a host cache directory.
+
+    The legacy root itself, plus the promoted shared layer when per-job write
+    isolation is in use (<cache>/tartci-layers-v1/shared). The jobs/, green/
+    and discard/ layers belong to VMs that may be mid-build and are never
+    scanned.
+    """
+    roots = [cache]
+    shared = cache / LAYER_DIR / "shared"
+    if shared.is_dir():
+        roots.append(shared)
+    return roots
+
+
+def iter_all_entries(cache: Path):
+    """(root, entry) for every entry in every readable root of a host cache."""
+    for root in cache_roots(cache):
+        for entry in iter_entries(root):
+            yield root, entry
 
 
 def is_manifest_header(path: Path) -> bool:
@@ -223,7 +259,7 @@ def result_verdict(ccache: str, cache: Path, key: str) -> str:
     return "consistent" if len(inputs) == 1 else "has_headers"
 
 
-def classify(ccache: str, cache: Path, info: dict, keep_consistent: bool) -> tuple[str, dict]:
+def classify(ccache: str, cache: Path, info: dict, all_zero: bool) -> tuple[str, dict]:
     """(action, detail): action is 'keep' or 'quarantine'."""
     if info["file_paths"] > 0:
         return "keep", {}
@@ -231,7 +267,7 @@ def classify(ccache: str, cache: Path, info: dict, keep_consistent: bool) -> tup
     consistent = bool(verdicts) and all(v == "consistent" for v in verdicts.values())
     detail = {"verdict": "zero_include_consistent" if consistent else "zero_include_suspect",
               "results": verdicts}
-    if consistent and keep_consistent:
+    if consistent and not all_zero:
         return "keep", detail
     return "quarantine", detail
 
@@ -270,22 +306,56 @@ def move_into(src: Path, cache: Path, dest_root: Path) -> Path:
     return dest
 
 
-def run_scan(cache: Path, ccache: str, *, keep_consistent: bool, size_cap: int,
-             quarantine_dir: Path | None, deadline: float | None) -> dict:
+def load_verdicts(qroot: Path) -> dict:
+    try:
+        value = json.loads((qroot / VERDICT_CACHE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def save_verdicts(qroot: Path, verdicts: dict) -> None:
+    qroot.mkdir(parents=True, exist_ok=True)
+    tmp = qroot / (VERDICT_CACHE + ".tmp")
+    tmp.write_text(json.dumps(verdicts, sort_keys=True))
+    os.replace(tmp, qroot / VERDICT_CACHE)
+
+
+def run_scan(cache: Path, ccache: str, *, all_zero: bool, size_cap: int,
+             quarantine_dir: Path | None, deadline: float | None,
+             verdicts: dict | None = None) -> dict:
+    """Walk every readable root; quarantine what classify() flags.
+
+    `verdicts` (relative path -> [size, mtime_ns]) remembers manifests already
+    proven consistent, so a legitimate include-less TU's manifest is checked
+    once, not on every boot. An entry is re-checked whenever its size or
+    mtime changes. The dict is updated in place with what this run saw.
+    """
     counts = {"entries": 0, "manifests_checked": 0, "zero_include": 0,
               "zero_include_consistent": 0, "zero_include_suspect": 0,
-              "flagged": 0, "quarantined": 0, "quarantine_errors": 0, "uninspectable": 0}
+              "consistent_cached": 0, "flagged": 0, "quarantined": 0,
+              "quarantine_errors": 0, "uninspectable": 0}
     flagged: list[dict] = []
     budget_exhausted = False
-    for entry in iter_entries(cache):
+    seen: dict = {}
+    for root, entry in iter_all_entries(cache):
         if deadline is not None and time.monotonic() > deadline:
             budget_exhausted = True
             break
         counts["entries"] += 1
         try:
-            if os.lstat(entry).st_size > size_cap:
-                continue
+            st = os.lstat(entry)
         except OSError:
+            continue
+        if st.st_size > size_cap:
+            continue
+        rel = str(entry.relative_to(cache))
+        stamp = [st.st_size, st.st_mtime_ns]
+        if not all_zero and verdicts is not None and verdicts.get(rel) == stamp:
+            counts["zero_include"] += 1
+            counts["zero_include_consistent"] += 1
+            counts["consistent_cached"] += 1
+            seen[rel] = stamp
             continue
         if not is_manifest_header(entry):
             continue
@@ -294,14 +364,16 @@ def run_scan(cache: Path, ccache: str, *, keep_consistent: bool, size_cap: int,
         if info is None:
             counts["uninspectable"] += 1
             continue
-        action, detail = classify(ccache, cache, info, keep_consistent)
+        action, detail = classify(ccache, root, info, all_zero)
         if info["file_paths"] == 0:
             counts["zero_include"] += 1
             counts[detail["verdict"]] += 1
         if action != "quarantine":
+            if detail.get("verdict") == "zero_include_consistent":
+                seen[rel] = stamp
             continue
         counts["flagged"] += 1
-        row = {"path": str(entry.relative_to(cache)), "created": info["created"], **detail}
+        row = {"path": rel, "created": info["created"], **detail}
         if quarantine_dir is not None:
             try:
                 move_into(entry, cache, quarantine_dir)
@@ -310,6 +382,11 @@ def run_scan(cache: Path, ccache: str, *, keep_consistent: bool, size_cap: int,
                 counts["quarantine_errors"] += 1
                 row["quarantine_error"] = str(exc)
         flagged.append(row)
+    if verdicts is not None and not budget_exhausted:
+        verdicts.clear()
+        verdicts.update(seen)
+    elif verdicts is not None:
+        verdicts.update(seen)
     return {"counts": counts, "flagged": flagged, "budget_exhausted": budget_exhausted}
 
 
@@ -410,8 +487,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache", required=True, help="the ccache directory jobs read")
     parser.add_argument("--quarantine-root", help="default: <cache>-quarantine beside it")
     parser.add_argument("--ccache", help="ccache binary (default: PATH, then Homebrew)")
-    parser.add_argument("--keep-consistent", action="store_true",
-                        help="leave zero-include manifests whose result lists only a source")
+    parser.add_argument("--all-zero-include", action="store_true",
+                        help="quarantine every zero-include manifest, consistent ones too")
     parser.add_argument("--size-cap", type=int, default=DEFAULT_SIZE_CAP)
     parser.add_argument("--budget", type=float, default=0.0,
                         help="stop after this many seconds (0: no limit)")
@@ -463,15 +540,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         qdir = None if plan else new_batch_dir(qroot)
         deadline = time.monotonic() + args.budget if args.budget > 0 else None
-        result["mode"] = "keep-consistent" if args.keep_consistent else "all-zero-include"
+        all_zero = args.all_zero_include or args.command == "reset"
+        result["mode"] = "all-zero-include" if all_zero else "suspect-only"
         if args.command == "reset":
-            result["before"] = sum(1 for _ in iter_entries(cache))
-        scan = run_scan(cache, ccache, keep_consistent=args.keep_consistent,
-                        size_cap=args.size_cap, quarantine_dir=qdir, deadline=deadline)
+            result["before"] = sum(1 for _ in iter_all_entries(cache))
+        verdicts = load_verdicts(qroot)
+        scan = run_scan(cache, ccache, all_zero=all_zero, size_cap=args.size_cap,
+                        quarantine_dir=qdir, deadline=deadline, verdicts=verdicts)
         result.update(scan)
         if args.command == "reset" and args.reset:
             moved = errors = 0
-            for entry in list(iter_entries(cache)):
+            for _root, entry in list(iter_all_entries(cache)):
                 if plan:
                     moved += 1
                     continue
@@ -483,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
             result["reset_moved"] = moved
             result["reset_errors"] = errors
         if args.command == "reset":
-            result["after"] = sum(1 for _ in iter_entries(cache))
+            result["after"] = sum(1 for _ in iter_all_entries(cache))
         if scan["budget_exhausted"]:
             result["status"] = "budget_exhausted"
         else:
@@ -492,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
             if qdir.exists():
                 result["quarantine_dir"] = str(qdir)
                 (qdir / "report.json").write_text(json.dumps(result, sort_keys=True, indent=1))
+            if not all_zero:
+                save_verdicts(qroot, verdicts)
             result["pruned_batches"] = prune_batches(qroot, args.retain_days)
             append_log(qroot, {k: v for k, v in result.items() if k != "flagged"})
     finally:
