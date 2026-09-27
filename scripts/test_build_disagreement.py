@@ -297,7 +297,7 @@ class Cli(unittest.TestCase):
 class Backtest(unittest.TestCase):
     """Replays recorded gate jobs from the 2026-09-26 m3 incident and a healthy day."""
 
-    def replay(self, name, now, hours=6.0):
+    def replay(self, name, now, hours=6.0, streak=bd.DEFAULT_STREAK):
         records = json.loads((FIXTURES / f"{name}.json").read_text())
         logs = FIXTURES / "logs"
 
@@ -306,7 +306,7 @@ class Backtest(unittest.TestCase):
             return path.read_text() if path.exists() else None
 
         ev = bd.Evaluation(records=records, now=bd.parse_time(now),
-                           window=dt.timedelta(hours=hours), log_for=log_for)
+                           window=dt.timedelta(hours=hours), log_for=log_for, streak=streak)
         return bd.evaluate(ev)
 
     @unittest.skipUnless((FIXTURES / "incident-2026-09-26.json").exists(), "fixture absent")
@@ -331,8 +331,12 @@ class Backtest(unittest.TestCase):
         failures = [r for r in records if r["outcome"] == "build_failure"
                     and "2026-09-26T16:00" <= r["completed_at"] <= "2026-09-26T20:00"]
         self.assertEqual({r["host"] for r in failures}, {"m1", "m3", "m5"})  # control: look-alike present
-        for stamp in stamps:
-            self.assertNotEqual(self.replay("incident-2026-09-26", stamp)["state"], "problem", stamp)
+        # K=2 is the setting where m5's two same-error reds plus m3's later
+        # green would fire without the "no other host fails the same way" guard.
+        for streak in (2, 3):
+            for stamp in stamps:
+                result = self.replay("incident-2026-09-26", stamp, streak=streak)
+                self.assertNotEqual(result["state"], "problem", (streak, stamp))
 
     @unittest.skipUnless((FIXTURES / "control-2026-09-25.json").exists(), "fixture absent")
     def test_healthy_day_is_quiet_at_every_step(self):
