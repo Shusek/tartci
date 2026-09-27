@@ -71,3 +71,33 @@ tartci_admission_clean_detail() {
     printf '%s' "reason=unreadable"
   fi
 }
+
+# Emit `admission_contention_waited` when an admission envelope records that
+# the wrapper waited out another caller's contention defer before its final
+# verdict. The wait count and duration otherwise live only in the envelope
+# file, which the next attempt overwrites. No-op when the provider defines no
+# `event` function or the envelope records no wait. $2 names the stage.
+tartci_admission_contention_event() {
+  local envelope="${1:-}" stage="${2:-unknown}" parsed
+  declare -F event >/dev/null 2>&1 || return 0
+  parsed="$(printf '%s' "$envelope" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    raise SystemExit(1)
+waits = d.get("tartci_contention_waits")
+if type(waits) is not int or waits <= 0:
+    raise SystemExit(1)
+secs = d.get("tartci_contention_wait_secs")
+secs = secs if isinstance(secs, (int, float)) and not isinstance(secs, bool) else ""
+verdict = str(d.get("verdict") or "unknown").replace(" ", "_")
+reason = str(d.get("reason") or "unknown").replace(" ", "_")
+print("waits=%d secs=%s verdict=%s reason=%s" % (waits, secs, verdict, reason))
+' 2>/dev/null)" || return 0
+  local fields=()
+  read -r -a fields <<< "$parsed stage=$stage"
+  event admission_contention_waited "$parsed stage=$stage" ${fields[@]+"${fields[@]}"}
+}

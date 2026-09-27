@@ -182,11 +182,16 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   each hold ~5,000 legitimate ones. The discriminator is the result it names:
   `ccache --extract-result` it and read the `.d`; a list of headers (or a
   missing result) means the manifest cannot describe that object. The scan
-  reports these as `zero_include_suspect`. A poisoned manifest can also name
-  another include-less TU's object and then looks consistent, which is why the
-  guard quarantines every zero-include manifest by default.
-  → *Clean:* `tartci ccache quarantine --host-cache` renames them into
-  `<cache>-quarantine/<stamp>/` (never deletes; `guard.log` keeps counts).
+  reports these as `zero_include_suspect` and the rest as
+  `zero_include_consistent`. Blind spot: a poisoned manifest that names
+  ANOTHER include-less TU's object looks consistent; `--all-zero-include`
+  (and `reset`) quarantine those too, at one preprocessor-mode lookup per
+  include-less TU on the next build.
+  → *Clean:* `tartci ccache quarantine --host-cache` renames suspects into
+  `<cache>-quarantine/<stamp>/` (never deletes; `guard.log` keeps both counts;
+  consistent verdicts are remembered in `verdicts.json`). It scans the legacy
+  root and `tartci-layers-v1/shared`, never the per-job `jobs/`, `green/` or
+  `discard/` layers.
   `tartci ccache reset --reset` moves the whole cache aside; it refuses while
   a VM runs or holds a lease unless `--force`. The macOS runner runs the
   quarantine before every VM boot (fail-open, `TARTCI_CCACHE_GUARD=0` disables;

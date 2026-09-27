@@ -459,6 +459,39 @@ tartci_stop_vm_lease_heartbeat(){
   fi
 }
 
+# A structured `lease_denied` event for the supervisor's events.jsonl, when the
+# sourcing provider defines `event` (the macOS runner does). A denial used to
+# reach only the note stream, so a host that refused every lease for an hour
+# left no event behind. axis is the exceeded capacity axes joined with "+"
+# (cores, memory, disk), or "none" for a denial that is not a capacity
+# verdict (legacy accounting, disk root unavailable, ...).
+tartci_vm_lease_denied_event(){
+  local out="$1" rc="$2" kind="$3" cores="$4" mem_mb="$5" priority="$6" parsed
+  declare -F event >/dev/null 2>&1 || return 0
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    d = {}
+if not isinstance(d, dict):
+    d = {}
+axis = d.get("exceeded_axis") if isinstance(d.get("exceeded_axis"), dict) else {}
+axes = "+".join(k for k in ("cores", "memory", "disk") if axis.get(k) is True) or "none"
+disk = d.get("disk") if isinstance(d.get("disk"), dict) else {}
+def num(v):
+    return v if type(v) is int else ""
+print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s" % (
+    axes, str(d.get("reason") or "unreadable").replace(" ", "_"),
+    num(d.get("requested_cores")), num(d.get("requested_mem_mb")),
+    num(disk.get("requested_bytes")), num(disk.get("free_bytes")),
+    num(disk.get("required_bytes"))))
+' 2>/dev/null)" || parsed="axis=none reason=unreadable"
+  local fields=()
+  read -r -a fields <<< "$parsed rc=$rc kind=$kind lease_cores=$cores lease_mem_mb=${mem_mb:-auto} priority=$priority"
+  event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
+}
+
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}"
   local receipt_provider="${8:-unknown}" receipt_lane="${9:-unknown}" receipt_runner="${10:-unknown}" lease_id rc=0 out
@@ -552,9 +585,14 @@ tartci_acquire_vm_lease(){
     [ -z "$disk_expected_mount_path" ] || disk_args+=(--disk-expected-mount-path "$disk_expected_mount_path")
   fi
   lease_id="vm-$kind-$vm_name"
+  # A parked warm VM (TARTCI_VM_LEASE_MEMORY_ONLY=1) holds its memory and disk
+  # but no cores until tartci_resize_vm_lease upgrades it at hand-off.
+  local core_args=(--cores "$cores")
+  [ "${TARTCI_VM_LEASE_MEMORY_ONLY:-0}" != 1 ] || core_args=(--cores 0 --memory-only)
+  TARTCI_LAST_VM_LEASE_DENIAL=""
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
     --id "$lease_id" \
-    --cores "$cores" \
+    "${core_args[@]}" \
     ${mem_args[@]+"${mem_args[@]}"} \
     ${disk_args[@]+"${disk_args[@]}"} \
     --priority "$priority" \
@@ -579,7 +617,10 @@ tartci_acquire_vm_lease(){
     fi
   fi
   if [ "$rc" -ne 0 ]; then
+    # shellcheck disable=SC2034 # read by the provider (warm-VM yield signal)
+    TARTCI_LAST_VM_LEASE_DENIAL="$out"
     tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
+    tartci_vm_lease_denied_event "$out" "$rc" "$kind" "$cores" "${mem_mb:-}" "$priority"
     return "$rc"
   fi
   tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
@@ -593,6 +634,39 @@ tartci_acquire_vm_lease(){
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  return 0
+}
+
+# Upgrade the active lease in place (leases.py resize): a parked warm VM's
+# memory-only lease becomes a full core lease at hand-off. Atomic under the
+# lease-store lock, so there is no released window another lease can take, and
+# the guardian and disk reservation are unchanged. Returns 75 on a capacity
+# denial with the lease left exactly as it was.
+tartci_resize_vm_lease(){
+  local cores="$1" mem_mb="$2" priority="$3" labels="${4:-}" lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}" out rc=0
+  TARTCI_LAST_VM_LEASE_DENIAL=""
+  tartci_positive_int_or_empty "$cores" || return 1
+  if [ -z "$lease_id" ]; then
+    # Break-glass (leases disabled) has no record to resize; the size is
+    # simply what the provider applies. Anything else without a lease is wrong.
+    [ "${_tartci_vm_lease_bypass_state[0]:-}" = authorized ] || return 1
+    TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+    TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
+    return 0
+  fi
+  out="$(python3 "$TARTCI_ROOT/scripts/leases.py" resize --id "$lease_id" \
+    --cores "$cores" --mem-mb "$mem_mb" --priority "$priority" --label "$labels" --json 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # shellcheck disable=SC2034 # read by the provider
+    TARTCI_LAST_VM_LEASE_DENIAL="$out"
+    tartci_vm_lease_note "lease resize denied for $lease_id cores=$cores mem_mb=$mem_mb priority=$priority rc=$rc: $out"
+    return "$rc"
+  fi
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
+  tartci_vm_lease_note "lease resized id=$lease_id cores=$cores mem_mb=$mem_mb priority=$priority"
   return 0
 }
 
