@@ -337,7 +337,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
     is no waiter queue and no preemption, and a priority at or above the gate
     class only lifts the non-gate budget. So a tagged release at 120 on slot 2
     occupies exactly what a merge-group guest on slot 2 would, and the release
-    PR gate at 90 cannot reach the gate reserve at all.
+    PR gate at 100 occupies exactly what a PR-head guest would.
     """
 
     ROOT = Path(__file__).resolve().parents[1]
@@ -367,7 +367,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.prio = dict(zip(("merge", "pr", "tagged", "pr_gate"), proc.stdout.split()))
-        self.assertEqual(self.prio, {"merge": "110", "pr": "100", "tagged": "120", "pr_gate": "90"})
+        self.assertEqual(self.prio, {"merge": "110", "pr": "100", "tagged": "120", "pr_gate": "100"})
 
     def _take(self, lease_id: str, klass: str, cores: int | None = None,
               check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -414,16 +414,41 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
         self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
         self.assertEqual(self._held(), ["slot1-gate", "slot2-gate"])
 
-    def test_release_pr_gate_cannot_reach_the_gate_reserve(self) -> None:
-        """The release PR gate is non-gate work: it draws only from the non-gate
-        budget, so slot 1 keeps the reserve even with it running on slot 2."""
-        self._take("slot2-release-pr", "pr_gate")
-        extra = self._take("extra-release-pr", "pr_gate", cores=1, check=False)
-        self.assertEqual(extra.returncode, 75)
-        self.assertEqual(json.loads(extra.stdout)["reason"], "capacity_exceeded")
-        body = json.loads(self._take("slot1-gate", "merge").stdout)
-        self.assertTrue(body["ok"])
-        self.assertEqual(self._held(), ["slot1-gate", "slot2-release-pr"])
+    def test_release_pr_gate_admits_exactly_like_pr_head(self) -> None:
+        """Every occupancy a two-slot host can be in gives the release PR gate
+        PR-head's verdict, so a slot that boots it holds what a gate guest on
+        that slot would and nothing more."""
+        occupancies = ((), ("merge",), ("pr",), ("tagged",), ("pr_gate",),
+                       ("merge", "pr"), ("tagged", "pr"), ("pr_gate", "merge"))
+        base = self.store
+        for n, held in enumerate(occupancies):
+            verdicts = {}
+            for klass in ("pr_gate", "pr"):
+                self.store = base.with_name(f"occ-{n}-{klass}")
+                for i, occupant in enumerate(held):
+                    self._take(f"held-{i}", occupant)
+                verdicts[klass] = self._take("probe", klass, check=False).returncode
+            with self.subTest(held=held):
+                self.assertEqual(verdicts["pr_gate"], verdicts["pr"])
+        self.store = base
+
+    def test_release_pr_gate_is_admitted_while_an_ordinary_build_holds_the_non_gate_budget(self) -> None:
+        """m5 as measured on 2026-09-27: 14 leasable cores, 8 reserved for the
+        gate, 6-core guests, and a governed agent build holding the whole
+        6-core non-gate budget. A release PR gate boot must still be admitted
+        from the reserve, as a PR-head boot on the same slot is."""
+        cores, reserved, guest = 14, 8, 6
+        base = self.store
+        verdicts = {}
+        for klass in ("pr_gate", "pr"):
+            self.store = base.with_name(f"governed-{klass}")
+            self.acquire("governed-build", guest, priority="40",
+                         capacity=cores, reserved=reserved)
+            verdicts[klass] = self.acquire(
+                "probe", guest, priority=self.prio[klass],
+                capacity=cores, reserved=reserved, check=False).returncode
+        self.store = base
+        self.assertEqual(verdicts, {"pr_gate": 0, "pr": 0})
 
 
 class LeaseStoreIntegrityTests(LeaseCliTestCase):
