@@ -242,7 +242,7 @@ workflows, listed contiguously and at most once:
 | class | workflows | lease priority |
 |---|---|---|
 | `pulp-release-tagged` | `Release CLI`, `Sign and Release` | `120` (gate) |
-| `pulp-release-pr-gate` | `Release-path PR gate` | `90` (non-gate) |
+| `pulp-release-pr-gate` | `Release-path PR gate` | `100` (gate, as PR-head) |
 
 Gate tiers stay first, so a default slot keeps gate-first order and only takes
 release work when no gate work waits. Each class is its own JIT registration
@@ -250,8 +250,11 @@ release work when no gate work waits. Each class is its own JIT registration
 job and a gate runner cannot take a release job. A lane that does not declare a
 class never scans for it, so hosts without the declaration never pick a release
 job. Tagged releases lease at `120`, above merge-group, so a release boot is
-admitted from gate-reserved capacity; the release PR gate stays non-gate at
-`90`, below PR-head, as the legacy release lane's `vm` class. The numeric
+admitted from gate-reserved capacity; the release PR gate leases at `100`,
+exactly as PR-head, so a slot that boots it holds what a gate guest on that
+slot would and an ordinary build holding the host's non-gate budget cannot
+lock it out. Each supervisor slot holds at most one lease, so neither release
+class can take a second slot's reserve. The numeric
 values apply only to registrations carrying the gate base label
 `pulp-build-vm`; the legacy `pulp-release` lane (`pulp-build-vm-release`) keeps
 `gate`/`vm`.
@@ -259,8 +262,18 @@ values apply only to registrations carrying the gate base label
 Only m5's `pulp-gate` lane declares the classes, and one slot is release-first:
 
 ```toml
-assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }
+assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
 ```
+
+Both release classes precede the gate classes on slot 2. m5's `pulp-gate` lane
+is the only registration that serves either class, and the pre-mint check
+admits a class only while every class the slot prefers over it is empty. On
+2026-09-26 the release PR gate was ordered last on both slots; with gate work
+queued continuously from 18Z it was selected once in six hours, that boot was
+denied at pre-mint when merge-group work reappeared, and three `Release-path
+PR gate` jobs waited over three hours while tagged releases (first on slot 2)
+were served. A class that no slot prefers ahead of steady gate demand is a
+class that host never serves.
 
 Because the order names every class, it is a preference: with no release
 queued the slot selects exactly what a default slot selects. Pulp opts in

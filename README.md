@@ -233,6 +233,12 @@ The macOS JIT runner also enforces a bounded warm-cache capacity through
 each disposable VM shares compiler objects without falling back to ccache's
 small process default. Set a smaller value explicitly on space-constrained
 hosts; depend mode remains disabled regardless of this capacity setting.
+Before each VM boots, the runner quarantines direct-mode manifests that list no
+include files from the shared cache (`scripts/ccache_guard.py`, fail-open,
+`TARTCI_CCACHE_GUARD=0` disables, `TARTCI_CCACHE_GUARD_BUDGET_SECS` bounds it,
+default 120). Such a manifest matches every lookup and once linked another
+source's object into every gate build on one host; see `docs/gotchas.md`.
+`tartci ccache scan|quarantine|reset` is the operator surface.
 
 Pulp's merge-group/PR-head gate can use the staged event-class assignment V2
 mode. It removes the legacy `pulp-gate-fast` selector from JIT advertisements,

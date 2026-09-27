@@ -164,6 +164,34 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   match. → *Fix:* set the hashing config **identically** in both. Matched config
   yields ~99.93%.
 
+- **Undefined symbol at link, on ONE host only, for a function whose definition
+  is plainly compiled into a linked archive.** (m3, 2026-09-26: every Pulp
+  `macos` gate on a `studio-*` runner failed linking `pulp-osc-render-wav`;
+  m1/m5 built the same commit green.)
+  → *Cause:* the shared host ccache held direct-mode manifests that list ZERO
+  include files but name another source's result (the object for
+  `audio_doctor.cpp` served for `wav_bridge.cpp`). With no includes to
+  re-check, such a manifest matches every lookup, so the archive silently
+  contains the wrong object. How they were written is unproven (concurrent
+  writers or a VM torn down mid-write over virtio-fs are the suspects).
+  → *Detect:* `tartci ccache scan --host-cache` (read-only). By hand:
+  `ccache --inspect <entry>` shows `Entry type: 1 (manifest)` and
+  `File paths (0)`; the raw magic bytes are `cc ac`, not ASCII "ccac". A
+  zero-include manifest is NOT proof of poison: Pulp compiles ~94 include-less
+  TUs (generated `*_control_shipping_marker.cpp`, `placeholder.cpp`), and m1/m5
+  each hold ~5,000 legitimate ones. The discriminator is the result it names:
+  `ccache --extract-result` it and read the `.d`; a list of headers (or a
+  missing result) means the manifest cannot describe that object. The scan
+  reports these as `zero_include_suspect`. A poisoned manifest can also name
+  another include-less TU's object and then looks consistent, which is why the
+  guard quarantines every zero-include manifest by default.
+  → *Clean:* `tartci ccache quarantine --host-cache` renames them into
+  `<cache>-quarantine/<stamp>/` (never deletes; `guard.log` keeps counts).
+  `tartci ccache reset --reset` moves the whole cache aside; it refuses while
+  a VM runs or holds a lease unless `--force`. The macOS runner runs the
+  quarantine before every VM boot (fail-open, `TARTCI_CCACHE_GUARD=0` disables;
+  events `ccache_guard` in the lane's event log).
+
 - **Link error: undefined `icu_74::Locale::...` on Ubuntu.**
   → *Cause:* Pulp opts into direct `icu::Locale`/BreakIterator calls when
   `PULP_HAS_SKIA` + ICU public headers are present (true with `libicu-dev`), but

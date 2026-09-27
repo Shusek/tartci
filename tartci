@@ -12,6 +12,10 @@
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
+#   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
+#   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
+#   tartci ccache reset [--reset] [--plan] [--force]  # operator reset; refuses
+#                              # while a VM runs or holds a lease (exit 3)
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
@@ -358,6 +362,29 @@ cmd_runtime() {
 
 cmd_reclaim() {
   exec python3 "$HERE/scripts/disk_reclaim.py" "$@"
+}
+
+# `tartci ccache <scan|quarantine|reset> [--host-cache | --cache DIR] ...`
+# --host-cache (the default when --cache is absent) is the cache the macOS gate
+# VMs mount: ${TARTCI_CI_CACHE:-~/.cache/pulp-ci}/ccache.
+cmd_ccache() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    scan|quarantine|reset) ;;
+    *) echo "usage: tartci ccache <scan|quarantine|reset> [--host-cache|--cache DIR] [--reset] [--force] [--plan] [--json]"; return 2 ;;
+  esac
+  local args=() have_cache=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --host-cache) ;;
+      --cache|--cache=*) have_cache=1; args+=("$arg") ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+  if [ "$have_cache" = 0 ]; then
+    args=(--cache "${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}/ccache" ${args[@]+"${args[@]}"})
+  fi
+  exec python3 "$HERE/scripts/ccache_guard.py" "$sub" ${args[@]+"${args[@]}"}
 }
 
 cmd_windows() {
@@ -1200,6 +1227,7 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  ccache)  shift; cmd_ccache "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
   network-profile) shift; cmd_network_profile "$@" ;;
