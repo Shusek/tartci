@@ -7,6 +7,8 @@
 #
 #   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
+#   tartci doctor build-disagreement [--profile P|--enable] [--json]
+#                              # cross-host compile/link disagreement (cache poisoning; default off)
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
@@ -159,6 +161,12 @@ cmd_doctor() {
   if [ "${1:-}" = "fleet" ]; then
     shift
     tartci_toml_exec "$HERE/scripts/fleet_doctor.py" "$@"
+  fi
+  # Cross-host build disagreement (probable shared-ccache poisoning). Read-only
+  # and default off: it reports "disabled" unless a profile or --enable opts in.
+  if [ "${1:-}" = "build-disagreement" ]; then
+    shift
+    tartci_toml_exec "$HERE/scripts/build_disagreement.py" "$@"
   fi
   echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
   echo "prereqs:"
