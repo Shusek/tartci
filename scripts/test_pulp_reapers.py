@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import os
 import pathlib
 import shutil
@@ -205,6 +206,9 @@ class Validation(unittest.TestCase):
 
     def test_fleet_profile_loader_uses_the_same_validator(self):
         base = (HERE.parent / "profiles" / "m3-macos-fleet.toml").read_text()
+        # The checked-in profile may already carry the table; drop it so the
+        # cases below decide what the loader sees.
+        base = re.sub(r"(?ms)^\[reclaim\]\n.*?(?=^\[)", "", base)
         with tempfile.TemporaryDirectory() as td:
             ok = pathlib.Path(td) / "ok.toml"
             ok.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n'
