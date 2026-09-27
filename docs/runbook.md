@@ -1915,6 +1915,22 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   gates (merged and proven, idle, no process using it, lineage not `active`,
   a fresh path check) are the safety; tartci adds and relaxes none.
 
+  Finished git checkouts that agents left in `/private/tmp` are a separate
+  opt-in (`scripts/tmp_checkouts.py`), because nothing else ever looks there:
+  m5 held 432 on 2026-09-27. With `tmp_checkouts = true` (and optionally
+  `tmp_checkout_idle_hours`, 24..720, default 48) in the same `[reclaim]`
+  table, each pass removes a checkout directly under `/private/tmp` only when
+  no process has its cwd inside it and no live build names it, it has been
+  idle for the window, `git status --porcelain` is empty, HEAD (and, for a
+  plain clone, every branch) is on a remote-tracking ref, and a clone has no
+  stash. Worktrees go through `git worktree remove` without `--force`, so
+  git's own refusals (submodules, locks) stand; clones are removed outright.
+  A worktree whose parent repository is gone (orphaned) and a `.git`
+  directory without a HEAD (broken) are counted and listed, never removed.
+  An unreadable process table removes nothing. The `reclaim_pass` event's
+  detail and fields carry what was removed, what was kept by reason, and the
+  orphaned and broken counts.
+
   Every pass writes `~/.tartci/state/reclaim/last-run.json` and appends a
   `reclaim_pass` event (and one `pulp_reaper` event per reaper run, with free
   space before and after) to `~/.tartci/state/reclaim/events.jsonl`. `tartci

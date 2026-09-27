@@ -56,6 +56,7 @@ import time
 from typing import Any, Iterable
 
 import pulp_reapers
+import tmp_checkouts
 
 BUILD_DIR_PREFIXES = ("build-",)
 BUILD_DIR_EXACT = ("build",)
@@ -627,11 +628,40 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
                 "summary")} for run in pulp.get("runs") or []],
         },
     }
+    tmp = receipt.get("tmp_checkouts") or report.get("tmp_checkouts") or {}
+    summary["tmp_checkouts"] = ({key: tmp.get(key) for key in (
+        "enabled", "reason", "error", "mode", "idle_hours", "checkouts", "removed",
+        "removed_bytes", "kept", "deferred", "orphaned_worktrees", "orphaned_paths",
+        "broken_checkouts", "broken_paths")}
+        if tmp else None)
+    tmp_freed = int(tmp.get("removed_bytes") or 0) if receipt.get("mode") == "fix" else 0
     summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
-                                  + int(summary["pulp_reapers"]["reclaimed_bytes"] or 0))
+                                  + int(summary["pulp_reapers"]["reclaimed_bytes"] or 0)
+                                  + tmp_freed)
     if "error" in receipt:
         summary["error"] = receipt["error"]
     return summary
+
+
+def tmp_checkout_detail(tmp: dict[str, Any] | None) -> str:
+    """"; tmp checkouts removed 3 (1.2 GiB), kept dirty=2 recent=5, 72 orphaned"."""
+    if not tmp or not tmp.get("enabled"):
+        return ""
+    if tmp.get("error") and tmp.get("checkouts") is None:
+        return f"; tmp checkouts: {tmp['error']}"
+    verb = "removed" if tmp.get("mode") == "fix" else "would remove"
+    kept = " ".join(f"{k}={v}" for k, v in sorted((tmp.get("kept") or {}).items()))
+    text = (f"; tmp checkouts {verb} {tmp.get('removed', 0)} "
+            f"({int(tmp.get('removed_bytes') or 0) / GIB:.1f} GiB)")
+    if kept:
+        text += f", kept {kept}"
+    if tmp.get("deferred"):
+        text += f", deferred {tmp['deferred']}"
+    if tmp.get("orphaned_worktrees"):
+        text += f", {tmp['orphaned_worktrees']} orphaned worktrees (not removed)"
+    if tmp.get("broken_checkouts"):
+        text += f", {tmp['broken_checkouts']} broken .git dirs (not removed)"
+    return text
 
 
 def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
@@ -649,7 +679,8 @@ def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(summary["finished_ts"])),
         "event": "reclaim_pass",
         "detail": (f"exit {code}; reclaimed {summary['reclaimed_bytes'] / GIB:.1f} GiB "
-                   f"(pulp {summary['pulp_reapers']['reclaimed_bytes'] / GIB:.1f} GiB)"),
+                   f"(pulp {summary['pulp_reapers']['reclaimed_bytes'] / GIB:.1f} GiB)"
+                   + tmp_checkout_detail(summary.get("tmp_checkouts"))),
         "fields": summary,
     }
     print(f"disk_reclaim: {json.dumps(event, sort_keys=True)}", file=stream, flush=True)
@@ -879,8 +910,18 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     progress.emit("pulp reapers: checking the fleet profile", force=True)
     pulp = pulp_reapers.run(fix=args.fix, state_dir=state_dir(args))
     receipt["pulp_reapers"] = pulp
+    # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
+    # gates). A live build naming one protects it, exactly as for build dirs;
+    # an unreadable process table protects all of them.
+    progress.emit("tmp checkouts: checking the fleet profile", force=True)
+    tmp = tmp_checkouts.run(
+        fix=args.fix, profile=pulp_reapers.default_profile_path(),
+        in_use=None if active is None
+        else (lambda path: names_candidate(active, path_spellings(path))))
+    receipt["tmp_checkouts"] = tmp
 
-    volumes_after = volumes_free_bytes(roots) if args.fix or pulp.get("runs") \
+    volumes_after = volumes_free_bytes(roots) \
+        if args.fix or pulp.get("runs") or tmp.get("removed") \
         else volumes_before
     free_after = tightest_free_bytes(volumes_after)
     report = {
@@ -903,6 +944,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         "free_bytes_by_volume_before": volumes_before,
         "free_bytes_by_volume_after": volumes_after,
         "pulp_reapers": pulp,
+        "tmp_checkouts": tmp,
     }
     receipt["report"] = report
 
