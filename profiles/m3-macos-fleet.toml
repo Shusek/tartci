@@ -27,6 +27,14 @@ agent_floor_cores = 6
 
 # Daniel-only external-volume execution. The stable Developer-ID identity is
 # the TCC responsible process; public/home-backed profiles do not inherit it.
+# Canary for the report-only cross-host build disagreement check. One host is
+# enough: the detector reads every gate host's jobs from GitHub, and M3 already
+# runs this fleet's other fleet-wide views. The launchd watchdog runs it at most
+# every 15 minutes and only logs; it never resets a cache or changes
+# scheduling. Remove this table to turn it off.
+[build_disagreement]
+enabled = true
+
 [launch_helper]
 path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
 approval_sha256_path = "/Users/danielraffel/.config/tartci/m3-launcher-approved.sha256"
