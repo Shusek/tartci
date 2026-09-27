@@ -394,20 +394,40 @@ tartci_assignment_v2_pre_mint_valid(){
   fi
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
-    tier="$(tartci_assignment_v2_tier_index "$tier_label")" || return 1
+    if ! tier="$(tartci_assignment_v2_tier_index "$tier_label")"; then
+      _tartci_assignment_v2_blocker "$tier_label" "" unknown_tier ""
+      return 1
+    fi
     # A class booted on a fallback grant is re-observed at the age the grant
     # was made at (0), so the job that justified the boot is still visible.
     min_age="$MIN_QUEUED_AGE"
     [ "$tier" != "$selected_tier" ] || min_age="$(tartci_fallback_min_age "$tier")"
-    q="$(tartci_assignment_v2_tier_demand "$tier_label" 0 "$min_age")" || return 1
-    printf '%s' "$q" | grep -qxE '[0-9]+' || return 1
-    if [ "$tier" = "$selected_tier" ]; then
-      [ "$q" -gt 0 ]
-      return
+    if ! q="$(tartci_assignment_v2_tier_demand "$tier_label" 0 "$min_age")" \
+       || ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      _tartci_assignment_v2_blocker "$tier_label" "$tier" demand_uncertain ""
+      return 1
     fi
-    [ "$q" -eq 0 ] || return 1
+    if [ "$tier" = "$selected_tier" ]; then
+      [ "$q" -gt 0 ] && return 0
+      _tartci_assignment_v2_blocker "$tier_label" "$tier" own_class_empty "$q"
+      return 1
+    fi
+    if [ "$q" -ne 0 ]; then
+      _tartci_assignment_v2_blocker "$tier_label" "$tier" higher_class_demand "$q"
+      return 1
+    fi
   done <<< "$ASSIGNMENT_V2_ORDER_LABELS"
+  _tartci_assignment_v2_blocker "" "" selected_class_not_ordered ""
   return 1
+}
+
+# Why the last pre-mint check refused, as key=value tokens for the
+# assignment_v2_pre_mint_denied event: the class (tier label) and tier whose
+# observation caused the denial, what it showed, and its queued count.
+ASSIGNMENT_V2_PRE_MINT_BLOCKER=""
+_tartci_assignment_v2_blocker(){
+  ASSIGNMENT_V2_PRE_MINT_BLOCKER="blocker_class=${1:--} blocker_tier=${2:--} blocker_reason=$3"
+  [ -z "${4:-}" ] || ASSIGNMENT_V2_PRE_MINT_BLOCKER="$ASSIGNMENT_V2_PRE_MINT_BLOCKER blocker_queued=$4"
 }
 
 # A denied pre-mint check proves the cached selection is no longer authority:
@@ -417,6 +437,7 @@ tartci_assignment_v2_pre_mint_valid(){
 # class instead of repeatedly booting for the stale class until the TTL expires.
 tartci_assignment_v2_pre_mint_admit(){
   local selected_tier="$1"
+  ASSIGNMENT_V2_PRE_MINT_BLOCKER=""
   if tartci_assignment_v2_pre_mint_valid "$selected_tier"; then
     return 0
   fi
