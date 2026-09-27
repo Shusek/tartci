@@ -454,6 +454,55 @@ place (a guest may be reading it), and is additive: re-run it after the lock
 changes. The consuming job still installs with `--require-hashes`, so the
 wheelhouse decides where the bytes come from, never which bytes are accepted.
 
+### Optional per-job ccache write isolation
+
+By default every guest mounts the host ccache read-write, so a job torn down
+mid-build (a Tart hang, a timeout, a cancel) can leave half-written direct-mode
+manifests that every later job trusts. On m3 in September 2026 that made every
+gate build link the wrong objects for 17 hours. Setting
+`ccache_write_isolation = true` on a `[[lane]]` (it renders
+`TARTCI_CCACHE_WRITE_ISOLATION=1`) makes each job:
+
+- read the shared store through ccache remote storage marked `read-only`;
+- write new entries only to its own layer (`remote_only`, so a hit is never
+  copied back into the layer);
+- have that layer promoted into the shared store by the host only when the
+  job's verdict is green (clean listener exit, the runner's own
+  `completed with result: Succeeded`, no lifecycle quarantine, and a GitHub
+  `success` conclusion whenever the API observed one) **and** `tart list`
+  proves the VM is gone. Everything else is deleted without touching the
+  shared store.
+
+The layer is attached when the job starts in the guest, after the JIT mint, so
+a VM booted before any job exists is covered the same way; the boot-time mount
+is unchanged. Everything lives under `$CACHE_ROOT/ccache/tartci-layers-v1/`
+(`shared/`, `jobs/<vm>/`, `green/`, `discard/`) in ccache's `file:` remote
+layout, which differs from the legacy primary cache beside it; the two never
+read or clean each other. The shared store therefore starts cold on the first
+isolated lane of a host. Host-only state, including the promotion audit log
+(`audit.jsonl`, one JSON line per attach / settle / promote / discard / trim,
+with the job's hit and miss counters when the host has ccache) and the list of
+keys each promotion wrote (`promotions/*.keys`), is in
+`$CACHE_ROOT/ccache-layer-state/`. Promotion hard-links result entries so an
+existing key is never overwritten, replaces a manifest only with a strictly
+newer one, rejects anything that is not a ccache entry in a well-formed key
+path, and runs after the job, off its critical path. A supervisor that dies
+mid-job leaves its layer to the next attach's sweep, which discards it.
+
+Enable on one lane, re-render, reload that lane at an idle boundary; roll back
+by deleting the key. Verify with:
+
+```bash
+state=~/.cache/pulp-ci/ccache-layer-state
+grep -c '"event": "promote"' "$state/audit.jsonl"                   # grows on green jobs
+grep '"event": "settle"' "$state/audit.jsonl" | grep '"verdict": "red"'  # and no promote follows these
+```
+
+The guard is ccache's `read-only` flag, not the mount: the mount is fixed at
+boot and shared with non-isolated lanes, so a hostile guest could still write
+the directory. A read-only mount of the shared store is the next step once VM
+boot is restructured.
+
 **Ephemeral runner concept:** an ephemeral per-job GitHub Actions runner clones
 the golden, mounts the host caches, runs **one** job, and self-destructs. The
 golden is never mutated; all per-run state lives in the disposable clone.
