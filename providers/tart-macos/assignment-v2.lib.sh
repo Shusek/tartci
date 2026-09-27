@@ -425,6 +425,15 @@ tartci_assignment_v2_pre_mint_valid(){
 # assignment_v2_pre_mint_denied event: the class (tier label) and tier whose
 # observation caused the denial, what it showed, and its queued count.
 ASSIGNMENT_V2_PRE_MINT_BLOCKER=""
+tartci_assignment_v2_pre_mint_denied_event(){
+  local selected_tier="$1" selected_labels="$2" blocker fields=()
+  blocker="${ASSIGNMENT_V2_PRE_MINT_BLOCKER:-blocker_reason=unrecorded}"
+  read -r -a fields <<< "$blocker"
+  event assignment_v2_pre_mint_denied \
+    "selected_tier=$selected_tier labels=$selected_labels $blocker" \
+    "selected_tier=$selected_tier" ${fields[@]+"${fields[@]}"}
+}
+
 _tartci_assignment_v2_blocker(){
   ASSIGNMENT_V2_PRE_MINT_BLOCKER="blocker_class=${1:--} blocker_tier=${2:--} blocker_reason=$3"
   [ -z "${4:-}" ] || ASSIGNMENT_V2_PRE_MINT_BLOCKER="$ASSIGNMENT_V2_PRE_MINT_BLOCKER blocker_queued=$4"

@@ -29,6 +29,7 @@ RUNNER = ROOT / "providers/tart-macos/runner.sh"
 JOB_CLAIM_LIB = ROOT / "providers/tart-macos/job-claim.lib.sh"
 VM_LEASE_LIB = ROOT / "providers/common/vm-lease.lib.sh"
 ADMISSION_LIB = ROOT / "providers/common/admission-clean.lib.sh"
+ASSIGNMENT_LIB = ROOT / "providers/tart-macos/assignment-v2.lib.sh"
 
 import sys  # noqa: E402
 
@@ -278,10 +279,22 @@ class PreMintBlockerTests(RunnerFixture, unittest.TestCase):
         self.assertNotIn("blocker_", result.stderr)
 
     def test_the_denied_event_carries_the_blocker(self) -> None:
-        body = RUNNER.read_text()
-        start = body.index("event assignment_v2_pre_mint_denied")
-        self.assertIn("ASSIGNMENT_V2_PRE_MINT_BLOCKER", body[start - 300:start + 400])
-        self.assertIn('"${blocker_fields[@]}"', body[start:start + 400])
+        self.assertIn('tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"',
+                      RUNNER.read_text())
+        log = self.root / "events.jsonl"
+        proc = run_bash(
+            shell_function(ASSIGNMENT_LIB, "tartci_assignment_v2_pre_mint_denied_event")
+            + shell_function(RUNNER, "json_sanitize") + shell_function(RUNNER, "event")
+            + f"EVENT_LOG={str(log)!r}\nRUNNER_NAME=lane\nCURRENT_VM=vm\n"
+            "ASSIGNMENT_V2_PRE_MINT_BLOCKER='blocker_class=pulp-build-merge-group "
+            "blocker_tier=0 blocker_reason=higher_class_demand blocker_queued=2'\n"
+            "tartci_assignment_v2_pre_mint_denied_event 1 a,b\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (row,) = events(log)
+        self.assertEqual(row["event"], "assignment_v2_pre_mint_denied")
+        self.assertEqual(row["fields"], {
+            "selected_tier": 1, "blocker_class": "pulp-build-merge-group",
+            "blocker_tier": 0, "blocker_reason": "higher_class_demand", "blocker_queued": 2})
 
 
 if __name__ == "__main__":

@@ -1988,11 +1988,7 @@ run_one(){
      && ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM"
-    local blocker_fields=()
-    read -r -a blocker_fields <<< "${ASSIGNMENT_V2_PRE_MINT_BLOCKER:-blocker_reason=unrecorded}"
-    event assignment_v2_pre_mint_denied \
-      "selected_tier=$selected_tier labels=$selected_labels ${ASSIGNMENT_V2_PRE_MINT_BLOCKER:-blocker_reason=unrecorded}" \
-      "selected_tier=$selected_tier" ${blocker_fields[@]+"${blocker_fields[@]}"}
+    tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
     discard_current_vm
     tartci_release_vm_lease
     return 75
