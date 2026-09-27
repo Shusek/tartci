@@ -298,9 +298,10 @@ class FakeRecord:
 
 
 class FakeScope:
-    def __init__(self, scope, endpoint, reachable, runners=(), error=""):
+    def __init__(self, scope, endpoint, reachable, runners=(), error="", applicable=True):
         self.scope, self.endpoint = scope, endpoint
         self.reachable, self.runners, self.error = reachable, tuple(runners), error
+        self.applicable = applicable
 
 
 class FakeCensus:
@@ -313,11 +314,11 @@ class FakeCensus:
 
     @property
     def complete(self):
-        return all(scope.reachable for scope in self.scopes)
+        return all(scope.reachable or not scope.applicable for scope in self.scopes)
 
     def unreachable_detail(self):
         return "; ".join(f"{s.scope} scope ({s.endpoint}): {s.error}"
-                         for s in self.scopes if not s.reachable)
+                         for s in self.scopes if not s.reachable and s.applicable)
 
 
 class RunnerCensusTests(unittest.TestCase):
@@ -385,6 +386,20 @@ class RunnerCensusTests(unittest.TestCase):
         facts = fd.check_runner_census(census, repo="org/repo").facts
         self.assertEqual(facts["total_registered"], 3)
         self.assertEqual(facts["online"], 2)
+
+    def test_a_user_owned_repository_without_an_organization_is_complete(self):
+        """A user account has no organization scope to read."""
+        census = FakeCensus("user/repo", [
+            FakeScope("repository", "repos/user/repo/actions/runners", True,
+                      [FakeRecord("r1")]),
+            FakeScope("organization", "orgs/user/actions/runners", False,
+                      error="not applicable: user is a user account", applicable=False),
+        ])
+        finding = fd.check_runner_census(census, repo="user/repo")
+        self.assertEqual(finding.state, fd.OK)
+        self.assertEqual(finding.code, "census_complete")
+        self.assertFalse(finding.facts["scopes"]["organization"]["applicable"])
+        self.assertIn("across 1 scope(s)", finding.detail)
 
     def test_census_object_missing_the_interface_is_unknown_not_zero(self):
         class Drifted:

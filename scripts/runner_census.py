@@ -14,6 +14,12 @@ as unreachable and makes the whole census incomplete, so a caller can tell
 "no runner carries this label" apart from "no runner was observed". An
 incomplete census answers UNKNOWN for a label it did not find, never UNSERVED.
 
+The one exception is a repository owned by a user account: it has no
+organization, so `orgs/<owner>/actions/runners` is a 404 by construction. That
+404 is confirmed against `users/<owner>` before the scope is recorded as not
+applicable; a 404 for an owner that is an organization, or whose type cannot be
+read, stays an unreachable scope.
+
 Registrations are per-scope: a repository runner and an organization runner can
 share a numeric id and are still two different machines, so records are keyed by
 (scope, id) and each record carries the endpoint that owns it. Delete or inspect
@@ -221,12 +227,17 @@ class ScopeCensus:
     reachable: bool
     error: str = ""
     runners: tuple[RunnerRecord, ...] = field(default_factory=tuple)
+    # False only for the organization scope of a user-owned repository, which
+    # cannot hold registrations. A scope that does not exist is not a scope
+    # that went unread.
+    applicable: bool = True
 
     def as_dict(self) -> dict:
         return {
             "scope": self.scope,
             "endpoint": self.endpoint,
             "reachable": self.reachable,
+            "applicable": self.applicable,
             "error": self.error,
             "count": len(self.runners) if self.reachable else None,
         }
@@ -252,11 +263,13 @@ class RunnerCensus:
 
     @property
     def complete(self) -> bool:
-        return all(scope.reachable for scope in self.scopes)
+        return all(scope.reachable or not scope.applicable for scope in self.scopes)
 
     @property
     def unreachable(self) -> tuple[ScopeCensus, ...]:
-        return tuple(scope for scope in self.scopes if not scope.reachable)
+        return tuple(
+            scope for scope in self.scopes if not scope.reachable and scope.applicable
+        )
 
     def unreachable_detail(self) -> str:
         return "; ".join(
@@ -275,6 +288,30 @@ class RunnerCensus:
 
 Fetch = Callable[[str, str], Iterable[dict]]
 
+USER_OWNER = "User"
+
+
+def _is_not_found(error: str) -> bool:
+    return bool(re.search(r"http 404|\b404 not found\b|\bnot found \(http 404\)", error, re.I))
+
+
+def _organization_scope_absent(fetch: Fetch, repo: str, error: str) -> bool:
+    """Whether a failed organization read is the 404 of a user-owned repo.
+
+    Only a 404 qualifies, and only when the fetcher can confirm the owner is a
+    user account. Any other failure, or an owner type that cannot be read,
+    leaves the scope unreachable.
+    """
+    if not _is_not_found(error):
+        return False
+    owner_type = getattr(fetch, "owner_type", None)
+    if not callable(owner_type):
+        return False
+    try:
+        return owner_type(split_repo(repo)[0]) == USER_OWNER
+    except Exception:  # noqa: BLE001 - an unread owner type proves nothing
+        return False
+
 
 def collect(repo: str, fetch: Fetch, *, scopes: Sequence[str] = SCOPES) -> RunnerCensus:
     """Read every scope. One scope failing never aborts the others."""
@@ -290,6 +327,13 @@ def collect(repo: str, fetch: Fetch, *, scopes: Sequence[str] = SCOPES) -> Runne
             rows = fetch(scope, endpoint)
         except CensusScopeError as exc:
             detail = f"{exc.code}: {exc.detail}" if exc.detail else exc.code
+            if scope == ORGANIZATION_SCOPE and _organization_scope_absent(fetch, repo, detail):
+                results.append(ScopeCensus(
+                    scope, endpoint, reachable=False, applicable=False,
+                    error=f"not applicable: {split_repo(repo)[0]} is a user account, "
+                          "which has no organization runners",
+                ))
+                continue
             results.append(ScopeCensus(scope, endpoint, reachable=False, error=detail))
             continue
         except Exception as exc:  # noqa: BLE001 — any failure is an unread scope
@@ -332,6 +376,16 @@ def cli_fetcher(cli: str, *, run_json: Callable[[list[str]], Any], per_page: int
                 restore_identity(saved)
             return extract_runners(payload)
 
+        def owner_type(owner: str) -> str | None:
+            saved = bind_identity(repo) if repo is not None else {}
+            try:
+                payload = run_json([cli, "api", f"users/{owner}"])
+            finally:
+                restore_identity(saved)
+            value = payload.get("type") if isinstance(payload, dict) else None
+            return value if isinstance(value, str) else None
+
+        fetch.owner_type = owner_type  # type: ignore[attr-defined]
         return fetch
 
     fetch = fetcher_for(None)
@@ -443,7 +497,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         for scope in census.scopes:
-            state = f"{len(scope.runners)} runner(s)" if scope.reachable else f"UNREACHABLE ({scope.error})"
+            if scope.reachable:
+                state = f"{len(scope.runners)} runner(s)"
+            elif not scope.applicable:
+                state = f"n/a ({scope.error})"
+            else:
+                state = f"UNREACHABLE ({scope.error})"
             print(f"{scope.scope:<13} {scope.endpoint}: {state}")
         for status in statuses:
             names = ", ".join(record.name for record in status.online) or "-"
