@@ -2170,3 +2170,10 @@ verified. Any ambiguity stops the batch; admission remains denied. The atomic
 receipt under the disk-admission state directory records bounds, before/after
 capacity, fetched main SHA, dispositions, removals, branch proofs, and whether
 one exact admission retry is eligible.
+
+## Cross-host build disagreement (probable cache poisoning)
+
+`tartci doctor build-disagreement` flags a gate host whose Build step fails to
+compile or link what another gate host builds green: the signature of a
+poisoned shared compiler cache. Read-only, never schedules, default off. Rules,
+detection floor, enablement and remedy: [build-disagreement.md](build-disagreement.md).
