@@ -265,6 +265,34 @@ tartci_pool_launchd_target() {
   printf 'gui/%s/%s\n' "${TARTCI_POOL_UID:-$(id -u)}" "$1"
 }
 
+# Wait until launchd no longer holds TARGET (gui/<uid>/<label>).
+#
+# `launchctl bootout` returns as soon as launchd has SENT the stop: measured
+# on a throwaway job whose TERM handler takes 6 s, bootout exited 0 in 0.04 s
+# and `launchctl print` kept finding the service for 6 more seconds. A lane
+# supervisor's TERM handler runs its whole cleanup (release the lease, retire
+# the runner, tear down a VM), bounded only by the plist's ExitTimeOut (30 s).
+# So a caller that acts on "pool off returned" while a slow lane is still
+# exiting sees it loaded: every host's first self-update install was refused
+# on exactly that ("refusing fleet install while target LaunchAgent is loaded:
+# ...forge-gate" on m5 and m1, "...vellum-gate" on m3) and only the retry,
+# seconds later, applied. Returns 0 once the service is absent, 1 if it is
+# still held after TARTCI_POOL_UNLOAD_WAIT_SECS (default 40: ExitTimeOut plus
+# launchd's own reap margin).
+tartci_pool_wait_unloaded() {
+  local target="$1" output deadline
+  deadline=$(( $(date +%s) + ${TARTCI_POOL_UNLOAD_WAIT_SECS:-40} ))
+  while :; do
+    if ! output="$(launchctl print "$target" 2>&1)"; then
+      case "$output" in
+        *"Could not find service"*|*"service not found"*) return 0 ;;
+      esac
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep "${TARTCI_POOL_UNLOAD_POLL_SECS:-0.25}"
+  done
+}
+
 tartci_pool_agent_loaded() {
   launchctl print "$(tartci_pool_launchd_target "$1")" >/dev/null 2>&1
 }
