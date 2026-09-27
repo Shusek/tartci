@@ -76,9 +76,9 @@ HEAD_BUILDING_EVENTS = frozenset({"push", "merge_group", "workflow_dispatch", "s
 
 REMEDY = (
     "Probable poisoned compiler cache on {host}. On {host}, run `tartci ccache "
-    "quarantine` (moves zero-include ccache manifests aside) or `tartci ccache "
-    "reset` (moves the whole shared cache aside); both refuse while a VM runs "
-    "unless --force. Where that command is not installed yet, drain the host's "
+    "reset` (quarantines zero-include manifests; add --reset to move the whole "
+    "shared cache aside; refuses while a VM runs or holds a lease unless "
+    "--force). On a host whose installed tartci predates that command, drain its "
     "gate lanes, move its shared ccache directory aside and resume. Then re-run "
     "the failing job and confirm it goes green on {host}."
 )

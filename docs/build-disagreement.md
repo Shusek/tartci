@@ -101,9 +101,9 @@ offline; `--dump-jobs <file>` records one.
 
 ## Remedy
 
-On the flagged host run `tartci ccache quarantine` (moves zero-include ccache
-manifests aside) or `tartci ccache reset` (moves the whole shared cache aside);
-both refuse while a VM runs unless `--force`. Where that command is not
-installed yet, drain the host's gate lanes, move its shared ccache directory
-aside and resume. Then re-run the failing job named in the finding and confirm
+On the flagged host run `tartci ccache reset`: it quarantines zero-include
+manifests, `--reset` also moves the whole shared cache aside, `--plan` shows
+what it would do, and it refuses while a VM runs or holds a lease unless
+`--force`. On a host whose installed tartci predates that command, drain its
+gate lanes, move its shared ccache directory aside and resume. Then re-run the failing job named in the finding and confirm
 it goes green on that host.
