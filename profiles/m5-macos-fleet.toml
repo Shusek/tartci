@@ -14,6 +14,15 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 # against 28 lock timeouts. Same shape as m3. The calls are not slow in
 # isolation; they exceed 15s under concurrent supervisors.
 github_api_timeout_seconds = 30
+# Agent core floor, as on m3. m5 has 6 non-gate cores, and one 6-core VM or
+# one governed build holds all of them, so every other agent build fell to a
+# leaseless -j2: on 2026-09-25..27, 196 governed builds ran `floor` at -j2
+# against 70 that got a lease (Shipyard metrics, routing_decision). A denied
+# non-gate build that asks with `leases acquire --allow-floor` now gets up to 6
+# cores at background QoS; floor leases are not charged against gate, VM or
+# build admission, and the pool is clamped to unleased memory (6 on this host).
+# Remove this line to go back.
+agent_floor_cores = 6
 # No persistent runners: the pulp-preamble-m5 runner was unconfigured and
 # crash-looping, and the preamble lane runs GitHub-hosted (PULP_PREAMBLE_RUNS_ON_JSON).
 persistent_runner_labels = []
