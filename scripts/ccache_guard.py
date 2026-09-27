@@ -60,7 +60,12 @@ Default-safe
 The guard reads entries through the host's own `ccache --inspect` and
 `--extract-result`, so it never re-implements ccache's format. Anything it
 cannot read is left alone and counted as `uninspectable`. A run that cannot
-take its lock (another guard on the same cache) skips. The runner calls it
+take its lock (another guard on the same cache) skips, unless it was given
+--wait[=SECS]: then it waits up to SECS (bare --wait: 120) for the lock and
+skips only if it is still held. The runner never waits; the operator CLI
+(`tartci ccache ...`) waits 120 s by default, because an operator's quarantine
+that lands while a pre-boot guard holds the lock otherwise skips and has to be
+retried by hand. The runner calls it
 fail-open: a guard failure is logged and never blocks a job. It takes the
 cache directory as an argument, so it composes with any layering that decides
 which directory a job reads.
@@ -69,7 +74,8 @@ Commands
 --------
   ccache_guard.py scan       --cache DIR [--all-zero-include] [--json]
   ccache_guard.py quarantine --cache DIR [--quarantine-root DIR]
-                             [--all-zero-include] [--budget SECS] [--json]
+                             [--all-zero-include] [--budget SECS]
+                             [--wait[=SECS]] [--json]
   ccache_guard.py reset      --cache DIR [--quarantine-root DIR] [--reset]
                              [--force] [--plan] [--json]
 
@@ -118,6 +124,8 @@ DEFAULT_RETAIN_DAYS = 30
 STAMP_RE = re.compile(r"^\d{8}T\d{6}Z(-\d+)?$")
 
 EXIT_OK, EXIT_SETUP, EXIT_BUSY, EXIT_SKIPPED, EXIT_BUDGET = 0, 1, 3, 4, 5
+DEFAULT_LOCK_WAIT_S = 120.0
+MAX_LOCK_WAIT_S = 3600.0
 
 
 def utc_stamp() -> str:
@@ -279,19 +287,29 @@ class Lock:
         self.path = path
         self.handle = None
 
-    def acquire(self) -> bool:
+    def acquire(self, wait_s: float = 0.0, poll_s: float = 0.25) -> bool:
+        """Take the lock, retrying for up to `wait_s` seconds (0: one try).
+
+        Bounded polling rather than a blocking flock, so a holder that never
+        lets go costs at most `wait_s` and the caller still reports a skip.
+        """
         import fcntl
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = open(self.path, "a+")
-        try:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while True:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 self.handle.close()
                 self.handle = None
                 return False
-            raise
-        return True
+            time.sleep(min(poll_s, remaining))
 
     def release(self) -> None:
         if self.handle is not None:
@@ -500,8 +518,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="reset: proceed even while the host is busy")
     parser.add_argument("--plan", action="store_true",
                         help="report what would happen, change nothing")
+    parser.add_argument("--wait", nargs="?", type=float, const=DEFAULT_LOCK_WAIT_S,
+                        default=0.0, metavar="SECS",
+                        help="wait up to SECS for another guard's lock instead of skipping "
+                             f"(bare --wait: {DEFAULT_LOCK_WAIT_S:g}; max {MAX_LOCK_WAIT_S:g})")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    if not 0 <= args.wait <= MAX_LOCK_WAIT_S:
+        parser.error(f"--wait must be from 0 through {MAX_LOCK_WAIT_S:g} seconds")
 
     cache = Path(args.cache).expanduser().absolute()
     result: dict = {"command": args.command, "cache": str(cache), "ts": utc_stamp()}
@@ -533,10 +557,17 @@ def main(argv: list[str] | None = None) -> int:
             result["forced_over"] = busy
 
     lock = Lock(qroot / ".guard.lock")
-    if not plan and not lock.acquire():
-        result.update(status="skipped", detail="another guard holds the lock on this cache")
-        emit(result, args.json)
-        return EXIT_SKIPPED
+    if not plan:
+        waited_from = time.monotonic()
+        acquired = lock.acquire(args.wait)
+        if args.wait:
+            result["lock_waited_s"] = round(time.monotonic() - waited_from, 2)
+        if not acquired:
+            result.update(status="skipped",
+                          detail="another guard holds the lock on this cache"
+                                 + (f" (waited {args.wait:g}s)" if args.wait else ""))
+            emit(result, args.json)
+            return EXIT_SKIPPED
     try:
         qdir = None if plan else new_batch_dir(qroot)
         deadline = time.monotonic() + args.budget if args.budget > 0 else None
