@@ -61,6 +61,22 @@ class HostProfileRoleTests(unittest.TestCase):
         self.assertEqual(profile["vm_pool_cores"], 6)
         self.assertLessEqual(profile["vm_pool_cores"], non_gate)
 
+    def test_checked_in_fleet_profiles_resolve_their_agent_floor(self) -> None:
+        # The floor each checked-in profile asks for, resolved on that host's
+        # own hardware: the memory clamp can shrink a floor the file states.
+        root = HOST_PROFILE_PATH.parents[1] / "profiles"
+        hosts = {"m3": ("dedicated-builder", 28, 262144, 6),
+                 "m5": ("dev-overflow", 18, 131072, 6)}
+        for host, (role, cores, mem, floor) in hosts.items():
+            with self.subTest(host=host):
+                profile = host_profile.build_profile(
+                    role=role, cores=cores, memory_mb=mem,
+                    fleet_profile=str(root / f"{host}-macos-fleet.toml"))
+                self.assertEqual(profile["agent_floor_cores"], floor)
+                self.assertEqual(profile["agent_floor_pool_cores"], floor)
+                self.assertEqual(profile["agent_floor_source"],
+                                 f"file:{root / f'{host}-macos-fleet.toml'}")
+
     def test_light_budget_is_clamped_to_small_hosts(self) -> None:
         profile = host_profile.build_profile(role="light", cores=4, model="portable")
         self.assertEqual(profile["headroom_cores"], 3)
