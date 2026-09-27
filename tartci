@@ -371,16 +371,23 @@ cmd_ccache() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     scan|quarantine|reset) ;;
-    *) echo "usage: tartci ccache <scan|quarantine|reset> [--host-cache|--cache DIR] [--reset] [--force] [--plan] [--json]"; return 2 ;;
+    *) echo "usage: tartci ccache <scan|quarantine|reset> [--host-cache|--cache DIR] [--reset] [--force] [--plan] [--wait[=SECS]] [--json]"; return 2 ;;
   esac
-  local args=() have_cache=0 arg
+  local args=() have_cache=0 have_wait=0 arg
   for arg in "$@"; do
     case "$arg" in
       --host-cache) ;;
       --cache|--cache=*) have_cache=1; args+=("$arg") ;;
+      --wait|--wait=*) have_wait=1; args+=("$arg") ;;
       *) args+=("$arg") ;;
     esac
   done
+  # An operator waits for a pre-boot guard's lock (bounded) instead of
+  # skipping; the runner calls ccache_guard.py directly and never waits.
+  # --wait=0 restores the immediate skip.
+  if [ "$have_wait" = 0 ]; then
+    args=("--wait=${TARTCI_CCACHE_WAIT_SECS:-120}" ${args[@]+"${args[@]}"})
+  fi
   if [ "$have_cache" = 0 ]; then
     args=(--cache "${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}/ccache" ${args[@]+"${args[@]}"})
   fi
