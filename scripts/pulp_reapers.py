@@ -52,6 +52,9 @@ import threading
 import time
 from typing import Any, Callable
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import tmp_checkouts  # noqa: E402
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - launchd hosts run 3.11+
@@ -61,7 +64,10 @@ GIB = 1024 ** 3
 DEFAULT_PRESSURE_FREE_GB = 200.0
 SETTINGS_TABLE = "reclaim"
 SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
-                           "pressure_free_gb", "worktree_build_idle_hours"})
+                           "pressure_free_gb", "worktree_build_idle_hours",
+                           # read by tmp_checkouts.py; validated here so one
+                           # install-time check covers the whole table
+                           "tmp_checkouts", "tmp_checkout_idle_hours"})
 # How long a merged worktree's build tree must sit unwritten before the worktree
 # reaper may take it (its own PULP_WORKTREE_BUILD_IDLE_HOURS gate). The ceiling
 # is a disk-arithmetic fact, not a preference. Measured on m3, 2026-09-27: one
@@ -139,6 +145,7 @@ def validate_table(table: Any) -> list[str]:
     if type(idle) is not int or not MIN_IDLE_HOURS <= idle <= MAX_IDLE_HOURS:
         problems.append("reclaim.worktree_build_idle_hours must be an integer from "
                         f"{MIN_IDLE_HOURS} through {MAX_IDLE_HOURS}")
+    problems.extend(tmp_checkouts.validate(table))
     return problems
 
 
