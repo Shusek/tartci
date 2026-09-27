@@ -1188,6 +1188,7 @@ cleanup(){
   tartci_pool_lock_release
   tartci_boundary_proof_abandon
   tartci_job_claim_release
+  tartci_vm_lease_waiter_withdraw
   [ "$CLEANED_UP" = 1 ] && return 0
   [ -z "$CURRENT_SCAN_PID" ] || kill "$CURRENT_SCAN_PID" 2>/dev/null || true
   [ -z "$CURRENT_SCAN_TMP" ] || rm -f "$CURRENT_SCAN_TMP" 2>/dev/null || true
@@ -1806,6 +1807,7 @@ run_one(){
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
+  LAST_RUN_LEASE_DENIED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
@@ -1836,6 +1838,14 @@ run_one(){
     heartbeat job-claim-covered
     return 75
   fi
+  # This lane now wants a VM lease for this class. With ranked waiters on, it
+  # says so before the admission precheck below, so a lower-priority lane
+  # whose acquire lands during that precheck yields the cores instead of
+  # winning them first-come. Off, this is a no-op. See vm-lease.lib.sh.
+  tartci_vm_lease_waiter_register "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
+    "$(tartci_vm_lease_cores tart-macos)" tart-macos-vm \
+    "$(tartci_vm_lease_priority "$selected_labels")" "$selected_labels" \
+    "$(tartci_vm_lease_mem_mb tart-macos)"
   # The verdict is a function of (repo, labels) alone — see
   # providers/common/admission-clean.lib.sh, which forwards exactly those two
   # plus the lane's static base branch — so it can be asked BEFORE the CoW
@@ -1907,6 +1917,7 @@ run_one(){
     tartci_warm_handoff "$i" "$selected_labels" "$lease_priority" "$selected_runner_api_root" \
       || handoff_rc=$?
     if [ "$handoff_rc" -eq 75 ]; then
+      LAST_RUN_LEASE_DENIED=1
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       heartbeat vm-lease-denied
@@ -1926,6 +1937,7 @@ run_one(){
     boot_vm_to_ssh "$i" "$vm" "$selected_labels" "$lease_priority" "$logdir" booting \
       "$selected_group_id" || lease_rc=$?
     if [ "$lease_rc" -ne 0 ] && [ "$BOOT_LEASE_DENIED" = 1 ]; then
+      LAST_RUN_LEASE_DENIED=1
       # The only loop path that reaches work and then fails before any heartbeat.
       # Without this the supervisor is silent while healthy, and a checker that
       # can only see heartbeat age has no choice but to call it stale.
@@ -2260,6 +2272,9 @@ if [ "$LOOP" = 1 ]; then
     # to boot, so it neither scans the queue nor asks Shipyard. Local and
     # read-only; fails open. See providers/tart-macos/lease-fit.lib.sh.
     if ! tartci_lease_fit_gate; then
+      # A lane whose acquire was denied is still waiting for exactly this
+      # capacity: keep its ranked waiter alive (bounded; no-op when off).
+      tartci_vm_lease_waiter_hold
       sleep "$POLL"
       continue
     fi
@@ -2382,6 +2397,9 @@ if [ "$LOOP" = 1 ]; then
       # that nobody will consume.
       tartci_boundary_proof_abandon
       tartci_job_claim_release
+      # A lane denied its lease keeps waiting for it; any other outcome
+      # (served, covered by a sibling, admission deferred) stops wanting one.
+      [ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw
       if [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ]; then
         PENDING_DELETE_ATTEMPTS=0
         note "teardown of $CURRENT_VM left deletion unproved — keeping it as pending-delete with its lease and reservation; reconciling in-loop instead of restarting"
@@ -2405,20 +2423,29 @@ if [ "$LOOP" = 1 ]; then
       fi
       CURRENT_RESV=""
     elif [ "$ws" -eq 1 ]; then
+      tartci_vm_lease_waiter_withdraw
       note "deferring ${POLL}s (queued=$q) — a sibling supervisor's warm VM is parked for $REPO; asked it to hand off"
       heartbeat waiting
       sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
+      tartci_vm_lease_waiter_withdraw
       note "yielding ${POLL}s (queued=$q host_health_yield=$hh running_macos_vms=$r/$cap) — host saturated, deferring new VM boot"
       event yielded_host_health "queued=$q host_health_yield=$hh running=$r/$cap"
       heartbeat yielding
       sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && [ "${yb:-0}" -eq 0 ]; then
+      tartci_vm_lease_waiter_withdraw
       note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$cap) — priority lane '${YIELD_WORKFLOW}' has the slot"
       event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$cap"
       heartbeat yielding
       sleep "$POLL"
     else
+      # Demand this lane could not place (no macOS VM slot) is still demand;
+      # no demand at all is not.
+      case "${q:-0}" in
+        0) tartci_vm_lease_waiter_withdraw ;;
+        *) tartci_vm_lease_waiter_hold ;;
+      esac
       note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$cap priority_demand=$p)"
       # No queued work means nothing is being refused; only demand that the
       # lane took and did not serve counts as blocked, so an idle pass ends the

@@ -171,6 +171,7 @@ class RunOneHarness:
             "tartci_vm_lease_priority(){ printf '0'; }\n"
             "tartci_acquire_vm_lease(){ return 0; }\n"
             "tartci_release_vm_lease(){ :; }\n"
+            "tartci_vm_lease_waiter_register(){ :; }\n"
             "discard_current_vm(){ :; }\n"
             "runtime_emit_complete(){ :; }\n"
             f"note(){{ printf '%s\\n' \"$*\" >>{str(self.notes)!r}; }}\n"

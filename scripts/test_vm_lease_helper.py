@@ -294,6 +294,90 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["vm-tart-linux-vm-unit-vm 2 tart-linux-vm unit-vm self-hosted,Linux", "0"])
 
+    def _ranked_race(self, knob: str) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+        """slot 2 (120) registers as a waiter, then forge (gate, 100) acquires first."""
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td) / "fleet.toml"
+            profile.write_text(f"schema = 1\n[leases]\nrank_vm_waiters = {knob}\n")
+            log = Path(td) / "events.jsonl"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_FLEET_PROFILE={profile}
+                export TARTCI_HOST_CORES=8 TARTCI_HOST_MEM_MB=65536 TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0 TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                unset TARTCI_RANK_VM_WAITERS TARTCI_VM_WAITER_FRESH_SECS
+                note() {{ :; }}
+                event() {{
+                  local kind="$1"; shift; shift
+                  python3 -c 'import json,sys; print(json.dumps({{"event":sys.argv[1],"fields":dict(a.split("=",1) for a in sys.argv[2:] if "=" in a)}}))' "$kind" "$@" >>{log}
+                }}
+                source {HELPER}
+                # The agent build holds the whole 3-core non-gate budget: one core is left.
+                python3 "$TARTCI_ROOT/scripts/leases.py" acquire --id agent --cores 3 \
+                  --mem-mb 1024 --priority 40 --kind pulp-governed-build --pid $$ --json >/dev/null
+                tartci_vm_lease_waiter_register m5-pulp-gate-slot2 1 tart-macos-vm 120 \
+                  self-hosted,pulp-release-tagged 2048
+                SLOT2_WAITER="$TARTCI_VM_WAITER_ID"
+                TARTCI_VM_WAITER_ID=""   # forge is another lane with no waiter of its own
+                rc=0
+                tartci_acquire_vm_lease forge-vm 1 tart-macos-vm gate forge-build 2048 {td} || rc=$?
+                echo "forge=$rc"
+                if [ "$rc" -eq 0 ]; then tartci_release_vm_lease; fi
+                TARTCI_VM_WAITER_ID="$SLOT2_WAITER"
+                rc=0
+                tartci_acquire_vm_lease slot2-vm 1 tart-macos-vm 120 pulp-release-tagged 2048 {td} || rc=$?
+                echo "slot2=$rc waiter_after=${{TARTCI_VM_WAITER_ID:-none}}"
+                [ "$rc" -ne 0 ] || tartci_release_vm_lease
+                """
+            )
+            proc = _run_bash(script)
+            rows = [__import__("json").loads(line) for line in log.read_text().splitlines()] \
+                if log.exists() else []
+        return proc, rows
+
+    def test_ranked_waiter_defers_a_lower_lane_and_names_the_waiter(self) -> None:
+        proc, rows = self._ranked_race("true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["forge=75", "slot2=0", "waiter_after=none"])
+        deferred = [r for r in rows if r["event"] == "lease_deferred_to_waiter"]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]["fields"]["waiter_lane"], "m5-pulp-gate-slot2")
+        self.assertEqual(deferred[0]["fields"]["waiter_priority"], "120")
+        self.assertNotIn("lease_denied", [r["event"] for r in rows])
+        self.assertEqual([r["fields"]["priority"] for r in rows if r["event"] == "lease_acquired"],
+                         ["120"])
+
+    def test_knob_off_the_first_acquire_still_wins(self) -> None:
+        proc, rows = self._ranked_race("false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["forge=0", "slot2=0", "waiter_after=none"])
+        self.assertNotIn("lease_deferred_to_waiter", [r["event"] for r in rows])
+
+    def test_macos_supervisor_waits_from_claim_to_grant(self) -> None:
+        text = MACOS_RUNNER.read_text(encoding="utf-8")
+        run_one = text[text.index("run_one(){"):]
+        claim = run_one.index("tartci_job_claim_acquire")
+        register = run_one.index("tartci_vm_lease_waiter_register")
+        precheck = run_one.index("tartci_admission_clean_enabled")
+        boot = run_one.index('boot_vm_to_ssh "$i"')
+        # Registered after the job is claimed and BEFORE the ~40 s precheck:
+        # that precheck is the window a lower lane's acquire lands in.
+        self.assertLess(claim, register)
+        self.assertLess(register, precheck)
+        self.assertLess(precheck, boot)
+        self.assertEqual(run_one.count("LAST_RUN_LEASE_DENIED=1"), 2)
+        self.assertIn('[ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw',
+                      text)
+        fit = text[text.index("if ! tartci_lease_fit_gate; then"):]
+        self.assertIn("tartci_vm_lease_waiter_hold", fit[:fit.index("continue")])
+        cleanup = text[text.index("cleanup(){"):]
+        self.assertIn("tartci_vm_lease_waiter_withdraw", cleanup[:cleanup.index("}")])
+
     def test_disabled_leases_do_not_touch_store(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             script = textwrap.dedent(

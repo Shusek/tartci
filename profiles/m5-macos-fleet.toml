@@ -47,6 +47,17 @@ repo = "/Users/danielraffel/Code/pulp"
 worktrees_root = "/Users/danielraffel/Code"
 pressure_free_gb = 200
 
+# Canary: rank waiting VM lanes by the lease priority they already carry
+# (scripts/leases.py). Six VM lanes share this host's one free 6-core VM slot
+# while an agent build holds the non-gate share, and today the first acquire
+# wins: on 2026-09-27 forge and a merge-group clone beat slot 2 after it had
+# already claimed its job. With this on, an acquire is deferred while a
+# strictly higher-priority waiter that fits now would no longer fit; ties stay
+# first-come and agent builds are untouched. Rollback: delete this table.
+# See docs/assignment-v2-rollout.md, "Ranked VM lease waiters".
+[leases]
+rank_vm_waiters = true
+
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"

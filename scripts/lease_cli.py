@@ -54,6 +54,16 @@ def parse_args(
         command_parser.add_argument("--role-file")
         command_parser.add_argument("--host-cores", type=int)
         command_parser.add_argument("--model")
+        command_parser.add_argument(
+            "--rank-vm-waiters",
+            choices=("on", "off"),
+            help="override the fleet profile's [leases] rank_vm_waiters knob",
+        )
+        command_parser.add_argument(
+            "--waiter-fresh-secs",
+            type=int,
+            help="override how long an unrefreshed VM lease waiter still counts",
+        )
         command_parser.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", aliases=["list"], help="show active leases")
@@ -96,6 +106,12 @@ def parse_args(
     acquire_parser.add_argument("--job-id", default="")
     acquire_parser.add_argument("--vm-name", default="")
     acquire_parser.add_argument(
+        "--waiter-id",
+        default="",
+        help="this lane's VM lease waiter: never ranked against itself, refreshed "
+             "on denial, withdrawn on grant",
+    )
+    acquire_parser.add_argument(
         "--disk-path",
         help="VM/overlay store path whose filesystem receives the growth reservation",
     )
@@ -136,6 +152,25 @@ def parse_args(
     resize_parser.add_argument("--mem-mb", type=int)
     resize_parser.add_argument("--priority")
     resize_parser.add_argument("--label", default="")
+    resize_parser.add_argument("--waiter-id", default="")
+
+    wait_parser = sub.add_parser(
+        "wait",
+        help="register or refresh a VM lane as a lease waiter (no-op unless rank_vm_waiters)",
+    )
+    add_common(wait_parser)
+    wait_parser.add_argument("--id", required=True)
+    wait_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
+    wait_parser.add_argument("--mem-mb", type=int)
+    wait_parser.add_argument("--priority", default="vm")
+    wait_parser.add_argument("--kind", required=True)
+    wait_parser.add_argument("--pid", type=int)
+    wait_parser.add_argument("--lane", default="")
+    wait_parser.add_argument("--label", default="")
+
+    withdraw_parser = sub.add_parser("withdraw", help="remove a VM lease waiter by id")
+    add_common(withdraw_parser)
+    withdraw_parser.add_argument("--id", required=True)
 
     heartbeat_parser = sub.add_parser("heartbeat", help="refresh a lease heartbeat")
     add_common(heartbeat_parser)

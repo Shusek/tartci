@@ -115,6 +115,23 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, pattern):
                     fleet.load(path)
 
+    def test_leases_table_is_canaried_on_m5_only_and_policed(self) -> None:
+        self.assertIs(fleet.load(HOST_CONFIGS["m5"])["leases"]["rank_vm_waiters"], True)
+        for host, path in HOST_CONFIGS.items():
+            if host != "m5":
+                self.assertNotIn("leases", fleet.load(path), host)
+        body = HOST_CONFIGS["m5"].read_text()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            for bad, pattern in (("rank_vm_waiters = true\nextra = 1", "unknown leases"),
+                                 ('rank_vm_waiters = "yes"', "must be a boolean"),
+                                 ("rank_vm_waiters = true\nwaiter_fresh_secs = 5",
+                                  "from 30 to 600")):
+                path.write_text(body.replace("[leases]\nrank_vm_waiters = true",
+                                             "[leases]\n" + bad))
+                with self.assertRaisesRegex(ValueError, pattern):
+                    fleet.load(path)
+
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         rendered = fleet.rendered_plists(data)
