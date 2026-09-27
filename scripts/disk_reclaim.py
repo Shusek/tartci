@@ -616,6 +616,11 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
             "reclaimed_bytes": pulp.get("reclaimed_bytes", 0),
             "free_bytes_before": pulp.get("free_bytes_before"),
             "free_bytes_after": pulp.get("free_bytes_after"),
+            # Report only; nothing deletes these (pulp_reapers.tmp_worktrees).
+            "worktrees_in_tmp": {key: (pulp.get("worktrees_in_tmp") or {}).get(key)
+                                 for key in ("count", "total_bytes", "size",
+                                             "oldest_mtime", "error")}
+            if pulp.get("worktrees_in_tmp") else None,
             "runs": [{key: run.get(key) for key in (
                 "reaper", "mode", "exit_code", "reclaimed_bytes", "reported_gb",
                 "free_bytes_before", "free_bytes_after", "duration_s", "error",

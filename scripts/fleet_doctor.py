@@ -25,6 +25,7 @@ import json
 import os
 import plistlib
 import subprocess
+import time
 
 import host_profile
 from dataclasses import dataclass, field
@@ -102,6 +103,9 @@ CODES: tuple[str, ...] = (
     "warm_vm_parked",
     "warm_vm_stale",
     "warm_vm_unreadable",
+    "worktrees_in_tmp",
+    "worktrees_in_tmp_none",
+    "worktrees_in_tmp_not_checked",
 )
 
 
@@ -785,6 +789,30 @@ def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | Non
     return rows, ""
 
 
+def check_worktrees_in_tmp(value: dict | None, *, reason: str = "") -> Finding:
+    """Pulp worktrees under /tmp (report only; pulp_reapers.tmp_worktrees)."""
+    import pulp_reapers
+
+    if value is None:
+        return Finding("worktrees_in_tmp", NOT_APPLICABLE, "worktrees_in_tmp_not_checked",
+                       f"not checked: {reason or '[reclaim] not enabled'}")
+    facts = {"worktrees_in_tmp": value}
+    if value.get("count") is None:
+        return Finding("worktrees_in_tmp", UNKNOWN, "worktrees_in_tmp_not_checked",
+                       f"could not list worktrees: {value.get('error')}", facts)
+    if value["count"] == 0:
+        return Finding("worktrees_in_tmp", OK, "worktrees_in_tmp_none",
+                       "no Pulp worktree under /tmp or /private/tmp", facts)
+    oldest = value.get("oldest_mtime")
+    age = "unknown" if oldest is None else \
+        f"{(time.time() - oldest) / 86400:.1f}d"
+    return Finding("worktrees_in_tmp", PROBLEM, "worktrees_in_tmp",
+                   f"{value['count']} Pulp worktree(s) under /tmp or /private/tmp, "
+                   f"size {value.get('size')}, oldest {age} old. "
+                   f"{pulp_reapers.TMP_WORKTREE_RULE}. Report only: nothing moves "
+                   "or deletes them; their owners must.", facts)
+
+
 def check_reclaim(value: dict | None) -> Finding:
     """The disk reclaimer's last pass, from its receipt (scripts/reclaim_status.py)."""
     import reclaim_status
@@ -1022,6 +1050,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
+            tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
     agents_dir = agents_dir or (home / "Library" / "LaunchAgents")
@@ -1103,6 +1132,18 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             reclaim_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_reclaim(reclaim_value))
+
+    def default_tmp_probe(profile: Path) -> tuple[dict | None, str]:
+        import pulp_reapers
+        settings, why = pulp_reapers.load_settings(profile)
+        if settings is None:
+            return None, why
+        return pulp_reapers.tmp_worktrees(Path(settings["repo"])), ""
+    try:
+        tmp_value, tmp_reason = (tmp_worktrees_probe or default_tmp_probe)(config)
+    except Exception as exc:  # noqa: BLE001 - reported as not checked
+        tmp_value, tmp_reason = {"count": None, "error": str(exc)}, ""
+    findings.append(check_worktrees_in_tmp(tmp_value, reason=tmp_reason))
     if probe is None:
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default

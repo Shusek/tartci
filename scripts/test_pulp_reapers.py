@@ -314,6 +314,85 @@ class EndToEnd(Isolated):
         self.assertIn("removed 1 build dir(s)", record.get("summary", ""), log)
 
 
+class WorktreesInTmp(Isolated):
+    """REPORT ONLY: Pulp worktrees under /tmp are counted, never touched."""
+
+    def setUp(self):
+        super().setUp()
+        # The control worktree must live OUTSIDE /tmp. $TMPDIR is /var/folders
+        # on macOS but /tmp on Linux CI, so move the fixture root when needed.
+        if pr._is_under_tmp(os.path.realpath(str(self.tmp)) + "/"):
+            base = pathlib.Path.home() / ".cache" / "tartci-tests"
+            base.mkdir(parents=True, exist_ok=True)
+            self.tmp = pathlib.Path(tempfile.mkdtemp(dir=base)).resolve()
+            self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._slash_tmp = tempfile.mkdtemp(prefix="tartci-tmp-wt-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, self._slash_tmp, True)
+        self.assertFalse(pr._is_under_tmp(os.path.realpath(str(self.tmp)) + "/"),
+                         "fixture root must not itself be under /tmp")
+
+    def test_counts_tmp_worktrees_and_not_the_ones_elsewhere(self):
+        repo = PulpRepo(self.tmp)
+        in_tmp = pathlib.Path(self._slash_tmp) / "wt"
+        git(repo.primary, "worktree", "add", "-q", "-b", "feat/tmp", str(in_tmp), repo.first)
+        (in_tmp / "blob").write_bytes(b"x" * 200_000)
+        outside = repo.worktree("outside", "feat/outside")  # the control
+        value = pr.tmp_worktrees(repo.primary)
+        self.assertEqual(value["count"], 1, value)
+        self.assertTrue(value["paths"][0].endswith("/wt"), value)
+        self.assertFalse(any(str(outside.name) in p for p in value["paths"]))
+        self.assertGreater(value["total_bytes"], 200_000)
+        self.assertIsNotNone(value["oldest_mtime"])
+        self.assertIn("never /tmp", value["rule"])
+        # Never touched.
+        self.assertTrue((in_tmp / "blob").is_file())
+        self.assertTrue(outside.is_dir())
+
+    def test_du_timeout_reads_unknown_not_zero(self):
+        repo = PulpRepo(self.tmp)
+        in_tmp = pathlib.Path(self._slash_tmp) / "wt"
+        git(repo.primary, "worktree", "add", "-q", "-b", "feat/tmp", str(in_tmp), repo.first)
+
+        def runner(argv, **kwargs):
+            if argv[0] == "du":
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return subprocess.run(argv, **kwargs)
+        value = pr.tmp_worktrees(repo.primary, runner=runner, du_timeout_s=1)
+        self.assertEqual(value["count"], 1)
+        self.assertIsNone(value["total_bytes"])
+        self.assertIn("unknown", value["size"])
+
+    def test_reclaim_pass_reports_it_as_an_event_field(self):
+        repo = PulpRepo(self.tmp)
+        in_tmp = pathlib.Path(self._slash_tmp) / "wt"
+        git(repo.primary, "worktree", "add", "-q", "-b", "feat/tmp", str(in_tmp), repo.first)
+        os.environ["TARTCI_FLEET_PROFILE"] = str(repo.profile(self.tmp / "p.toml", pressure_free_gb=1))
+        scan = self.tmp / "scan"
+        scan.mkdir()
+        state = self.tmp / "reclaim-state"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            dr.main(["--roots", str(scan), "--fix", "--state-dir", str(state)])
+        event = json.loads((state / "events.jsonl").read_text().splitlines()[0])
+        self.assertEqual(event["fields"]["pulp_reapers"]["worktrees_in_tmp"]["count"], 1)
+        self.assertTrue(in_tmp.is_dir(), "a reclaim pass must never remove a /tmp worktree")
+
+    def test_doctor_finding_names_the_rule_and_count(self):
+        import fleet_doctor as fd
+        finding = fd.check_worktrees_in_tmp({"count": 3, "size": "4.0 GiB",
+                                            "oldest_mtime": time.time() - 86400})
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "worktrees_in_tmp"))
+        self.assertIn("3 Pulp worktree(s)", finding.detail)
+        self.assertIn(pr.TMP_WORKTREE_RULE, finding.detail)
+        ok = fd.check_worktrees_in_tmp({"count": 0})
+        self.assertEqual((ok.state, ok.code), (fd.OK, "worktrees_in_tmp_none"))
+        off = fd.check_worktrees_in_tmp(None, reason="not enabled")
+        self.assertEqual(off.code, "worktrees_in_tmp_not_checked")
+        reasons = json.loads((HERE / "fleet_reasons.json").read_text())["reasons"]
+        for code in ("worktrees_in_tmp", "worktrees_in_tmp_none", "worktrees_in_tmp_not_checked"):
+            self.assertIn(code, fd.CODES)
+            self.assertIn(code, reasons)
+
+
 class DiskReclaimIntegration(Isolated):
     def test_receipt_event_and_log_line_carry_the_pulp_result(self):
         repo = PulpRepo(self.tmp)
