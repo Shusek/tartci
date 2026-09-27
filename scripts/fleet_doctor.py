@@ -417,11 +417,13 @@ def check_runner_census(census: Any, *, repo: str = "", error_code: str | None =
             scope.scope: {
                 "endpoint": scope.endpoint,
                 "reachable": scope.reachable,
+                "applicable": scope.applicable,
                 "registered": len(scope.runners) if scope.reachable else None,
                 "error": scope.error or None,
             }
             for scope in census.scopes
         }
+        applicable_scopes = sum(1 for scope in census.scopes if scope.applicable)
         records = list(census.runners)
         complete = census.complete
         facts = {
@@ -445,7 +447,7 @@ def check_runner_census(census: Any, *, repo: str = "", error_code: str | None =
     return Finding(
         check, OK, "census_complete",
         f"{facts['total_registered']} registration(s) across "
-        f"{len(scopes)} scope(s), {facts['online']} online. {IDLE_ZERO_NOTE}",
+        f"{applicable_scopes} scope(s), {facts['online']} online. {IDLE_ZERO_NOTE}",
         facts)
 
 

@@ -381,6 +381,11 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   scope that went unread is not a scope that was empty.
   → *Fix:* decide capacity from both scopes. A zero from one endpoint is the
   dangerous reading: it looks like there is nothing to protect.
+  → *User-owned repositories* have no organization scope: `orgs/<user>/...`
+  is a 404 by construction. The census confirms the owner is a user account
+  (`users/<owner>` type `User`) and reports that scope `n/a`, so the census
+  stays complete. A 404 for an organization, or an owner type that cannot be
+  read, still leaves the scope UNREACHABLE.
 
 - **A host's role says `dedicated-builder` but it serves no gate work.**
   Same incident: the 28-core Mac Studio (`TARTCI_AGENT_BUILD_CAP_CORES=12`,
