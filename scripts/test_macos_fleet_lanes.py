@@ -2708,9 +2708,15 @@ class ServingBlockedTests(unittest.TestCase):
     is a fault.
     """
 
-    def _readiness(self, extra_state: dict, **kwargs) -> dict:
+    def _readiness(self, extra_state: dict, disk_receipt: dict | None = None,
+                   **kwargs) -> dict:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            receipts = root / "disk-admission"
+            receipts.mkdir()
+            if disk_receipt is not None:
+                (receipts / "one-runner.disk-admission.json").write_text(
+                    json.dumps(disk_receipt))
             agents = root / "agents"
             agents.mkdir()
             receipt = {"plists": {"one.plist": "a"}, "retired_launchd_labels": []}
@@ -2721,12 +2727,14 @@ class ServingBlockedTests(unittest.TestCase):
                 "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "supervisor_pid": "101",
                 "supervisor_pid_started_at": start,
+                "runner": "one-runner",
             }
             state.update(extra_state)
             (state_dir / "one.state.json").write_text(json.dumps(state))
             (agents / "one.plist").write_bytes(plistlib.dumps({
                 "EnvironmentVariables": {
                     "HOME": str(root), "TARTCI_STATE_DIR": str(state_dir),
+                    "TARTCI_DISK_DENIAL_RECEIPT_DIR": str(receipts),
                 },
             }))
             running = subprocess.CompletedProcess(
@@ -2773,6 +2781,55 @@ class ServingBlockedTests(unittest.TestCase):
         self.assertEqual(lanes[0]["streak"], 143)
         self.assertEqual(lanes[0]["last_phase"], "admission-error")
         self.assertGreaterEqual(lanes[0]["blocked_seconds"], 10800)
+
+    # -- a full disk is blocked at once, not after the transience window ------
+
+    def _disk_denied(self, seconds_ago: int, status: str = "denied") -> dict:
+        return {"status": status, "reason": "disk_capacity_insufficient",
+                "observed_at": self._ago(seconds_ago)}
+
+    def test_a_disk_denial_inside_the_streak_is_blocked_immediately(self) -> None:
+        """m3, 2026-09-27: the Workshop volume filled and every lease was
+        refused for disk, yet the host read "serving: ok" because the streak
+        was younger than the 90-minute transience gate."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(1200),
+            "serving_blocked_streak": 3,
+            "serving_blocked_last_phase": "vm-lease-denied",
+        }, disk_receipt=self._disk_denied(30))
+        self.assertTrue(self._blocked(value))
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertEqual((lane["cause"], lane["reason"]),
+                         ("disk", "disk_capacity_insufficient"))
+        self.assertEqual(value["verified_running_supervisors"], 1)
+
+    def test_a_resolved_disk_receipt_does_not_block(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(1200),
+            "serving_blocked_streak": 3,
+        }, disk_receipt=self._disk_denied(30, status="resolved"))
+        self.assertFalse(self._blocked(value))
+
+    def test_a_disk_denial_from_before_the_streak_does_not_block(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(600),
+            "serving_blocked_streak": 2,
+        }, disk_receipt=self._disk_denied(3600))
+        self.assertFalse(self._blocked(value))
+
+    def test_a_disk_denial_with_no_open_streak_does_not_block(self) -> None:
+        """A lane that has since served or gone idle cleared its streak."""
+        value = self._readiness({
+            "serving_blocked_since": "", "serving_blocked_streak": 0,
+        }, disk_receipt=self._disk_denied(30))
+        self.assertFalse(self._blocked(value))
+
+    def test_a_long_unserved_streak_is_labelled_unserved(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 143,
+        })
+        self.assertEqual(value["serving"]["blocked_lanes"][0]["cause"], "unserved")
 
     def test_a_blocked_lane_is_not_a_fleet_readiness_problem(self) -> None:
         """The design decision, stated as an assertion.
