@@ -68,12 +68,17 @@ tartci_job_claim_exact_count(){
   return 1
 }
 
+# The result lands in the caller's variable named by $1. This function's own
+# locals must not share a name a caller passes: bash scoping is dynamic, so
+# `local out` here would shadow a caller's `out` and printf -v would write the
+# local copy, leaving the caller's empty (every job_claim event once read
+# detail=unreadable for exactly that reason).
 _tartci_job_claim_call(){
-  local out_var="$1"; shift
-  local out rc=0
-  out="$(python3 "$TARTCI_ROOT/scripts/job_claim.py" "$@" 2>/dev/null)" || rc=$?
-  printf -v "$out_var" '%s' "$out"
-  return "$rc"
+  local _jc_out_var="$1"; shift
+  local _jc_out _jc_rc=0
+  _jc_out="$(python3 "$TARTCI_ROOT/scripts/job_claim.py" "$@" 2>/dev/null)" || _jc_rc=$?
+  printf -v "$_jc_out_var" '%s' "$_jc_out"
+  return "$_jc_rc"
 }
 
 # Decide whether this lane may boot for its selected class.
@@ -118,16 +123,20 @@ print("queued=%s standing=%s local=%d fleet_idle=%d" % (
     d.get("queued"), d.get("standing_claims"),
     len(d.get("local_claims") or []), len(d.get("fleet_idle_runners") or [])))
 ' 2>/dev/null)" || detail="detail=unreadable"
+  # The same numbers as typed event fields (word-split on purpose: every
+  # token is key=value with no spaces).
+  local fields=()
+  read -r -a fields <<< "$detail"
   case "$rc" in
     0)
       JOB_CLAIM_ID="$claim_id"
       JOB_CLAIM_LABELS="$selected_labels"
-      event job_claim "labels=$selected_labels $detail"
+      event job_claim "labels=$selected_labels $detail" ${fields[@]+"${fields[@]}"}
       return 0
       ;;
     3)
       JOB_CLAIM_CONTENDED=1
-      event job_claim_contended "labels=$selected_labels $detail"
+      event job_claim_contended "labels=$selected_labels $detail" ${fields[@]+"${fields[@]}"}
       note "every queued job of class $selected_labels is already covered ($detail) — not booting"
       return 75
       ;;

@@ -459,6 +459,39 @@ tartci_stop_vm_lease_heartbeat(){
   fi
 }
 
+# A structured `lease_denied` event for the supervisor's events.jsonl, when the
+# sourcing provider defines `event` (the macOS runner does). A denial used to
+# reach only the note stream, so a host that refused every lease for an hour
+# left no event behind. axis is the exceeded capacity axes joined with "+"
+# (cores, memory, disk), or "none" for a denial that is not a capacity
+# verdict (legacy accounting, disk root unavailable, ...).
+tartci_vm_lease_denied_event(){
+  local out="$1" rc="$2" kind="$3" cores="$4" mem_mb="$5" priority="$6" parsed
+  declare -F event >/dev/null 2>&1 || return 0
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    d = {}
+if not isinstance(d, dict):
+    d = {}
+axis = d.get("exceeded_axis") if isinstance(d.get("exceeded_axis"), dict) else {}
+axes = "+".join(k for k in ("cores", "memory", "disk") if axis.get(k) is True) or "none"
+disk = d.get("disk") if isinstance(d.get("disk"), dict) else {}
+def num(v):
+    return v if type(v) is int else ""
+print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s" % (
+    axes, str(d.get("reason") or "unreadable").replace(" ", "_"),
+    num(d.get("requested_cores")), num(d.get("requested_mem_mb")),
+    num(disk.get("requested_bytes")), num(disk.get("free_bytes")),
+    num(disk.get("required_bytes"))))
+' 2>/dev/null)" || parsed="axis=none reason=unreadable"
+  local fields=()
+  read -r -a fields <<< "$parsed rc=$rc kind=$kind lease_cores=$cores lease_mem_mb=${mem_mb:-auto} priority=$priority"
+  event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
+}
+
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}"
   local receipt_provider="${8:-unknown}" receipt_lane="${9:-unknown}" receipt_runner="${10:-unknown}" lease_id rc=0 out
@@ -587,6 +620,7 @@ tartci_acquire_vm_lease(){
     # shellcheck disable=SC2034 # read by the provider (warm-VM yield signal)
     TARTCI_LAST_VM_LEASE_DENIAL="$out"
     tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
+    tartci_vm_lease_denied_event "$out" "$rc" "$kind" "$cores" "${mem_mb:-}" "$priority"
     return "$rc"
   fi
   tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
