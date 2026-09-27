@@ -1579,6 +1579,7 @@ run_runner_until_done_unlayered(){
   jit=""
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
+     mkdir -p \"\$HOME/Library/Caches/Pulp\" && ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
      ${CCACHE_LAYER_GUEST_PREP}export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
@@ -1586,9 +1587,10 @@ run_runner_until_done_unlayered(){
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
+     printf 'PULP_CONFIGURE_CHECK_CACHE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/configure-checks\" >> .env.tartci && \
      if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
      if [ -n '$CURRENT_GUEST_CORES' ]; then printf 'TARTCI_GUEST_CORES=%s\n' '$CURRENT_GUEST_CORES' >> .env.tartci; fi && \
      if [ -n '$CURRENT_GUEST_MEM_MB' ]; then printf 'TARTCI_GUEST_MEM_MB=%s\n' '$CURRENT_GUEST_MEM_MB' >> .env.tartci; fi && \
@@ -1753,12 +1755,24 @@ boot_vm_to_ssh(){
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
     return 1
   fi
+  # Pulp's configure-check replay (tools/cmake/PulpConfigureCheckCache.cmake)
+  # keys SDL3's ~180 try_compile results on the SDK, compiler and flags and
+  # writes them atomically (tmp + rename), so one host directory can serve
+  # every VM on the host. Without a mount the cache lives in the disposable
+  # guest and every gate configure re-runs all 192 try_compiles.
+  if ! tartci_prepare_disk_root "$CACHE_ROOT/configure-checks"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
   CURRENT_GUEST_CORES="$lease_cores"
   CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp -t "tart-run-$vm")"
   local tart_dirs=(
     --dir="ccache:$CACHE_ROOT/ccache"
     --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
+    --dir="configure-checks:$CACHE_ROOT/configure-checks"
   )
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
   CURRENT_PIP_WHEELHOUSE=0
