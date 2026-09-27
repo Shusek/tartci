@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -249,6 +250,48 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(rc, guard.EXIT_SKIPPED)
         self.assertEqual(report["status"], "skipped")
         self.assertTrue(self.poison.exists())
+
+    def hold_lock_for(self, seconds: float) -> threading.Thread:
+        lock = guard.Lock(self.fx.qroot / ".guard.lock")
+        self.assertTrue(lock.acquire())
+        thread = threading.Thread(target=lambda: (time.sleep(seconds), lock.release()))
+        thread.start()
+        self.addCleanup(thread.join)
+        return thread
+
+    def test_wait_takes_the_lock_once_the_other_guard_lets_go(self) -> None:
+        # m5, 2026-09-27: an operator quarantine landed while a pre-boot guard
+        # held the lock and skipped. With --wait it runs once the lock frees.
+        self.hold_lock_for(1.0)
+        rc, report = self.fx.run("quarantine", "--wait=10")
+        self.assertEqual(rc, guard.EXIT_OK, report)
+        self.assertGreaterEqual(report["lock_waited_s"], 0.5)
+        self.assertFalse(self.poison.exists())
+
+    def test_wait_is_bounded_and_still_skips_a_lock_that_is_never_released(self) -> None:
+        self.hold_lock_for(3.0)
+        started = time.monotonic()
+        rc, report = self.fx.run("quarantine", "--wait=0.5")
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertEqual((rc, report["status"]), (guard.EXIT_SKIPPED, "skipped"))
+        self.assertIn("waited 0.5s", report["detail"])
+        self.assertTrue(self.poison.exists())
+
+    def test_wait_rejects_out_of_range_values(self) -> None:
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            guard.main(["quarantine", "--cache", str(self.fx.cache), "--wait=-1"])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            guard.main(["quarantine", "--cache", str(self.fx.cache), "--wait=99999"])
+
+    def test_operator_cli_waits_by_default_and_the_runner_does_not(self) -> None:
+        body = (ROOT / "tartci").read_text()
+        section = body[body.index("cmd_ccache()"):body.index("cmd_windows()")]
+        self.assertIn('--wait=${TARTCI_CCACHE_WAIT_SECS:-120}', section)
+        runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
+        start = runner.index('ccache_guard.py" quarantine')
+        call = runner[start:runner.index("--json", start)]
+        self.assertIn("--budget", call)  # control: this IS the runner's call
+        self.assertNotIn("--wait", call)
 
     def test_missing_ccache_skips(self) -> None:
         out = io.StringIO()
