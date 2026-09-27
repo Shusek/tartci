@@ -698,6 +698,38 @@ record_scan_error(){
   printf '%s\n' "$1" >"$SCAN_ERROR_FILE" 2>/dev/null || true
 }
 
+# Quarantine structurally invalid direct-mode manifests (zero include files)
+# in the shared host ccache before a VM reads it. Such a manifest matches every
+# lookup and can serve another source's object: on 2026-09-26 it linked the
+# wrong object into every m3 gate build (undefined symbol at link). Fail-open
+# by design: the guard only renames entries into <cache>-quarantine, a guard
+# failure is an event, never a failed job. TARTCI_CCACHE_GUARD=0 disables it.
+tartci_ccache_guard(){
+  local cache="$1" out rc=0 budget
+  [ "${TARTCI_CCACHE_GUARD:-1}" = 0 ] && { event ccache_guard "status=disabled"; return 0; }
+  budget="${TARTCI_CCACHE_GUARD_BUDGET_SECS:-120}"
+  out="$(python3 "$TARTCI_ROOT/scripts/ccache_guard.py" quarantine \
+    --cache "$cache" --budget "$budget" --json 2>&1)" || rc=$?
+  out="$(printf '%s' "$out" | tail -1 | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin)
+except Exception:
+    print("unparsed"); sys.exit(0)
+c = r.get("counts", {})
+print("status=%s quarantined=%s zero_include=%s suspect=%s consistent=%s uninspectable=%s errors=%s batch=%s" % (
+    r.get("status"), c.get("quarantined", 0), c.get("zero_include", 0),
+    c.get("zero_include_suspect", 0), c.get("zero_include_consistent", 0),
+    c.get("uninspectable", 0), c.get("quarantine_errors", 0), r.get("quarantine_dir", "-")))
+' 2>/dev/null || echo unparsed)"
+  event ccache_guard "rc=$rc $out"
+  case "$out" in
+    *"suspect=0 "*) ;;
+    *) note "ccache guard: $out" ;;
+  esac
+  return 0
+}
+
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
 event(){
   local kind="$1" detail="${2:-}" ts
@@ -1781,6 +1813,7 @@ run_one(){
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
     return 1
   fi
+  tartci_ccache_guard "$CACHE_ROOT/ccache"
   if ! tartci_prepare_disk_root "$FETCHCONTENT_SOURCE_ROOT"; then
     discard_current_vm
     tartci_release_vm_lease

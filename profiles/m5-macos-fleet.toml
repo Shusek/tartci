@@ -64,12 +64,15 @@ replaces_launchd_labels = [
 # promote the supervisor out of the background band. Gate lanes only.
 process_type = "Adaptive"
 # Release-first slot (docs/assignment-v2-rollout.md, "Release event classes").
-# Slot 2 consults tagged releases before the gate classes and falls back to
-# gate work whenever no release waits; slot 1 keeps gate-first order. The
-# release tiers below serve only jobs carrying a release class label, which
-# Pulp appends when PULP_RELEASE_CLASS_TOKENS=1. Rollback: delete this key and
+# Slot 2 consults both release classes before the gate classes and falls back
+# to gate work whenever no release waits; slot 1 keeps gate-first order. This
+# lane is the only registration that can serve either class, so a class ordered
+# below the gate classes on every slot is never minted while gate work queues:
+# the pre-mint check requires every preferred class to be empty. The release
+# tiers below serve only jobs carrying a release class label, which Pulp
+# appends when PULP_RELEASE_CLASS_TOKENS opts in. Rollback: delete this key and
 # the release tiers, re-render, reload slot 2 at an idle boundary.
-assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }
+assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
