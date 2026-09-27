@@ -1829,6 +1829,16 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Gate and VM requests never take a floor. `TARTCI_AGENT_FLOOR_CORES` /
   `TARTCI_AGENT_FLOOR_POOL_CORES` override the profile for one shell; `tartci
   host-profile` exports the effective values.
+- **Ranked VM lease waiters (opt-in, default off; m5 canary)** — `[leases]
+  rank_vm_waiters = true` in a fleet profile lets a VM lane register as a
+  waiter (`leases wait` / `leases withdraw`) and defers a VM `acquire` or
+  `resize` (`reason=deferred_to_waiter`, rc 75) while a strictly
+  higher-priority live waiter that fits now would not fit after it. Ties stay
+  first-come, a waiter that cannot fit blocks nobody, and non-VM (agent build)
+  leases are never ranked or deferred. Waiters live in `waiters.json` beside
+  `leases.json` and expire after `waiter_fresh_secs` (default 90) without a
+  refresh or when their owner process exits. Full rules and the canary proxy:
+  `docs/assignment-v2-rollout.md`, "Ranked VM lease waiters".
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
   charged on the memory axis is the figure the clone is booted with

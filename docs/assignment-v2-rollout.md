@@ -302,6 +302,112 @@ with `tartci fleet-macos`, then reload the slot-2 supervisor at an idle boundary
 Rollback is deleting the key, re-rendering, and reloading slot 2; nothing on disk
 outlives it.
 
+## Ranked VM lease waiters (opt-in, m5 canary)
+
+Every VM lane on a host (both Pulp gate slots, the release lane, forge, spectr,
+vellum) takes its lease from the same host lease store, and each acquires only
+after its own Shipyard admission precheck (about 40 s). The store used to grant
+the first caller, whatever its priority. On m5 on 2026-09-27 a governed agent
+build (priority 40) held its 6-core non-gate share, which by design is never
+taken, leaving room for exactly one 6-core VM:
+
+- 05:42:05Z slot 2 claimed a `pulp-release-pr-gate` job (queued=1); 05:42:13Z
+  forge's `clone_start` took the cores; 05:42:42Z slot 2 `lease_denied axis=cores`;
+- 06:10:37Z slot 2 claimed again; 06:10:46Z slot 1's merge-group clone took the
+  cores; 06:11:20Z slot 2 denied.
+
+`[leases] rank_vm_waiters = true` in the fleet profile (env
+`TARTCI_RANK_VM_WAITERS=0|1` for one shell) turns on ranking:
+
+- A lane registers as a **waiter** (`leases.py wait`: priority, cores, memory,
+  timestamp, owner pid) right after it claims a job and before its admission
+  precheck, keeps it while its acquire is denied and it waits for capacity
+  (bounded by `TARTCI_VM_WAITER_HOLD_SECS`, default 900), and withdraws it
+  when it stops wanting a VM. A grant withdraws it atomically.
+- A VM acquire (or a parked warm VM's `resize` to a core lease) is **deferred**
+  (`reason=deferred_to_waiter`, rc 75, event `lease_deferred_to_waiter` naming
+  `waiter_lane` and `waiter_priority`) while a strictly higher-priority waiter,
+  refreshed within `waiter_fresh_secs` (default 90) and whose owner process is
+  still alive, fits in the host now and would not fit once this lease is
+  granted.
+- Priorities are the ones lanes already lease at; nothing new is ranked:
+  release tagged 120 > merge-group 110 > PR-head 100 = release PR gate 100 =
+  the `gate` class (100: forge, spectr, vellum) > `vm` (60).
+- **Ties stay first-come**: equal priority is not ranked, so the first acquire
+  wins exactly as before.
+- **Work-conserving**: a waiter that cannot fit anyway (it needs more than is
+  free) blocks nobody, and a grant that leaves room for the waiter is never
+  deferred. Disk is not ranked; it is one volume-wide axis both leases are
+  already admitted against.
+- **Agent and other non-VM builds are untouched**: they cannot register, are
+  never deferred, and keep their whole non-gate share.
+
+Off (the default, every host but m5), the store never reads or writes
+`waiters.json` and the supervisor never registers; admission is byte-for-byte
+today's. `tartci leases status --json` lists live waiters when the knob is on.
+
+What it changes on m5, and what it does not: the two races above involved the
+release PR gate at 100. Forge's `gate` class is also 100 (a tie, still
+first-come) and slot 1's merge-group is 110 (it correctly outranks the PR gate),
+so neither of those two races flips; the release PR gate stays on hosted
+runners (`PULP_RELEASE_PR_GATE_MACOS_RUNS_ON_JSON`). What the knob does stop is
+a higher class (a tagged release at 120, merge-group at 110) losing the one free
+slot to any lower VM lane whose acquire happens to land first.
+
+### Canary proxy
+
+- **Mechanism**: a higher-priority VM lane loses a core race to a lower one.
+- **Count**: per hour of contention, the `lease_denied` events with
+  `fields.axis == "cores"` for a lane at priority P where a `lease_acquired` (or,
+  before this change, a `clone_start`) by another lane at priority below P
+  occurred within the 90 s before it. Hours with no `lease_denied` at all are
+  not contention and are excluded from the denominator.
+- **Source**: every lane's `events.jsonl` on m5 (under each supervisor's state
+  directory), merged and sorted by `ts`. `lease_denied` carries `priority`;
+  `lease_acquired` carries `priority`, `kind` and `lease_cores`.
+- **Control**: the total `lease_acquired` count over the same window must be
+  non-zero; a zero means the logs were not read or the lanes were idle, and the
+  race count proves nothing.
+
+```bash
+cat ~/.tartci/state/macos-fleet/*/events.jsonl |
+python3 -c '
+import json, sys, datetime as dt
+CLASS = {"background": 10, "build": 40, "vm": 60, "runner": 80, "gate": 100}
+def prio(v):
+    v = str(v)
+    return int(v) if v.isdigit() else CLASS.get(v)
+t = lambda s: dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+def parse(line):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return None
+    return row if isinstance(row, dict) and "ts" in row else None
+rows = sorted(filter(None, map(parse, sys.stdin)), key=lambda r: r["ts"])
+acq = [r for r in rows if r["event"] == "lease_acquired"]
+denied = [r for r in rows if r["event"] == "lease_denied"
+          and (r.get("fields") or {}).get("axis") == "cores"]
+def inverted(d):
+    p = prio(d["fields"].get("priority"))
+    return p is not None and any(
+        a["runner"] != d["runner"]
+        and dt.timedelta(0) <= t(d["ts"]) - t(a["ts"]) <= dt.timedelta(seconds=90)
+        and (prio(a["fields"].get("priority")) or 0) < p for a in acq)
+lost = sum(map(inverted, denied))
+hours = len({d["ts"][:13] for d in denied})
+print(f"control lease_acquired={len(acq)} cores_denials={len(denied)} "
+      f"contended_hours={hours} inversions={lost} per_hour={lost / max(1, hours):.2f}")'
+```
+
+`lease_acquired` is emitted by the same change (knob on or off), so the
+before/after needs either a day of these bytes with the knob off or the hand
+count above as the baseline; `clone_start` carries no priority. Expect the
+inversion count to fall to zero on m5 while the control stays comparable, and
+`lease_deferred_to_waiter` to appear roughly where inversions used to. Rollback: delete the `[leases]` table,
+re-render, restart the supervisors at an idle boundary; stale waiters expire on
+their own within `waiter_fresh_secs`.
+
 ## Fallback lanes without a timer (opt-in, not enabled)
 
 m1's `pulp-gate` lane is the fleet's fallback: `min_queued_age_seconds = 600`

@@ -43,8 +43,10 @@ DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
-    "reclaim",
+    "reclaim", "leases",
 }
+# Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
+LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
 # Report-only cross-host build disagreement check, run by the launchd watchdog
 # (scripts/build_disagreement_watch.py). Keys mirror the detector's profile
 # table plus the watch's own cadence and dedup knobs.
@@ -437,6 +439,18 @@ def load(path: Path) -> dict:
         problems = pulp_reapers.validate_table(reclaim)
         if problems:
             fail("; ".join(problems))
+    lease_policy = data.get("leases")
+    if lease_policy is not None:
+        if not isinstance(lease_policy, dict):
+            fail("leases must be a table")
+        unknown = set(lease_policy) - LEASES_KEYS
+        if unknown:
+            fail(f"unknown leases keys: {sorted(unknown)}")
+        if type(lease_policy.get("rank_vm_waiters", False)) is not bool:
+            fail("leases.rank_vm_waiters must be a boolean")
+        fresh = lease_policy.get("waiter_fresh_secs", 90)
+        if type(fresh) is not int or not 30 <= fresh <= 600:
+            fail("leases.waiter_fresh_secs must be an integer from 30 to 600")
     github_app = data.get("github_app")
     if github_app is not None:
         if not isinstance(github_app, dict):

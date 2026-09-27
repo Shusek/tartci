@@ -322,6 +322,76 @@ def agent_floor_settings(fleet_profile: str | None = None) -> tuple[dict[str, in
     return settings, source
 
 
+# --- VM lease waiter ranking ---------------------------------------------------
+#
+# Opt-in `[leases]` table of the fleet profile. With rank_vm_waiters on, a VM
+# lane that wants a lease registers as a waiter in the lease store, and a VM
+# acquisition is deferred while a strictly higher-priority waiter that fits now
+# would no longer fit after it (scripts/leases.py). Off (the default) the store
+# neither reads nor writes waiters. waiter_fresh_secs bounds how long a waiter
+# counts without being refreshed. TARTCI_RANK_VM_WAITERS (0/1) and
+# TARTCI_VM_WAITER_FRESH_SECS override the file for one shell.
+LEASE_POLICY_DEFAULT_FRESH_SECS = 90
+
+
+def _parse_leases_table(text: str) -> dict[str, Any]:
+    """Read the [leases] table. Malformed input yields {} (knob off), never a raise."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            table = tomllib.loads(text).get("leases") or {}
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return {}
+        return dict(table) if isinstance(table, dict) else {}
+    values: dict[str, Any] = {}
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_table = line == "[leases]"
+            continue
+        if in_table and "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if value in ("true", "false"):
+                values[key.strip()] = value == "true"
+            elif value.isdigit():
+                values[key.strip()] = int(value)
+    return values
+
+
+def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
+    """Return {rank_vm_waiters, vm_waiter_fresh_secs, lease_policy_source}."""
+    enabled = False
+    fresh = LEASE_POLICY_DEFAULT_FRESH_SECS
+    source = "default"
+    path = fleet_profile_path(fleet_profile)
+    try:
+        table = _parse_leases_table(path.read_text(encoding="utf-8"))
+    except OSError:
+        table = {}
+    if type(table.get("rank_vm_waiters")) is bool:
+        enabled = table["rank_vm_waiters"]
+        source = f"file:{path}"
+    if type(table.get("waiter_fresh_secs")) is int and table["waiter_fresh_secs"] > 0:
+        fresh = table["waiter_fresh_secs"]
+    raw = os.environ.get("TARTCI_RANK_VM_WAITERS")
+    if raw is not None and raw.strip() in ("0", "1"):
+        enabled = raw.strip() == "1"
+        source = "environment"
+    raw = os.environ.get("TARTCI_VM_WAITER_FRESH_SECS")
+    if raw is not None and raw.strip().isdigit() and int(raw.strip()) > 0:
+        fresh = int(raw.strip())
+    return {
+        "rank_vm_waiters": enabled,
+        "vm_waiter_fresh_secs": fresh,
+        "lease_policy_source": source,
+    }
+
+
 def _clamp_at_least(value: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), max(minimum, maximum))
 
@@ -433,6 +503,7 @@ def build_profile(
         "agent_floor_pool_cores": agent_floor_pool,
         "agent_floor_qos": "background",
         "agent_floor_source": floor_source,
+        **lease_policy_settings(fleet_profile),
         "watch_lock_limit": defaults.watch_lock_limit,
         "macos_vm_cap": defaults.macos_vm_cap,
         "notes": [

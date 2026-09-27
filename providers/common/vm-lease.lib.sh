@@ -492,6 +492,110 @@ print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_b
   event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
 }
 
+# The cores a VM lease of $1 at priority $2 is granted: a non-gate lane is
+# clamped to the host's non-gate budget (see tartci_acquire_vm_lease).
+tartci_vm_lease_granted_cores(){
+  local cores="$1" priority="$2" ngc
+  tartci_positive_int_or_empty "$cores" || cores=1
+  ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || ngc=""
+  if tartci_vm_lease_is_non_gate_priority "$priority" \
+     && tartci_positive_int_or_empty "$ngc" && [ "$cores" -gt "$ngc" ]; then
+    cores="$ngc"
+  fi
+  printf '%s' "$cores"
+}
+
+# --- ranked VM lease waiters (opt-in: [leases] rank_vm_waiters) ---------------
+#
+# A lane registers as a waiter once it has taken a job and wants a VM, BEFORE
+# its admission precheck, so a lower-priority lane whose acquire lands first is
+# deferred rather than handed the cores (scripts/leases.py). The store refreshes
+# the waiter on every denied acquire and withdraws it on a grant; the lane
+# withdraws it when it stops wanting a VM. A lane whose acquire was denied keeps
+# its waiter while it waits for capacity (tartci_vm_lease_waiter_hold), bounded
+# by TARTCI_VM_WAITER_HOLD_SECS so a lane that never gets to re-check demand
+# cannot hold it forever. Every call fails open: a waiter that cannot be
+# written only means this lane is ranked first-come, exactly as without it.
+: "${TARTCI_VM_WAITER_HOLD_SECS:=900}"
+TARTCI_VM_WAITER_ID=""
+TARTCI_VM_WAITER_SINCE=0
+declare -a _tartci_vm_waiter_args=()
+_tartci_vm_waiters_knob=""
+
+# The knob is read once per supervisor process (a profile change reaches the
+# supervisor with its next restart; the lease store itself reads it per call,
+# and either side alone being on changes nothing).
+tartci_vm_lease_waiters_enabled(){
+  tartci_vm_leases_enabled || return 1
+  if [ -z "$_tartci_vm_waiters_knob" ]; then
+    _tartci_vm_waiters_knob="$(tartci_profile_value rank_vm_waiters 2>/dev/null)" \
+      || _tartci_vm_waiters_knob=False
+  fi
+  [ "$_tartci_vm_waiters_knob" = True ]
+}
+
+# $1 lane id, $2 requested cores, $3 kind, $4 lease priority, $5 labels, $6 mem MB.
+tartci_vm_lease_waiter_register(){
+  local lane="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}"
+  tartci_vm_lease_waiters_enabled || return 0
+  cores="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  tartci_positive_int_or_empty "$mem_mb" || mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  _tartci_vm_waiter_args=(
+    --id "waiter-$lane" --cores "$cores" --mem-mb "$mem_mb" --priority "$priority"
+    --kind "$kind" --pid "$$" --lane "$lane" --label "$labels"
+  )
+  if python3 "$TARTCI_ROOT/scripts/leases.py" wait "${_tartci_vm_waiter_args[@]}" \
+       --json >/dev/null 2>&1; then
+    [ "$TARTCI_VM_WAITER_ID" = "waiter-$lane" ] || TARTCI_VM_WAITER_SINCE="$(date +%s)"
+    TARTCI_VM_WAITER_ID="waiter-$lane"
+  else
+    tartci_vm_lease_note "VM lease waiter registration failed for $lane (ignored: first-come)"
+    TARTCI_VM_WAITER_ID=""
+  fi
+  return 0
+}
+
+# Keep a denied lane's waiter alive while it waits for capacity.
+tartci_vm_lease_waiter_hold(){
+  [ -n "$TARTCI_VM_WAITER_ID" ] || return 0
+  if [ $(( $(date +%s) - TARTCI_VM_WAITER_SINCE )) -ge "$TARTCI_VM_WAITER_HOLD_SECS" ]; then
+    tartci_vm_lease_waiter_withdraw
+    return 0
+  fi
+  python3 "$TARTCI_ROOT/scripts/leases.py" wait "${_tartci_vm_waiter_args[@]}" \
+    --json >/dev/null 2>&1 || true
+}
+
+tartci_vm_lease_waiter_withdraw(){
+  [ -n "$TARTCI_VM_WAITER_ID" ] || return 0
+  python3 "$TARTCI_ROOT/scripts/leases.py" withdraw --id "$TARTCI_VM_WAITER_ID" \
+    --json >/dev/null 2>&1 || true
+  TARTCI_VM_WAITER_ID=""
+  TARTCI_VM_WAITER_SINCE=0
+}
+
+# A deferral is not a capacity denial: it gets its own event naming the waiter
+# it yielded to, and no lease_denied (whose axis=cores count is the canary's
+# proxy for the race this prevents).
+tartci_vm_lease_deferred_event(){
+  local out="$1" kind="$2" cores="$3" priority="$4" parsed
+  declare -F event >/dev/null 2>&1 || return 0
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    w = json.loads(sys.stdin.read()).get("waiter") or {}
+except (ValueError, AttributeError):
+    w = {}
+def v(x):
+    return str(x if x not in (None, "") else "unknown").replace(" ", "_")
+print("waiter_lane=%s waiter_priority=%s waiter_cores=%s waiter_since=%s" % (
+    v(w.get("lane")), v(w.get("priority")), v(w.get("cores")), v(w.get("waiting_since"))))
+' 2>/dev/null)" || parsed="waiter_lane=unknown"
+  local fields=()
+  read -r -a fields <<< "$parsed kind=$kind lease_cores=$cores priority=$priority"
+  event lease_deferred_to_waiter "$parsed priority=$priority" ${fields[@]+"${fields[@]}"}
+}
+
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}"
   local receipt_provider="${8:-unknown}" receipt_lane="${9:-unknown}" receipt_runner="${10:-unknown}" lease_id rc=0 out
@@ -530,12 +634,11 @@ tartci_acquire_vm_lease(){
   # Clamping here makes any over-sized request safe by construction, so no
   # override is load-bearing and no VM lane can encroach on the gate reserve.
   # The gate lane runs at gate priority and is intentionally NOT clamped.
-  local _ngc
-  _ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)"
-  if tartci_vm_lease_is_non_gate_priority "$priority" \
-     && tartci_positive_int_or_empty "$_ngc" && [ "$cores" -gt "$_ngc" ]; then
-    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_ngc (non-gate budget)"
-    cores="$_ngc"
+  local _granted
+  _granted="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  if [ "$_granted" != "$cores" ]; then
+    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_granted (non-gate budget)"
+    cores="$_granted"
   fi
   # Size the guest from the cores this lease will actually be granted — i.e.
   # AFTER the clamp above. Deriving from the requested count would charge a
@@ -590,6 +693,8 @@ tartci_acquire_vm_lease(){
   local core_args=(--cores "$cores")
   [ "${TARTCI_VM_LEASE_MEMORY_ONLY:-0}" != 1 ] || core_args=(--cores 0 --memory-only)
   TARTCI_LAST_VM_LEASE_DENIAL=""
+  local waiter_args=()
+  [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
     --id "$lease_id" \
     "${core_args[@]}" \
@@ -602,6 +707,7 @@ tartci_acquire_vm_lease(){
     --label "$labels" \
     --job-id "${GITHUB_RUN_ID:-}" \
     --vm-name "$vm_name" \
+    ${waiter_args[@]+"${waiter_args[@]}"} \
     --json 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
@@ -611,7 +717,8 @@ tartci_acquire_vm_lease(){
         --id "$lease_id" --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
         ${disk_args[@]+"${disk_args[@]}"} --priority "$priority" --pid "$$" \
         --kind "$kind" --owner "$(tartci_vm_lease_owner)" --label "$labels" \
-        --job-id "${GITHUB_RUN_ID:-}" --vm-name "$vm_name" --json 2>&1)" || rc=$?
+        --job-id "${GITHUB_RUN_ID:-}" --vm-name "$vm_name" \
+        ${waiter_args[@]+"${waiter_args[@]}"} --json 2>&1)" || rc=$?
       tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
       tartci_record_worktree_cleanup_retry "$out" "$rc"
     fi
@@ -620,9 +727,17 @@ tartci_acquire_vm_lease(){
     # shellcheck disable=SC2034 # read by the provider (warm-VM yield signal)
     TARTCI_LAST_VM_LEASE_DENIAL="$out"
     tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
-    tartci_vm_lease_denied_event "$out" "$rc" "$kind" "$cores" "${mem_mb:-}" "$priority"
+    case "$out" in
+      *'"reason": "deferred_to_waiter"'*)
+        tartci_vm_lease_deferred_event "$out" "$kind" "$cores" "$priority" ;;
+      *)
+        tartci_vm_lease_denied_event "$out" "$rc" "$kind" "$cores" "${mem_mb:-}" "$priority" ;;
+    esac
     return "$rc"
   fi
+  # The store withdrew this lane's waiter with the grant.
+  TARTCI_VM_WAITER_ID=""
+  TARTCI_VM_WAITER_SINCE=0
   tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
@@ -634,6 +749,10 @@ tartci_acquire_vm_lease(){
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  if declare -F event >/dev/null 2>&1; then
+    event lease_acquired "kind=$kind priority=$priority lease_cores=$cores" \
+      "kind=$kind" "priority=$priority" "lease_cores=$cores" "lease_mem_mb=${mem_mb:-auto}"
+  fi
   return 0
 }
 
@@ -654,14 +773,23 @@ tartci_resize_vm_lease(){
     TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
     return 0
   fi
+  local waiter_args=()
+  [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" resize --id "$lease_id" \
-    --cores "$cores" --mem-mb "$mem_mb" --priority "$priority" --label "$labels" --json 2>&1)" || rc=$?
+    --cores "$cores" --mem-mb "$mem_mb" --priority "$priority" --label "$labels" \
+    ${waiter_args[@]+"${waiter_args[@]}"} --json 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     # shellcheck disable=SC2034 # read by the provider
     TARTCI_LAST_VM_LEASE_DENIAL="$out"
     tartci_vm_lease_note "lease resize denied for $lease_id cores=$cores mem_mb=$mem_mb priority=$priority rc=$rc: $out"
+    case "$out" in
+      *'"reason": "deferred_to_waiter"'*)
+        tartci_vm_lease_deferred_event "$out" resize "$cores" "$priority" ;;
+    esac
     return "$rc"
   fi
+  TARTCI_VM_WAITER_ID=""
+  TARTCI_VM_WAITER_SINCE=0
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing

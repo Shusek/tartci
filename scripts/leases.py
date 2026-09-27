@@ -405,8 +405,22 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     )
     floor_cores = max(0, floor_cores)
     floor_pool = max(floor_cores, floor_pool) if floor_cores else 0
+    rank_override = getattr(args, "rank_vm_waiters", None)
+    rank_vm_waiters = (
+        rank_override == "on"
+        if rank_override in ("on", "off")
+        else bool(profile.get("rank_vm_waiters", False))
+    )
+    fresh_override = getattr(args, "waiter_fresh_secs", None)
+    waiter_fresh = (
+        int(fresh_override)
+        if fresh_override is not None and int(fresh_override) > 0
+        else int(profile.get("vm_waiter_fresh_secs", host_profile.LEASE_POLICY_DEFAULT_FRESH_SECS))
+    )
     return {
         "total": max(1, total),
+        "rank_vm_waiters": int(rank_vm_waiters),
+        "waiter_fresh_secs": max(1, waiter_fresh),
         "agent_floor_cores": floor_cores,
         "agent_floor_pool_cores": floor_pool,
         "reserved_gate_cores": reserved,
@@ -525,6 +539,282 @@ def floor_grant(
     return size, mem
 
 
+# --- VM lease waiters ---------------------------------------------------------
+#
+# Opt-in ([leases] rank_vm_waiters in the fleet profile; off by default). Every
+# VM lane on a host races the same acquire after its own admission precheck, so
+# today the FIRST caller wins whatever its priority. A lane that wants a VM
+# lease may register as a waiter (priority, cores, memory, timestamp). A VM
+# acquisition is then deferred while a strictly higher-priority waiter that
+# fits in the host now would no longer fit once this lease is granted:
+#
+#   * priorities are the ones the lanes already lease at; nothing new is ranked;
+#   * equal priority is not ranked, so ties stay first-come (the first acquire);
+#   * work-conserving: a waiter that cannot fit now anyway blocks nobody, and a
+#     lease that leaves room for the waiter is never deferred;
+#   * only VM leases are ranked or deferred. Agent and other governed builds
+#     never register, never wait behind a waiter and keep their whole budget;
+#   * a waiter counts only while its owner process is alive and it was refreshed
+#     within waiter_fresh_secs, so a dead or wandering lane blocks nothing.
+#
+# Waiters live in their own file under the same store lock, so no reader of
+# leases.json ever sees one, and with the knob off the file is never touched.
+
+
+def waiters_file(store_dir: pathlib.Path) -> pathlib.Path:
+    return store_dir / "waiters.json"
+
+
+def load_waiters(store_dir: pathlib.Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Waiter records, fail-open: an unreadable file ranks nobody."""
+    path = waiters_file(store_dir)
+    if not path.exists():
+        return [], []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "[]")
+    except (OSError, json.JSONDecodeError):
+        return [], [f"waiters_unreadable:{path}"]
+    if not isinstance(data, list):
+        return [], [f"waiters_unreadable:{path}"]
+    return [row for row in data if isinstance(row, dict)], []
+
+
+def write_waiters(store_dir: pathlib.Path, waiters: list[dict[str, Any]]) -> None:
+    path = waiters_file(store_dir)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(waiters, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def live_waiters(
+    waiters: list[dict[str, Any]], fresh_secs: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(live, expired). Live = owner alive with its exact start time AND seen recently."""
+    now = utcnow()
+    boot = host_boot_time()
+    live: list[dict[str, Any]] = []
+    expired: list[dict[str, Any]] = []
+    for waiter in waiters:
+        seen = parse_ts(waiter.get("seen_at"))
+        fresh = seen is not None and (now - seen).total_seconds() < fresh_secs
+        alive = identity_matches(
+            waiter,
+            pid_key="pid",
+            start_key="process_start_time",
+            boot_key="host_boot_time",
+            current_boot=boot,
+            require_start=True,
+        )
+        (live if fresh and alive else expired).append(waiter)
+    return live, expired
+
+
+def admits(
+    cfg: dict[str, int], records: list[dict[str, Any]], priority: int, cores: int, mem_mb: int
+) -> bool:
+    verdict = core_and_memory_verdict(cfg, usage(records, cfg), priority, cores, mem_mb)
+    return not (
+        verdict["total_exceeded"] or verdict["class_exceeded"] or verdict["mem_exceeded"]
+    )
+
+
+def blocking_waiter(
+    cfg: dict[str, int],
+    waiters: list[dict[str, Any]],
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    priority: int,
+    self_waiter_id: str,
+) -> dict[str, Any] | None:
+    """The highest-ranked waiter this grant would displace, or None.
+
+    A waiter displaces the grant only if it outranks it, fits in `before` (the
+    host without this grant) and does not fit in `after` (with it). Disk is not
+    ranked: it is one volume-wide axis both leases are admitted against anyway.
+    """
+    ranked = sorted(
+        waiters,
+        key=lambda row: (
+            -record_int(row, "priority"),
+            str(row.get("waiting_since") or ""),
+            str(row.get("id") or ""),
+        ),
+    )
+    for waiter in ranked:
+        if self_waiter_id and str(waiter.get("id")) == self_waiter_id:
+            continue
+        if not is_vm_kind(waiter.get("command_kind")):
+            continue
+        waiter_priority = record_int(waiter, "priority")
+        if waiter_priority <= priority:
+            continue
+        cores = record_int(waiter, "lease_size_cores")
+        mem = record_int(waiter, "lease_size_mem_mb")
+        if not admits(cfg, before, waiter_priority, cores, mem):
+            continue
+        if admits(cfg, after, waiter_priority, cores, mem):
+            continue
+        return waiter
+    return None
+
+
+def waiter_summary(waiter: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": waiter.get("id"),
+        "lane": waiter.get("lane"),
+        "priority": record_int(waiter, "priority"),
+        "priority_class": waiter.get("priority_class"),
+        "cores": record_int(waiter, "lease_size_cores"),
+        "mem_mb": record_int(waiter, "lease_size_mem_mb"),
+        "waiting_since": waiter.get("waiting_since"),
+        "seen_at": waiter.get("seen_at"),
+    }
+
+
+def rank_check(
+    store_dir: pathlib.Path,
+    cfg: dict[str, int],
+    *,
+    kind: Any,
+    priority: int,
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    waiter_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Called under the store lock. Prunes expired waiters; returns the blocker."""
+    if not cfg.get("rank_vm_waiters") or not is_vm_kind(kind):
+        return None, []
+    waiters, problems = load_waiters(store_dir)
+    live, expired = live_waiters(waiters, int(cfg["waiter_fresh_secs"]))
+    if expired:
+        write_waiters(store_dir, live)
+    return blocking_waiter(cfg, live, before, after, priority, waiter_id), problems
+
+
+def settle_waiter(
+    store_dir: pathlib.Path, cfg: dict[str, int], waiter_id: str, *, granted: bool
+) -> None:
+    """Under the store lock: a grant withdraws the lane's waiter, a denial refreshes it."""
+    if not waiter_id or not cfg.get("rank_vm_waiters"):
+        return
+    waiters, problems = load_waiters(store_dir)
+    if problems:
+        return
+    if granted:
+        kept = [row for row in waiters if str(row.get("id")) != waiter_id]
+        if len(kept) != len(waiters):
+            write_waiters(store_dir, kept)
+        return
+    for row in waiters:
+        if str(row.get("id")) == waiter_id:
+            row["seen_at"] = iso(utcnow())
+            write_waiters(store_dir, waiters)
+            return
+
+
+def deferral_result(
+    waiter: dict[str, Any],
+    *,
+    lease_id: str,
+    lease_size: int,
+    req_mem: int,
+    priority: int,
+    priority_class: str,
+    capacity: dict[str, Any],
+    reaped: list[dict[str, Any]],
+    problems: list[str],
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": "deferred_to_waiter",
+        "id": lease_id,
+        "exceeded_axis": {"cores": False, "memory": False, "disk": False},
+        "requested_cores": lease_size,
+        "requested_mem_mb": req_mem,
+        "priority": priority,
+        "priority_class": priority_class,
+        "waiter": waiter_summary(waiter),
+        "capacity": capacity,
+        "reaped": reaped_summary(reaped),
+        "problems": problem_summary(problems),
+    }
+
+
+def register_waiter(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    cfg = capacity_config(args)
+    if not cfg["rank_vm_waiters"]:
+        return {"ok": True, "registered": False, "reason": "rank_vm_waiters_off"}, 0
+    if not is_vm_kind(args.kind):
+        return {"ok": False, "reason": "waiter_requires_vm_kind", "kind": args.kind}, 64
+    cores = int(args.cores_requested)
+    if cores < 0:
+        raise ValueError("waiter cores must be non-negative")
+    priority, priority_class = parse_priority(args.priority)
+    mem = int(args.mem_mb) if args.mem_mb is not None else cores * cfg["per_job_mem_mb"]
+    identity = process_identity(int(args.pid) if args.pid else os.getpid())
+    if not identity["process_start_time"]:
+        return {"ok": False, "reason": "waiter_owner_not_alive", "pid": identity["pid"]}, 64
+    now = iso(utcnow())
+    with locked_store(store_dir):
+        waiters, problems = load_waiters(store_dir)
+        live, _ = live_waiters(waiters, int(cfg["waiter_fresh_secs"]))
+        previous = next((row for row in live if str(row.get("id")) == args.id), None)
+        same_owner = previous is not None and (
+            previous.get("pid") == identity["pid"]
+            and previous.get("process_start_time") == identity["process_start_time"]
+        )
+        record = {
+            "id": args.id,
+            "lane": args.lane,
+            "label": args.label,
+            "command_kind": args.kind,
+            "lease_size_cores": cores,
+            "lease_size_mem_mb": mem,
+            "priority": priority,
+            "priority_class": priority_class,
+            "pid": identity["pid"],
+            "process_start_time": identity["process_start_time"],
+            "host_boot_time": identity["host_boot_time"],
+            # First-come among equals is by when the lane started waiting, so a
+            # refresh keeps the original timestamp.
+            "waiting_since": previous.get("waiting_since") if same_owner else now,
+            "seen_at": now,
+        }
+        kept = [row for row in live if str(row.get("id")) != args.id]
+        kept.append(record)
+        write_waiters(store_dir, kept)
+        ahead = [
+            waiter_summary(row)
+            for row in kept
+            if row is not record and record_int(row, "priority") > priority
+        ]
+        return {
+            "ok": True,
+            "registered": True,
+            "waiter": waiter_summary(record),
+            "outranked_by": ahead,
+            "problems": problem_summary(problems),
+        }, 0
+
+
+def withdraw_waiter(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    with locked_store(store_dir):
+        if not waiters_file(store_dir).exists():
+            return {"ok": True, "withdrawn": None}, 0
+        waiters, problems = load_waiters(store_dir)
+        kept = [row for row in waiters if str(row.get("id")) != args.id]
+        removed = len(kept) != len(waiters)
+        if removed:
+            write_waiters(store_dir, kept)
+        return {
+            "ok": True,
+            "withdrawn": args.id if removed else None,
+            "problems": problem_summary(problems),
+        }, 0
+
+
 def sort_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         records,
@@ -578,7 +868,21 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
                 disk_volumes.append(disk_capacity(active, probe, 0, 0))
             except (OSError, ValueError) as exc:
                 problems.append(f"disk_probe_failed:{device_id}:{exc}")
+        waiter_rows: dict[str, Any] = {}
+        if cfg.get("rank_vm_waiters"):
+            waiters, waiter_problems = load_waiters(store_dir)
+            problems.extend(waiter_problems)
+            live, _ = live_waiters(waiters, int(cfg["waiter_fresh_secs"]))
+            waiter_rows["waiters"] = [
+                waiter_summary(row)
+                for row in sorted(
+                    live,
+                    key=lambda row: (-record_int(row, "priority"),
+                                     str(row.get("waiting_since") or "")),
+                )
+            ]
         return {
+            **waiter_rows,
             "schema": 3,
             "store_dir": str(store_dir),
             "mode": "provider VM runners atomically acquire host core, memory, and per-volume disk-growth leases when enabled",
@@ -742,6 +1046,9 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             lease_size, req_mem = floor
         elif total_exceeded or class_exceeded or mem_exceeded or disk_exceeded:
             write_records(store_dir, active)
+            settle_waiter(
+                store_dir, cfg, str(getattr(args, "waiter_id", "") or ""), granted=False
+            )
             core_axis = total_exceeded or class_exceeded
             reason = (
                 "capacity_exceeded"
@@ -771,6 +1078,39 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 75
+
+        waiter_id = str(getattr(args, "waiter_id", "") or "")
+        if floor is None:
+            hypothetical = {
+                "id": lease_id,
+                "lease_size_cores": lease_size,
+                "lease_size_mem_mb": req_mem,
+                "priority": priority,
+            }
+            blocker, waiter_problems = rank_check(
+                store_dir,
+                cfg,
+                kind=args.kind,
+                priority=priority,
+                before=active,
+                after=[*active, hypothetical],
+                waiter_id=waiter_id,
+            )
+            problems.extend(waiter_problems)
+            if blocker is not None:
+                write_records(store_dir, active)
+                settle_waiter(store_dir, cfg, waiter_id, granted=False)
+                return deferral_result(
+                    blocker,
+                    lease_id=lease_id,
+                    lease_size=lease_size,
+                    req_mem=req_mem,
+                    priority=priority,
+                    priority_class=priority_class,
+                    capacity=current_usage,
+                    reaped=reaped,
+                    problems=problems,
+                ), 75
 
         identity = process_identity(pid)
         record = {
@@ -817,6 +1157,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         active.append(record)
         write_records(store_dir, active)
+        settle_waiter(store_dir, cfg, waiter_id, granted=True)
         return {
             "ok": True,
             "floor": floor is not None,
@@ -1092,6 +1433,9 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         core_axis = verdict["total_exceeded"] or verdict["class_exceeded"]
         if core_axis or verdict["mem_exceeded"]:
             write_records(store_dir, active)
+            settle_waiter(
+                store_dir, cfg, str(getattr(args, "waiter_id", "") or ""), granted=False
+            )
             return {
                 "ok": False,
                 "reason": "capacity_exceeded" if core_axis else "memory_exceeded",
@@ -1105,6 +1449,22 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 75
+        waiter_id = str(getattr(args, "waiter_id", "") or "")
+        resized = {**record, "lease_size_cores": lease_size, "lease_size_mem_mb": req_mem,
+                   "priority": priority}
+        blocker, waiter_problems = rank_check(
+            store_dir, cfg, kind=record.get("command_kind"), priority=priority,
+            before=active, after=[*others, resized], waiter_id=waiter_id,
+        )
+        problems.extend(waiter_problems)
+        if blocker is not None:
+            write_records(store_dir, active)
+            settle_waiter(store_dir, cfg, waiter_id, granted=False)
+            return deferral_result(
+                blocker, lease_id=args.id, lease_size=lease_size, req_mem=req_mem,
+                priority=priority, priority_class=priority_class,
+                capacity=current_usage, reaped=reaped, problems=problems,
+            ), 75
         previous = {"cores": record_int(record, "lease_size_cores"),
                     "mem_mb": record_mem_mb(record, cfg["per_job_mem_mb"])}
         record.update({
@@ -1118,6 +1478,7 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if getattr(args, "label", None):
             record["label"] = args.label
         write_records(store_dir, active)
+        settle_waiter(store_dir, cfg, waiter_id, granted=True)
         return {
             "ok": True,
             "lease": record,
@@ -1229,6 +1590,10 @@ def main(argv: list[str] | None = None) -> int:
             result, rc = resize(args)
         elif args.command == "heartbeat":
             result, rc = heartbeat(args)
+        elif args.command == "wait":
+            result, rc = register_waiter(args)
+        elif args.command == "withdraw":
+            result, rc = withdraw_waiter(args)
         elif args.command == "guard-exec":
             return guard_exec(args)
         elif args.command == "guard-run":
