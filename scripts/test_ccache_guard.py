@@ -161,8 +161,8 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(before, sorted(p for p in self.fx.cache.rglob("*") if p.is_file()))
         self.assertFalse(self.fx.qroot.exists())
 
-    def test_quarantine_moves_every_zero_include_manifest_intact(self) -> None:
-        rc, report = self.fx.run("quarantine")
+    def test_all_zero_include_moves_every_zero_include_manifest_intact(self) -> None:
+        rc, report = self.fx.run("quarantine", "--all-zero-include")
         self.assertEqual(rc, guard.EXIT_OK)
         moved = self.quarantined(report)
         self.assertEqual(moved, {self.rel(self.poison), self.rel(self.legit),
@@ -182,16 +182,59 @@ class GuardTests(unittest.TestCase):
         batch_report = json.loads((Path(report["quarantine_dir"]) / "report.json").read_text())
         self.assertEqual(len(batch_report["flagged"]), 3)
 
-    def test_keep_consistent_quarantines_only_suspects(self) -> None:
-        rc, report = self.fx.run("quarantine", "--keep-consistent")
+    def test_default_quarantines_only_suspects_and_counts_both(self) -> None:
+        rc, report = self.fx.run("quarantine")
         self.assertEqual(rc, guard.EXIT_OK)
+        self.assertEqual(report["mode"], "suspect-only")
         self.assertEqual(self.quarantined(report),
                          {self.rel(self.poison), self.rel(self.dangling)})
         self.assertTrue(self.legit.exists())
+        self.assertEqual(report["counts"]["zero_include_suspect"], 2)
+        self.assertEqual(report["counts"]["zero_include_consistent"], 1)
+        log = json.loads((self.fx.qroot / "guard.log").read_text().splitlines()[-1])
+        self.assertEqual((log["counts"]["zero_include_suspect"],
+                          log["counts"]["zero_include_consistent"]), (2, 1))
 
-    def test_second_run_finds_nothing(self) -> None:
+    def test_a_consistent_verdict_is_remembered_until_the_entry_changes(self) -> None:
         self.fx.run("quarantine")
         rc, report = self.fx.run("quarantine")
+        self.assertEqual(rc, guard.EXIT_OK)
+        self.assertEqual(report["counts"]["consistent_cached"], 1)
+        self.assertEqual(report["counts"]["zero_include_consistent"], 1)
+        # Only the healthy and the uninspectable manifests are opened again.
+        self.assertEqual(report["counts"]["manifests_checked"], 2)
+        # Rewritten in place (new mtime/size): checked again, and now suspect.
+        self.legit.write_bytes(guard.MAGIC + bytes([1, 1]) + json.dumps(
+            {"paths": [], "results": [R_HEADERS], "created": 1}).encode() + b" ")
+        rc, report = self.fx.run("quarantine")
+        self.assertEqual(report["counts"]["consistent_cached"], 0)
+        self.assertFalse(self.legit.exists())
+
+    def test_per_job_layers_are_never_scanned_but_the_shared_layer_is(self) -> None:
+        layers = self.fx.cache / guard.LAYER_DIR
+        placed = {}
+        for layer in ("jobs/vm-1", "green/vm-2", "discard/vm-3", "shared"):
+            root = layers / layer
+            for key, body in ((POISON, {"paths": [], "results": [R_HEADERS]}),
+                              (R_HEADERS, {"dep": HEADER_DEP})):
+                path = root / key[0] / key[1] / key[2:]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                kind = 1 if key == POISON else 0
+                path.write_bytes(guard.MAGIC + bytes([1, kind]) + json.dumps(body).encode())
+            placed[layer] = root / POISON[0] / POISON[1] / POISON[2:]
+        rc, report = self.fx.run("quarantine")
+        self.assertEqual(rc, guard.EXIT_OK)
+        moved = self.quarantined(report)
+        self.assertIn(str(placed["shared"].relative_to(self.fx.cache)), moved)
+        self.assertFalse(placed["shared"].exists())
+        for layer in ("jobs/vm-1", "green/vm-2", "discard/vm-3"):
+            self.assertTrue(placed[layer].exists(), layer)
+            self.assertFalse(any(layer in m for m in moved), layer)
+        self.assertIn(self.rel(self.poison), moved)  # the legacy root too
+
+    def test_second_run_finds_nothing(self) -> None:
+        self.fx.run("quarantine", "--all-zero-include")
+        rc, report = self.fx.run("quarantine", "--all-zero-include")
         self.assertEqual(rc, guard.EXIT_OK)
         self.assertEqual(report["counts"]["zero_include"], 0)
         self.assertNotIn("quarantine_dir", report)
@@ -372,7 +415,8 @@ class RealCcacheTests(unittest.TestCase):
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = guard.main(["quarantine", "--cache", str(self.cache), "--json"])
+            rc = guard.main(["quarantine", "--cache", str(self.cache), "--all-zero-include",
+                             "--json"])
         report = json.loads(out.getvalue().strip().splitlines()[-1])
         self.assertEqual(rc, guard.EXIT_OK)
         self.assertEqual(report["counts"]["quarantined"], 2)
@@ -381,15 +425,15 @@ class RealCcacheTests(unittest.TestCase):
         self.assertIn("wav_bridge", symbols)
         self.assertNotIn("marker", symbols)
 
-    def test_keep_consistent_cannot_see_a_foreign_include_less_object(self) -> None:
+    def test_default_cannot_see_a_foreign_include_less_object(self) -> None:
         found = self.manifests()
         shutil.copyfile(found[False], found[True])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            guard.main(["scan", "--cache", str(self.cache), "--keep-consistent", "--json"])
+            guard.main(["scan", "--cache", str(self.cache), "--json"])
         report = json.loads(out.getvalue().strip().splitlines()[-1])
-        # Both manifests look consistent, so the lenient mode flags nothing:
-        # the reason the default quarantines every zero-include manifest.
+        # Both manifests look consistent, so the default flags nothing: the
+        # documented blind spot that --all-zero-include (and reset) close.
         self.assertEqual(report["counts"]["zero_include_consistent"], 2)
         self.assertEqual(report["counts"]["flagged"], 0)
 

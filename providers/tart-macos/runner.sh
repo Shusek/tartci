@@ -729,12 +729,34 @@ print("status=%s quarantined=%s zero_include=%s suspect=%s consistent=%s uninspe
 }
 
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
+# event KIND DETAIL [key=value ...]
+# DETAIL stays the human-readable line. Each key=value after it is also
+# written as a typed member of a "fields" object, so a reader can select on
+# a value without parsing DETAIL. A value that is a JSON number is written as
+# one; anything else is a string. Keys outside [a-z_][a-z0-9_]* are dropped.
 event(){
-  local kind="$1" detail="${2:-}" ts
+  local kind="$1" detail="${2:-}" ts fields="" sep="" pair key value
+  shift
+  [ "$#" -eq 0 ] || shift
+  for pair in "$@"; do
+    case "$pair" in *=*) ;; *) continue ;; esac
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    [[ "$key" =~ ^[a-z_][a-z0-9_]*$ ]] || continue
+    [ -n "$value" ] || continue
+    if [[ "$value" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+      fields+="$sep\"$key\":$value"
+    else
+      value="${value//\\/\\\\}"
+      fields+="$sep\"$key\":\"$(json_sanitize "$value")\""
+    fi
+    sep=","
+  done
+  [ -z "$fields" ] || fields=",\"fields\":{$fields}"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  printf '{"ts":"%s","event":"%s","runner":"%s","vm":"%s","detail":"%s"}\n' \
+  printf '{"ts":"%s","event":"%s","runner":"%s","vm":"%s","detail":"%s"%s}\n' \
     "$ts" "$(json_sanitize "$kind")" "$(json_sanitize "$RUNNER_NAME")" \
-    "$(json_sanitize "${CURRENT_VM:-}")" "$(json_sanitize "$detail")" >>"$EVENT_LOG"
+    "$(json_sanitize "${CURRENT_VM:-}")" "$(json_sanitize "$detail")" "$fields" >>"$EVENT_LOG"
 }
 
 heartbeat(){
@@ -1716,6 +1738,7 @@ run_one(){
     # this is a fallback copy and must not grow a file per attempt.
     [ -z "$precheck_json" ] \
       || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
+    tartci_admission_contention_event "$precheck_json" precheck
     if [ "$precheck_rc" -ne 0 ]; then
       local precheck_detail
       precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
@@ -1908,6 +1931,7 @@ run_one(){
     fi
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
+    tartci_admission_contention_event "$admission_json" boundary
     if [ "$admission_rc" -ne 0 ]; then
       local admission_detail
       admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
@@ -1964,8 +1988,7 @@ run_one(){
      && ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM"
-    event assignment_v2_pre_mint_denied \
-      "selected_tier=$selected_tier labels=$selected_labels"
+    tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
     discard_current_vm
     tartci_release_vm_lease
     return 75
@@ -2070,7 +2093,8 @@ i=0
   exit 0
 }
 [ -n "$PRINT_PRE_MINT_SELECTION" ] && {
-  if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'; else printf '0\n'; fi
+  if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'
+  else printf '0\n'; printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2; fi
   exit 0
 }
 [ -n "$PRINT_IDLE_RETARGET" ] && {
