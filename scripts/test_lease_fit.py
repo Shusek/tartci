@@ -16,6 +16,7 @@ lane that could have booted.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import plistlib
@@ -157,6 +158,111 @@ def write_lane(agents: Path, state_root: Path, name: str, record: dict | None) -
 def fit_record(verdict: str, cores: int = 12, budget: int = 14, max_concurrent: int = 1) -> dict:
     return {"verdict": verdict, "requested_cores": cores, "requested_mem_mb": 16384,
             "core_budget": budget, "max_concurrent": max_concurrent}
+
+
+def write_fleet_lane(agents: Path, state_root: Path, prefix: str, slot: int, record: dict | None,
+                     *, repo: str = "Generous-Corp/pulp",
+                     labels: str = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+                     events: list[dict] | None = None) -> Path:
+    """A lane shaped like an installed fleet plist: no TARTCI_RUNNER_NAME.
+
+    The supervisor derives its runner name from the prefix and slot, so the
+    verdict record is `<prefix>-<slot:02d>.lease-fit.json`.
+    """
+    state = state_root / f"{prefix}-slot{slot}"
+    state.mkdir(parents=True, exist_ok=True)
+    label = f"com.danielraffel.tartci.tart-runner-macos-fleet.{prefix}.slot{slot}"
+    (agents / f"{label}.plist").write_bytes(plistlib.dumps({
+        "Label": label,
+        "EnvironmentVariables": {
+            "TARTCI_STATE_DIR": str(state),
+            "TARTCI_RUNNER_NAME_PREFIX": prefix,
+            "TARTCI_RUNNER_SLOT": str(slot),
+            "TARTCI_RUNNER_REPO": repo,
+            "TARTCI_RUNNER_LABELS": labels,
+            "TARTCI_EVENT_LOG": str(state / "events.jsonl"),
+        },
+    }))
+    runner = f"{prefix}-{slot:02d}"
+    if record is not None:
+        (state / f"{runner}.lease-fit.json").write_text(json.dumps({**record, "lane": runner}))
+    if events is not None:
+        (state / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in events))
+    return state
+
+
+def iso(delta_secs: int) -> str:
+    moment = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delta_secs)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class FleetPlistTests(unittest.TestCase):
+    """Records are found the way installed fleet plists name them."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.agents = self.tmp / "agents"
+        self.agents.mkdir()
+        self.state = self.tmp / "state"
+
+    def report_text(self) -> str:
+        proc = subprocess.run(
+            [sys.executable, "-B", str(FIT), "report", "--agents-dir", str(self.agents), "--text"],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_a_lane_named_by_prefix_and_slot_is_measured(self) -> None:
+        write_fleet_lane(self.agents, self.state, "m5-pulp-gate", 1, fit_record("fits_now", 6, 14, 2))
+        write_fleet_lane(self.agents, self.state, "m5-pulp-gate-slot2", 2, fit_record("not_now", 6, 14, 2))
+        records, missing = lease_fit.lane_records(
+            self.agents, "com.danielraffel.tartci.tart-runner-macos-fleet.")
+        self.assertEqual(missing, [])
+        self.assertEqual(sorted(row["lane"] for row in records),
+                         ["m5-pulp-gate-01", "m5-pulp-gate-slot2-02"])
+        text = self.report_text()
+        self.assertIn("lease fit: ok (2 lanes: 1 fits now, 1 not now", text)
+        self.assertNotIn("unknown", text)
+
+    def test_transitions_in_the_last_day_are_counted(self) -> None:
+        events = [
+            {"ts": iso(-3 * 86400), "event": "lease_unfit_now"},
+            {"ts": iso(-600), "event": "lease_unfit_now"},
+            {"ts": iso(-500), "event": "lease_fit_restored"},
+            {"ts": iso(-400), "event": "lease_unfit_now"},
+            {"ts": iso(-300), "event": "job_claim"},
+        ]
+        write_fleet_lane(self.agents, self.state, "m5-pulp-gate", 1,
+                         fit_record("not_now", 6, 14, 2), events=events)
+        records, _ = lease_fit.lane_records(
+            self.agents, "com.danielraffel.tartci.tart-runner-macos-fleet.")
+        self.assertEqual(records[0]["events_24h"],
+                         {"lease_unfit_now": 2, "lease_fit_restored": 1, "lease_never_fits": 0})
+        self.assertIn("last 24h: 2 not-now waits, 1 restored", self.report_text())
+
+    def test_an_unreadable_log_is_not_zero(self) -> None:
+        write_fleet_lane(self.agents, self.state, "m5-pulp-gate", 1, fit_record("fits_now", 6, 14, 2))
+        self.assertIsNone(lease_fit.lease_fit_events(self.state / "missing.jsonl"))
+        self.assertIn("event logs unreadable", self.report_text())
+
+    def test_a_release_lane_is_not_an_identical_gate_lane(self) -> None:
+        for prefix, slot in (("m5-pulp-gate", 1), ("m5-pulp-gate-slot2", 2)):
+            write_fleet_lane(self.agents, self.state, prefix, slot, fit_record("fits_now", 6, 14, 2))
+        write_fleet_lane(self.agents, self.state, "m5-pulp-release", 1,
+                         fit_record("fits_now", 6, 14, 2),
+                         labels="self-hosted,macOS,ARM64,pulp-build-vm-release")
+        self.assertNotIn("CONFIGURATION", self.report_text())
+        # The control: a third identical gate lane does exceed the budget.
+        write_fleet_lane(self.agents, self.state, "m5-pulp-gate-slot3", 3, fit_record("fits_now", 6, 14, 2))
+        self.assertIn("lease fit: CONFIGURATION", self.report_text())
+
+    def test_other_repositories_are_not_compared(self) -> None:
+        for prefix, repo in (("studio-forge-gate", "o/forge"), ("studio-spectr-gate", "o/spectr"),
+                             ("studio-vellum-gate", "o/vellum")):
+            write_fleet_lane(self.agents, self.state, prefix, 1,
+                             fit_record("fits_now", 14, 26, 1), repo=repo)
+        self.assertIn("lease fit: ok (3 lanes", self.report_text())
 
 
 class ConfigurationFindingTests(unittest.TestCase):

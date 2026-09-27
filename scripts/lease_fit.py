@@ -32,11 +32,13 @@ import json
 import os
 import pathlib
 import plistlib
+import socket
 import sys
 from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import leases  # noqa: E402
+import macos_runner_identity  # noqa: E402
 
 FITS_NOW = 0
 NOT_NOW = 3
@@ -204,34 +206,91 @@ def record_path(state_dir: str, runner_name: str) -> pathlib.Path:
     return pathlib.Path(state_dir).expanduser() / f"{runner_name}.lease-fit.json"
 
 
+EVENT_WINDOW_SECS = 24 * 3600
+EVENT_TAIL_BYTES = 8 * 1024 * 1024
+FIT_EVENTS = ("lease_unfit_now", "lease_fit_restored", "lease_never_fits")
+
+
+def lease_fit_events(path: pathlib.Path, now: dt.datetime | None = None,
+                     window_secs: int = EVENT_WINDOW_SECS) -> dict[str, int] | None:
+    """Count this lane's lease-fit transitions in the last `window_secs`.
+
+    The lane logs a transition, not every poll: `lease_unfit_now` when its VM
+    stops fitting and `lease_fit_restored` when it fits again. None means the
+    log could not be read, which is not the same as zero transitions.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    cutoff = now - dt.timedelta(seconds=window_secs)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - EVENT_TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        return None
+    counts = {name: 0 for name in FIT_EVENTS}
+    for raw in data.splitlines():
+        if b"lease_" not in raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        name = row.get("event") if isinstance(row, dict) else None
+        if name not in counts:
+            continue
+        try:
+            ts = dt.datetime.strptime(str(row.get("ts")), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=dt.timezone.utc)
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            counts[name] += 1
+    return counts
+
+
 def lane_records(agents_dir: pathlib.Path, prefix: str) -> tuple[list[dict[str, Any]], list[str]]:
     """Each managed macOS lane's latest lease-fit record, from its own plist.
 
-    Returns (records, lanes_without_a_record).
+    The record's file name is the lane's runner name, which a fleet plist
+    rarely states: it is derived from the name prefix and slot exactly as the
+    supervisor derives it (macos_runner_identity), so it is resolved the same
+    way here. Returns (records, lanes_without_a_record).
     """
     records: list[dict[str, Any]] = []
     missing: list[str] = []
+    hostname = socket.gethostname()
     for plist in sorted(agents_dir.glob(f"{prefix}*.plist")):
         if not plist.is_file() or plist.is_symlink():
             continue
         label = plist.name.removesuffix(".plist")
         try:
-            env = plistlib.loads(plist.read_bytes()).get("EnvironmentVariables") or {}
-        except (OSError, plistlib.InvalidFileException, ValueError):
+            data = plistlib.loads(plist.read_bytes())
+            identity = macos_runner_identity.resolve_plist_identity(data, hostname=hostname)
+        except (OSError, plistlib.InvalidFileException, ValueError, AttributeError):
             missing.append(label)
             continue
-        state_dir = env.get("TARTCI_STATE_DIR")
-        runner = env.get("TARTCI_RUNNER_NAME")
-        if not isinstance(state_dir, str) or not isinstance(runner, str):
-            missing.append(label)
-            continue
+        env = data.get("EnvironmentVariables") if isinstance(data, dict) else None
+        env = env if isinstance(env, dict) else {}
         try:
-            row = json.loads(record_path(state_dir, runner).read_text(encoding="utf-8"))
+            row = json.loads(record_path(identity.state_dir, identity.runner_name)
+                             .read_text(encoding="utf-8"))
         except (OSError, ValueError):
             missing.append(label)
             continue
         if isinstance(row, dict):
             row["label"] = label
+            repo = env.get("TARTCI_RUNNER_REPO")
+            if isinstance(repo, str) and repo:
+                row["repo"] = repo
+            runner_labels = env.get("TARTCI_RUNNER_LABELS")
+            if isinstance(runner_labels, str) and runner_labels:
+                row["runner_labels"] = runner_labels
+            event_log = env.get("TARTCI_EVENT_LOG")
+            if not isinstance(event_log, str) or not event_log:
+                event_log = str(pathlib.Path(identity.state_dir) / "events.jsonl")
+            row["events_24h"] = lease_fit_events(pathlib.Path(event_log).expanduser())
             records.append(row)
         else:
             missing.append(label)
@@ -241,17 +300,21 @@ def lane_records(agents_dir: pathlib.Path, prefix: str) -> tuple[list[dict[str, 
 def configuration_findings(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Lanes that can never lease, and identical lanes that cannot all run at once.
 
-    Identical means the same VM size against the same budget. Lanes of
-    different sizes share a host on purpose and are not compared.
+    Identical means the same VM size against the same budget, serving the same
+    repository with the same runner labels. Lanes of different sizes, or for
+    different repositories or label classes (a release lane beside two gate
+    lanes, whose queues fill independently), share a host on purpose and are
+    not compared.
     """
     never = [row for row in records if row.get("verdict") == "never"]
-    groups: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = {}
+    groups: dict[tuple[Any, Any, Any, Any, Any], list[dict[str, Any]]] = {}
     for row in records:
         if row.get("verdict") in ("fits_now", "not_now"):
-            key = (row.get("requested_cores"), row.get("requested_mem_mb"), row.get("core_budget"))
+            key = (row.get("requested_cores"), row.get("requested_mem_mb"),
+                   row.get("core_budget"), row.get("repo"), row.get("runner_labels"))
             groups.setdefault(key, []).append(row)
     oversubscribed = []
-    for (cores, mem, budget), rows in sorted(groups.items(), key=lambda item: str(item[0])):
+    for (cores, mem, budget, _repo, _labels), rows in sorted(groups.items(), key=lambda item: str(item[0])):
         capacity = min(int(row.get("max_concurrent") or 0) for row in rows)
         if len(rows) > capacity:
             oversubscribed.append({
@@ -262,6 +325,28 @@ def configuration_findings(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "max_concurrent": capacity,
             })
     return {"never": never, "oversubscribed": oversubscribed}
+
+
+def verdict_summary(records: list[dict[str, Any]]) -> str:
+    """"5 lanes: 4 fit now, 1 not now; last 24h: 12 not-now waits, 11 restored"."""
+    now: dict[str, int] = {}
+    for row in records:
+        verdict = str(row.get("verdict") or "unknown").replace("_", " ")
+        now[verdict] = now.get(verdict, 0) + 1
+    order = ["fits now", "not now", "never", "unknown"]
+    parts = [f"{now[key]} {key}" for key in order if key in now]
+    parts += [f"{count} {key}" for key, count in sorted(now.items()) if key not in order]
+    text = f"{len(records)} lanes: " + ", ".join(parts)
+    counted = [row["events_24h"] for row in records if isinstance(row.get("events_24h"), dict)]
+    if counted:
+        unfit = sum(c["lease_unfit_now"] for c in counted)
+        restored = sum(c["lease_fit_restored"] for c in counted)
+        text += f"; last 24h: {unfit} not-now waits, {restored} restored"
+        if len(counted) < len(records):
+            text += f" ({len(records) - len(counted)} lanes' logs unreadable)"
+    else:
+        text += "; last 24h: event logs unreadable"
+    return text
 
 
 def report(argv: list[str]) -> int:
@@ -284,6 +369,13 @@ def report(argv: list[str]) -> int:
             for row in findings["never"]
         ],
         "oversubscribed": findings["oversubscribed"],
+        "lanes": [
+            {"lane": row.get("lane") or row.get("label"),
+             "verdict": row.get("verdict"),
+             "updated_at": row.get("updated_at"),
+             "events_24h": row.get("events_24h")}
+            for row in records
+        ],
     }
     if not args.text:
         print(json.dumps(payload, sort_keys=True))
@@ -292,11 +384,11 @@ def report(argv: list[str]) -> int:
         return 0
     if not payload["never"] and not payload["oversubscribed"]:
         if records:
-            print("lease fit: ok")
+            print(f"lease fit: ok ({verdict_summary(records)})")
         else:
             print("lease fit: unknown (no lane has recorded a verdict yet)")
         return 0
-    print("lease fit: CONFIGURATION")
+    print(f"lease fit: CONFIGURATION ({verdict_summary(records)})")
     for row in payload["never"]:
         print(f"  lane {row['lane']}: {row['vm_cores']}-core VM can never lease "
               f"(budget {row['core_budget']}); it does not poll for work")

@@ -2005,12 +2005,18 @@ could be granted.
 - *Never* (the VM is larger than the budget it is admitted against): the lane
   stops polling, logs a `CONFIGURATION` line, and reports heartbeat
   `lease-never-fits` and event `lease_never_fits`.
-- Each lane writes its verdict to `$TARTCI_STATE_DIR/<lane>.lease-fit.json`.
-  `tartci doctor fleet` (`lease_fit` check) and `tartci pool status` (text line
-  and `lease_fit` JSON key) read it. They report a lane that can never lease
-  (`lane_lease_never_fits`) and more identical lanes than the budget runs at
-  once (`lanes_exceed_lease_capacity`), for example two 12-core gate lanes in
-  m5's 14-core universe.
+- Each lane writes its verdict to `$TARTCI_STATE_DIR/<runner>.lease-fit.json`,
+  where `<runner>` is the name the supervisor derives from the plist (prefix +
+  slot, `scripts/macos_runner_identity.py`); fleet plists rarely set
+  `TARTCI_RUNNER_NAME`. `tartci doctor fleet` (`lease_fit` check) and
+  `tartci pool status` (text line and `lease_fit` JSON key) read it. They
+  report a lane that can never lease (`lane_lease_never_fits`) and more
+  identical lanes (same VM size, budget, repository and runner labels) than
+  the budget runs at once (`lanes_exceed_lease_capacity`), for example two
+  12-core gate lanes in m5's 14-core universe. The `pool status` line also
+  counts each lane's current verdict and its last 24 h of `lease_unfit_now` /
+  `lease_fit_restored` transitions from the lane's event log, e.g.
+  `lease fit: ok (6 lanes: 5 fits now, 1 not now; last 24h: 404 not-now waits, 399 restored)`.
 - `TARTCI_LEASE_FIT_GATE=0` disables the check.
 
 **Per-job claim** (`providers/tart-macos/job-claim.lib.sh`, `scripts/job_claim.py`).
