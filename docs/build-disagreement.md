@@ -74,7 +74,10 @@ tartci doctor build-disagreement --enable            # text
 tartci doctor build-disagreement --enable --json     # exit 1 on a problem finding
 ```
 
-Per host, in the fleet profile (no checked-in profile enables it):
+Per host, in the fleet profile (no checked-in profile enables it). A macOS
+fleet profile carries the table only once `scripts/macos_fleet_lanes.py` lists
+`build_disagreement` among its accepted top-level keys; the installer rejects
+unknown tables:
 
 ```toml
 [build_disagreement]
@@ -98,6 +101,41 @@ codes Actions logs carry; set `TARTCI_GH_LOG_CLI` (or `--log-cli`) to a plain
 
 `--from-jobs <file> --logs-dir <dir> --now <time>` replays a recorded job list
 offline; `--dump-jobs <file>` records one.
+
+## Periodic watch
+
+The launchd watchdog (`com.danielraffel.tartci.launchd-watchdog`, `tartci
+launchd heal`, `StartInterval` 300 s) runs the check on a host whose installed
+fleet profile (`~/.config/tartci/macos-fleet-profile.toml`) has
+`[build_disagreement] enabled = true`. No new daemon: it runs after the heal
+pass through `scripts/build_disagreement_watch.py` and writes to the watchdog
+log (`~/Library/Logs/tartci/tartci-launchd-watchdog.log`). It is report only:
+it never resets a cache and never changes scheduling.
+
+- **Cadence:** at most once every `interval_minutes` (default and floor 15).
+  `tartci launchd status` and `heal --dry-run` never run it.
+- **Budgets:** `max_api_calls` and `max_log_fetches` are passed through, capped
+  at the detector defaults (200 and 12); the run is killed after
+  `timeout_seconds` (default 240) and reported `unknown`.
+- **Outcome:** exit 1 (a problem) and 3 (GitHub unreadable) are findings, not
+  watchdog failures. A timeout, a crash or unparseable output is `unknown`.
+- **Dedup:** one `ALARM` per (flagged host, error fingerprint). A pair still
+  being reported is not re-sent; it alarms again only after it has been absent
+  for `realert_hours` (default 24). State lives in
+  `$TARTCI_HOME/state/build-disagreement-watch.json`.
+- **Log CLI:** `TARTCI_GH_LOG_CLI` when it answers `--version` as gh, otherwise
+  `/opt/homebrew/bin/gh`, `/usr/local/bin/gh` and each `gh` on PATH, skipping
+  wrappers that do not answer as gh. None found is `unknown
+  (log_cli_unavailable)` and the detector is not run.
+
+Every due cycle logs one `build-disagreement: ran state=...` line (the count of
+runs), plus `ALARM` and `remedy:` lines for a new pair. One host is enough: the
+detector reads every gate host's jobs from GitHub, so the canary is the host
+that already runs fleet-wide views (M3, `studio`).
+
+`python3 scripts/build_disagreement_watch.py status` prints the last cycle;
+`cycle --force --replay-jobs <file> --replay-logs <dir> --replay-now <time>`
+replays a recorded window through the same path.
 
 ## Remedy
 
