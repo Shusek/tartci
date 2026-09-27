@@ -8,6 +8,9 @@ LABEL="com.danielraffel.tartci.self-update"
 TEMPLATE="$HERE/launchd/$LABEL.plist.template"
 AGENTS_DIR="${TARTCI_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 TARGET="$AGENTS_DIR/$LABEL.plist"
+LAUNCHCTL="${TARTCI_LAUNCHCTL_BIN:-/bin/launchctl}"
+# shellcheck source=scripts/launchd_domain_guard.sh
+. "$HERE/scripts/launchd_domain_guard.sh"
 APPLY=0
 case "${1:-}" in
   --install) APPLY=1 ;;
@@ -36,8 +39,9 @@ if [ "$APPLY" != 1 ]; then
   echo "(plan only; re-run with --install)"
   exit 0
 fi
+tartci_launchd_domain_guard "$TARGET" "$LAUNCHCTL" || exit 4
 mkdir -p "$AGENTS_DIR" "$HOME/Library/Logs/tartci"
 install -m 0644 "$rendered" "$TARGET"
-launchctl bootstrap "gui/$(id -u)" "$TARGET"
-launchctl print "gui/$(id -u)/$LABEL" >/dev/null
+"$LAUNCHCTL" bootstrap "gui/$(id -u)" "$TARGET"
+"$LAUNCHCTL" print "gui/$(id -u)/$LABEL" >/dev/null
 echo "installed and loaded $LABEL"

@@ -22,6 +22,7 @@ the fault present and the fault absent -- can be exercised without a fleet host.
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import subprocess
 
@@ -68,10 +69,13 @@ CODES: tuple[str, ...] = (
     "installed_generation_unknown",
     "lane_lease_never_fits",
     "lanes_exceed_lease_capacity",
+    "launchd_registration_leaked",
+    "launchd_registrations_ok",
+    "launchd_registrations_unreadable",
     "lease_fit_ok",
     "lease_fit_unmeasured",
-    "no_managed_launchagents",
     "no_installed_profile",
+    "no_managed_launchagents",
     "no_persistent_runners",
     "persistent_runners_without_hold_receipt",
     "profile_drift",
@@ -81,6 +85,11 @@ CODES: tuple[str, ...] = (
     "readiness_not_managed",
     "readiness_probe_failed",
     "readiness_verdict_depends_on_invocation",
+    "reclaim_failed",
+    "reclaim_never_recorded",
+    "reclaim_ok",
+    "reclaim_stale",
+    "reclaim_unreadable",
     "sealed_launcher_bundle",
     "self_update_current",
     "self_update_problem",
@@ -709,6 +718,93 @@ def check_warm_vm(value: dict | None) -> Finding:
                    f"warm VM record unreadable: {(value or {}).get('error')}", facts)
 
 
+# LaunchAgent labels tartci installs. A loaded job under one of these whose
+# plist is not in the account's own LaunchAgents directory was registered by
+# something other than an installer run as this account: in practice a test or
+# script that ran an installer with a temporary HOME. The label then SHADOWS
+# the real agent, and every "is it loaded" view still says yes.
+TARTCI_AGENT_PREFIXES = (
+    "com.danielraffel.tartci.",
+    "com.danielraffel.pulp.",
+    "com.danielraffel.shipyard.",
+    "com.danielraffel.forge.",
+)
+
+
+def check_launchd_registrations(rows: list[dict] | None, *, home: Path,
+                                 error: str = "") -> Finding:
+    """Every loaded tartci LaunchAgent must come from <home>/Library/LaunchAgents.
+
+    `rows` is [{"label", "path"}] for each loaded job whose label carries a
+    tartci prefix; `path` is launchd's own record of the plist it loaded (None
+    when launchd holds no path for it). None means launchd could not be asked.
+    """
+    if rows is None:
+        return Finding("launchd_registrations", UNKNOWN, "launchd_registrations_unreadable",
+                       f"could not list this account's launchd jobs: {error or 'no launchctl'}")
+    agents = str(home / "Library" / "LaunchAgents") + "/"
+    leaked = [row for row in rows
+              if not (isinstance(row.get("path"), str) and row["path"].startswith(agents)
+                      and "/" not in row["path"][len(agents):])]
+    facts = {"loaded": len(rows), "leaked": leaked, "expected_dir": agents.rstrip("/")}
+    if leaked:
+        names = ", ".join(f"{row['label']} <- {row.get('path') or 'no plist path'}"
+                          for row in leaked)
+        return Finding("launchd_registrations", PROBLEM, "launchd_registration_leaked",
+                       f"{len(leaked)} loaded tartci job(s) registered from outside "
+                       f"{agents.rstrip('/')}: {names}", facts)
+    return Finding("launchd_registrations", OK, "launchd_registrations_ok",
+                   f"{len(rows)} loaded tartci job(s), all from {agents.rstrip('/')}", facts)
+
+
+def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | None = None
+                          ) -> tuple[list[dict] | None, str]:
+    """(rows, error) for every loaded job with a tartci label, read from launchd."""
+    import re
+
+    def default_run(argv: list[str]) -> tuple[int, str, str]:
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 127, "", str(exc)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    run = run or default_run
+    code, out, err = run(["/bin/launchctl", "list"])
+    if code != 0:
+        return None, (err or out).strip()[:200] or f"launchctl list exit {code}"
+    labels = sorted({line.split("\t")[-1].strip() for line in out.splitlines()[1:]
+                     if line.split("\t")[-1].strip().startswith(TARTCI_AGENT_PREFIXES)})
+    rows = []
+    for label in labels:
+        code, text, err = run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"])
+        if code != 0:
+            continue  # listed in another domain or gone since the list
+        match = re.search(r"^\tpath = (.+)$", text, re.M)
+        rows.append({"label": label, "path": match.group(1).strip() if match else None})
+    return rows, ""
+
+
+def check_reclaim(value: dict | None) -> Finding:
+    """The disk reclaimer's last pass, from its receipt (scripts/reclaim_status.py)."""
+    import reclaim_status
+
+    value = value or {"state": "unreadable", "error": "no status"}
+    state = value.get("state")
+    detail = reclaim_status.describe(value) if state != "unreadable" or value.get("receipt") \
+        else f"reclaim status unreadable: {value.get('error')}"
+    facts = {"reclaim": value}
+    if state == "ok":
+        return Finding("reclaim", OK, "reclaim_ok", detail, facts)
+    if state == "failed":
+        return Finding("reclaim", PROBLEM, "reclaim_failed", detail, facts)
+    if state == "stale":
+        return Finding("reclaim", PROBLEM, "reclaim_stale", detail, facts)
+    if state == "never":
+        return Finding("reclaim", UNKNOWN, "reclaim_never_recorded", detail, facts)
+    return Finding("reclaim", UNKNOWN, "reclaim_unreadable", detail, facts)
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -924,6 +1020,8 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             drift_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             self_update_summary: dict | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
+            launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
+            reclaim_value: dict | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
     agents_dir = agents_dir or (home / "Library" / "LaunchAgents")
@@ -991,6 +1089,20 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     except Exception as exc:  # noqa: BLE001 - reported as unreadable
         warm_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_warm_vm(warm_value))
+    rows, launchd_error = launchd_registrations(launchd_run)
+    findings.append(check_launchd_registrations(rows, home=home, error=launchd_error))
+    if reclaim_value is None:
+        try:
+            import reclaim_status
+            # An explicit TARTCI_RECLAIM_STATE_DIR wins, as it does for the
+            # reclaim pass that writes the receipt; otherwise read `home`'s.
+            reclaim_value = reclaim_status.status(
+                None if os.environ.get("TARTCI_RECLAIM_STATE_DIR")
+                else home / ".tartci" / "state" / "reclaim",
+                log_path=home / "Library" / "Logs" / "tartci" / "tartci-reclaim.log")
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            reclaim_value = {"state": "unreadable", "error": str(exc)}
+    findings.append(check_reclaim(reclaim_value))
     if probe is None:
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default

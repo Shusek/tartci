@@ -65,7 +65,20 @@ class FakePoolHost:
             "launchctl": textwrap.dedent(f"""\
                 #!/bin/sh
                 printf '%s\\n' "$*" >> "{self.log}"
+                # Like launchd, a booted-out service stops being printable
+                # (immediately here; see PoolOffWaitsForLaunchdTests for
+                # the real, delayed release).
+                if [ "$1" = bootout ]; then
+                  base="{self.prints}/$(printf '%s' "$2" | tr '/' '_')"
+                  if [ -f "$base.linger" ]; then touch "$base.exiting"; else rm -f "$base.rc"; fi
+                fi
                 if [ "$1" = print ]; then
+                  base="{self.prints}/$(printf '%s' "$2" | tr '/' '_')"
+                  if [ -f "$base.exiting" ]; then
+                    left="$(cat "$base.linger")"
+                    if [ "$left" -le 0 ]; then rm -f "$base.rc" "$base.exiting"
+                    else echo $((left - 1)) > "$base.linger"; fi
+                  fi
                   name=$(printf '%s' "$2" | tr '/' '_')
                   if [ -f "{self.prints}/$name.rc" ]; then
                     cat "{self.prints}/$name.out" 2>/dev/null
@@ -107,6 +120,14 @@ class FakePoolHost:
             f"state = running\n\tpid = {pid}\n\texit timeout = 30\n")
         (self.prints / f"{self._name(label)}.rc").write_text("0")
 
+    def linger(self, label: str, prints: int) -> None:
+        """After bootout, keep `label` printable for `prints` more calls.
+
+        This is launchd's real behaviour: bootout returns once the stop is
+        SENT, and the service stays loaded while its TERM handler runs.
+        """
+        (self.prints / f"{self._name(label)}.linger").write_text(str(prints))
+
     def print_error(self, label: str) -> None:
         (self.prints / f"{self._name(label)}.out").unlink(missing_ok=True)
         (self.prints / f"{self._name(label)}.err").write_text("Input/output error\n")
@@ -122,6 +143,53 @@ class FakePoolHost:
 
     def records(self) -> tuple[str, str]:
         return self.participation.read_text(), self.state.read_text()
+
+
+class PoolOffWaitsForLaunchdTests(unittest.TestCase):
+    """`pool off` returns only once launchd has let go of every lane.
+
+    The ordering bug: self-update runs `pool off` and then the fleet installer,
+    whose first check is `launchctl print` on every target lane. bootout had
+    returned, but a lane still in its TERM cleanup was still loaded, so every
+    host's first install was refused ("...forge-gate" on m5 and m1,
+    "...vellum-gate" on m3) and only the retry applied.
+    """
+
+    def installer_check(self, host: FakePoolHost, label: str) -> subprocess.CompletedProcess[str]:
+        # Exactly what install_macos_fleet.sh's assert_agent_unloaded asks.
+        return subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                              env=host.env, text=True, capture_output=True, check=False)
+
+    def test_off_waits_out_a_lane_still_running_its_term_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td), busy=False)
+            host.linger(IDLE_LANE, 6)
+            proc = host.pool("off")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            check = self.installer_check(host, IDLE_LANE)
+            self.assertNotEqual(check.returncode, 0, "installer would see the lane loaded")
+            self.assertIn("Could not find service", check.stderr)
+            prints = [line for line in host.log.read_text().splitlines()
+                      if line == f"print gui/{os.getuid()}/{IDLE_LANE}"]
+            # The wait really polled through the linger, not past it.
+            self.assertGreaterEqual(len(prints), 7)
+            self.assertEqual(host.records(), ("0\n", "off\n"))
+
+    def test_a_lane_that_never_lets_go_fails_off_and_keeps_admission_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td), busy=False)
+            host.linger(IDLE_LANE, 10 ** 6)
+            host.env["TARTCI_POOL_UNLOAD_WAIT_SECS"] = "1"
+            proc = host.pool("off")
+            self.assertEqual(proc.returncode, 13, proc.stdout + proc.stderr)
+            self.assertIn(IDLE_LANE, proc.stderr)
+            self.assertNotIn(LANE + "\n", proc.stderr.replace(IDLE_LANE, ""))
+            self.assertEqual(host.records(), ("0\n", "off\n"))
+            # And the installer's refusal still stands for it: never install
+            # while a lane is genuinely loaded.
+            self.assertEqual(self.installer_check(host, IDLE_LANE).returncode, 0)
+            body = (ROOT / "scripts" / "install_macos_fleet.sh").read_text()
+            self.assertIn('assert_agent_unloaded "$label" target || exit 3', body)
 
 
 class PoolOffMidJobTests(unittest.TestCase):

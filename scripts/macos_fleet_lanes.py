@@ -28,6 +28,7 @@ import tartci_support_manifest as support_manifest
 import macos_launcher_identity
 import macos_launcher_probe
 import network_profile
+import pulp_reapers
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -42,6 +43,7 @@ DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
+    "reclaim",
 }
 # Report-only cross-host build disagreement check, run by the launchd watchdog
 # (scripts/build_disagreement_watch.py). Keys mirror the detector's profile
@@ -427,6 +429,14 @@ def load(path: Path) -> dict:
             fail(f"unknown build_disagreement keys: {sorted(unknown)}")
         if type(disagreement.get("enabled", False)) is not bool:
             fail("build_disagreement.enabled must be a boolean")
+    # Opt-in: run Pulp's own build-directory reapers from `tartci reclaim`
+    # (scripts/pulp_reapers.py). One validator for install time and run time,
+    # so a profile that installs is a profile the reclaim pass acts on.
+    reclaim = data.get("reclaim")
+    if reclaim is not None:
+        problems = pulp_reapers.validate_table(reclaim)
+        if problems:
+            fail("; ".join(problems))
     github_app = data.get("github_app")
     if github_app is not None:
         if not isinstance(github_app, dict):
