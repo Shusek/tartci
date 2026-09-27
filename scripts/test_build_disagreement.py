@@ -320,6 +320,8 @@ class Backtest(unittest.TestCase):
         self.assertEqual((finding["rule"], finding["host"]), ("streak", "m3"))
         self.assertIn("write_scenario_wav", finding["log"]["fingerprint"])
         self.assertEqual(finding["green_counterpart"]["host"], "m1")
+        self.assertEqual(finding["commit"][:8], "dd8d519d")  # newest failure: the one to re-run
+        self.assertIn("tartci ccache", finding["remedy"])
 
     @unittest.skipUnless((FIXTURES / "incident-2026-09-26.json").exists(), "fixture absent")
     def test_cross_host_pr_breakage_the_same_evening_is_quiet(self):

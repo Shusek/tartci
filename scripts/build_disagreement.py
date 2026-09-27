@@ -61,6 +61,7 @@ DEFAULT_WINDOW_HOURS = 6.0
 DEFAULT_STREAK = 3
 DEFAULT_MAX_API_CALLS = 200
 DEFAULT_MAX_LOG_FETCHES = 12
+LISTING_MARGIN = dt.timedelta(hours=2)
 # Ordered: first matching prefix wins. Shipyard's durable tag for M3 is
 # `studio`, so its ephemeral runners are named studio-*.
 DEFAULT_HOST_PREFIXES: tuple[tuple[str, str], ...] = (
@@ -74,10 +75,12 @@ DEFAULT_HOST_PREFIXES: tuple[tuple[str, str], ...] = (
 HEAD_BUILDING_EVENTS = frozenset({"push", "merge_group", "workflow_dispatch", "schedule"})
 
 REMEDY = (
-    "Probable poisoned compiler cache on {host}. Reset that host's shared "
-    "ccache (tartci's ccache reset command for the host; if it is not "
-    "installed, stop the host's gate lanes, clear its shared ccache directory "
-    "and restart them), then re-run the failing job and confirm it goes green."
+    "Probable poisoned compiler cache on {host}. On {host}, run `tartci ccache "
+    "quarantine` (moves zero-include ccache manifests aside) or `tartci ccache "
+    "reset` (moves the whole shared cache aside); both refuse while a VM runs "
+    "unless --force. Where that command is not installed yet, drain the host's "
+    "gate lanes, move its shared ccache directory aside and resume. Then re-run "
+    "the failing job and confirm it goes green on {host}."
 )
 
 # A compile or link failure. `ld: warning` is deliberately absent: the gate
@@ -370,7 +373,8 @@ def finding(rule: str, host: str, confirmed: list[dict], unknown: list[dict],
             **extra: Any) -> dict[str, Any]:
     state = "problem" if confirmed else "unknown"
     rows = confirmed or unknown
-    first = rows[0]
+    # A streak is reported by its newest failure: that is the job to re-run.
+    first = rows[-1] if rule == "streak" else rows[0]
     failure = first["failure"]
     green = first.get("green") or extra.get("green") or {}
     out = {
@@ -593,8 +597,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return None
     else:
         try:
+            # Runs are listed by creation, jobs judged by completion: widen the
+            # listing so a job that started before the window still counts.
             records = fetch_records(gh, repo, pick("workflow", DEFAULT_WORKFLOW),
-                                    now - window, now, **norm)
+                                    now - window - LISTING_MARGIN, now, **norm)
         except (RuntimeError, ValueError, OSError) as error:
             result = {"schema": 1, "check": "build_disagreement", "state": "unknown",
                       "code": "github_unreadable", "detail": str(error)}
