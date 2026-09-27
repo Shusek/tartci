@@ -160,3 +160,22 @@ tartci_boundary_proof_take_access(){
   fi
   return 0
 }
+
+# 0 when a failed repository-access proof is a real denial (the proof said
+# deny, or GitHub refused the App), 1 when it only could not be answered.
+tartci_repository_access_denied(){
+  local rc="$1" error_file="$2"
+  [ "$rc" -eq 3 ] && return 0
+  grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$error_file" 2>/dev/null
+}
+
+# One short, single-line cause for an event detail.
+tartci_repository_access_reason(){
+  local error_file="$1" line
+  line="$(head -c 400 "$error_file" 2>/dev/null | tr '\n\t' '  ')" || line=""
+  case "$line" in
+    *"timed out"*) printf 'reason=timeout' ;;
+    "") printf 'reason=unknown' ;;
+    *) printf 'reason=error detail=%s' "$(printf '%s' "$line" | cut -c1-160)" ;;
+  esac
+}
