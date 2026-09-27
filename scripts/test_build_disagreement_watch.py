@@ -133,9 +133,10 @@ class EnabledIncident(WatchCase):
         self.assertEqual(len(report["alarms"]), 1, "control: an alarm was raised")
         self.assertEqual(len(runner.calls), 1)
         self.assertEqual(Path(runner.calls[0][1]).name, "build_disagreement.py")
-        joined = " ".join(runner.calls[0])
-        self.assertNotIn("reset", joined)
-        self.assertNotIn("ccache", joined)
+        # Compare argv words (path arguments by basename), not a substring of
+        # the whole command line: the checkout path may itself contain "ccache".
+        words = {Path(arg).name if os.sep in arg else arg for arg in runner.calls[0]}
+        self.assertTrue(words.isdisjoint({"reset", "ccache", "quarantine"}), sorted(words))
         self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
 
