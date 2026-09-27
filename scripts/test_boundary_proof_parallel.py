@@ -304,6 +304,63 @@ class ProviderAccessBlockTests(unittest.TestCase):
         self.assertFalse(h.discards.exists())
 
 
+class TransientAccessFailureTests(unittest.TestCase):
+    """A proof GitHub could not answer is asked once more; a denial never is."""
+
+    def _run(self, failures: int, fail: str = "Command timed out after 20 seconds"
+             ) -> tuple[subprocess.CompletedProcess, Harness]:
+        raw = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, raw, True)
+        h = Harness(Path(raw))
+        h.stub_shipyard([("admit", "clean", 0)])
+        count = h.tmp / "gh-calls"
+        group = json.dumps({"visibility": "selected"})
+        repos = json.dumps({"total_count": 1, "repositories": [{"full_name": REPO}]})
+        # The first `failures` calls fail; later calls answer like GitHub.
+        h._exe("stub-gh", (
+            "#!/bin/bash\n"
+            f"echo x >>{str(count)!r}\n"
+            f"n=$(wc -l <{str(count)!r} | tr -d ' ')\n"
+            f"if [ \"$n\" -le {failures} ]; then echo {fail!r} >&2; exit 1; fi\n"
+            f"case \"$2\" in *repositories*) echo {repos!r} ;; *) echo {group!r} ;; esac\n"))
+        denied = h.tmp / "denied"
+        result = h.run(
+            access_function()
+            + f"record_jit_admission_denied(){{ echo \"$*\" >>{str(denied)!r}; }}\n"
+            + "tartci_boundary_proof_start \"$vm\" \"$selected_labels\" 7\n"
+            + "_tartci_boundary_proof_join\n"
+            + "rc=0; access 7 || rc=$?\nexit $rc\n"
+        )
+        return result, h
+
+    def test_a_timed_out_proof_is_asked_again_and_the_vm_is_kept(self) -> None:
+        result, h = self._run(failures=1)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("passed", result.stdout)
+        self.assertFalse(h.discards.exists())
+        self.assertEqual(h.event_names().count("jit_repository_access_retry"), 1)
+        retry = [line for line in h.events.read_text().splitlines()
+                 if line.startswith("jit_repository_access_retry")][0]
+        self.assertIn("reason=timeout", retry)
+
+    def test_a_second_failure_discards_and_names_the_cause(self) -> None:
+        result, h = self._run(failures=2)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(h.discards.read_text().split(), ["discard"])
+        names = h.event_names()
+        self.assertIn("jit_repository_access_error", names)
+        self.assertNotIn("jit_repository_access_denied", names)
+        self.assertFalse((h.tmp / "denied").exists(), "a timeout is not a denial")
+
+    def test_a_denial_is_never_asked_again(self) -> None:
+        result, h = self._run(failures=5, fail="HTTP 403: Resource not accessible by integration")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(h.discards.read_text().split(), ["discard"])
+        self.assertNotIn("jit_repository_access_retry", h.event_names())
+        self.assertIn("jit_repository_access_denied", h.event_names())
+        self.assertEqual(len((h.tmp / "gh-calls").read_text().split()), 1)
+
+
 class FallbackToTheSynchronousCallTests(unittest.TestCase):
     def test_a_stale_verdict_is_asked_again_at_the_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

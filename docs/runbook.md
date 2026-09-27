@@ -1327,6 +1327,14 @@ synchronous call the boundary always made. The `admission_check` event says
 which answer was used (`source=parallel age=Ns` or `source=boundary`).
 `TARTCI_BOUNDARY_PROOF_PARALLEL=0` restores the fully sequential boundary.
 
+A repository-access proof that GitHub could not answer (a timed-out or failed
+API call, not a denial) is asked once more, synchronously, before the booted VM
+is discarded; each retry logs `jit_repository_access_retry` with a `reason=`.
+A denial (`rc=3`, HTTP 401/403/404) is never retried and still logs
+`jit_repository_access_denied`. A proof that still cannot be answered logs
+`jit_repository_access_error`, so every discard at this boundary names its
+cause in the lane's event log.
+
 Degrading trades one ephemeral single-job VM that a superseded run may claim --
 bounded, non-corrupting, and unable to satisfy the current head's required
 checks -- against an unbounded fleet stop. Never widen this to `admit`

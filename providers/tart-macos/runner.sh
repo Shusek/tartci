@@ -2038,15 +2038,34 @@ run_one(){
     access_rc=$?
   fi
   tartci_boundary_proof_abandon
+  # A proof that could not be answered (a GitHub call that timed out, a 5xx)
+  # is not a denial, and the VM is already booted: ask once more before
+  # throwing it away. A denial is never retried. On m1 on 2026-09-27 eight
+  # booted forge VMs were discarded in a day on a single 20-second timeout.
+  if [ "$access_rc" -ne 0 ] && ! tartci_repository_access_denied "$access_rc" "$access_error"; then
+    event jit_repository_access_retry \
+      "repo=$REPO group=$selected_group_id rc=$access_rc $(tartci_repository_access_reason "$access_error")"
+    if access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+        python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+        --repo "$REPO" --runner-group-id "$selected_group_id" \
+        --gh-cli "$JIT_GH_CLI" 2>"$access_error")"; then
+      access_rc=0
+    else
+      access_rc=$?
+    fi
+  fi
   [ -z "$access_json" ] \
     || printf '%s\n' "$access_json" >"$STATE_DIR/$vm.repository-access.json"
   if [ "$access_rc" -ne 0 ]; then
-    if [ "$access_rc" -eq 3 ] \
-       || grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$access_error"; then
+    if tartci_repository_access_denied "$access_rc" "$access_error"; then
       record_jit_admission_denied "$selected_group_id" "$selected_labels" \
         "repository access denied before JIT registration; inspect $access_error"
       event jit_repository_access_denied \
         "repo=$REPO group=$selected_group_id labels=$selected_labels"
+    else
+      # Every discard of a booted VM names its cause in the event log.
+      event jit_repository_access_error \
+        "repo=$REPO group=$selected_group_id rc=$access_rc $(tartci_repository_access_reason "$access_error")"
     fi
     note "[$i] runner group cannot prove repository access — refusing JIT registration and discarding VM"
     discard_current_vm
