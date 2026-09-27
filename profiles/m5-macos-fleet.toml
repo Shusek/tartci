@@ -56,7 +56,9 @@ pressure_free_gb = 200
 # first-come and agent builds are untouched. Rollback: delete this table.
 # See docs/assignment-v2-rollout.md, "Ranked VM lease waiters".
 [leases]
-rank_vm_waiters = true
+# Baseline window: lease_acquired telemetry on, ranking off. Flip to true to
+# canary ranked waiters so the proxy has a same-host before/after.
+rank_vm_waiters = false
 
 [[lane]]
 id = "pulp-gate"

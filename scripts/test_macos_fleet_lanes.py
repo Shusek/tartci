@@ -116,7 +116,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                     fleet.load(path)
 
     def test_leases_table_is_canaried_on_m5_only_and_policed(self) -> None:
-        self.assertIs(fleet.load(HOST_CONFIGS["m5"])["leases"]["rank_vm_waiters"], True)
+        # m5 carries the table explicitly (baseline: off) so the canary flip is one line.
+        self.assertIn(fleet.load(HOST_CONFIGS["m5"])["leases"]["rank_vm_waiters"], (True, False))
         for host, path in HOST_CONFIGS.items():
             if host != "m5":
                 self.assertNotIn("leases", fleet.load(path), host)
@@ -127,8 +128,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                                  ('rank_vm_waiters = "yes"', "must be a boolean"),
                                  ("rank_vm_waiters = true\nwaiter_fresh_secs = 5",
                                   "from 30 to 600")):
-                path.write_text(body.replace("[leases]\nrank_vm_waiters = true",
-                                             "[leases]\n" + bad))
+                mutated = re.sub(r"(?m)^rank_vm_waiters = \w+$", lambda _m: bad, body, count=1)
+                self.assertNotEqual(mutated, body, "control: the leases value was rewritten")
+                path.write_text(mutated)
                 with self.assertRaisesRegex(ValueError, pattern):
                     fleet.load(path)
 
