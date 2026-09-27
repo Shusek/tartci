@@ -1139,13 +1139,19 @@ if fleet["managed"]:
     if blocked is None:
         print("serving: unknown (not checked from here)")
     elif blocked:
-        print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
+        disk = [lane for lane in lanes if lane.get("cause") == "disk"]
+        if disk:
+            reasons = ",".join(sorted({str(lane.get("reason") or "denied") for lane in disk}))
+            print(f"serving: BLOCKED (disk: {reasons}; {len(disk)} lane(s) refused a VM lease)")
+        else:
+            print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
         for lane in lanes:
             streak = lane.get("streak")
+            extra = f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk" else ""
             print(
                 f"  lane {lane['label']}: blocked_seconds={lane['blocked_seconds']} "
                 f"streak={'unknown' if streak is None else streak} "
-                f"last_phase={lane.get('last_phase') or '-'}"
+                f"last_phase={lane.get('last_phase') or '-'}{extra}"
             )
     else:
         print("serving: ok")
