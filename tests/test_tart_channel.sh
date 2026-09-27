@@ -63,6 +63,15 @@ HOME="$tmp/home" BREW_CALLS="$tmp/brew.calls" OS_MAJOR=14 \
   TARTCI_SW_VERS_BIN="$tmp/bin/sw_vers" PATH="$tmp/bin:/usr/bin:/bin" \
   "$repo_root/tartci" setup >"$tmp/stdout" 2>"$tmp/stderr"
 grep -q 'retaining existing Tart on macOS 14' "$tmp/stderr"
+# This setup succeeds, so it reaches the disk-reclaimer installer with a temp
+# HOME. That must be refused before launchctl is touched: it once bootstrapped
+# $tmp/home's plist into the real gui/<uid> domain, replacing the host's real
+# reclaim agent with one that ran a deleted directory and exited 127 hourly.
+grep -q 'launchd guard: HOME=' "$tmp/stderr"
+if [ -f "$tmp/home/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist" ]; then
+  echo "setup wrote a reclaim agent into the temp HOME" >&2
+  exit 1
+fi
 if grep -q 'openai/tools' "$tmp/brew.calls"; then
   echo "macOS 14 setup attempted the Sequoia-only OpenAI channel" >&2
   exit 1

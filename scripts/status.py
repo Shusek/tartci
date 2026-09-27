@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import plistlib
+import re
 import shutil
 import subprocess
 import time
@@ -17,6 +18,7 @@ from typing import Any
 
 import disk_reclaim
 import leases
+import reclaim_status
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +108,14 @@ def janitor_agent(label: str = RECLAIM_LABEL,
     probe = run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=5)
     if probe["returncode"] != 127:
         out["loaded"] = probe["ok"]
+    if probe["ok"]:
+        # launchd's own record of which plist it loaded. A label loaded from
+        # anywhere else is a leaked registration shadowing this one (a test
+        # that ran an installer with a temporary HOME), so "loaded" alone
+        # would report the wrong job as this janitor.
+        match = re.search(r"^\tpath = (.+)$", probe["stdout"], re.M)
+        out["loaded_plist"] = match.group(1).strip() if match else None
+        out["shadowed"] = out["loaded_plist"] != str(path)
     if not out["installed"]:
         return out
     try:
@@ -217,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         "leases": lease_status(),
         "janitors": janitors,
         "disk": disk_space(janitors["reclaim"].get("settings")),
+        "reclaim_last_pass": reclaim_status.status(),
         "notes": [
             "status is host-local and does not acquire provider capacity",
             "lease status may take the host lease lock and reap dead-owner records",
@@ -247,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
                 state = "NOT INSTALLED"
             elif agent["loaded"] is None:
                 state = "installed, launchd not reachable from here"
+            elif agent.get("shadowed"):
+                state = (f"installed, but launchd holds a DIFFERENT plist "
+                         f"({agent.get('loaded_plist')}): leaked registration")
             else:
                 state = "installed and loaded" if agent["loaded"] else \
                     "installed but NOT loaded"
@@ -254,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             when = "never observed" if last is None else \
                 f"last pass {(time.time() - last) / 3600:.1f}h ago"
             print(f"{description}: {state}; {when}")
+        print(reclaim_status.describe(data["reclaim_last_pass"]))
         lease_capacity = (data.get("leases") or {}).get("capacity") or {}
         if lease_capacity:
             print(

@@ -30,6 +30,37 @@ import disk_reclaim as dr  # noqa: E402
 
 DAY = 86400.0
 
+_ISOLATION: tempfile.TemporaryDirectory | None = None
+_SAVED_ENV: dict[str, str | None] = {}
+
+
+def setUpModule():
+    """Keep every pass in this module off the host it runs on.
+
+    dr.main now writes a receipt under $TARTCI_HOME and reads the INSTALLED
+    fleet profile to decide whether to run Pulp's reapers. On a fleet host
+    with `[reclaim] pulp_worktree_builds = true`, a test pass that reached
+    the real profile would run the real reapers against the real worktrees.
+    """
+    global _ISOLATION
+    _ISOLATION = tempfile.TemporaryDirectory()
+    iso = pathlib.Path(_ISOLATION.name)
+    for key, value in (("TARTCI_HOME", str(iso / "tartci")),
+                       ("TARTCI_RECLAIM_STATE_DIR", str(iso / "tartci" / "state" / "reclaim")),
+                       ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml"))):
+        _SAVED_ENV[key] = os.environ.get(key)
+        os.environ[key] = value
+
+
+def tearDownModule():
+    for key, value in _SAVED_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    if _ISOLATION is not None:
+        _ISOLATION.cleanup()
+
 
 def make_build_tree(path: pathlib.Path, *, age_days: float = 0.0,
                     marker: str = "CMakeCache.txt") -> pathlib.Path:

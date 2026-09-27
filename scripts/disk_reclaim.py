@@ -55,6 +55,8 @@ import sys
 import time
 from typing import Any, Iterable
 
+import pulp_reapers
+
 BUILD_DIR_PREFIXES = ("build-",)
 BUILD_DIR_EXACT = ("build",)
 
@@ -568,6 +570,103 @@ def rotate_log(path: pathlib.Path, max_bytes: int, generations: int,
     return True
 
 
+RECEIPT_NAME = "last-run.json"
+EVENTS_NAME = "events.jsonl"
+EVENTS_MAX_BYTES = 1024 * 1024
+EVENTS_GENERATIONS = 3
+
+
+def state_dir(args: argparse.Namespace) -> pathlib.Path:
+    if getattr(args, "state_dir", None):
+        return pathlib.Path(args.state_dir).expanduser()
+    return pulp_reapers.default_state_dir()
+
+
+def _atomic_write(path: pathlib.Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(body)
+    os.replace(tmp, path)
+
+
+def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
+    """The small, stable shape the receipt, the event and status all share."""
+    report = receipt.get("report") or {}
+    pulp = receipt.get("pulp_reapers") or report.get("pulp_reapers") or {}
+    finished = time.time()
+    summary: dict[str, Any] = {
+        "schema": 1,
+        "started_ts": round(receipt.get("started_ts", finished), 3),
+        "finished_ts": round(finished, 3),
+        "duration_s": round(finished - receipt.get("started_ts", finished), 1),
+        "exit_code": code,
+        # None is "the pass raised"; a receipt must still say it ran and failed.
+        "result": "ok" if code == 0 else "failed",
+        "mode": receipt.get("mode"),
+        "pressure": report.get("pressure"),
+        "free_bytes_before": report.get("free_bytes_before"),
+        "free_bytes_after": report.get("free_bytes_after"),
+        "tartci_reclaimed_bytes": report.get("reclaimed_bytes", 0),
+        "pulp_reapers": {
+            "enabled": bool(pulp.get("enabled")),
+            "reason": pulp.get("reason"),
+            "error": pulp.get("error"),
+            "pressure": pulp.get("pressure"),
+            "scripts": pulp.get("scripts"),
+            "reclaimed_bytes": pulp.get("reclaimed_bytes", 0),
+            "free_bytes_before": pulp.get("free_bytes_before"),
+            "free_bytes_after": pulp.get("free_bytes_after"),
+            "runs": [{key: run.get(key) for key in (
+                "reaper", "mode", "exit_code", "reclaimed_bytes", "reported_gb",
+                "free_bytes_before", "free_bytes_after", "duration_s", "error",
+                "summary")} for run in pulp.get("runs") or []],
+        },
+    }
+    summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
+                                  + int(summary["pulp_reapers"]["reclaimed_bytes"] or 0))
+    if "error" in receipt:
+        summary["error"] = receipt["error"]
+    return summary
+
+
+def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
+                code: int | None, stream: Any = None) -> dict[str, Any] | None:
+    """Write the last-run receipt and append one reclaim_pass event.
+
+    Also printed to stderr as one JSON line, because stderr is the reclaim log
+    and a grep for `reclaim_pass` there should find every pass. Never raises:
+    a receipt that cannot be written must not turn a successful reclaim into
+    a failed one, and the missing receipt is itself what status reports.
+    """
+    stream = sys.stderr if stream is None else stream
+    summary = pass_summary(receipt, code)
+    event = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(summary["finished_ts"])),
+        "event": "reclaim_pass",
+        "detail": (f"exit {code}; reclaimed {summary['reclaimed_bytes'] / GIB:.1f} GiB "
+                   f"(pulp {summary['pulp_reapers']['reclaimed_bytes'] / GIB:.1f} GiB)"),
+        "fields": summary,
+    }
+    print(f"disk_reclaim: {json.dumps(event, sort_keys=True)}", file=stream, flush=True)
+    directory = state_dir(args)
+    try:
+        _atomic_write(directory / RECEIPT_NAME, json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        events = directory / EVENTS_NAME
+        rotate_log(events, EVENTS_MAX_BYTES, EVENTS_GENERATIONS, stream=stream)
+        with events.open("a") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            for run in summary["pulp_reapers"]["runs"]:
+                handle.write(json.dumps({
+                    "ts": event["ts"], "event": "pulp_reaper",
+                    "detail": f"{run['reaper']} exit {run['exit_code']}",
+                    "fields": run}, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"disk_reclaim: could not write the reclaim receipt under {directory}: {exc}",
+              file=stream)
+        return None
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Reclaim regenerable build directories on a CI host.")
@@ -599,6 +698,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-generations", type=int,
                         default=int(os.environ.get("TARTCI_RECLAIM_LOG_GENERATIONS", "5")),
                         help="how many rotated generations to keep (default 5)")
+    parser.add_argument("--state-dir",
+                        default=os.environ.get("TARTCI_RECLAIM_STATE_DIR"),
+                        help="where the last-run receipt and reclaim events are written (default: $TARTCI_RECLAIM_STATE_DIR, else $TARTCI_HOME/state/reclaim)")
     parser.add_argument("--fix", action="store_true",
                         help="actually delete; without it the pass is a dry run")
     parser.add_argument("--json", action="store_true", help="emit a JSON report")
@@ -606,7 +708,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """One pass, always followed by its receipt and event.
+
+    The receipt is what makes a dead janitor visible. m3's reclaim agent was
+    shadowed by a leaked registration for a day and exited 127 every hour
+    without writing a line anywhere tartci looks; `tartci status` kept printing
+    "installed and loaded" because a job with that label WAS loaded. A pass
+    that does not leave a fresh receipt is now the signal, whatever launchd
+    believes.
+    """
     args = build_parser().parse_args(argv)
+    receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run"}
+    code: int | None = None
+    try:
+        code = _run(args, receipt)
+        return code
+    finally:
+        record_pass(args, receipt, code)
+
+
+def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # Every other knob widens or narrows what is examined. These two decide
     # whether anything is examined at all: a zero age gate deletes every
     # generated tree the scan reaches the moment it reaches it, and a
@@ -746,7 +867,16 @@ def main(argv: list[str] | None = None) -> int:
         reclaimed += size
         deleted.append(record)
 
-    volumes_after = volumes_free_bytes(roots) if args.fix else volumes_before
+    # Pulp's own reapers, when this host opted in. After tartci's pass rather
+    # than before, so free_bytes_before stays the true start of the pass, and
+    # before the re-measure, so the floor below is judged on what both freed.
+    # Their gates are theirs; nothing here narrows or widens them.
+    progress.emit("pulp reapers: checking the fleet profile", force=True)
+    pulp = pulp_reapers.run(fix=args.fix, state_dir=state_dir(args))
+    receipt["pulp_reapers"] = pulp
+
+    volumes_after = volumes_free_bytes(roots) if args.fix or pulp.get("runs") \
+        else volumes_before
     free_after = tightest_free_bytes(volumes_after)
     report = {
         "process_scan_ok": active is not None,
@@ -767,7 +897,9 @@ def main(argv: list[str] | None = None) -> int:
         "free_bytes_after": free_after,
         "free_bytes_by_volume_before": volumes_before,
         "free_bytes_by_volume_after": volumes_after,
+        "pulp_reapers": pulp,
     }
+    receipt["report"] = report
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))

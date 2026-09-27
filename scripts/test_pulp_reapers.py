@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""The reclaim pass drives Pulp's own reapers, opt-in, from a fresh origin/main.
+
+The end-to-end cases run the REAL reapers (verbatim copies under
+tests/fixtures/pulp-reapers, see its SOURCE file) against a throwaway Pulp-like
+repository: a bare origin, a primary clone, and worktrees under a scratch root.
+Every "kept" assertion is paired with a "removed" control in the same run, so a
+pass that silently did nothing cannot satisfy the test.
+
+Run:  python3 -m unittest scripts.test_pulp_reapers
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import disk_reclaim as dr  # noqa: E402
+import macos_fleet_lanes as fleet  # noqa: E402
+import pulp_reapers as pr  # noqa: E402
+
+FIXTURE = HERE.parent / "tests" / "fixtures" / "pulp-reapers"
+DAY = 86400.0
+
+
+def git(cwd: pathlib.Path, *args: str) -> str:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def backdate(path: pathlib.Path, days: float) -> None:
+    stamp = time.time() - days * DAY
+    for entry in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        os.utime(entry, (stamp, stamp), follow_symlinks=False)
+    os.utime(path, (stamp, stamp))
+
+
+def fill(path: pathlib.Path, days: float) -> pathlib.Path:
+    (path / "CMakeFiles").mkdir(parents=True, exist_ok=True)
+    (path / "CMakeCache.txt").write_text("x")
+    (path / "CMakeFiles" / "obj.o").write_bytes(b"y" * 4096)
+    backdate(path, days)
+    return path
+
+
+class PulpRepo:
+    """origin.git + a primary clone, the shape `[reclaim] repo` points at."""
+
+    def __init__(self, root: pathlib.Path, *, with_ci: bool = True):
+        self.root = root
+        self.origin = root / "origin.git"
+        seed = root / "seed"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
+        shutil.copytree(FIXTURE / "tools" / "scripts", seed / "tools" / "scripts")
+        if with_ci:
+            shutil.copytree(FIXTURE / "tools" / "ci", seed / "tools" / "ci")
+        (seed / ".gitignore").write_text("build/\nbuild-*/\n")
+        (seed / "README.md").write_text("pulp\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-q", "-m", "a")
+        self.first = git(seed, "rev-parse", "HEAD")
+        (seed / "README.md").write_text("pulp 2\n")
+        git(seed, "commit", "-q", "-am", "b")
+        git(seed, "remote", "add", "origin", str(self.origin))
+        git(seed, "push", "-q", "origin", "main")
+        self.seed = seed
+        self.primary = root / "pulp"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.primary)], check=True)
+        self.worktrees = root / "wts"
+        self.worktrees.mkdir()
+
+    def advance(self, name: str = "later") -> str:
+        (self.seed / f"{name}.txt").write_text(name)
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "-q", "-m", name)
+        git(self.seed, "push", "-q", "origin", "main")
+        return git(self.seed, "rev-parse", "HEAD")
+
+    def worktree(self, name: str, branch: str) -> pathlib.Path:
+        path = self.worktrees / name
+        git(self.primary, "worktree", "add", "-q", "-b", branch, str(path), self.first)
+        return path
+
+    def profile(self, path: pathlib.Path, **overrides) -> pathlib.Path:
+        table = {"pulp_worktree_builds": True, "repo": str(self.primary),
+                 "worktrees_root": str(self.worktrees), "pressure_free_gb": 10000}
+        table.update(overrides)
+        lines = ["[reclaim]"]
+        for key, value in table.items():
+            lines.append(f"{key} = {json.dumps(value)}")
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+
+class Isolated(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = pathlib.Path(self._tmp.name).resolve()
+        self.state = self.tmp / "state"
+        self._env = {k: os.environ.get(k) for k in (
+            "PULP_BUILD_DIR_LOCK_ROOT", "TARTCI_FLEET_PROFILE", "TARTCI_HOME")}
+        os.environ["PULP_BUILD_DIR_LOCK_ROOT"] = str(self.tmp / "locks")
+        os.environ["TARTCI_HOME"] = str(self.tmp / "tartci")
+        os.environ["TARTCI_FLEET_PROFILE"] = str(self.tmp / "absent.toml")
+        self.procs: list[subprocess.Popen] = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            proc.kill()
+            proc.wait()
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._tmp.cleanup()
+
+    def hold(self, path: pathlib.Path) -> None:
+        """A live process whose command line names `path`, like a build does."""
+        # Not `sh -c "sleep N"`: sh execs the last command in place, so the
+        # path would vanish from the process table before the reaper looks.
+        self.procs.append(subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)", str(path)],
+            cwd=str(path)))
+
+    def quiet(self, fn, *args, **kwargs):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            result = fn(*args, **kwargs)
+        return result, err.getvalue()
+
+
+class OffByDefault(Isolated):
+    def recorder(self):
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append(script.name)
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+        return calls, reaper
+
+    def test_no_profile_runs_nothing(self):
+        calls, reaper = self.recorder()
+        out = pr.run(fix=True, profile=self.tmp / "absent.toml", state_dir=self.state,
+                     reaper=reaper)
+        self.assertFalse(out["enabled"])
+        self.assertIn("no installed fleet profile", out["reason"])
+        self.assertEqual(calls, [])
+
+    def test_profile_without_the_table_or_with_it_false_runs_nothing(self):
+        repo = PulpRepo(self.tmp)
+        for body in ("schema = 1\n", repo.profile(self.tmp / "p.toml",
+                                                  pulp_worktree_builds=False).read_text()):
+            profile = self.tmp / "p.toml"
+            profile.write_text(body)
+            calls, reaper = self.recorder()
+            out = pr.run(fix=True, profile=profile, state_dir=self.state, reaper=reaper)
+            self.assertFalse(out["enabled"], body)
+            self.assertEqual(calls, [], body)
+        # Control: the same repo with the switch on DOES run a reaper, so the
+        # two empty call lists above are the switch, not a broken fixture.
+        calls, reaper = self.recorder()
+        out = pr.run(fix=True, profile=repo.profile(self.tmp / "p.toml"),
+                     state_dir=self.state, reaper=reaper)
+        self.assertTrue(out["enabled"])
+        self.assertIn("clean_build_cov.sh", calls)
+
+
+class Validation(unittest.TestCase):
+    def good(self, **overrides):
+        table = {"pulp_worktree_builds": True, "repo": "/r", "worktrees_root": "/w"}
+        table.update(overrides)
+        return table
+
+    def test_accepts_the_minimal_enabled_table_and_a_one_day_idle_window(self):
+        self.assertEqual(pr.validate_table(self.good()), [])
+        self.assertEqual(pr.validate_table(self.good(worktree_build_idle_hours=24)), [])
+
+    def test_idle_window_can_neither_loosen_the_reaper_nor_exceed_a_day(self):
+        # 1 would loosen the reaper's own 2 h gate; 25 would let a merged
+        # 40 GB tree outlive the ~48 h it takes to eat a lease's headroom.
+        for hours in (0, 1, 25, 48, 2.5, True):
+            self.assertTrue(pr.validate_table(self.good(worktree_build_idle_hours=hours)),
+                            hours)
+
+    def test_rejects_unknown_keys_relative_paths_and_missing_paths(self):
+        self.assertTrue(pr.validate_table(self.good(age_days=1)))
+        self.assertTrue(pr.validate_table(self.good(repo="Code/pulp")))
+        self.assertTrue(pr.validate_table({"pulp_worktree_builds": True}))
+        self.assertTrue(pr.validate_table(self.good(pulp_worktree_builds="yes")))
+
+    def test_fleet_profile_loader_uses_the_same_validator(self):
+        base = (HERE.parent / "profiles" / "m3-macos-fleet.toml").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            ok = pathlib.Path(td) / "ok.toml"
+            ok.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n'
+                          'repo = "/Volumes/Workshop/Code/pulp"\n'
+                          'worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"\n')
+            self.assertIs(fleet.load(ok)["reclaim"]["pulp_worktree_builds"], True)
+            bad = pathlib.Path(td) / "bad.toml"
+            bad.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n')
+            with self.assertRaisesRegex(ValueError, "reclaim.repo is required"):
+                fleet.load(bad)
+
+
+class Materialize(Isolated):
+    def test_checkout_is_origin_main_and_carries_tools_ci(self):
+        repo = PulpRepo(self.tmp)
+        checkout, detail, sha = pr.materialize(repo.primary, self.state / "pulp-reapers")
+        self.assertIsNotNone(checkout, detail)
+        self.assertEqual(git(checkout, "rev-parse", "HEAD"), git(repo.origin, "rev-parse", "main"))
+        # The worktree reaper imports this; a copy without it dies with
+        # ModuleNotFoundError on its first candidate.
+        self.assertTrue((checkout / "tools" / "ci" / "build_dir_lock.py").is_file())
+        # It is a worktree of the configured repository, which is how both
+        # reapers find the worktrees they police.
+        self.assertIn(str(checkout), git(repo.primary, "worktree", "list"))
+
+    def test_follows_origin_main_on_the_next_pass(self):
+        repo = PulpRepo(self.tmp)
+        checkout, _, first = pr.materialize(repo.primary, self.state / "pulp-reapers")
+        newer = repo.advance()
+        self.assertNotEqual(first, newer)
+        checkout, detail, sha = pr.materialize(repo.primary, self.state / "pulp-reapers")
+        self.assertEqual(sha, newer, detail)
+        self.assertEqual(git(checkout, "rev-parse", "HEAD"), newer)
+
+    def test_origin_without_tools_ci_is_refused_and_nothing_runs(self):
+        repo = PulpRepo(self.tmp, with_ci=False)
+        profile = repo.profile(self.tmp / "p.toml")
+        calls = []
+        out = pr.run(fix=True, profile=profile, state_dir=self.state,
+                     reaper=lambda script, **kw: calls.append(script) or {})
+        self.assertIn("build_dir_lock.py", out["error"])
+        self.assertEqual(calls, [])
+
+
+class EndToEnd(Isolated):
+    """The real reapers, under pressure and not."""
+
+    def run_real(self, repo: PulpRepo, **overrides):
+        profile = repo.profile(self.tmp / "p.toml", **overrides)
+        return self.quiet(pr.run, fix=True, profile=profile, state_dir=self.state)
+
+    def test_two_day_old_build_cov_idle_goes_active_stays(self):
+        # m3, 2026-09-27: a 40 GB build-cov two days old, on a volume with
+        # 21 GiB free. tartci's 7-day pressure gate kept it; Pulp's reaper
+        # must take it unless something is using it.
+        repo = PulpRepo(self.tmp)
+        idle = fill(repo.worktrees / "wt-idle" / "build-cov", days=2)
+        active = fill(repo.worktrees / "wt-active" / "build-cov", days=2)
+        self.hold(active)
+        (out, log) = self.run_real(repo)
+        self.assertTrue(out["pressure"], out)
+        self.assertFalse(idle.exists(), log)
+        self.assertTrue(active.is_dir(), log)
+        runs = {r["reaper"]: r for r in out["runs"]}
+        self.assertEqual(runs["clean_build_cov"]["exit_code"], 0, log)
+
+    def test_build_cov_runs_even_without_pressure_but_worktree_reaper_does_not(self):
+        repo = PulpRepo(self.tmp)
+        cov = fill(repo.worktrees / "wt" / "build-cov", days=2)
+        (out, log) = self.run_real(repo, pressure_free_gb=1)
+        free_gib = shutil.disk_usage(repo.worktrees).free / pr.GIB
+        if free_gib < 1:  # pragma: no cover - a host this full has other problems
+            self.skipTest("host has under 1 GiB free, so 'no pressure' is not constructible")
+        self.assertFalse(out["pressure"])
+        self.assertEqual([r["reaper"] for r in out["runs"]], ["clean_build_cov"])
+        self.assertIn("clean_worktree_builds", out["skipped"])
+        self.assertFalse(cov.exists(), log)
+
+    def test_merged_idle_worktree_build_goes_under_pressure_and_the_guarded_ones_stay(self):
+        repo = PulpRepo(self.tmp)
+        merged = repo.worktree("merged", "feat/merged")
+        build = fill(merged / "build", days=2)
+        active_lineage = repo.worktree("lineage-active", "feat/busy")
+        git(repo.primary, "config", "branch.feat/busy.pulpWorktreeStatus", "active")
+        kept_lineage = fill(active_lineage / "build", days=2)
+        in_use = repo.worktree("in-use", "feat/inuse")
+        kept_in_use = fill(in_use / "build", days=2)
+        self.hold(in_use)
+        recent = repo.worktree("recent", "feat/recent")
+        kept_recent = fill(recent / "build", days=0)
+        (out, log) = self.run_real(repo)
+        runs = {r["reaper"]: r for r in out["runs"]}
+        self.assertIn("clean_worktree_builds", runs, out)
+        record = runs["clean_worktree_builds"]
+        if record["exit_code"] == 3 and "could not read process" in log:
+            self.skipTest("this host's lsof/ps cannot give the reaper a clean process "
+                          "snapshot, so it refuses (exit 3) by design; not a pass")
+        self.assertEqual(record["exit_code"], 0, log)
+        self.assertFalse(build.exists(), log)
+        self.assertTrue(kept_lineage.is_dir(), log)
+        self.assertTrue(kept_in_use.is_dir(), log)
+        self.assertTrue(kept_recent.is_dir(), log)
+        self.assertIn("removed 1 build dir(s)", record.get("summary", ""), log)
+
+
+class DiskReclaimIntegration(Isolated):
+    def test_receipt_event_and_log_line_carry_the_pulp_result(self):
+        repo = PulpRepo(self.tmp)
+        cov = fill(repo.worktrees / "wt" / "build-cov", days=2)
+        os.environ["TARTCI_FLEET_PROFILE"] = str(repo.profile(self.tmp / "p.toml"))
+        scan = self.tmp / "scan"
+        scan.mkdir()
+        state = self.tmp / "reclaim-state"
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()) as err:
+            code = dr.main(["--roots", str(scan), "--json", "--fix",
+                            "--state-dir", str(state)])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertFalse(cov.exists())
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["pulp_reapers"]["enabled"])
+        receipt = json.loads((state / "last-run.json").read_text())
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(receipt["result"], "ok")
+        self.assertTrue(receipt["pulp_reapers"]["enabled"])
+        self.assertEqual(receipt["pulp_reapers"]["runs"][0]["reaper"], "clean_build_cov")
+        for key in ("free_bytes_before", "free_bytes_after", "reclaimed_bytes"):
+            self.assertIn(key, receipt["pulp_reapers"]["runs"][0])
+        events = [json.loads(line) for line in
+                  (state / "events.jsonl").read_text().splitlines()]
+        # Under pressure (pressure_free_gb = 10000) both reapers run.
+        self.assertEqual([e["event"] for e in events],
+                         ["reclaim_pass", "pulp_reaper", "pulp_reaper"])
+        self.assertEqual([e["fields"]["reaper"] for e in events[1:]],
+                         ["clean_build_cov", "clean_worktree_builds"])
+        self.assertIn('"event": "reclaim_pass"', err.getvalue())
+
+    def test_a_failed_pass_still_leaves_a_receipt(self):
+        state = self.tmp / "reclaim-state"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(self.tmp / "absent"), "--state-dir", str(state)])
+        self.assertEqual(code, 2)
+        receipt = json.loads((state / "last-run.json").read_text())
+        self.assertEqual((receipt["exit_code"], receipt["result"]), (2, "failed"))
+
+
+if __name__ == "__main__":
+    unittest.main()
