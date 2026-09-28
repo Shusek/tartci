@@ -98,6 +98,9 @@ CODES: tuple[str, ...] = (
     "supply_match",
     "supply_mismatch",
     "supply_unknown",
+    "tool_freshness_current",
+    "tool_freshness_stale",
+    "tool_freshness_unmeasured",
     "warm_vm_none",
     "warm_vm_overdue",
     "warm_vm_parked",
@@ -702,6 +705,20 @@ def check_self_update(summary: dict | None) -> Finding:
                    {"skew": summary.get("skew"), "last": summary.get("last")})
 
 
+def check_tool_freshness(summary: dict | None) -> Finding:
+    """Shipyard and the pulp CLI against their latest releases."""
+    if not isinstance(summary, dict) or summary.get("state") is None:
+        return Finding("tool_freshness", UNKNOWN, "tool_freshness_unmeasured",
+                       "tool freshness was never measured on this host "
+                       "(run `tartci fleet-macos tool-freshness --refresh`)")
+    lines = "; ".join(summary.get("lines") or [])
+    if summary.get("problem"):
+        return Finding("tool_freshness", PROBLEM, "tool_freshness_stale",
+                       f"{summary['problem']} ({lines})", {"state": summary["state"]})
+    return Finding("tool_freshness", OK, "tool_freshness_current", lines,
+                   {"state": summary["state"]})
+
+
 def check_warm_vm(value: dict | None) -> Finding:
     """The host's parked warm gate VM (opt-in; scripts/warm_vm_status.py)."""
     state = (value or {}).get("state")
@@ -1049,6 +1066,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             probe: Callable[[Path], dict] | None = None,
             drift_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             self_update_summary: dict | None = None,
+            tool_freshness_summary: dict | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
@@ -1106,6 +1124,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception:  # noqa: BLE001 - reported as unmeasured
             self_update_summary = None
     findings.append(check_self_update(self_update_summary))
+    if tool_freshness_summary is None:
+        try:
+            import tool_freshness
+            tool_freshness_summary = tool_freshness.summary(home)
+        except Exception:  # noqa: BLE001 - reported as unmeasured
+            tool_freshness_summary = None
+    findings.append(check_tool_freshness(tool_freshness_summary))
     import lease_fit
     if readable:
         fit_records, fit_missing = lease_fit.lane_records(

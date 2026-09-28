@@ -238,6 +238,24 @@
       "why": "An unreadable installed profile or published file, or a host_id the published file does not declare, leaves the comparison unanswered, which is not the same as a match.",
       "remedy": "Run `tartci fleet-macos verify-supply` for the specific reason."
     },
+    "tool_freshness_current": {
+      "summary": "Shipyard and the pulp CLI are at their latest releases, or behind for less than the stale window.",
+      "why": "A merged improvement only helps once the host runs it; this is the proof it arrived.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read an old measurement as current; the line carries its measured time."
+    },
+    "tool_freshness_stale": {
+      "summary": "Shipyard or the pulp CLI has been behind its latest release for longer than the stale window, or its version or releases could not be read.",
+      "why": "An installed CLI can sit months behind its releases unnoticed, so every agent build and gate on the host runs without merged fixes.",
+      "remedy": "Read `tartci fleet-macos tool-freshness` and ~/.tartci/state/tool-freshness/events.jsonl; update with `shipyard update --to <tag> --refresh-daemon` or the pulp release's install.sh, then `tartci fleet-macos tool-freshness --refresh`.",
+      "do_not": "Do not install from a working copy's build directory; install the published release so every host runs the same bytes."
+    },
+    "tool_freshness_unmeasured": {
+      "summary": "Tool freshness has never been measured on this host.",
+      "why": "The launchd watchdog measures it every 30 minutes, so an unmeasured host usually means the watchdog is not running its pass.",
+      "remedy": "Run `tartci fleet-macos tool-freshness --refresh`, then check the watchdog log for why it did not.",
+      "do_not": "Do not read unmeasured as current."
+    },
     "warm_vm_none": {
       "summary": "No warm gate VM is parked on this host.",
       "why": "A warm VM is opt-in (lane key warm_vm) and off by default; when on, none is parked while the lane is serving, cooling down, or yielding to other demand.",
