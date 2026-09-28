@@ -454,7 +454,14 @@ many VM leases of that lane's size its lease store admits right now. m5's
 second lane beside a running 12-core VM, and m3 at 24/26 cores, therefore
 report `free=0`. `in_flight` counts lanes already between admission and
 assignment. A heartbeat older than max(120 s, 6 polls), an unrecognised phase
-or an unreadable lease store makes the whole report `unknown`, never zero. A
+or an unreadable lease store makes the whole report `unknown`, never zero.
+The supervisor keeps its current phase fresh while its queue scan runs
+(`providers/tart-macos/heartbeat-keepalive.lib.sh`, every
+`TARTCI_HEARTBEAT_KEEPALIVE_SECS`, default 30, 0 = off): a 90-200 s scan used to
+age an idle lane's heartbeat past 120 s, and on m3 7 of 20 supply samples read
+`unknown` for that reason alone. The refresh stops at the supervisor's next
+heartbeat and exits within one interval of the supervisor dying, so a dead
+lane still goes stale. A
 Tart inventory that cannot be read (after the same retry the supervisor uses)
 is treated as the host's own slot claim treats it: the reservation files are
 the occupancy (`"inventory": "reservations"` in the report).
