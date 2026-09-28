@@ -23,15 +23,21 @@ launchd watchdog, and optionally applies the update itself:
             `tool_apply_failed`.
   summary   reads only the cached state; it never runs a tool or fetches.
 
+A tool with a `generation_link` (Shipyard's ghapp auth generation) is also
+measured through that generation's own `shipyard --version`; the older of
+the two decides whether the tool is behind, so a generation left on an old
+release reads STALE even when the CLI is current.
+
 Settings (optional) live in ~/.config/tartci/tool-freshness.toml:
 
     stale_hours = 12
+    host_class = "studio"         # default: the installed fleet profile's host.id
     [tools.shipyard]
     auto_apply = false            # stop automatic Shipyard updates here
     [tools.pulp]
     enabled = false               # stop measuring the pulp CLI here
 
-`{home}` and `{tag}` are substituted in commands. A tool whose binary is
+`{home}`, `{tag}` and `{host_class}` are substituted in commands. A tool whose binary is
 absent is `not_installed`, which is reported but is never a problem.
 """
 
@@ -68,10 +74,15 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
     "shipyard": {
         "repo": "danielraffel/Shipyard",
         "version_command": ["{home}/.local/bin/shipyard", "--version"],
-        # Installs the tag, smoke-verifies it, and only then refreshes the
-        # detached daemon: Shipyard's own unattended fleet rollout path.
-        "apply_command": ["{home}/.local/bin/shipyard", "update", "--to", "{tag}",
-                          "--refresh-daemon"],
+        # ghapp runs from a separate content-addressed auth generation that
+        # `shipyard update` never installs, so it can lag the CLI silently.
+        "generation_link": "{home}/.local/bin/ghapp.shipyard-generation",
+        # The governed rollout for this host's class: binds the release, stages
+        # CLI, daemon, ghapp, token helper and close guard as one generation,
+        # probes it, swaps atomically and rolls back on failure.
+        "apply_command": ["{home}/.local/bin/shipyard", "runner", "fleet-update", "--to", "{tag}",
+                          "--host-class", "{host_class}", "--apply", "--json"],
+        "verdict_json": True,
         "auto_apply": True,
     },
     "pulp": {
@@ -153,6 +164,8 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours"):
             if key in data:
                 settings[key] = float(data[key])
+        if isinstance(data.get("host_class"), str):
+            settings["host_class"] = data["host_class"]
         for name, override in (data.get("tools") or {}).items():
             settings["tools"].setdefault(name, {"enabled": True, "apply_command": None,
                                                 "auto_apply": False})
@@ -160,10 +173,72 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
     return settings
 
 
-def _expand(argv: list[str] | None, home: Path, tag: str = "") -> list[str] | None:
+def _expand(argv: list[str] | None, home: Path, tag: str = "",
+            host_class: str = "") -> list[str] | None:
     if not argv:
         return None
-    return [part.replace("{home}", str(home)).replace("{tag}", tag) for part in argv]
+    return [part.replace("{home}", str(home)).replace("{tag}", tag)
+            .replace("{host_class}", host_class) for part in argv]
+
+
+def host_class(home: Path, settings: dict) -> str | None:
+    """The fleet-update host class: settings, else the fleet profile's host.id."""
+    if settings.get("host_class"):
+        return str(settings["host_class"])
+    profile = home / ".config" / "tartci" / "macos-fleet-profile.toml"
+    if tomllib is None or not profile.is_file():
+        return None
+    try:
+        with profile.open("rb") as handle:
+            host = tomllib.load(handle).get("host") or {}
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return host.get("id") if isinstance(host.get("id"), str) else None
+
+
+def json_documents(text: str) -> list[dict]:
+    """Every JSON object in a stream of (possibly pretty-printed) documents."""
+    decoder, found, index = json.JSONDecoder(), [], 0
+    while True:
+        index = text.find("{", index)
+        if index < 0:
+            return found
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        index = end
+
+
+def read_versions(tool: dict, home: Path,
+                  run: Callable[[list[str], float], tuple[int, str]]) -> dict:
+    """Installed CLI version and, when the tool has one, its generation's version."""
+    argv = _expand(tool.get("version_command"), home)
+    rc, out = run(argv, COMMAND_TIMEOUT_S) if argv else (127, "no version_command")
+    value: dict[str, Any] = {"rc": rc, "out": out,
+                             "installed": _version(out) if rc == 0 else None,
+                             "generation": None, "generation_error": None}
+    link = _expand([tool["generation_link"]], home)[0] if tool.get("generation_link") else None
+    if link:
+        try:
+            target = Path(os.readlink(link))
+        except FileNotFoundError:
+            return value  # this host has no auth generation: nothing to lag
+        except OSError as exc:
+            value["generation_error"] = f"{link} unreadable: {exc}"
+            return value
+        if not target.is_absolute():
+            target = Path(link).parent / target
+        grc, gout = run([str(target.parent / "shipyard"), "--version"], COMMAND_TIMEOUT_S)
+        value["generation"] = _version(gout) if grc == 0 else None
+        value["generation_dir"] = str(target.parent)
+        if value["generation"] is None:
+            value["generation_error"] = (f"generation {target.parent.name[:12]} version "
+                                         f"unreadable (exit {grc}): {gout[:120]}")
+    return value
 
 
 def run_command(argv: list[str], timeout: float) -> tuple[int, str]:
@@ -204,16 +279,24 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
             run: Callable[[list[str], float], tuple[int, str]],
             feed: Callable[[str], str], stale_hours: float) -> dict:
     row: dict[str, Any] = {"tool": name, "repo": tool.get("repo"), "measured_at": _iso(now)}
-    argv = _expand(tool.get("version_command"), home)
-    rc, out = run(argv, COMMAND_TIMEOUT_S) if argv else (127, "no version_command")
-    installed = _version(out) if rc == 0 else None
+    versions = read_versions(tool, home, run)
+    rc, out, installed = versions["rc"], versions["out"], versions["installed"]
     row["installed"] = _vstr(installed)
+    if versions.get("generation_dir"):
+        row["generation"] = _vstr(versions["generation"])
+        row["generation_dir"] = versions["generation_dir"]
     if rc == 127:
         row.update(state="not_installed", reason=out)
         return row
     if installed is None:
         row.update(state="unknown", reason=f"version unreadable (exit {rc}): {out[:200]}")
         return row
+    if versions["generation_error"]:
+        row.update(state="unknown", reason=versions["generation_error"])
+        return row
+    # The older of the CLI and its auth generation is what the host really runs.
+    installed = min(installed, versions["generation"] or installed)
+    row["effective"] = _vstr(installed)
     try:
         releases = parse_releases(feed(str(tool["repo"])))
     except Exception as exc:  # noqa: BLE001 - an unreadable feed is unknown, never current
@@ -233,7 +316,7 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     # them is behind since at least the oldest one listed. Keep the earliest
     # time recorded for this installed version, so the bound never moves later.
     lower_bound = len(newer) == len(releases)
-    if previous and previous.get("installed") == row["installed"]:
+    if previous and (previous.get("effective") or previous.get("installed")) == row["effective"]:
         earlier = _epoch(previous.get("behind_since"))
         if earlier is not None and earlier < behind_since:
             behind_since = earlier
@@ -261,19 +344,33 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
             float(settings["apply_retry_hours"]) * 3600:
         row["apply"] = f"already attempted {tag} at {last.get('at')}: {last.get('result')}"
         return None
-    argv = _expand(tool["apply_command"], home, tag)
+    klass = host_class(home, settings) or ""
+    if "{host_class}" in " ".join(tool["apply_command"]) and not klass:
+        row["apply"] = ("refused: no host class (set host_class in tool-freshness.toml "
+                        "or install a fleet profile)")
+        return None
+    argv = _expand(tool["apply_command"], home, tag, klass)
     rc, out = run(argv, APPLY_TIMEOUT_S)  # type: ignore[arg-type]
-    vrc, vout = run(_expand(tool["version_command"], home), COMMAND_TIMEOUT_S)  # type: ignore[arg-type]
-    after = _vstr(_version(vout)) if vrc == 0 else None
-    landed = after == row["latest"]
-    result = "ok" if landed else f"FAILED (exit {rc}, installed {after}): {out[-300:]}"
+    verdict = None
+    if tool.get("verdict_json"):
+        summaries = [doc for doc in json_documents(out) if doc.get("event") == "fleet_summary"]
+        verdict = summaries[-1].get("verdict") if summaries else "no fleet_summary"
+    after = read_versions(tool, home, run)
+    effective = min(v for v in (after["installed"], after["generation"] or after["installed"]) if v) \
+        if after["installed"] else None
+    landed = _vstr(effective) == row["latest"] and verdict in (None, "verified")
+    detail = f"verdict {verdict}, " if verdict is not None else ""
+    result = "ok" if landed else (f"FAILED ({detail}exit {rc}, installed {_vstr(after['installed'])}"
+                                  f", generation {_vstr(after['generation'])}): {out[-300:]}")
     attempts[name] = {"target": tag, "at": _iso(now), "result": result}
-    row["apply"] = f"applied {tag}: {result}"
+    row["apply"] = f"applied {tag}: {result}" if landed else f"applied {tag}: {result[:200]}"
     if not landed:
         _append_event(state, {"event": "tool_apply_failed", "tool": name, "at": _iso(now),
-                              "from": row["installed"], "target": row["latest"],
-                              "installed_after": after, "exit": rc, "detail": out[-300:]})
-    return {"installed": after}
+                              "from": row["effective"], "target": row["latest"],
+                              "installed_after": _vstr(after["installed"]),
+                              "generation_after": _vstr(after["generation"]),
+                              "verdict": verdict, "exit": rc, "detail": out[-300:]})
+    return {"installed": _vstr(after["installed"])}
 
 
 def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
@@ -297,20 +394,23 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             continue
         prior = previous.get(name) if isinstance(previous.get(name), dict) else None
         row = measure(name, tool, home, now, prior, run, feed, float(settings["stale_hours"]))
-        before = prior.get("installed") if prior else None
+        before = {key: prior.get(key) for key in ("installed", "generation")} if prior else {}
         applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run)
         if applied and applied.get("installed"):
-            before, note = row.get("installed"), row.get("apply")
+            before = {key: row.get(key) for key in ("installed", "generation")}
+            note = row.get("apply")
             row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]))
             row["apply"] = note
-        if before and row.get("installed") and before != row["installed"]:
-            _append_event(state, {
-                "event": "tool_deployed", "tool": name, "at": _iso(now),
-                "from": before, "to": row["installed"], "latest": row.get("latest"),
-                "by": "auto_apply" if applied else "observed",
-                "downgrade": _version(row["installed"]) < _version(before),  # type: ignore[operator]
-                "verify": "current" if row.get("state") == "current"
-                else str(row.get("state"))})
+        for key, component in (("installed", "cli"), ("generation", "auth_generation")):
+            old, new = before.get(key), row.get(key)
+            if old and new and old != new:
+                _append_event(state, {
+                    "event": "tool_deployed", "tool": name, "component": component,
+                    "at": _iso(now), "from": old, "to": new, "latest": row.get("latest"),
+                    "by": "auto_apply" if applied else "observed",
+                    "downgrade": _version(new) < _version(old),  # type: ignore[operator]
+                    "verify": "current" if row.get("state") == "current"
+                    else str(row.get("state"))})
         tools[name] = row
     value = {"measured_at": _iso(now), "stale_hours": settings["stale_hours"], "tools": tools}
     _write_json(state / "state.json", value)
@@ -320,11 +420,14 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
 
 def render_row(row: dict) -> str:
     name, state = row.get("tool"), row.get("state")
+    installed = row.get("installed")
+    if row.get("generation_dir"):
+        installed = f"{installed} (ghapp generation {row.get('generation') or 'unreadable'})"
     if state == "current":
-        text = f"{name}: {row['installed']} current with latest {row['latest_tag']}"
+        text = f"{name}: {installed} current with latest {row['latest_tag']}"
     elif state == "behind":
         bound = ">=" if row.get("behind_since_lower_bound") else ""
-        text = (f"{name}: {row['installed']} behind latest {row['latest_tag']} by "
+        text = (f"{name}: {installed} behind latest {row['latest_tag']} by "
                 f"{row['releases_behind']} release(s) for {bound}{row['behind_hours']:g} h "
                 f"(since {row['behind_since']})" + (" STALE" if row.get("stale") else ""))
     elif state == "not_installed":
