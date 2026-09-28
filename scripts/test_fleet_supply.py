@@ -103,7 +103,13 @@ class VerifySupplyTests(unittest.TestCase):
         result = self.verdicts(M3.read_text())
         self.assertEqual(result["state"], "match")
         self.assertEqual(result["host_id"], "studio")
-        self.assertEqual(len(result["lanes"]), 5)
+        # One row per registration: pulp-gate's four classes (two gate, two
+        # release) plus the spectr, forge and vellum lanes.
+        self.assertEqual(len(result["lanes"]), 7)
+        self.assertEqual(
+            sorted(row["class_label"] for row in result["lanes"] if row["lane"] == "pulp-gate"),
+            ["pulp-build-merge-group", "pulp-build-pr-head",
+             "pulp-release-pr-gate", "pulp-release-tagged"])
         self.assertTrue(all(row["verdict"] == fleet.MATCH for row in result["lanes"]))
 
     def test_changed_labels_differ(self) -> None:

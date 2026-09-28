@@ -111,11 +111,16 @@ process_type = "Adaptive"
 # index, and after a discard the supervisor re-selects in that slot's order.
 # Rollback is removing this key. See docs/assignment-v2-rollout.md.
 assignment_idle_retarget_seconds = 120
-# PR-first canary (docs/assignment-v2-rollout.md, "Per-slot class preference").
-# Slot 2 consults PR-head before merge-group and falls back to merge-group when
-# no PR-head job waits; slot 1 keeps the configured merge-group-first order.
-# Rollback: delete this key, re-render, reload slot 2 at an idle boundary.
-assignment_slot_tier_order = { 2 = ["pulp-build-pr-head", "pulp-build-merge-group"] }
+# Per-slot class order (docs/assignment-v2-rollout.md, "Per-slot class
+# preference" and "Release event classes"). Slot 2 keeps the PR-first canary:
+# PR-head before merge-group, the fix for PR-head starvation; releases follow
+# the gate classes there. Slot 1 is this host's release-first slot: both
+# release classes before the gate classes, falling back to gate work whenever
+# no release waits. The release tiers below serve only jobs carrying a release
+# class label, which Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in.
+# Rollback: delete the slot-1 entry and the release tiers (restore slot 2 to
+# the two gate classes), re-render, reload both slots at an idle boundary.
+assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"], 2 = ["pulp-build-pr-head", "pulp-build-merge-group", "pulp-release-tagged", "pulp-release-pr-gate"] }
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
@@ -125,6 +130,21 @@ runner_group_id = 1
 [[lane.tier]]
 label = "pulp-build-pr-head"
 workflow = "Build and Test"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Release CLI"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Sign and Release"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-pr-gate"
+workflow = "Release-path PR gate"
 runner_group_id = 1
 
 [[lane]]

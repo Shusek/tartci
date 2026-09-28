@@ -75,13 +75,16 @@ class SnapshotShapeTests(unittest.TestCase):
 class RegistrationRuleTests(unittest.TestCase):
     def test_m3_pulp_gate_registers_one_set_per_class_and_never_gate_fast(self) -> None:
         rows = _rows(fleet.advertised_labels_snapshot([M3], None), "pulp-gate")
-        self.assertEqual([row["labels"] for row in rows], [
-            BASE + ["pulp-build-merge-group"], BASE + ["pulp-build-pr-head"]])
-        self.assertEqual([row["class_label"] for row in rows],
-                         ["pulp-build-merge-group", "pulp-build-pr-head"])
+        classes = ["pulp-build-merge-group", "pulp-build-pr-head",
+                   "pulp-release-tagged", "pulp-release-pr-gate"]
+        self.assertEqual([row["labels"] for row in rows],
+                         [BASE + [cls] for cls in classes])
+        self.assertEqual([row["class_label"] for row in rows], classes)
+        self.assertEqual([row["workflows"] for row in rows], [
+            ["Build and Test"], ["Build and Test"],
+            ["Release CLI", "Sign and Release"], ["Release-path PR gate"]])
         for row in rows:
             self.assertEqual(row["assignment_mode"], "event-class-v2")
-            self.assertEqual(row["workflows"], ["Build and Test"])
             self.assertEqual(row["host_id"], "studio")
             self.assertNotIn("pulp-gate-fast", row["labels"])
 
@@ -93,7 +96,7 @@ class RegistrationRuleTests(unittest.TestCase):
         lane["labels"] = [*lane["labels"], "pulp-gate-fast"]
         rows = [row for row in fleet.advertised_registrations(data)
                 if row["lane"] == "pulp-gate"]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 4)
         for row in rows:
             self.assertNotIn("pulp-gate-fast", row["labels"])
         # Control: the same edit in a legacy (non-V2) lane keeps the label,
@@ -193,7 +196,8 @@ class RunnerParityTests(unittest.TestCase):
         lane = next(lane for lane in data["lane"] if lane["id"] == "pulp-gate")
         env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"],
-                         "pulp-build-merge-group,pulp-build-pr-head")
+                         "pulp-build-merge-group,pulp-build-pr-head,"
+                         "pulp-release-tagged,pulp-release-pr-gate")
         self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
 
 

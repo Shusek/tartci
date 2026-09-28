@@ -51,6 +51,45 @@
     {
       "profile": "m1-macos-fleet",
       "host_id": "m1",
+      "lane": "pulp-gate",
+      "repo": "Generous-Corp/pulp",
+      "assignment_mode": "event-class-v2",
+      "class_label": "pulp-release-tagged",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-release-tagged"
+      ],
+      "workflows": [
+        "Release CLI",
+        "Sign and Release"
+      ]
+    },
+    {
+      "profile": "m1-macos-fleet",
+      "host_id": "m1",
+      "lane": "pulp-gate",
+      "repo": "Generous-Corp/pulp",
+      "assignment_mode": "event-class-v2",
+      "class_label": "pulp-release-pr-gate",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-release-pr-gate"
+      ],
+      "workflows": [
+        "Release-path PR gate"
+      ]
+    },
+    {
+      "profile": "m1-macos-fleet",
+      "host_id": "m1",
       "lane": "spectr-gate",
       "repo": "danielraffel/spectr",
       "assignment_mode": "legacy",
@@ -142,6 +181,45 @@
       ],
       "workflows": [
         "Build and Test"
+      ]
+    },
+    {
+      "profile": "m3-macos-fleet",
+      "host_id": "studio",
+      "lane": "pulp-gate",
+      "repo": "Generous-Corp/pulp",
+      "assignment_mode": "event-class-v2",
+      "class_label": "pulp-release-tagged",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-release-tagged"
+      ],
+      "workflows": [
+        "Release CLI",
+        "Sign and Release"
+      ]
+    },
+    {
+      "profile": "m3-macos-fleet",
+      "host_id": "studio",
+      "lane": "pulp-gate",
+      "repo": "Generous-Corp/pulp",
+      "assignment_mode": "event-class-v2",
+      "class_label": "pulp-release-pr-gate",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-release-pr-gate"
+      ],
+      "workflows": [
+        "Release-path PR gate"
       ]
     },
     {
