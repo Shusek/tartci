@@ -1764,6 +1764,13 @@ arrive, and a host that did not get it is loud:
   network profile never ran its heal pass, skew refresh or config warnings (m3,
   for two days). A failed reconcile is now printed to the watchdog log and the
   pass runs anyway; the exit stays 6 to keep the signal.
+- **Retired lanes no longer hold the reconcile.** A runner LaunchAgent kept on
+  disk but disabled in launchd (m3's two legacy `tart-runner-macos-release*`
+  agents) cannot be bootstrapped, yet the reconcile planned a full reload for
+  it and so deferred forever behind the host's running VMs. A disabled,
+  unloaded controller is now staged (`stage-disabled`: plist kept current,
+  receipt `staged`, never loaded) without waiting for idle; a controller that
+  is enabled, or disabled but still loaded, still reloads only when no VM runs.
 
 #### Adding a machine
 

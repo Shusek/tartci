@@ -392,6 +392,17 @@ def _unload(label: str, dry_run: bool = False) -> bool:
     return watchdog.wait_until_unloaded(label, timeout_s=timeout + 5.0)
 
 
+def _disabled_labels() -> set[str] | None:
+    """Labels launchd holds disabled in this user's domain; None when unreadable."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import tartci_launchd_watchdog as watchdog  # pylint: disable=import-outside-toplevel
+
+    try:
+        return watchdog.disabled_services()
+    except OSError:
+        return None
+
+
 def _any_tart_vm_running() -> bool | None:
     """Compatibility seam retained for existing callers and focused tests."""
     global _LAST_TART_VM_PROBE_REASON
@@ -624,6 +635,12 @@ def _reconcile_unlocked(profile_path: Path, agents_dir: Path, *, dry_run: bool =
     plans: list[tuple[str, Path, dict[str, Any], bool, str, bool, Path | None]] = []
     promotions: list[tuple[str, Path, str]] = []
     desired_labels: set[str] = set()
+    # A controller launchd holds disabled and unloaded (a retired lane kept on
+    # disk) can never be bootstrapped, so planning a reload for it deferred the
+    # whole reconcile forever on a host that always has a VM running. It is
+    # staged instead: its plist is kept current and it is never loaded.
+    disabled = _disabled_labels()
+    held_off: set[str] = set()
     for label, path, desired, disk_changed in wanted:
         desired_labels.add(label)
         digest = _plist_digest(desired)
@@ -634,6 +651,10 @@ def _reconcile_unlocked(profile_path: Path, agents_dir: Path, *, dry_run: bool =
             and prior.get("path") == str(path)
         )
         applied = exact_receipt and prior.get("state") == "loaded" and loaded_path == path
+        if label != RELAY_LABEL and disabled is not None and label in disabled \
+                and loaded_path is None:
+            held_off.add(label)
+            applied = exact_receipt and prior.get("state") == "staged"
         if (
             label != RELAY_LABEL
             and participating
@@ -646,14 +667,17 @@ def _reconcile_unlocked(profile_path: Path, agents_dir: Path, *, dry_run: bool =
             promotions.append((label, path, digest))
             applied = True
         if disk_changed or not applied:
-            stage_only = label != RELAY_LABEL and not participating
+            stage_only = label != RELAY_LABEL and (not participating or label in held_off)
             plans.append((label, path, desired, disk_changed, digest, stage_only, loaded_path))
             result["changes"].append({
                 "label": label,
-                "action": "write-and-stage" if stage_only else "write-and-full-reload",
+                "action": ("stage-disabled" if label in held_off
+                           else "write-and-stage" if stage_only else "write-and-full-reload"),
             })
 
-    if plans and not dry_run:
+    # Staging a disabled, unloaded controller touches no running agent, so it
+    # does not wait for the host's VMs to finish.
+    if [plan for plan in plans if plan[0] not in held_off] and not dry_run:
         vm_running = _any_tart_vm_running()
         if vm_running is None:
             result.update(
