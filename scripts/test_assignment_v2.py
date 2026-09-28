@@ -942,7 +942,8 @@ class ReleaseClassTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(self._select()[2], "1")
 
     def test_lane_without_release_classes_never_picks_a_release_job(self) -> None:
-        """The two-tier fixture is every non-m5 slot: release demand is not
+        """The two-tier fixture is any lane that does not declare the release
+        classes (every shipped pulp-gate lane now does): release demand is not
         its demand, whatever else is queued."""
         for queue in ({"release": True}, {"release_pr": True},
                       {"release": True, "release_pr": True}):
@@ -1110,6 +1111,71 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
         # Control: the same runner once the release has been taken.
         self.assertEqual(self._decide(2, "2", merge=True, pr=True),
                          ("1", "pulp-build-merge-group"))
+
+
+class ShippedFleetReleaseFirstSlotTests(RunnerFixture, unittest.TestCase):
+    """Every host's shipped pulp-gate slots serve a release while gate work
+    queues, on exactly one slot.
+
+    The class-shaping environment is taken from each rendered profile, so a
+    change to any host's shipped order is a change to these verdicts. Tiers are
+    merge-group (0), PR-head (1), release-tagged (2) and release PR gate (3).
+    The release-first slot is slot 2 on m1 and m5 and slot 1 on m3, whose slot
+    2 keeps the PR-first canary; the other slot on each host is the control on
+    every identical queue.
+    """
+
+    HOSTS = {"m1": ("m1", 2), "m3": ("studio", 1), "m5": ("m5", 2)}
+    FLEET = ROOT / "scripts" / "macos_fleet_lanes.py"
+    SHAPING = M5ReleaseFirstIdleRetargetTests.SHAPING
+    _on_slot = M5ReleaseFirstIdleRetargetTests._on_slot
+    _selected_tier = M5ReleaseFirstIdleRetargetTests._selected_tier
+    _pre_mint = M5ReleaseFirstIdleRetargetTests._pre_mint
+
+    def setUp(self) -> None:
+        super().setUp()
+        spec = spec_from_file_location("macos_fleet_lanes_fleet_release", self.FLEET)
+        assert spec is not None and spec.loader is not None
+        fleet = module_from_spec(spec)
+        spec.loader.exec_module(fleet)
+        self.hosts = {}
+        for profile, (host_id, _) in self.HOSTS.items():
+            slots = {}
+            path = ROOT / "profiles" / f"{profile}-macos-fleet.toml"
+            for name, body in fleet.rendered_plists(fleet.load(path)).items():
+                for slot, suffix in ((1, f".{host_id}.pulp-gate.plist"),
+                                     (2, f".{host_id}.pulp-gate.slot2.plist")):
+                    if name.endswith(suffix):
+                        slots[slot] = plistlib.loads(body)["EnvironmentVariables"]
+            self.assertEqual(sorted(slots), [1, 2], profile)
+            self.hosts[profile] = slots
+
+    def test_each_host_serves_releases_first_on_exactly_one_slot(self) -> None:
+        busy = {"merge": True, "pr": True}
+        for profile, (_, release_slot) in self.HOSTS.items():
+            with self.subTest(host=profile):
+                self.slots = self.hosts[profile]
+                other = 3 - release_slot
+                # A tagged release outranks gate work only on the release-first slot.
+                self.assertEqual(
+                    [slot for slot in (1, 2)
+                     if self._selected_tier(slot, release=True, **busy) == "2"
+                     and self._pre_mint(slot, "2", release=True, **busy) == "1"],
+                    [release_slot])
+                # The release PR gate is served while gate work waits, likewise.
+                self.assertEqual(
+                    [slot for slot in (1, 2)
+                     if self._selected_tier(slot, release_pr=True, **busy) == "3"
+                     and self._pre_mint(slot, "3", release_pr=True, **busy) == "1"],
+                    [release_slot])
+                # Control: the other slot serves gate work on the identical queue.
+                self.assertIn(self._selected_tier(other, release=True, **busy), {"0", "1"})
+                # Work-conserving: with only releases waiting both slots serve them.
+                for slot in (1, 2):
+                    self.assertEqual(self._selected_tier(slot, release=True), "2")
+                    self.assertEqual(self._pre_mint(slot, "2", release=True), "1")
+                # With no release waiting the release-first slot serves gate work.
+                self.assertIn(self._selected_tier(release_slot, **busy), {"0", "1"})
 
 
 class IdleRetargetTests(RunnerFixture, unittest.TestCase):
