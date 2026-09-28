@@ -766,7 +766,8 @@ event(){
 heartbeat(){
   local phase="$1" ts state_file tmp_file
   # A newer phase from the supervisor ends any keepalive refresh of the old one.
-  tartci_heartbeat_keepalive_stop
+  # Without the keepalive library loaded no refresher can have been started.
+  ! declare -F tartci_heartbeat_keepalive_stop >/dev/null || tartci_heartbeat_keepalive_stop
   LAST_HEARTBEAT_PHASE="$phase"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
