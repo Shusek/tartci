@@ -45,30 +45,54 @@ def feed(*releases: tuple[str, float]) -> str:
 
 
 class Host:
-    """Fake tool installs: installed versions, apply behaviour, and a call log."""
+    """Fake tool installs: CLI versions, the ghapp generation, fleet-update, a call log."""
 
-    def __init__(self, versions: dict[str, str | None]):
+    def __init__(self, versions: dict[str, str | None], generation: str | None = None):
         self.versions = versions
+        self.generation = generation
         self.calls: list[list[str]] = []
         self.apply_installs: dict[str, str | None] = {}
+        self.apply_generation: str | None = None  # default: the generation moves with the CLI
+        self.verdict = "verified"
 
     def run(self, argv: list[str], timeout: float) -> tuple[int, str]:
         self.calls.append(argv)
+        if "auth-generations" in argv[0]:
+            return (0, f"shipyard {self.generation}") if self.generation else (1, "exec failed")
         name = Path(argv[0]).name
-        if "update" in argv:
+        if "fleet-update" in argv:
             installed = self.apply_installs.get(name)
             if installed is None:
-                return 1, "download failed"
+                return 1, json.dumps({"event": "fleet_summary", "verdict": "failed"}, indent=2)
             self.versions[name] = installed
-            return 0, f"updated to {installed}"
+            if self.generation is not None:
+                self.generation = self.apply_generation or installed
+            receipt = {"event": "host_verification", "host_class": argv[argv.index("--host-class") + 1],
+                       "verdict": self.verdict}
+            summary = {"event": "fleet_summary", "target": argv[argv.index("--to") + 1],
+                       "verdict": self.verdict}
+            # Shipyard streams one pretty-printed document per event.
+            return 0, json.dumps(receipt, indent=2) + "\n" + json.dumps(summary, indent=2)
         version = self.versions.get(name)
         if version is None:
             return 127, "not installed"
         return 0, f"{name} {version}" if name == "shipyard" else f"pulp v{version}"
 
 
+def make_generation(home: Path) -> Path:
+    """The layout Shipyard installs: a symlink to ghapp inside a generation dir."""
+    gen = home / ".local/share/shipyard/auth-generations/75f602aa0abf"
+    gen.mkdir(parents=True)
+    (gen / "ghapp").write_text("#!/bin/sh\n")
+    link = home / ".local/bin/ghapp.shipyard-generation"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(gen / "ghapp")
+    return gen
+
+
 def settings(**overrides) -> dict:
     value = {"stale_hours": 12.0, "apply_after_minutes": 30.0, "apply_retry_hours": 6.0,
+             "host_class": "studio",
              "tools": {name: dict(tool, enabled=True) for name, tool in tf.DEFAULT_TOOLS.items()}}
     value.update(overrides)
     return value
@@ -162,34 +186,108 @@ class ToolFreshnessTests(unittest.TestCase):
         row = self.refresh(host)["tools"]["shipyard"]
         self.assertEqual(row["state"], "behind")
         self.assertIn("waiting", row["apply"])
-        self.assertFalse(any("update" in call for call in host.calls))
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
 
     def test_auto_apply_installs_verifies_and_records_one_deploy_event(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
         host.apply_installs["shipyard"] = "0.221.1"
         row = self.refresh(host)["tools"]["shipyard"]
-        self.assertIn([str(self.home / ".local/bin/shipyard"), "update", "--to", "v0.221.1",
-                       "--refresh-daemon"], host.calls)
+        self.assertIn([str(self.home / ".local/bin/shipyard"), "runner", "fleet-update", "--to",
+                       "v0.221.1", "--host-class", "studio", "--apply", "--json"], host.calls)
         self.assertEqual(row["state"], "current")
         self.assertEqual(row["apply"], "applied v0.221.1: ok")
         self.assertEqual(self.events(), [{
-            "event": "tool_deployed", "tool": "shipyard", "at": iso(NOW), "from": "0.221.0",
-            "to": "0.221.1", "latest": "0.221.1", "by": "auto_apply", "downgrade": False,
-            "verify": "current"}])
+            "event": "tool_deployed", "tool": "shipyard", "component": "cli", "at": iso(NOW),
+            "from": "0.221.0", "to": "0.221.1", "latest": "0.221.1", "by": "auto_apply",
+            "downgrade": False, "verify": "current"}])
         # pulp has no apply command: it is never updated from here.
-        self.assertFalse(any(Path(c[0]).name == "pulp" and "update" in c for c in host.calls))
+        self.assertFalse(any(Path(c[0]).name == "pulp" and len(c) > 2 for c in host.calls))
+
+    def test_a_lagging_ghapp_generation_makes_a_current_cli_stale(self) -> None:
+        make_generation(self.home)
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"}, generation="0.221.0")
+        off = settings(tools={name: dict(tool, enabled=True, auto_apply=False)
+                              for name, tool in tf.DEFAULT_TOOLS.items()})
+        row = self.refresh(host, settings=off)["tools"]["shipyard"]
+        self.assertEqual((row["installed"], row["generation"], row["effective"]),
+                         ("0.221.1", "0.221.0", "0.221.0"))
+        self.assertEqual(row["state"], "behind")
+        self.assertTrue(row["stale"])
+        line = tf.render_row(row)
+        self.assertIn("0.221.1 (ghapp generation 0.221.0) behind latest v0.221.1", line)
+        self.assertIn("STALE", line)
+        self.assertEqual(tf.summary(self.home)["problem"], "shipyard 20 h behind v0.221.1")
+        host.generation = "0.221.1"
+        row = self.refresh(host, NOW + HOUR, settings=off)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "current")
+        self.assertEqual([(e["component"], e["from"], e["to"], e["by"]) for e in self.events()],
+                         [("auth_generation", "0.221.0", "0.221.1", "observed")])
+
+    def test_an_unreadable_generation_is_unknown_not_current(self) -> None:
+        make_generation(self.home)
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"}, generation=None)
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "unknown")
+        self.assertIn("generation 75f602aa0abf version unreadable", row["reason"])
+
+    def test_fleet_update_moves_cli_and_generation_and_logs_both(self) -> None:
+        make_generation(self.home)
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"}, generation="0.221.0")
+        host.apply_installs["shipyard"] = "0.221.1"
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["apply"], "applied v0.221.1: ok")
+        self.assertEqual((row["state"], row["generation"]), ("current", "0.221.1"))
+        self.assertEqual([(e["component"], e["from"], e["to"], e["by"]) for e in self.events()],
+                         [("auth_generation", "0.221.0", "0.221.1", "auto_apply")])
+
+    def test_a_fleet_update_verdict_other_than_verified_is_a_failure(self) -> None:
+        make_generation(self.home)
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"}, generation="0.221.0")
+        host.apply_installs["shipyard"] = "0.221.1"
+        host.verdict = "rollback_failed"
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertIn("FAILED (verdict rollback_failed", row["apply"])
+        failed = [e for e in self.events() if e["event"] == "tool_apply_failed"]
+        self.assertEqual([e["verdict"] for e in failed], ["rollback_failed"])
+
+    def test_a_verified_verdict_with_the_generation_left_behind_is_a_failure(self) -> None:
+        make_generation(self.home)
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"}, generation="0.221.0")
+        host.apply_installs["shipyard"] = "0.221.1"
+        host.apply_generation = "0.221.0"
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertIn("FAILED (verdict verified", row["apply"])
+        self.assertIn("generation 0.221.0", row["apply"])
+
+    def test_no_host_class_refuses_to_apply(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+        no_class = settings()
+        del no_class["host_class"]
+        row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
+        self.assertIn("refused: no host class", row["apply"])
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+
+    def test_host_class_defaults_to_the_fleet_profile_host_id(self) -> None:
+        if tf.tomllib is None:
+            self.skipTest("needs tomllib")
+        profile = self.home / ".config/tartci/macos-fleet-profile.toml"
+        profile.parent.mkdir(parents=True)
+        profile.write_text('[host]\nid = "m5"\nssh = "m5"\n')
+        self.assertEqual(tf.host_class(self.home, {}), "m5")
+        self.assertEqual(tf.host_class(self.home, {"host_class": "m1"}), "m1")
 
     def test_a_failed_apply_is_recorded_and_not_retried_inside_the_window(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
         row = self.refresh(host)["tools"]["shipyard"]
         self.assertIn("FAILED", row["apply"])
         self.assertEqual([e["event"] for e in self.events()], ["tool_apply_failed"])
-        calls = len([c for c in host.calls if "update" in c])
+        calls = len([c for c in host.calls if "fleet-update" in c])
         row = self.refresh(host, NOW + HOUR)["tools"]["shipyard"]
-        self.assertEqual(len([c for c in host.calls if "update" in c]), calls)
+        self.assertEqual(len([c for c in host.calls if "fleet-update" in c]), calls)
         self.assertIn("already attempted v0.221.1", row["apply"])
         self.refresh(host, NOW + 7 * HOUR)
-        self.assertEqual(len([c for c in host.calls if "update" in c]), calls + 1)
+        self.assertEqual(len([c for c in host.calls if "fleet-update" in c]), calls + 1)
 
     def test_auto_apply_off_leaves_the_tool_alone(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
@@ -197,7 +295,7 @@ class ToolFreshnessTests(unittest.TestCase):
         off = settings(tools={name: dict(tool, enabled=True, auto_apply=False)
                               for name, tool in tf.DEFAULT_TOOLS.items()})
         self.refresh(host, settings=off)
-        self.assertFalse(any("update" in call for call in host.calls))
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
 
     def test_a_deployment_made_elsewhere_is_observed_and_recorded(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.305.0"})

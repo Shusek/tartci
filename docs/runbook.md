@@ -1744,19 +1744,34 @@ arrive, and a host that did not get it is loud:
 - **When it refreshes.** Every watchdog pass, at most every 30 minutes;
   `tartci fleet-macos tool-freshness --refresh` measures now.
 - **Automatic apply.** Shipyard updates itself from here by default: once its
-  newest release is 30 minutes old, `shipyard update --to <tag>
-  --refresh-daemon` (install, smoke-verify, then refresh the daemon), then the
-  version is re-read and must equal the release. One attempt per release per 6
-  hours. The pulp CLI updates itself at session start, so it is measured here
-  but not applied. `~/.config/tartci/tool-freshness.toml` overrides per host:
+  newest release is 30 minutes old, `shipyard runner fleet-update --to <tag>
+  --host-class <this host> --apply --json`, the governed rollout that stages
+  CLI, daemon, ghapp, token helper and close guard as one content-addressed
+  generation, probes it, swaps atomically and rolls back on failure. Success
+  needs the JSON `fleet_summary` verdict `verified` AND the re-read CLI and
+  ghapp generation versions both equal to the release. The host class is
+  `host_class` in the settings, else the installed fleet profile's `host.id`
+  (studio, m1, m5); with neither, apply refuses. One attempt per release per
+  6 hours. Never `shipyard update --refresh-daemon` here: it swaps only the
+  CLI and daemon and leaves ghapp on its old generation (m3's ghapp stayed on
+  0.217.0 under a 0.222.0 CLI). The pulp CLI updates itself at session start,
+  so it is measured here but not applied. `~/.config/tartci/tool-freshness.toml`
+  overrides per host:
 
       stale_hours = 12
+      host_class = "studio"
       [tools.shipyard]
       auto_apply = false     # stop automatic Shipyard updates on this host
 
+- **The ghapp generation is measured too.** `readlink
+  ~/.local/bin/ghapp.shipyard-generation` names the generation; that
+  directory's `shipyard --version` is its release. The line reads `shipyard:
+  0.222.0 (ghapp generation 0.217.0) behind ...`, and the older of the two
+  decides behind and STALE. An unreadable generation is UNKNOWN, never
+  current; a host with no generation link measures the CLI alone.
 - **Deploy log.** `~/.tartci/state/tool-freshness/events.jsonl` gets one
-  `tool_deployed` event (tool, from, to, `by` auto_apply or observed, verify)
-  whenever an installed version changes, whoever changed it, and a
+  `tool_deployed` event (tool, `component` cli or auth_generation, from, to,
+  `by` auto_apply or observed, verify) whenever an installed version changes, whoever changed it, and a
   `tool_apply_failed` event when an automatic apply does not land.
 - **The watchdog must actually run.** `tartci launchd heal` reconciles the
   relay network profile first, and that reconcile defers whenever any Tart VM
