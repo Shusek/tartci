@@ -55,6 +55,17 @@ runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
 min_queued_age_seconds = 600
+# Fallback lane (docs/assignment-v2-rollout.md): for queued work younger than
+# the 600 s rule, boot now when m3 ("studio") has no free, leasable gate slot
+# for that class. The 600 s rule stays the upper bound; an unreadable peer
+# keeps it. Over 2026-09-26/28, 55 of 287 macOS gate jobs that queued >= 120 s
+# met that condition while an m1 slot was free (about 1,060 job-minutes, median
+# 8.6 min earlier). m5 is deliberately NOT a preferred host: its supply report
+# counts lease fit, not host load, so while m5 is starved (load 179, swap
+# 31.5/32 GB) deferring to it would leave young work on the starved host; and
+# m5 is unreachable over SSH, which would make every decision "unknown" (hold).
+# Rollback: delete this key, re-render, reload.
+fallback_preferred_hosts = ["studio"]
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]
 # A full exhaustive tier scan is normally ~20s on this host, but two

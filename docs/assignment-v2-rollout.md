@@ -482,7 +482,16 @@ Cost while young demand exists: one extra exhaustive scan and one SSH per
 preferred host per live selection (at most every 120 s). No GitHub or SSH call
 is made when the knob is off or when there is no young demand.
 
-### Enabling it (not enabled on any host)
+### Enabling it (m1 `pulp-gate`, preferring m3 only)
+
+m1's `pulp-gate` lane sets `fallback_preferred_hosts = ["studio"]`. m5 is left
+out on purpose: its `pool supply` report counts lease fit, not host load, so a
+starved m5 still reports free slots, and deferring to it keeps young work on the
+starved host. m5 is also unreachable over SSH at times while its runners still
+serve, and an unreadable peer turns every decision into a hold. Add `"m5"` back
+once m5 is reachable and healthy.
+
+The general recipe follows.
 
 Prerequisites, checked from the fallback host as the lane's user:
 
