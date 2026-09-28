@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import os
 import plistlib
 import subprocess
@@ -416,7 +417,10 @@ class FallbackSupervisorTests(RunnerFixture, unittest.TestCase):
 
 class ProfileRenderTests(unittest.TestCase):
     def _profile(self, lane_extra: str, ssh_profiles: bool = True) -> str:
-        text = (ROOT / "profiles" / "m1-macos-fleet.toml").read_text()
+        # Start from the shipped profile without its own fallback key, so each
+        # test states exactly the key it exercises.
+        text = re.sub(r'(?m)^fallback_preferred_hosts = .*\n', "",
+                      (ROOT / "profiles" / "m1-macos-fleet.toml").read_text())
         return text.replace('assignment_idle_retarget_seconds = 120\n',
                             'assignment_idle_retarget_seconds = 120\n' + lane_extra, 1)
 
@@ -447,10 +451,19 @@ class ProfileRenderTests(unittest.TestCase):
             "min_queued_age_seconds = 600", "min_queued_age_seconds = 0", 1)
         self.assertNotEqual(self._run(zero_age).returncode, 0)
 
-    def test_checked_in_profiles_do_not_enable_it(self) -> None:
-        for path in (ROOT / "profiles").glob("*-macos-fleet.toml"):
-            with self.subTest(profile=path.name):
-                self.assertNotIn("fallback_preferred_hosts", path.read_text())
+    def test_only_m1_pulp_gate_falls_back_and_only_to_m3(self) -> None:
+        import macos_fleet_lanes as fleet  # noqa: PLC0415
+        enabled = []
+        for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
+            data = fleet.tomllib.loads(path.read_text())
+            for lane in data.get("lane", []):
+                env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+                if "TARTCI_FALLBACK_PEERS" in env:
+                    enabled.append((path.name, lane["id"], env["TARTCI_FALLBACK_PEERS"]))
+        # m5 is excluded on purpose: deferring to a starved host keeps young
+        # work there, and an unreachable peer turns every decision into a hold.
+        self.assertEqual(enabled, [("m1-macos-fleet.toml", "pulp-gate", "studio=m3")])
+        self.assertEqual(self._run((ROOT / "profiles" / "m1-macos-fleet.toml").read_text()).returncode, 0)
 
 
 if __name__ == "__main__":
