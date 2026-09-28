@@ -870,6 +870,25 @@ def refresh_skew(interval_s: int = 1800) -> None:
         pass
 
 
+def refresh_tools(interval_s: int = 1800, timeout_s: int = 600) -> None:
+    """Re-measure Shipyard and pulp CLI freshness at most every interval_s.
+
+    Also where an automatic tool update runs (tool_freshness.py applies a
+    behind tool whose settings allow it, then re-reads and verifies it), so a
+    merged release reaches this host without anyone logging in.
+    """
+    python = _toml_python()
+    if python is None:
+        return
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        subprocess.run([python, os.path.join(root, "scripts", "tool_freshness.py"),
+                        "--refresh", "--if-older", str(interval_s)],
+                       capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def config_problem(value: dict) -> str | None:
     """One-line summary when anything is not ok, else None."""
     parts = []
@@ -886,6 +905,10 @@ def config_problem(value: dict) -> str | None:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     if self_update.get("problem"):
         parts.append(f"self_update={self_update['problem']}")
+    for key in ("tool_freshness", "host_vitals"):
+        row = value.get(key) if isinstance(value.get(key), dict) else {}
+        if row.get("problem"):
+            parts.append(f"{key}={row['problem']}")
     return "; ".join(parts) or None
 
 
@@ -1071,6 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
                  if r["verdict"] in {"wedged", "broken", "attention"}]
     if not args.status and not args.dry_run and os.path.isfile(args.fleet_config):
         refresh_skew()
+        refresh_tools()
     config = config_verdicts(args.fleet_config, args.fleet_receipt)
     config_summary = config_problem(config)
     config["warned"] = False

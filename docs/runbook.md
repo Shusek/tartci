@@ -1722,6 +1722,49 @@ fleet`), and check GitHub's job history against it with
   procedure). After the fix that caused the rollback lands, the next scheduled
   run on a host that still has self-update picks it up normally.
 
+### Shipyard and pulp CLI freshness (`tartci fleet-macos tool-freshness`)
+
+tartci's skew covers tartci only. The other tools every gate and agent session
+on a host runs are measured the same way, so a merged improvement is seen to
+arrive, and a host that did not get it is loud:
+
+- **What is measured.** The installed version (`~/.local/bin/shipyard
+  --version`, `~/.pulp/bin/pulp version`) against the newest plain `vX.Y.Z`
+  release in the repository's public Atom feed (no REST quota). A behind tool
+  is dated from the first release newer than it; an install older than every
+  release in the feed is shown as `>=` that oldest entry, and the bound never
+  moves later. `STALE` once behind for more than `stale_hours` (12).
+- **Where it shows.** A line per tool in `tartci pool status` and `tartci
+  fleet-macos config-verdicts`, a `tool_freshness_*` finding in `tartci doctor
+  fleet` (stale is a problem, so doctor exits 1), and a rate-limited WARN in
+  the launchd watchdog log. Never folded into `fleet ready`. `pool status` also
+  prints fseventsd from the host-vitals sensor's published reading
+  (`~/.local/state/pulp/host_vitals.json`), warning above 1024 MB; the remedy is
+  `sudo killall fseventsd`, which nothing here runs.
+- **When it refreshes.** Every watchdog pass, at most every 30 minutes;
+  `tartci fleet-macos tool-freshness --refresh` measures now.
+- **Automatic apply.** Shipyard updates itself from here by default: once its
+  newest release is 30 minutes old, `shipyard update --to <tag>
+  --refresh-daemon` (install, smoke-verify, then refresh the daemon), then the
+  version is re-read and must equal the release. One attempt per release per 6
+  hours. The pulp CLI updates itself at session start, so it is measured here
+  but not applied. `~/.config/tartci/tool-freshness.toml` overrides per host:
+
+      stale_hours = 12
+      [tools.shipyard]
+      auto_apply = false     # stop automatic Shipyard updates on this host
+
+- **Deploy log.** `~/.tartci/state/tool-freshness/events.jsonl` gets one
+  `tool_deployed` event (tool, from, to, `by` auto_apply or observed, verify)
+  whenever an installed version changes, whoever changed it, and a
+  `tool_apply_failed` event when an automatic apply does not land.
+- **The watchdog must actually run.** `tartci launchd heal` reconciles the
+  relay network profile first, and that reconcile defers whenever any Tart VM
+  is running. It used to return 6 before the watchdog, so a busy host with a
+  network profile never ran its heal pass, skew refresh or config warnings (m3,
+  for two days). A failed reconcile is now printed to the watchdog log and the
+  pass runs anyway; the exit stays 6 to keep the signal.
+
 #### Adding a machine
 
 1. Add `profiles/<host>-macos-fleet.toml` with `[host] ssh = "<alias>"`, the

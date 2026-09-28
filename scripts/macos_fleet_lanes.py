@@ -2650,7 +2650,9 @@ def config_verdicts(config: Path, support_root: Path,
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
-                "self_update": self_update_summary()}
+                "self_update": self_update_summary(),
+                "tool_freshness": tool_freshness_summary(),
+                "host_vitals": host_vitals_summary()}
     value: dict = {}
     try:
         drift = profile_drift(config, support_root / "profiles")
@@ -2683,7 +2685,51 @@ def config_verdicts(config: Path, support_root: Path,
     except Exception as exc:  # noqa: BLE001
         value["supply"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
     value["self_update"] = self_update_summary()
+    value["tool_freshness"] = tool_freshness_summary()
+    value["host_vitals"] = host_vitals_summary()
     return value
+
+
+def tool_freshness_summary() -> dict:
+    """Cached installed-vs-released freshness of Shipyard and the pulp CLI."""
+    try:
+        import tool_freshness
+        return tool_freshness.summary()
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        return {"lines": [f"tools: freshness UNKNOWN ({type(exc).__name__}: {exc})"],
+                "problem": None}
+
+
+FSEVENTSD_WARN_MB = 1024
+
+
+def host_vitals_summary(path: Path | None = None) -> dict:
+    """fseventsd from the host-vitals sensor's published reading. Never probes.
+
+    The sensor (Pulp's host_vitals_sensor.sh, every 60 s) owns the probe; a
+    runaway fseventsd needs a sudo restart, so it is reported for a person
+    and never folded into readiness.
+    """
+    path = path or Path(os.environ.get("TARTCI_HOST_VITALS_STATE")
+                        or Path.home() / ".local/state/pulp/host_vitals.json")
+    try:
+        reading = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"lines": [f"fseventsd: UNKNOWN (no host-vitals reading at {path})"],
+                "problem": None}
+    sampled = reading.get("sampled_at") if isinstance(reading, dict) else None
+    age = f", sampled {int(time.time() - sampled)}s ago" if isinstance(sampled, int) else ""
+    fsev = reading.get("fseventsd") if isinstance(reading, dict) else None
+    if not isinstance(fsev, dict) or not isinstance(fsev.get("rss_mb"), int):
+        return {"lines": [f"fseventsd: UNKNOWN (host-vitals reading has no fseventsd field{age}; "
+                          "reinstall the sensor)"], "problem": None}
+    limit = fsev.get("warn_mb") if isinstance(fsev.get("warn_mb"), int) else FSEVENTSD_WARN_MB
+    text = f"fseventsd: {fsev['rss_mb']} MB RSS, {fsev.get('cpu_pct')}% CPU{age}"
+    if fsev["rss_mb"] > limit:
+        problem = f"fseventsd {fsev['rss_mb']} MB RSS > {limit} MB"
+        return {"lines": [f"{text} WARN (> {limit} MB; restart with sudo killall fseventsd)"],
+                "problem": problem, "fseventsd": fsev}
+    return {"lines": [text], "problem": None, "fseventsd": fsev}
 
 
 def self_update_summary() -> dict:
@@ -2717,6 +2763,9 @@ def render_config_verdicts(value: dict | None) -> str:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     lines.extend(self_update.get("lines") or
                  ["tartci: skew UNKNOWN (not checked from here)"])
+    for key in ("tool_freshness", "host_vitals"):
+        row = value.get(key) if isinstance(value.get(key), dict) else {}
+        lines.extend(row.get("lines") or [f"{key}: UNKNOWN (not checked from here)"])
     supply = value.get("supply") if isinstance(value.get("supply"), dict) else {}
     if supply.get("commits_differ"):
         lines.append(f"  supply published at {supply['published_commit'][:12]}, host generation "
