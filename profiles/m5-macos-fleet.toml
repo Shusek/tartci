@@ -68,9 +68,9 @@ tmp_checkouts = true
 # first-come and agent builds are untouched. Rollback: delete this table.
 # See docs/assignment-v2-rollout.md, "Ranked VM lease waiters".
 [leases]
-# Baseline window: lease_acquired telemetry on, ranking off. Flip to true to
-# canary ranked waiters so the proxy has a same-host before/after.
-rank_vm_waiters = false
+# Canary: ranked VM lease waiters on for m5 (baseline window 2026-09-27T09:03Z
+# to 2026-09-28T08:07Z: 1 inversion in 12 contended hours, 78 acquires).
+rank_vm_waiters = true
 
 [[lane]]
 id = "pulp-gate"
