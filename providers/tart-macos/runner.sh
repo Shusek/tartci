@@ -418,6 +418,8 @@ source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
 # shellcheck source=providers/tart-macos/lease-fit.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/lease-fit.lib.sh"
+# shellcheck source=providers/tart-macos/heartbeat-keepalive.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/heartbeat-keepalive.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
@@ -763,6 +765,8 @@ event(){
 
 heartbeat(){
   local phase="$1" ts state_file tmp_file
+  # A newer phase from the supervisor ends any keepalive refresh of the old one.
+  tartci_heartbeat_keepalive_stop
   LAST_HEARTBEAT_PHASE="$phase"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
@@ -1185,6 +1189,7 @@ reconcile_pending_delete(){
 }
 
 cleanup(){
+  tartci_heartbeat_keepalive_stop
   tartci_pool_lock_release
   tartci_boundary_proof_abandon
   tartci_job_claim_release
@@ -2248,6 +2253,7 @@ tartci_boundary_proof_validate \
   || die "invalid parallel boundary-proof configuration"
 tartci_job_claim_validate || die "invalid job-claim configuration"
 tartci_lease_fit_validate || die "invalid lease-fit configuration"
+tartci_heartbeat_keepalive_validate || die "invalid heartbeat keepalive configuration"
 
 # Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
 # shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
@@ -2311,6 +2317,9 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
       continue
     fi
+    # The scan can outlast the heartbeat staleness window; keep this lane's
+    # current phase fresh until the next heartbeat (heartbeat-keepalive.lib.sh).
+    tartci_heartbeat_keepalive_start
     selection="$(select_work)"
     IFS='|' read -r q selected_labels selected_tier <<< "$selection"
     if printf '%s' "$q" | grep -qxE '[1-9][0-9]*'; then
