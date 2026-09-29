@@ -12,11 +12,37 @@ import time
 from pathlib import Path
 
 
+# The probe writes, reads back and removes one small file on the VM store
+# (tart_home). On m3 on 2026-09-29 that volume stalled for hours (the hourly
+# reclaim scan of it took 70 and 204 min instead of 1-2), the probe's write
+# outlived a 10 s deadline, launchd's bootout interrupted it (EINTR in mktemp),
+# and every `pool on` from 08:40Z to 17:05Z was refused. An access DENIAL fails
+# at once with an exit code; only a slow volume runs into the deadline, so a
+# longer deadline cannot turn a denial into a pass.
+DEFAULT_TIMEOUT_SECONDS = 60.0
+TIMEOUT_ENV = "TARTCI_LAUNCH_HELPER_PROBE_TIMEOUT_SECS"
+# One small file operation: it must not queue behind the host's own heavy I/O
+# as a throttled Background job would (macOS throttles Background disk I/O
+# whenever other I/O is in flight).
+PROCESS_TYPE = "Standard"
+
+
 def fail(message: str) -> None:
     raise ValueError(message)
 
 
-def run(helper: dict, profile: dict, timeout_seconds: float = 10.0) -> dict:
+def timeout_from_env(default: float = DEFAULT_TIMEOUT_SECONDS) -> float:
+    raw = os.environ.get(TIMEOUT_ENV, "").strip()
+    if not raw:
+        return default
+    if not raw.isdigit() or not 10 <= int(raw) <= 300:
+        fail(f"invalid {TIMEOUT_ENV}: expected 10-300")
+    return float(raw)
+
+
+def run(helper: dict, profile: dict, timeout_seconds: float | None = None) -> dict:
+    if timeout_seconds is None:
+        timeout_seconds = timeout_from_env()
     host = profile["host"]
     label = "com.danielraffel.tartci.launcher-volume-probe"
     domain = f"gui/{os.getuid()}"
@@ -42,7 +68,7 @@ def run(helper: dict, profile: dict, timeout_seconds: float = 10.0) -> dict:
             ],
             "WorkingDirectory": host["home"],
             "RunAtLoad": True,
-            "ProcessType": "Background",
+            "ProcessType": PROCESS_TYPE,
             "StandardOutPath": str(log_root / "launcher-volume-probe.log"),
             "StandardErrorPath": str(log_root / "launcher-volume-probe.log"),
         }, sort_keys=False))
@@ -87,7 +113,9 @@ def run(helper: dict, profile: dict, timeout_seconds: float = 10.0) -> dict:
                     break
                 time.sleep(0.1)
             if outcome is None:
-                fail("launch helper volume probe timed out")
+                fail(f"launch helper volume probe timed out after {timeout_seconds:g}s "
+                     f"(its write to {host['tart_home']} did not finish: slow volume I/O, "
+                     "not an access denial)")
         except Exception as error:  # Preserve the primary probe diagnosis.
             probe_error = error
         finally:

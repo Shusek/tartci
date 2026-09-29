@@ -953,6 +953,56 @@ def _config_state_file() -> str:
     return os.path.join(os.path.dirname(_state_file()), "launchd-watchdog-config.json")
 
 
+# ── host left OFF by a failed self-update ───────────────────────────────────
+
+def _installed_tartci() -> str:
+    shim = os.path.expanduser("~/.local/bin/tartci")
+    if os.path.isfile(shim):
+        return shim
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tartci")
+
+
+def _pool_on() -> tuple[int, str]:
+    try:
+        proc = subprocess.run(["/bin/bash", _installed_tartci(), "pool", "on"],
+                              cwd=os.path.expanduser("~"), capture_output=True, text=True,
+                              timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+    return proc.returncode, (proc.stderr or proc.stdout).strip()
+
+
+def host_off_pass(status_only: bool = False, now: float | None = None) -> str | None:
+    """Recover and alert for a host a failed self-update left OFF.
+
+    Returns the line to log, or None when there is nothing to say. Every pass
+    while the host is unexpectedly OFF prints a WARN (not rate-limited: this
+    is an outage, not drift). Never raises.
+    """
+    try:
+        import host_off  # noqa: PLC0415 - sibling module
+        sdir, pool_file = host_off.state_dir(), host_off.pool_state_file()
+        now = utcnow() if now is None else now
+        outcome = None
+        if not status_only:
+            outcome = host_off.recover(sdir, pool_file, _pool_on, now=now,
+                                       who="launchd-watchdog")
+            host_off.alert(sdir, pool_file, host=os.uname().nodename.split(".")[0], now=now)
+        current = host_off.status(sdir, pool_file, now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return f"{_iso(utcnow())} launchd-watchdog: host-off check failed: {exc}"
+    if outcome and outcome.get("attempted") and outcome.get("ok"):
+        return f"{_iso(now)} launchd-watchdog: host was left OFF by a failed self-update; pool on succeeded"
+    if current.get("unexpected"):
+        tried = ""
+        if outcome and outcome.get("attempted"):
+            tried = f"; pool on failed: {outcome.get('reason')}"
+        elif outcome:
+            tried = f"; {outcome.get('reason')}"
+        return f"{_iso(now)} launchd-watchdog: WARN host-off: {current['detail']}{tried}"
+    return None
+
+
 # ── rate limiting ────────────────────────────────────────────────────────────
 
 def _state_file() -> str:
@@ -1038,6 +1088,13 @@ def main(argv: list[str] | None = None) -> int:
         return reload_command(args.reload, args.launch_agents_dir,
                               dry_run=args.dry_run,
                               allow_mid_job=args.allow_mid_job)
+
+    # First, before anything that can block on a slow volume: a host that a
+    # failed self-update left OFF is put back in service and, past 15 min,
+    # reported loudly (scripts/host_off.py).
+    host_off_line = host_off_pass(status_only=args.status or args.dry_run)
+    if host_off_line:
+        print(host_off_line)
 
     agents = discover_agents(args.launch_agents_dir)
     # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and
