@@ -1058,7 +1058,7 @@ class ScaleTests(Base):
             text = text.replace('id = "m1"', 'id = "x9"', 1).replace('ssh = "m1"\n', "")
             (root / "profiles/x9-macos-fleet.toml").write_text(text)
             hosts = {row["host_id"]: row["ssh"] for row in fleet.published_snapshot(root)["hosts"]}
-            self.assertEqual(hosts, {"m1": "m1", "studio": "m3", "m5": "m5", "x9": None})
+            self.assertEqual(hosts, {"m1": "m1", "studio": "m3", "m5": "m5", "m5studio": "m5s", "x9": None})
             (root / "profiles/x9-macos-fleet.toml").write_text(
                 text.replace('id = "x9"', 'id = "x9"\nssh = "bad alias!"', 1))
             with self.assertRaises(ValueError):
