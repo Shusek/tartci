@@ -471,8 +471,9 @@ the age rule whenever their state is unknown. See
 without a timer".
 
 Pulp event-class-V2 supervisors must not advertise a fixed
-`TARTCI_VM_LEASE_PRIORITY`: merge-group derives priority `110` and PR-head
-derives `100`, so both can use reserved gate cores while merge-group sorts first.
+`TARTCI_VM_LEASE_PRIORITY`: merge-group derives priority `110`, PR-head `100`,
+and the `pulp-release-pr-gate` class `115` (tagged releases `120`), so all can
+use reserved gate cores while the higher classes sort and rank first.
 Other required-gate supervisors may explicitly advertise `gate`; advisory
 supervisors must yield to that class.
 Pulp's exclusive `pulp-release-tagged` class also receives a gate-priority

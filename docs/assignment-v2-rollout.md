@@ -242,7 +242,7 @@ workflows, listed contiguously and at most once:
 | class | workflows | lease priority |
 |---|---|---|
 | `pulp-release-tagged` | `Release CLI`, `Sign and Release` | `120` (gate) |
-| `pulp-release-pr-gate` | `Release-path PR gate` | `100` (gate, as PR-head) |
+| `pulp-release-pr-gate` | `Release-path PR gate` | `115` (gate) |
 
 Gate tiers stay first, so a default slot keeps gate-first order and only takes
 release work when no gate work waits. Each class is its own JIT registration
@@ -250,10 +250,12 @@ release work when no gate work waits. Each class is its own JIT registration
 job and a gate runner cannot take a release job. A lane that does not declare a
 class never scans for it, so hosts without the declaration never pick a release
 job. Tagged releases lease at `120`, above merge-group, so a release boot is
-admitted from gate-reserved capacity; the release PR gate leases at `100`,
-exactly as PR-head, so a slot that boots it holds what a gate guest on that
-slot would and an ordinary build holding the host's non-gate budget cannot
-lock it out. Each supervisor slot holds at most one lease, so neither release
+admitted from gate-reserved capacity; the release PR gate leases at `115`,
+gate class like PR-head, so a slot that boots it holds what a gate guest on
+that slot would and an ordinary build holding the host's non-gate budget cannot
+lock it out. Where ranked VM lease waiters are on, 115 puts a ready release PR
+gate ahead of merge-group, PR-head and the other lanes' `gate` class (forge,
+spectr, vellum), and behind a tagged release. Each supervisor slot holds at most one lease, so neither release
 class can take a second slot's reserve. The numeric
 values apply only to registrations carrying the gate base label
 `pulp-build-vm`; the legacy `pulp-release` lane (`pulp-build-vm-release`) keeps
@@ -331,7 +333,7 @@ taken, leaving room for exactly one 6-core VM:
   still alive, fits in the host now and would not fit once this lease is
   granted.
 - Priorities are the ones lanes already lease at; nothing new is ranked:
-  release tagged 120 > merge-group 110 > PR-head 100 = release PR gate 100 =
+  release tagged 120 > release PR gate 115 > merge-group 110 > PR-head 100 =
   the `gate` class (100: forge, spectr, vellum) > `vm` (60).
 - **Ties stay first-come**: equal priority is not ranked, so the first acquire
   wins exactly as before.
@@ -346,13 +348,15 @@ Off (the default, every host but m5), the store never reads or writes
 `waiters.json` and the supervisor never registers; admission is byte-for-byte
 today's. `tartci leases status --json` lists live waiters when the knob is on.
 
-What it changes on m5, and what it does not: the two races above involved the
-release PR gate at 100. Forge's `gate` class is also 100 (a tie, still
-first-come) and slot 1's merge-group is 110 (it correctly outranks the PR gate),
-so neither of those two races flips; the release PR gate stays on hosted
-runners (`PULP_RELEASE_PR_GATE_MACOS_RUNS_ON_JSON`). What the knob does stop is
-a higher class (a tagged release at 120, merge-group at 110) losing the one free
-slot to any lower VM lane whose acquire happens to land first.
+What it changes on m5: both races above involved the release PR gate. It
+leases at 115, above forge's `gate` class (100) and slot 1's merge-group (110),
+so with the knob on both races flip: the forge and merge-group acquires are
+deferred while the release PR gate waits and fits. More generally the knob stops
+a higher class (a tagged release at 120, the release PR gate at 115,
+merge-group at 110) losing the one free slot to any lower VM lane whose acquire
+happens to land first. With the knob off (every other host) 115 admits exactly
+as 100 did: any priority at or above the gate class only lifts the non-gate
+budget.
 
 ### Canary proxy
 
