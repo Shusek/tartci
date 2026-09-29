@@ -386,6 +386,24 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         "reclaimed_bytes": 0,
     }
     report["worktrees_in_tmp"] = tmp_worktrees(pathlib.Path(settings["repo"]), runner=runner)
+    checkout_path = (state_dir or default_state_dir()) / "pulp-reapers"
+    try:
+        checkout, detail, sha = materialize(pathlib.Path(settings["repo"]),
+                                            checkout_path, runner=runner)
+    except (OSError, subprocess.SubprocessError) as exc:
+        checkout, detail, sha = None, f"could not materialize reapers: {exc}", None
+    report["scripts"] = detail
+    report["scripts_sha"] = sha
+    if checkout is not None:
+        # The same fresh origin/main checkout carries Pulp's host-vitals
+        # sensor. It is kept current even where the reapers cannot run (no
+        # worktree root yet, as on a new host): scripts/host_vitals_sensor.py.
+        try:
+            import host_vitals_sensor  # noqa: PLC0415 - sibling module
+            report["host_vitals_sensor"] = host_vitals_sensor.refresh(
+                checkout / "tools" / "scripts", fix)
+        except Exception as exc:  # noqa: BLE001 - the reapers still run
+            report["host_vitals_sensor"] = {"state": "refresh_failed", "detail": str(exc)}
     if not root.is_dir():
         report["error"] = f"worktrees_root {root} is not a directory"
         return report
@@ -395,14 +413,6 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
     # reaper on exactly the host whose volume we cannot read.
     pressure = free is not None and free < settings["pressure_free_gb"] * GIB
     report["pressure"] = pressure
-    checkout_path = (state_dir or default_state_dir()) / "pulp-reapers"
-    try:
-        checkout, detail, sha = materialize(pathlib.Path(settings["repo"]),
-                                            checkout_path, runner=runner)
-    except (OSError, subprocess.SubprocessError) as exc:
-        checkout, detail, sha = None, f"could not materialize reapers: {exc}", None
-    report["scripts"] = detail
-    report["scripts_sha"] = sha
     if checkout is None:
         report["error"] = detail
         report["free_bytes_after"] = free

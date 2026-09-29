@@ -2068,6 +2068,17 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   (`reclaim_low_space`) name the volume and its free space instead of calling
   the pass failed.
 
+  The same origin/main checkout carries Pulp's host-vitals sensor. Its
+  installer copies `host_vitals.sh` and `host_vitals_sensor.sh` into
+  `~/.local/bin`, so a change to them never reached a host: on 2026-09-29 m1,
+  m3 and m5 ran the 09-25 copy without the fseventsd reading, and m5studio had
+  none. Each pass compares the installed copies with the checkout by SHA-256
+  and, in fix mode, re-runs Pulp's `install_host_vitals_sensor.sh` from it when
+  they differ or when the sensor is missing (`scripts/host_vitals_sensor.py`).
+  This runs even while the worktree root is missing. `pool status` prints
+  `host-vitals sensor: DRIFT` or `NOT INSTALLED` until it matches. The pass
+  records the outcome in the receipt as `pulp_reapers.host_vitals_sensor`.
+
   Every pass writes `~/.tartci/state/reclaim/last-run.json` and appends a
   `reclaim_pass` event (and one `pulp_reaper` event per reaper run, with free
   space before and after) to `~/.tartci/state/reclaim/events.jsonl`. `tartci

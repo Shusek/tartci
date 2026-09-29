@@ -2791,6 +2791,24 @@ FSEVENTSD_WARN_MB = 1024
 
 
 def host_vitals_summary(path: Path | None = None) -> dict:
+    """The host-vitals sensor: its fseventsd reading, and whether it is Pulp's.
+
+    Drift of the installed sensor from Pulp origin/main is reported first
+    (scripts/host_vitals_sensor.py); a stale copy is what hid fseventsd on
+    every host until the reclaim pass started reinstalling it.
+    """
+    value = _fseventsd_summary(path)
+    try:
+        import host_vitals_sensor  # noqa: PLC0415 - sibling module
+        line = host_vitals_sensor.status_line()
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        line = f"host-vitals sensor: UNVERIFIED ({type(exc).__name__}: {exc})"
+    if line:
+        value["lines"] = [line, *value["lines"]]
+    return value
+
+
+def _fseventsd_summary(path: Path | None = None) -> dict:
     """fseventsd from the host-vitals sensor's published reading. Never probes.
 
     The sensor (Pulp's host_vitals_sensor.sh, every 60 s) owns the probe; a
