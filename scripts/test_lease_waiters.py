@@ -139,7 +139,7 @@ class RaceTests(WaiterTestCase):
     def test_a_tie_stays_first_come(self) -> None:
         self.knob(True)
         self.agent_build()
-        self.wait("waiter-slot2", "100")  # release PR gate leases as PR-head
+        self.wait("waiter-slot2", "100")  # a PR-head waiter
         rc, body = self.vm("vm-forge", "gate")  # forge's gate class is also 100
         self.assertEqual(rc, 0, body)
         rc, body = self.vm("vm-slot2", "100", waiter="waiter-slot2")
@@ -163,6 +163,82 @@ class RaceTests(WaiterTestCase):
         self.assertEqual(row["waiting_since"], "2020-01-01T00:00:00Z")
         self.wait("waiter-slot2", "120")  # an explicit refresh keeps it too
         self.assertEqual(self.waiter_rows()[0]["waiting_since"], "2020-01-01T00:00:00Z")
+
+
+class ReleasePrGateRankTests(WaiterTestCase):
+    """The release PR gate outranks forge and ordinary gate work, and yields to
+    a tagged release. Priorities come from the shipped path: the shell helper
+    applied to the labels the rendered m5 profile registers, and forge's lease
+    priority from its rendered plist."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    HELPER = ROOT / "providers" / "common" / "vm-lease.lib.sh"
+
+    def setUp(self) -> None:
+        super().setUp()
+        import plistlib
+        import macos_fleet_lanes as fleet
+
+        rendered = fleet.rendered_plists(
+            fleet.load(self.ROOT / "profiles" / "m5-macos-fleet.toml"))
+
+        def env_of(suffix: str) -> dict:
+            bodies = [b for name, b in rendered.items() if name.endswith(suffix)]
+            self.assertEqual(len(bodies), 1, suffix)
+            return plistlib.loads(bodies[0])["EnvironmentVariables"]
+
+        forge = env_of(".m5.forge-gate.plist")["TARTCI_VM_LEASE_PRIORITY"]
+        base = env_of(".m5.pulp-gate.slot2.plist")["TARTCI_RUNNER_LABELS"]
+        classes = ("pulp-release-tagged", "pulp-release-pr-gate",
+                   "pulp-build-merge-group", "pulp-build-pr-head")
+        proc = subprocess.run(
+            ["bash", "-c",
+             'set -euo pipefail\nsource "$1"\nshift\n'
+             'for l; do tartci_vm_lease_priority "$l"; echo; done\n',
+             "priority", str(self.HELPER), *(f"{base},{c}" for c in classes)],
+            text=True, capture_output=True, check=False,
+            env={k: v for k, v in os.environ.items() if k != "TARTCI_VM_LEASE_PRIORITY"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.prio = dict(zip(("tagged", "pr_gate", "merge", "pr"), proc.stdout.split()))
+        self.prio["forge"] = forge
+
+    def test_order_is_tagged_then_pr_gate_then_gate_work(self) -> None:
+        num = {k: leases.parse_priority(v)[0] for k, v in self.prio.items()}
+        self.assertGreater(num["tagged"], num["pr_gate"])
+        for other in ("merge", "pr", "forge"):
+            with self.subTest(other=other):
+                self.assertGreater(num["pr_gate"], num[other])
+                self.assertGreaterEqual(num[other], leases.PRIORITY_CLASSES["gate"])
+
+    def test_forge_acquire_defers_to_a_waiting_release_pr_gate(self) -> None:
+        """The 2026-09-27 05:42Z race on m5: slot 2 claimed a release PR gate
+        job and forge's clone took the one free 6-core slot first."""
+        self.knob(True)
+        self.agent_build()
+        self.wait("waiter-slot2", self.prio["pr_gate"], lane="m5-pulp-gate-slot2")
+        for lane in ("forge", "merge", "pr"):
+            with self.subTest(lane=lane):
+                rc, body = self.vm(f"vm-{lane}", self.prio[lane])
+                self.assertEqual((rc, body["reason"]), (75, "deferred_to_waiter"))
+                self.assertEqual(body["waiter"]["lane"], "m5-pulp-gate-slot2")
+        rc, body = self.vm("vm-slot2", self.prio["pr_gate"], waiter="waiter-slot2")
+        self.assertEqual(rc, 0, body)
+
+    def test_release_pr_gate_defers_to_a_waiting_tagged_release(self) -> None:
+        self.knob(True)
+        self.agent_build()
+        self.wait("waiter-release", self.prio["tagged"])
+        rc, body = self.vm("vm-slot2", self.prio["pr_gate"])
+        self.assertEqual((rc, body["reason"]), (75, "deferred_to_waiter"))
+        self.assertEqual(self.vm("vm-release", self.prio["tagged"], waiter="waiter-release")[0], 0)
+
+    def test_knob_off_forge_still_wins_first_come(self) -> None:
+        self.agent_build()
+        self.wait("waiter-slot2", self.prio["pr_gate"])
+        self.assertEqual(self.vm("vm-forge", self.prio["forge"])[0], 0)
+        rc, body = self.vm("vm-slot2", self.prio["pr_gate"], waiter="waiter-slot2")
+        self.assertEqual((rc, body["reason"]), (75, "capacity_exceeded"))
 
 
 class ExpiryTests(WaiterTestCase):
