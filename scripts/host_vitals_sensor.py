@@ -57,11 +57,15 @@ def drift(source_dir: Path | None = None, bin_dir: Path | None = None,
           plist: Path | None = None) -> dict[str, Any]:
     """Installed sensor vs Pulp origin/main. Read-only.
 
-    state: current | drift | not_installed | source_missing
+    state: current | drift | not_installed | source_missing | not_applicable
     """
     source_dir = source_dir or default_source_dir()
     bin_dir = bin_dir or default_bin_dir()
     plist = plist or default_plist()
+    if not source_dir.is_dir():
+        # This host does not run the reclaim pass that keeps the sensor current
+        # (no fleet profile, or not a macOS fleet host): nothing to compare.
+        return {"state": "not_applicable", "detail": f"no {source_dir}"}
     if not plist.exists():
         return {"state": "not_installed", "detail": f"no {plist}"}
     differing, missing_source = [], []

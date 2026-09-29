@@ -66,6 +66,11 @@ class DriftTests(Fixture):
         self.assertEqual(self.drift()["state"], "current")
         (self.src / "host_vitals.sh").unlink()
         self.assertEqual(self.drift()["state"], "source_missing")
+        # A host without the reclaim checkout (a CI box, a non-fleet Mac) is
+        # not told to install anything, and pool status stays quiet.
+        absent = hvs.drift(self.tmp / "none", self.bin, self.plist)
+        self.assertEqual(absent["state"], "not_applicable")
+        self.assertIsNone(hvs.status_line(absent))
 
     def test_pool_status_line_only_when_it_is_not_origin_main(self) -> None:
         self.install_old()
@@ -74,8 +79,8 @@ class DriftTests(Fixture):
         self.assertIsNone(hvs.status_line({"state": "current"}))
         with mock.patch.object(hvs, "status_line", return_value="host-vitals sensor: DRIFT (x)"):
             lines = lanes.host_vitals_summary(self.tmp / "absent.json")["lines"]
-        self.assertEqual(lines[0], "host-vitals sensor: DRIFT (x)")
-        self.assertIn("fseventsd", lines[1])
+        self.assertEqual(lines[-1], "host-vitals sensor: DRIFT (x)")
+        self.assertIn("fseventsd", lines[0])
 
 
 class RefreshTests(Fixture):
