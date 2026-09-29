@@ -206,6 +206,12 @@
       "why": "Exit 3 means free space is still below the floor after reclaiming, 4 means the process table or free space could not be read (nothing deleted), 2 means an unusable scan root. A full data volume refuses every lease (disk_capacity_exceeded).",
       "remedy": "Read the reclaim_pass event in ~/.tartci/state/reclaim/events.jsonl and the tail of ~/Library/Logs/tartci/tartci-reclaim.log."
     },
+    "reclaim_low_space": {
+      "summary": "The reclaimer's last pass ran, and a scanned volume is still below the free-space floor (exit 3).",
+      "why": "The pass itself worked: it deleted everything its rules allow and the volume is still full. What remains is data it may not remove (active or dirty checkouts, caches outside its roots). A volume this full stalls I/O and refuses leases.",
+      "remedy": "`tartci pool status` names the volume. Read the reclaim_pass event's tmp_checkouts.kept for what stayed and why, then free space on that volume by hand.",
+      "do_not": "Do not read exit 3 as a broken reclaimer, and do not loosen its safety gates to make it pass."
+    },
     "reclaim_never_recorded": {
       "summary": "No reclaim pass has written a receipt on this host yet.",
       "why": "Receipts ship with the Pulp-reaper reclaim change; a host that has not completed a pass on that generation has none, which proves nothing either way.",

@@ -67,7 +67,8 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            "pressure_free_gb", "worktree_build_idle_hours",
                            # read by tmp_checkouts.py; validated here so one
                            # install-time check covers the whole table
-                           "tmp_checkouts", "tmp_checkout_idle_hours"})
+                           "tmp_checkouts", "tmp_checkout_idle_hours",
+                           "worktree_root_checkouts"})
 # How long a merged worktree's build tree must sit unwritten before the worktree
 # reaper may take it (its own PULP_WORKTREE_BUILD_IDLE_HOURS gate). The ceiling
 # is a disk-arithmetic fact, not a preference. Measured on m3, 2026-09-27: one

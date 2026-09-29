@@ -15,6 +15,7 @@ import os
 import posixpath
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -1724,6 +1725,51 @@ def host_off_problem(pool_state: str) -> dict | None:
             "minutes": value["minutes"], "since": value["since"], "loud": value["loud"]}
 
 
+DISK_WARN_PERCENT = 85
+DISK_PROBLEM_PERCENT = 92
+
+
+def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
+    """Used % of the VM store volume (host.tart_home) and the home volume.
+
+    m3's VM store (Workshop) went from 70% to 84% used in two days, and in the
+    same window its I/O stalled for hours (a directory scan took 70-204 min
+    instead of 1-2) under the system's own space-reclaim pressure. A volume
+    this full is a readiness fact about the host, not only a lease denial.
+    At DISK_PROBLEM_PERCENT the VM store volume is a readiness problem; the
+    home volume only warns, because what fills it (iCloud, caches, Chrome's
+    code-sign clones) is outside what this fleet can act on or wait out.
+    """
+    rows = []
+    seen: set[int] = set()
+    try:
+        # Only the one key: full validation (load) is readiness's other job.
+        tart_home = (tomllib.loads(Path(config).read_text()).get("host") or {}).get("tart_home")
+    except Exception:  # noqa: BLE001 - an unreadable profile reports no store row
+        tart_home = None
+    for role, raw in (("vm_store", tart_home), ("home", str(home or Path.home()))):
+        if not isinstance(raw, str) or not raw:
+            continue
+        path = Path(raw).expanduser()
+        try:
+            device = path.stat().st_dev
+            if device in seen:
+                continue
+            seen.add(device)
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            rows.append({"role": role, "path": str(path), "state": "unknown",
+                         "detail": str(exc)})
+            continue
+        percent = 100.0 * (usage.total - usage.free) / usage.total if usage.total else 0.0
+        state = ("problem" if role == "vm_store" and percent >= DISK_PROBLEM_PERCENT
+                 else "warn" if percent >= DISK_WARN_PERCENT else "ok")
+        rows.append({"role": role, "path": str(path), "state": state,
+                     "used_percent": round(percent, 1),
+                     "free_gib": round(usage.free / 1024 ** 3, 1)})
+    return rows
+
+
 def fleet_readiness(
     receipt_path: Path,
     config: Path,
@@ -1774,6 +1820,14 @@ def fleet_readiness(
     left_off = host_off_problem(pool_state)
     if left_off is not None:
         problems.append(left_off)
+    disks = disk_pressure(config)
+    for disk in disks:
+        if disk["state"] == "problem":
+            problems.append({
+                "code": "disk_pressure", "label": disk["path"],
+                "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB free "
+                           f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"),
+            })
     if participating != (pool_state == "on"):
         problems.append({
             "code": "admission_state_mismatch",
@@ -2096,6 +2150,7 @@ def fleet_readiness(
             "blocked_seconds_threshold": blocked_serving_seconds,
         },
         "problems": problems,
+        "disk": disks,
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.
         "config": config_verdicts(config, support_root),

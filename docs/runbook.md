@@ -1701,6 +1701,12 @@ fleet`), and check GitHub's job history against it with
   08:40Z to 17:16Z: two updates and their rollbacks could not `pool on`
   because the launch helper's volume probe timed out on a stalled Workshop
   volume, and the same-target guard then refused every scheduled run.
+- **Disk pressure.** `pool status` prints a `disk:` line for the VM store
+  volume (`host.tart_home`) and the home volume: `WARN` at 85% used. At 92%
+  the VM store volume is a readiness problem (`disk_pressure`, fleet ready: NO),
+  because a volume that full stalls I/O. The home volume only warns: what fills
+  it (iCloud, caches, Chrome's code-sign clones) is outside what the fleet can
+  act on.
 - **Launch helper volume probe.** `pool on` proves the signed launcher can
   write the VM store (`--probe-store`: write, read back, remove one small file
   under `tart_home`). It runs at `ProcessType` Standard (a Background job's disk
@@ -2045,6 +2051,22 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   An unreadable process table removes nothing. The `reclaim_pass` event's
   detail and fields carry what was removed, what was kept by reason, and the
   orphaned and broken counts.
+
+  `worktree_root_checkouts = true` applies the same rules to `worktrees_root`
+  (enabled on m3 only, where that root is agent territory; on m1 and m5 it is
+  the directory beside the primary checkouts). Three more gates apply to every
+  root: a live `.pulp-build-active` marker (in use), a clone other worktrees
+  point into (`has_worktrees`) and a branch whose Pulp lineage is `active`
+  (`lineage_active`). Git is asked with `--no-optional-locks`, so checking a
+  checkout never refreshes its index and makes it look recently used.
+  Keep-verdicts are cached in `~/.tartci/state/reclaim/checkout-verdicts.json`
+  while the checkout's newest mtime is unchanged, for at most a day. The
+  event's `by_root` gives each root's counts.
+
+  Exit 3 means the pass ran and a scanned volume is still below the
+  `--fail-below-gb` floor. `pool status` and `doctor fleet`
+  (`reclaim_low_space`) name the volume and its free space instead of calling
+  the pass failed.
 
   Every pass writes `~/.tartci/state/reclaim/last-run.json` and appends a
   `reclaim_pass` event (and one `pulp_reaper` event per reaper run, with free

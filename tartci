@@ -1221,6 +1221,13 @@ if fleet["managed"]:
     for label in unmeasurable:
         # Not "ok". The lane predates the counter, so nothing here can see it.
         print(f"  serving unmeasurable: {label} (generation predates the serving counter)")
+    for disk in fleet.get("disk") or []:
+        if disk.get("state") == "unknown":
+            print(f"disk: {disk['role']} {disk['path']}: UNKNOWN ({disk.get('detail')})")
+            continue
+        mark = {"ok": "ok", "warn": "WARN", "problem": "PROBLEM"}[disk["state"]]
+        print(f"disk: {disk['role']} {disk['path']}: {mark} {disk['used_percent']}% used, "
+              f"{disk['free_gib']} GiB free")
     for problem in fleet["problems"]:
         line = f"  problem: {problem['code']}"
         if "label" in problem:
