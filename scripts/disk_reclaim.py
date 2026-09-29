@@ -27,14 +27,22 @@ so an idle host keeps recent build dirs warm and a full host reclaims harder.
 
 `--fail-below-gb` closes the escalation half: a host still below the floor after
 a reclaim pass exits non-zero, so launchd records it and a supervisor can see a
-full disk instead of only seeing refused leases.
+full disk instead of only seeing refused leases. The floor is judged on the
+volume lease admission probes, which is the volume holding the Tart store
+(`--lease-path`, else `$TART_HOME`, else the fleet profile's
+`[host].tart_home`). A scan root on another volume is still measured and
+reported, and still selects its own pressure gate, but it cannot fail the
+pass: m3 keeps its VMs on Workshop while its boot disk is mostly personal data
+the janitor must never touch, so failing on the boot disk reported a host that
+leases fine as one that refuses every lease. Only when no Tart store is
+declared does the floor fall back to every scanned volume.
 
 Exit codes:
 
   0  the pass ran and the host is above its floor,
   2  no scan roots resolved, so nothing was examined,
-  3  the pass ran and the host is STILL below `--fail-below-gb`; the reclaim
-     could not free enough and a human needs to look,
+  3  the pass ran and the lease volume is STILL below `--fail-below-gb`; the
+     reclaim could not free enough and a human needs to look,
   4  a measurement the decision depends on could not be taken (the process
      table or the free-space figure). Nothing was deleted. This is distinct
      from 3 on purpose: 3 means the host is full, 4 means we do not know.
@@ -57,6 +65,11 @@ from typing import Any, Iterable
 
 import pulp_reapers
 import tmp_checkouts
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - launchd hosts run 3.11+
+    tomllib = None  # type: ignore[assignment]
 
 BUILD_DIR_PREFIXES = ("build-",)
 BUILD_DIR_EXACT = ("build",)
@@ -519,6 +532,39 @@ def tightest_volume_root(volumes: list[dict[str, Any]]) -> str | None:
     return min(known, key=lambda v: v["free_bytes"])["root"]
 
 
+def resolve_lease_path(explicit: str | None) -> dict[str, Any] | None:
+    """The Tart store lease admission probes, and where that answer came from.
+
+    The runners hand `$TART_HOME` to the lease as its disk root, so the floor
+    that says "this host will refuse leases" has to be read off that volume
+    and no other. Precedence: an explicit `--lease-path`, then `$TART_HOME`,
+    then the installed fleet profile's `[host].tart_home`. None when nothing
+    declares one, which keeps the legacy every-scanned-volume floor.
+
+    A declared path that does not exist is still returned: an unmounted
+    Workshop volume is a lease root the runners cannot use, and the floor has
+    to say "unknown" (exit 4) rather than quietly judge some other disk.
+    """
+    if explicit:
+        return {"path": os.path.expanduser(explicit), "source": "--lease-path"}
+    tart_home = os.environ.get("TART_HOME", "").strip()
+    if tart_home:
+        return {"path": os.path.expanduser(tart_home), "source": "TART_HOME"}
+    profile = pulp_reapers.default_profile_path()
+    if tomllib is None or not profile.is_file():
+        return None
+    try:
+        with profile.open("rb") as handle:
+            host = tomllib.load(handle).get("host")
+    except (OSError, ValueError):
+        return None
+    value = host.get("tart_home") if isinstance(host, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return {"path": os.path.expanduser(value.strip()),
+            "source": f"{profile} [host].tart_home"}
+
+
 def rotate_log(path: pathlib.Path, max_bytes: int, generations: int,
                stream: Any = None) -> bool:
     """Rename an oversized log aside at startup, keeping `generations` of it.
@@ -724,7 +770,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="age gate used under disk pressure (default 7)")
     parser.add_argument("--fail-below-gb", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_FAIL_BELOW_GB", "0")),
-                        help="exit 3 when free space is still below this after the pass (0 disables)")
+                        help="exit 3 when the lease volume's free space is still below this after the pass (0 disables)")
+    parser.add_argument("--lease-path",
+                        default=os.environ.get("TARTCI_RECLAIM_LEASE_PATH"),
+                        help="the Tart store whose volume --fail-below-gb judges (default: $TARTCI_RECLAIM_LEASE_PATH, else $TART_HOME, else the fleet profile's [host].tart_home; with none, every scanned volume)")
     parser.add_argument("--log-path",
                         default=os.environ.get("TARTCI_RECLAIM_LOG"),
                         help="log file to rotate aside at startup once it reaches --log-max-bytes (default: $TARTCI_RECLAIM_LOG; unset disables rotation)")
@@ -805,7 +854,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
 
     now = time.time()
     volumes_before = volumes_free_bytes(roots)
-    free_before = tightest_free_bytes(volumes_before)
+    lease = resolve_lease_path(args.lease_path)
+    # The floor's volumes: the lease volume when a Tart store is declared,
+    # else every scanned volume (the legacy judgement, unchanged).
+    floor_roots = [pathlib.Path(lease["path"])] if lease else roots
+    floor_before = volumes_free_bytes(floor_roots) if lease else volumes_before
+    free_before = tightest_free_bytes(floor_before)
     # An unknown free figure selects the LONGER gate. Guessing "full" here
     # would make an unreadable volume delete more aggressively than a healthy
     # one, which is exactly backwards.
@@ -920,10 +974,23 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         else (lambda path: names_candidate(active, path_spellings(path))))
     receipt["tmp_checkouts"] = tmp
 
-    volumes_after = volumes_free_bytes(roots) \
-        if args.fix or pulp.get("runs") or tmp.get("removed") \
-        else volumes_before
-    free_after = tightest_free_bytes(volumes_after)
+    remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed"))
+    volumes_after = volumes_free_bytes(roots) if remeasure else volumes_before
+    if lease:
+        floor_after = volumes_free_bytes(floor_roots) if remeasure else floor_before
+    else:
+        floor_after = volumes_after
+    free_after = tightest_free_bytes(floor_after)
+    floor_devices = {volume["device"] for volume in floor_after}
+    # Scanned volumes the floor does not judge, reported so a low boot disk
+    # stays visible without failing a host whose lease volume is healthy.
+    scan_below_floor = [
+        volume["root"] for volume in volumes_after
+        if lease and args.fail_below_gb > 0
+        and (volume["device"] is None or volume["device"] not in floor_devices)
+        and volume["free_bytes"] is not None
+        and volume["free_bytes"] < args.fail_below_gb * GIB
+    ]
     report = {
         "process_scan_ok": active is not None,
         "roots": [str(root) for root in roots],
@@ -943,6 +1010,13 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         "free_bytes_after": free_after,
         "free_bytes_by_volume_before": volumes_before,
         "free_bytes_by_volume_after": volumes_after,
+        # What free_bytes_before/after and the floor were read from.
+        "floor_scope": "lease_volume" if lease else "scan_volumes",
+        "lease_path": lease["path"] if lease else None,
+        "lease_path_source": lease["source"] if lease else None,
+        "free_bytes_by_floor_volume_before": floor_before,
+        "free_bytes_by_floor_volume_after": floor_after,
+        "scan_volumes_below_floor": scan_below_floor,
         "pulp_reapers": pulp,
         "tmp_checkouts": tmp,
     }
@@ -955,11 +1029,11 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         freed_verb = "reclaimed" if args.fix else "would reclaim"
         for record in deleted:
             print(f"  {verb} {record['size_bytes'] / GIB:6.1f} GiB  {record['path']}")
-        tightest_root = tightest_volume_root(volumes_after)
+        tightest_root = tightest_volume_root(floor_after)
         free_text = "unknown" if free_after is None else (
             f"{free_after / GIB:.1f} GiB"
-            + (f" on {tightest_root}" if tightest_root and len(volumes_after) > 1
-               else ""))
+            + (f" on {tightest_root}"
+               if tightest_root and (lease or len(floor_after) > 1) else ""))
         print(f"disk_reclaim: {len(candidates)} candidate(s) under "
               f"{', '.join(str(r) for r in roots)}; {verb} {len(deleted)}; "
               f"{freed_verb} {reclaimed / GIB:.1f} GiB; "
@@ -977,6 +1051,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
               file=sys.stderr)
         return 4
 
+    for root in scan_below_floor:
+        print(f"disk_reclaim: note: scanned volume {root} is below the "
+              f"{args.fail_below_gb:g} GiB floor; it does not hold the Tart "
+              f"store ({lease['path']}), so leases are not judged on it.",
+              file=sys.stderr)
+
     if args.fail_below_gb > 0 and free_after is None:
         print("disk_reclaim: could not read free space, so the "
               f"{args.fail_below_gb:g} GiB floor could not be checked.",
@@ -984,7 +1064,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         return 4
 
     if args.fail_below_gb > 0 and free_after < args.fail_below_gb * GIB:
-        tightest_root = tightest_volume_root(volumes_after)
+        tightest_root = tightest_volume_root(floor_after)
         where = f" on {tightest_root}" if tightest_root else ""
         print(f"disk_reclaim: FREE SPACE STILL LOW after reclaim: "
               f"{free_after / GIB:.1f} GiB{where} < {args.fail_below_gb:g} GiB floor. "

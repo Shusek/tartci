@@ -45,6 +45,10 @@ def setUpModule():
     global _ISOLATION
     _ISOLATION = tempfile.TemporaryDirectory()
     iso = pathlib.Path(_ISOLATION.name)
+    # The floor reads the lease volume from these; the host's own Tart store
+    # must not decide which volume a test pass judges.
+    for key in ("TART_HOME", "TARTCI_RECLAIM_LEASE_PATH"):
+        _SAVED_ENV[key] = os.environ.pop(key, None)
     for key, value in (("TARTCI_HOME", str(iso / "tartci")),
                        ("TARTCI_RECLAIM_STATE_DIR", str(iso / "tartci" / "state" / "reclaim")),
                        ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml"))):
@@ -909,14 +913,8 @@ class ProgressWiringTests(MainTests):
         self.assertNotIn("removing ", err_dry)
 
 
-class MultiVolumeTests(unittest.TestCase):
-    """Every volume the scan spans must be measured, not just the first.
-
-    The janitor used to read free space from roots[0] alone, so a host that
-    scans a boot disk and an external volume judged pressure and the
-    --fail-below-gb floor on whichever happened to be listed first. On m3 that
-    is the boot disk, while the volume that actually fills is Workshop.
-    """
+class TwoRootHarness(unittest.TestCase):
+    """Two scan roots, with per-root volume facts that can be faked."""
 
     def setUp(self):
         self.first = tempfile.TemporaryDirectory()
@@ -958,6 +956,16 @@ class MultiVolumeTests(unittest.TestCase):
 
     def separate_volumes(self):
         return {str(self.a): 101, str(self.b): 202}
+
+
+class MultiVolumeTests(TwoRootHarness):
+    """Every volume the scan spans must be measured, not just the first.
+
+    The janitor used to read free space from roots[0] alone, so a host that
+    scans a boot disk and an external volume judged pressure and, when no
+    Tart store is declared, the --fail-below-gb floor on whichever happened
+    to be listed first.
+    """
 
     def test_the_short_gate_applies_only_to_the_pressured_volume(self):
         """A low boot disk must not shorten the gate on a healthy volume.
@@ -1060,6 +1068,95 @@ class MultiVolumeTests(unittest.TestCase):
         self.assertEqual(
             [v["root"] for v in report_ctl["free_bytes_by_volume_before"]],
             [str(self.a), str(self.b)])
+
+
+class LeaseVolumeFloorTests(TwoRootHarness):
+    """The floor is judged on the volume that holds the Tart store.
+
+    Lease admission probes $TART_HOME, so "this host will refuse leases" is a
+    statement about that volume alone. m3 keeps its VMs on Workshop and scans
+    a boot-disk ~/Code whose volume is mostly personal data the janitor must
+    never touch; judging the floor there failed every pass on a host that was
+    leasing fine.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.vms = self.b / "VMs"
+        self.vms.mkdir()
+
+    def free_table(self, a, b):
+        return {str(self.a): a, str(self.b): b, str(self.vms): b}
+
+    def test_a_low_scan_volume_off_the_lease_volume_does_not_fail(self):
+        code, report = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", str(self.vms),
+            free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+            devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["floor_scope"], "lease_volume")
+        self.assertEqual(report["free_bytes_after"], 900 * dr.GIB)
+        self.assertEqual(report["scan_volumes_below_floor"], [str(self.a)])
+        # Both scanned volumes are still reported, separately.
+        self.assertEqual(
+            [v["root"] for v in report["free_bytes_by_volume_after"]],
+            [str(self.a), str(self.b)])
+        # Control: starve the lease volume instead and the floor must fire.
+        code_ctl, report_ctl = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", str(self.vms),
+            free=self.free_table(900 * dr.GIB, 3 * dr.GIB),
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 3)
+        self.assertEqual(report_ctl["free_bytes_after"], 3 * dr.GIB)
+        self.assertEqual(report_ctl["scan_volumes_below_floor"], [])
+
+    def test_a_lease_volume_shared_with_the_scan_still_fails(self):
+        """m5's shape: Tart store and ~/Code on one internal disk."""
+        same = {str(self.a): 101, str(self.b): 101}
+        code, report = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", str(self.vms),
+            free=self.free_table(3 * dr.GIB, 3 * dr.GIB), devices=same)
+        self.assertEqual(code, 3)
+        self.assertEqual(report["scan_volumes_below_floor"], [])
+
+    def test_tart_home_names_the_lease_volume(self):
+        with unittest.mock.patch.dict(os.environ, {"TART_HOME": str(self.vms)}):
+            code, report = self.run_json(
+                "--fail-below-gb", "60",
+                free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+                devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["lease_path_source"], "TART_HOME")
+        # Control: nothing declared keeps the legacy every-volume floor.
+        code_ctl, report_ctl = self.run_json(
+            "--fail-below-gb", "60",
+            free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 3)
+        self.assertEqual(report_ctl["floor_scope"], "scan_volumes")
+
+    def test_the_fleet_profile_names_the_lease_volume(self):
+        profile = self.a / "profile.toml"
+        profile.write_text(f'[host]\ntart_home = "{self.vms}"\n')
+        with unittest.mock.patch.dict(
+                os.environ, {"TARTCI_FLEET_PROFILE": str(profile)}):
+            code, report = self.run_json(
+                "--fail-below-gb", "60",
+                free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+                devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["lease_path"], str(self.vms))
+        self.assertIn("[host].tart_home", report["lease_path_source"])
+
+    def test_an_unavailable_lease_volume_cannot_certify_the_floor(self):
+        missing = str(self.b / "unmounted" / "VMs")
+        free = self.free_table(900 * dr.GIB, 900 * dr.GIB)
+        free[missing] = None
+        code, report = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", missing,
+            free=free, devices=self.separate_volumes())
+        self.assertEqual(code, 4)
+        self.assertIsNone(report["free_bytes_after"])
 
 
 class RootDiscoveryTests(unittest.TestCase):
