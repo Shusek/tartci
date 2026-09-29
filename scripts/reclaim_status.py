@@ -11,7 +11,9 @@ believes.
 
 States:
   ok          the last pass finished recently and exited 0
-  failed      the last pass finished recently and did not exit 0
+  low_space   the last pass ran (exit 3) and a scanned volume is still below
+              the free-space floor: the reclaimer worked, the disk is still full
+  failed      the last pass finished recently and did not exit 0 or 3
   stale       no pass has finished within STALE_AFTER_S: the agent is dead,
               shadowed, wedged, or never scheduled, whatever launchd says
   never       no receipt yet (a host that has not run a pass since this shipped)
@@ -86,9 +88,13 @@ def status(state_dir: pathlib.Path | None = None, *, now: float | None = None,
         pulp_reapers_enabled=bool(pulp.get("enabled")),
         pulp_reclaimed_bytes=pulp.get("reclaimed_bytes", 0),
         pulp_error=pulp.get("error"),
+        fail_below_gb=receipt.get("fail_below_gb"),
+        tightest_root=receipt.get("tightest_root"),
     )
     if age > stale_after_s:
         out["state"] = "stale"
+    elif receipt.get("exit_code") == 3:
+        out["state"] = "low_space"
     elif receipt.get("exit_code") != 0:
         out["state"] = "failed"
     else:
@@ -116,6 +122,14 @@ def describe(value: dict[str, Any]) -> str:
         return (f"reclaim: STALE, no pass finished in {hours:.1f}h "
                 f"(> {value['stale_after_s'] / 3600:g}h); the reclaim agent is not "
                 f"running whatever launchd says; {body}")
+    if state == "low_space":
+        free = value.get("free_bytes_after")
+        where = value.get("tightest_root") or "a scanned volume"
+        amount = "unknown" if free is None else f"{free / GIB:.1f} GiB"
+        floor = value.get("fail_below_gb")
+        floor_text = f" < {floor:g} GiB floor" if isinstance(floor, (int, float)) else ""
+        return (f"reclaim: FREE SPACE STILL LOW after the pass: {amount} on {where}"
+                f"{floor_text} (nothing left that the reclaimer may delete); {body}")
     if state == "failed":
         return f"reclaim: LAST PASS FAILED; {body}"
     return f"reclaim: ok; {body}"

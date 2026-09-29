@@ -75,10 +75,20 @@ flat_rollback = "pulp-build-runner:latest"
 pulp_worktree_builds = true
 repo = "/Volumes/Workshop/Code/pulp"
 worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
-pressure_free_gb = 200
+# Run Pulp's merged-worktree build reaper on every pass, not only below 200
+# GiB free: on 2026-09-29 Workshop was at 84% (623 GiB free, +14 points in two
+# days) with I/O stalling, and a dry run of the reaper found 16 merged,
+# lineage-proven worktree build dirs holding ~461 GB it may delete. Its own
+# gates (merged, proven, idle, not in use, lineage not active) are the safety;
+# this threshold only decides when the tree walk is worth running.
+pressure_free_gb = 1100
 # Remove finished git checkouts agents left in /private/tmp (48 h idle,
 # clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py
 tmp_checkouts = true
+# The same checkout rules on the worktree root above (agent territory on this
+# host): 232 idle, clean, pushed worktrees there held ~143 GiB on 2026-09-29.
+# Dirty, unpushed, recent, in-use and lineage-active checkouts stay.
+worktree_root_checkouts = true
 
 [[lane]]
 id = "pulp-gate"

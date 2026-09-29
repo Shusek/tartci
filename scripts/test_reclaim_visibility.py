@@ -126,9 +126,22 @@ class LastPass(unittest.TestCase):
         self.assertEqual(rs.status(self.dir)["state"], "stale")
 
     def test_recent_failed_pass_is_a_problem(self):
-        self.write(exit_code=3)
+        self.write(exit_code=2)
         finding = fd.check_reclaim(rs.status(self.dir))
         self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "reclaim_failed"))
+
+    def test_exit_3_names_the_full_volume_instead_of_a_failed_pass(self):
+        # m3, 2026-09-29: "LAST PASS FAILED; exit 3" while the pass had run
+        # and the boot data volume sat at 55 GiB under a 60 GiB floor.
+        self.write(exit_code=3, free_bytes_after=55 * rs.GIB, fail_below_gb=60,
+                   tightest_root="/Users/x/Code")
+        value = rs.status(self.dir)
+        self.assertEqual(value["state"], "low_space")
+        finding = fd.check_reclaim(value)
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "reclaim_low_space"))
+        self.assertIn("FREE SPACE STILL LOW after the pass: 55.0 GiB on /Users/x/Code < 60 GiB floor",
+                      finding.detail)
+        self.assertNotIn("LAST PASS FAILED", finding.detail)
 
     def test_no_receipt_is_unknown_and_garbage_is_unreadable(self):
         self.assertEqual(fd.check_reclaim(rs.status(self.dir)).code, "reclaim_never_recorded")
@@ -151,6 +164,61 @@ class LastPass(unittest.TestCase):
                               "--state-dir", str(self.dir)], capture_output=True, text=True,
                              check=True, env={**os.environ})
         self.assertEqual(json.loads(out.stdout)["state"], "failed")
+
+
+class DiskPressure(unittest.TestCase):
+    """The VM store volume's fill level is a readiness fact (pool status)."""
+
+    def run_with(self, used_percent: float, home_percent: float = 50.0):
+        import shutil
+        from unittest import mock
+        import macos_fleet_lanes as fleet
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        store, home = tmp / "vms", tmp / "home"
+        store.mkdir()
+        home.mkdir()
+        config = tmp / "profile.toml"
+        config.write_text(f'[host]\ntart_home = "{store}"\n')
+        total = 1000 * rs.GIB
+
+        def usage(path):
+            percent = used_percent if pathlib.Path(path) == store else home_percent
+            free = int(total * (100 - percent) / 100)
+            return shutil._ntuple_diskusage(total, total - free, free)
+        # Distinct devices, as on m3 (Workshop and the boot volume).
+        real_stat = pathlib.Path.stat
+
+        def fake_stat(self, *args, **kwargs):
+            value = real_stat(self, *args, **kwargs)
+            if self == store:
+                return os.stat_result((value.st_mode, value.st_ino, 4242, *tuple(value)[3:]))
+            return value
+        with mock.patch.object(fleet.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(pathlib.Path, "stat", fake_stat):
+            return fleet.disk_pressure(config, home)
+
+    def test_thresholds(self):
+        rows = {row["role"]: row for row in self.run_with(84.0)}
+        self.assertEqual(rows["vm_store"]["state"], "ok")
+        self.assertEqual({row["role"]: row["state"] for row in self.run_with(86.0)}["vm_store"],
+                         "warn")
+        self.assertEqual({row["role"]: row["state"] for row in self.run_with(93.0)}["vm_store"],
+                         "problem")
+
+    def test_a_full_home_volume_warns_but_is_not_a_readiness_problem(self):
+        rows = {row["role"]: row for row in self.run_with(50.0, home_percent=94.0)}
+        self.assertEqual(rows["home"]["state"], "warn")
+        self.assertEqual(rows["vm_store"]["state"], "ok")
+
+    def test_readiness_turns_a_full_store_into_a_problem_and_pool_status_prints_it(self):
+        import macos_fleet_lanes as fleet
+        source = (HERE / "macos_fleet_lanes.py").read_text()
+        body = source[source.index("def fleet_readiness("):]
+        self.assertIn('if disk["state"] == "problem":', body[:body.index("\ndef ")])
+        self.assertIn('"code": "disk_pressure"', body[:body.index("\ndef ")])
+        self.assertIn('for disk in fleet.get("disk") or []:', (HERE.parent / "tartci").read_text())
+        self.assertEqual((fleet.DISK_WARN_PERCENT, fleet.DISK_PROBLEM_PERCENT), (85, 92))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import disk_reclaim as dr  # noqa: E402
@@ -198,6 +199,99 @@ class GateTests(Fixture):
         self.assertEqual((report["deferred"], report["removed"], report["kept"]), (2, 0, {}))
 
 
+class WorktreeRootGateTests(Fixture):
+    """Gates added for the host worktree root; they apply to every root."""
+
+    def test_a_live_build_marker_keeps_it(self) -> None:
+        wt = self.worktree("building")
+        (wt / ".pulp-build-active").write_text(f"pid={os.getpid()}\nstarted_at=x\n")
+        age(wt, 3)
+        self.assertEqual(self.scan()["kept"], {"in_use": 1})
+        (wt / ".pulp-build-active").write_text("pid=999999\n")   # a dead build
+        age(wt, 3)
+        self.assertEqual(self.scan()["kept"], {"dirty": 1})   # the stale marker is untracked
+
+    def test_a_clone_that_other_worktrees_point_into_is_kept(self) -> None:
+        clone = self.clone("hub")
+        git(clone, "worktree", "add", "-q", "--detach", str(self.base / "elsewhere"), "HEAD")
+        age(clone, 3)
+        report = self.scan()
+        self.assertEqual(report["kept"], {"has_worktrees": 1})
+        self.assertTrue(clone.exists())
+
+    def test_an_active_lineage_branch_is_kept(self) -> None:
+        wt = self.tmp / "owned"
+        git(self.parent, "worktree", "add", "-q", "-b", "feature/owned", str(wt), "origin/main")
+        git(self.parent, "push", "-q", "origin", "feature/owned")
+        git(self.parent, "config", "branch.feature/owned.pulpWorktreeStatus", "active")
+        age(wt, 3)
+        self.assertEqual(self.scan()["kept"], {"lineage_active": 1})
+        git(self.parent, "config", "branch.feature/owned.pulpWorktreeStatus", "merged")
+        self.assertEqual(self.scan()["removed"], 1)   # the control
+
+    def test_keep_verdicts_are_cached_until_the_checkout_changes(self) -> None:
+        dirty = self.clone("dirty")
+        (dirty / "new.txt").write_text("x")
+        age(dirty, 3)
+        cache: dict = {}
+        first = self.scan(next_cache=cache)
+        self.assertEqual(first["kept"], {"dirty": 1})
+        # Asking git did not make the checkout look used.
+        self.assertEqual(self.scan()["kept"], {"dirty": 1})
+        self.assertEqual(cache[str(dirty)]["reason"], "dirty")
+        calls = []
+
+        def counting(argv, **kw):
+            calls.append(argv)
+            return subprocess.run(argv, **kw)
+        self.scan(cache=cache, runner=counting, next_cache={})
+        self.assertFalse([a for a in calls if "status" in a], calls)
+        (dirty / "new.txt").unlink()        # cleaned: the top level changed
+        age(dirty, 3)
+        os.utime(dirty, (time.time() - 3 * DAY + 60, time.time() - 3 * DAY + 60))
+        self.assertEqual(self.scan(cache=cache)["removed"], 1)
+
+
+class MultiRootTests(Fixture):
+    def profile(self, body: str) -> pathlib.Path:
+        path = self.base / "profile.toml"
+        path.write_text(body)
+        return path
+
+    def test_both_roots_are_swept_and_reported_per_root(self) -> None:
+        worktrees = self.base / "agent-worktrees"
+        worktrees.mkdir()
+        self.clone("done-tmp")
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(worktrees / "done-wt")],
+                       check=True)
+        age(worktrees / "done-wt", 3)
+        profile = self.profile(
+            "[reclaim]\ntmp_checkouts = true\nworktree_root_checkouts = true\n"
+            f'worktrees_root = "{worktrees}"\n')
+        with mock.patch.dict(os.environ, {"TARTCI_TMP_CHECKOUT_ROOT": str(self.tmp)}), \
+                mock.patch.object(tc, "process_cwds", return_value=["/"]):
+            report = tc.run(fix=True, profile=profile, in_use=lambda p: False,
+                            verdicts=self.base / "verdicts.json")
+        self.assertEqual(report["removed"], 2, report)
+        self.assertEqual(sorted(report["by_root"]), sorted([str(self.tmp), str(worktrees)]))
+        self.assertEqual(report["by_root"][str(worktrees)]["removed"], 1)
+
+    def test_worktree_root_is_opt_in_and_needs_a_root(self) -> None:
+        self.assertTrue(pr.validate_table({"worktree_root_checkouts": True}))
+        self.assertEqual(pr.validate_table({"worktree_root_checkouts": True,
+                                            "worktrees_root": "/Volumes/W/agent-worktrees"}), [])
+        settings, _ = tc.load_settings(self.profile("[reclaim]\ntmp_checkouts = true\n"))
+        self.assertEqual(len(settings["roots"]), 1)
+
+    def test_only_m3_sweeps_its_worktree_root(self) -> None:
+        # m1 and m5 keep worktrees beside their primary checkouts in ~/Code,
+        # where idle clean clones are the operator's own repositories.
+        root = pathlib.Path(__file__).resolve().parents[1] / "profiles"
+        enabled = sorted(path.name for path in root.glob("*-macos-fleet.toml")
+                         if "worktree_root_checkouts = true" in path.read_text())
+        self.assertEqual(enabled, ["m3-macos-fleet.toml"])
+
+
 class WiringTests(Fixture):
     def profile(self, body: str) -> pathlib.Path:
         path = self.base / "profile.toml"
@@ -229,7 +323,7 @@ class WiringTests(Fixture):
         self.assertEqual(summary["tmp_checkouts"]["kept"], {"dirty": 2})
         self.assertEqual(summary["reclaimed_bytes"], 3 * dr.GIB)
         detail = dr.tmp_checkout_detail(summary["tmp_checkouts"])
-        self.assertIn("tmp checkouts removed 2 (3.0 GiB), kept dirty=2", detail)
+        self.assertIn("stale checkouts removed 2 (3.0 GiB), kept dirty=2", detail)
         self.assertIn("1 orphaned worktrees (not removed)", detail)
         self.assertIn("4 broken .git dirs (not removed)", detail)
         # A dry run's would-remove bytes are not reclaimed bytes.

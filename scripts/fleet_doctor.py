@@ -91,6 +91,7 @@ CODES: tuple[str, ...] = (
     "readiness_probe_failed",
     "readiness_verdict_depends_on_invocation",
     "reclaim_failed",
+    "reclaim_low_space",
     "reclaim_never_recorded",
     "reclaim_ok",
     "reclaim_stale",
@@ -876,6 +877,8 @@ def check_reclaim(value: dict | None) -> Finding:
     facts = {"reclaim": value}
     if state == "ok":
         return Finding("reclaim", OK, "reclaim_ok", detail, facts)
+    if state == "low_space":
+        return Finding("reclaim", PROBLEM, "reclaim_low_space", detail, facts)
     if state == "failed":
         return Finding("reclaim", PROBLEM, "reclaim_failed", detail, facts)
     if state == "stale":

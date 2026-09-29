@@ -654,6 +654,8 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
         "free_bytes_before": report.get("free_bytes_before"),
         "free_bytes_after": report.get("free_bytes_after"),
         "tartci_reclaimed_bytes": report.get("reclaimed_bytes", 0),
+        "fail_below_gb": report.get("fail_below_gb"),
+        "tightest_root": report.get("tightest_root"),
         "pulp_reapers": {
             "enabled": bool(pulp.get("enabled")),
             "reason": pulp.get("reason"),
@@ -678,7 +680,7 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
     summary["tmp_checkouts"] = ({key: tmp.get(key) for key in (
         "enabled", "reason", "error", "mode", "idle_hours", "checkouts", "removed",
         "removed_bytes", "kept", "deferred", "orphaned_worktrees", "orphaned_paths",
-        "broken_checkouts", "broken_paths")}
+        "broken_checkouts", "broken_paths", "root", "by_root")}
         if tmp else None)
     tmp_freed = int(tmp.get("removed_bytes") or 0) if receipt.get("mode") == "fix" else 0
     summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
@@ -690,14 +692,14 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
 
 
 def tmp_checkout_detail(tmp: dict[str, Any] | None) -> str:
-    """"; tmp checkouts removed 3 (1.2 GiB), kept dirty=2 recent=5, 72 orphaned"."""
+    """"; stale checkouts removed 3 (1.2 GiB), kept dirty=2 recent=5, 72 orphaned"."""
     if not tmp or not tmp.get("enabled"):
         return ""
     if tmp.get("error") and tmp.get("checkouts") is None:
-        return f"; tmp checkouts: {tmp['error']}"
+        return f"; stale checkouts: {tmp['error']}"
     verb = "removed" if tmp.get("mode") == "fix" else "would remove"
     kept = " ".join(f"{k}={v}" for k, v in sorted((tmp.get("kept") or {}).items()))
-    text = (f"; tmp checkouts {verb} {tmp.get('removed', 0)} "
+    text = (f"; stale checkouts {verb} {tmp.get('removed', 0)} "
             f"({int(tmp.get('removed_bytes') or 0) / GIB:.1f} GiB)")
     if kept:
         text += f", kept {kept}"
@@ -967,7 +969,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
     # gates). A live build naming one protects it, exactly as for build dirs;
     # an unreadable process table protects all of them.
-    progress.emit("tmp checkouts: checking the fleet profile", force=True)
+    progress.emit("stale checkouts: checking the fleet profile", force=True)
     tmp = tmp_checkouts.run(
         fix=args.fix, profile=pulp_reapers.default_profile_path(),
         in_use=None if active is None
@@ -1019,6 +1021,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         "scan_volumes_below_floor": scan_below_floor,
         "pulp_reapers": pulp,
         "tmp_checkouts": tmp,
+        # Exit 3 means the pass ran and this volume is still below the floor;
+        # status names it rather than calling the pass "failed".
+        "fail_below_gb": args.fail_below_gb,
+        "tightest_root": tightest_volume_root(volumes_after),
     }
     receipt["report"] = report
 
