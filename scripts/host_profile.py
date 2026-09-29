@@ -392,6 +392,104 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     }
 
 
+# --- guest DNS resolvers --------------------------------------------------------
+#
+# Opt-in `[guest_network]` table of the fleet profile. A Tart guest takes its
+# resolver from the host's vmnet DHCP (192.168.64.1), which the host answers by
+# forwarding to its own resolver. On a host whose resolver is Tailscale MagicDNS
+# that is the tailnet's global nameserver, one remote AdGuard node: on
+# 2026-09-28 03:48-03:51Z it stopped answering and every host's Tailscale
+# forwarder logged "context deadline exceeded" against it at the same minute,
+# failing npm/cargo/curl lookups in gate VMs on four hosts at once. Setting
+# `dns_servers` makes the runner configure those resolvers inside each guest
+# before it registers, so a guest no longer shares the host's single upstream.
+# Absent (the default) the guest keeps the DHCP resolver. A malformed value
+# reads as absent here (never a raise on a lease path); the fleet validator
+# rejects it at install time. TARTCI_GUEST_DNS_SERVERS overrides the file for
+# one shell ("off" or empty turns it off).
+GUEST_DNS_MAX_SERVERS = 4
+
+
+def normalize_guest_dns_servers(values: Any) -> list[str] | None:
+    """Return the validated resolver list, or None when `values` is unusable."""
+    import ipaddress
+
+    if not isinstance(values, list) or not 1 <= len(values) <= GUEST_DNS_MAX_SERVERS:
+        return None
+    servers: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            return None
+        try:
+            address = ipaddress.ip_address(value.strip())
+        except ValueError:
+            return None
+        if address.is_loopback or address.is_unspecified or address.is_multicast \
+                or address.is_link_local:
+            return None
+        text = str(address)
+        if text in servers:
+            return None
+        servers.append(text)
+    return servers
+
+
+def _parse_guest_network_table(text: str) -> dict[str, Any]:
+    """Read the [guest_network] table. Malformed input yields {} (knob off)."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            table = tomllib.loads(text).get("guest_network") or {}
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return {}
+        return dict(table) if isinstance(table, dict) else {}
+    values: dict[str, Any] = {}
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_table = line == "[guest_network]"
+            continue
+        if in_table and "=" in line:
+            key, _, value = line.partition("=")
+            try:
+                values[key.strip()] = json.loads(value.strip())
+            except ValueError:
+                continue
+    return values
+
+
+def guest_network_settings(fleet_profile: str | None = None) -> dict[str, Any]:
+    """Return {guest_dns_servers (space-separated, "" = off), guest_dns_source}."""
+    servers: list[str] = []
+    source = "default"
+    path = fleet_profile_path(fleet_profile)
+    try:
+        table = _parse_guest_network_table(path.read_text(encoding="utf-8"))
+    except OSError:
+        table = {}
+    if "dns_servers" in table:
+        parsed = normalize_guest_dns_servers(table["dns_servers"])
+        if parsed is not None:
+            servers = parsed
+            source = f"file:{path}"
+        else:
+            source = f"invalid:{path}"
+    raw = os.environ.get("TARTCI_GUEST_DNS_SERVERS")
+    if raw is not None:
+        words = [w for w in raw.replace(",", " ").split() if w]
+        if not words or words == ["off"]:
+            servers, source = [], "environment"
+        else:
+            parsed = normalize_guest_dns_servers(words)
+            if parsed is not None:
+                servers, source = parsed, "environment"
+    return {"guest_dns_servers": " ".join(servers), "guest_dns_source": source}
+
+
 def _clamp_at_least(value: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), max(minimum, maximum))
 
@@ -504,6 +602,7 @@ def build_profile(
         "agent_floor_qos": "background",
         "agent_floor_source": floor_source,
         **lease_policy_settings(fleet_profile),
+        **guest_network_settings(fleet_profile),
         "watch_lock_limit": defaults.watch_lock_limit,
         "macos_vm_cap": defaults.macos_vm_cap,
         "notes": [

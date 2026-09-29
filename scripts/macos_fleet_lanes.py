@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath
 import tartci_support_manifest as support_manifest
 import macos_launcher_identity
 import macos_launcher_probe
+import host_profile
 import network_profile
 import pulp_reapers
 
@@ -43,10 +44,13 @@ DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
-    "reclaim", "leases",
+    "reclaim", "leases", "guest_network",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
+# Opt-in guest resolvers the runner configures inside each VM before it
+# registers (host_profile.guest_network_settings, providers/tart-macos/runner.sh).
+GUEST_NETWORK_KEYS = {"dns_servers"}
 # Report-only cross-host build disagreement check, run by the launchd watchdog
 # (scripts/build_disagreement_watch.py). Keys mirror the detector's profile
 # table plus the watch's own cadence and dedup knobs.
@@ -451,6 +455,16 @@ def load(path: Path) -> dict:
         fresh = lease_policy.get("waiter_fresh_secs", 90)
         if type(fresh) is not int or not 30 <= fresh <= 600:
             fail("leases.waiter_fresh_secs must be an integer from 30 to 600")
+    guest_network = data.get("guest_network")
+    if guest_network is not None:
+        if not isinstance(guest_network, dict):
+            fail("guest_network must be a table")
+        unknown = set(guest_network) - GUEST_NETWORK_KEYS
+        if unknown:
+            fail(f"unknown guest_network keys: {sorted(unknown)}")
+        if host_profile.normalize_guest_dns_servers(guest_network.get("dns_servers")) is None:
+            fail("guest_network.dns_servers must list 1 to "
+                 f"{host_profile.GUEST_DNS_MAX_SERVERS} distinct routable IP addresses")
     github_app = data.get("github_app")
     if github_app is not None:
         if not isinstance(github_app, dict):

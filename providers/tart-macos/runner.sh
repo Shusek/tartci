@@ -426,6 +426,8 @@ source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/pip-wheelhouse.lib.sh"
 # shellcheck source=providers/tart-macos/ccache-layer.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
+# shellcheck source=providers/tart-macos/guest-dns.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/guest-dns.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -1979,6 +1981,9 @@ run_one(){
     CURRENT_LABELS="$LABELS"
     return 75
   fi
+  # Opt-in ([guest_network] dns_servers); fail-open. Before the runner exists,
+  # so every download the job makes resolves through the configured resolvers.
+  tartci_apply_guest_dns "$ip"
   heartbeat ensuring-runner
   event runner_version "required=$RUNNER_VERSION"
   if ! ensure_runner_version "$ip"; then
