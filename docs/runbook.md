@@ -1957,7 +1957,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   host from reaching the denial at all: hourly, it removes regenerable build
   directories that are idle past an age gate, and exits non-zero when the host
   is still below `TARTCI_RECLAIM_FAIL_BELOW_GB` afterwards so a full disk
-  surfaces as a failing agent rather than only as refused leases. Preview a host
+  surfaces as a failing agent rather than only as refused leases. That floor is
+  judged on the volume lease admission probes, the one holding the Tart store
+  (`TARTCI_RECLAIM_LEASE_PATH`, else `TART_HOME`, else the fleet profile's
+  `[host].tart_home`); a scanned volume elsewhere (m3's boot-disk `~/Code`,
+  mostly personal data) is reported and noted when low but cannot fail the
+  pass. With no Tart store declared, every scanned volume is judged. Preview a host
   with `tartci reclaim` (dry run) before installing it; see
   `launchd/README.md`. Ask `tartci status` whether this host actually has that
   agent, whether launchd holds it, and how much room is left on each volume it

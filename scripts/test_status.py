@@ -159,6 +159,24 @@ class DiskSpaceTests(unittest.TestCase):
         self.assertIsNone(out["tightest_free_bytes"])
         self.assertIsNone(out["tightest_root"])
 
+    def test_the_lease_volume_is_reported_beside_the_scan_volumes(self):
+        """The floor's volume need not be a scanned one; status must name it."""
+        with tempfile.TemporaryDirectory() as scan, \
+                tempfile.TemporaryDirectory() as vms:
+            out = status.disk_space({"TARTCI_RECLAIM_ROOTS": scan,
+                                     "TARTCI_RECLAIM_LEASE_PATH": vms})
+        self.assertEqual(out["lease_volume"]["root"], vms)
+        self.assertEqual(out["lease_volume"]["source"], "--lease-path")
+        self.assertIsNotNone(out["lease_volume"]["free_bytes"])
+        # Control: nothing declared (and no profile or TART_HOME) names none.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TART_HOME", "TARTCI_RECLAIM_LEASE_PATH")}
+        env["TARTCI_FLEET_PROFILE"] = "/definitely/no/profile.toml"
+        with tempfile.TemporaryDirectory() as scan, \
+                mock.patch.dict(os.environ, env, clear=True):
+            out_ctl = status.disk_space({"TARTCI_RECLAIM_ROOTS": scan})
+        self.assertIsNone(out_ctl["lease_volume"])
+
     def test_failure_reports_error_rather_than_a_clean_reading(self):
         with mock.patch.object(dr, "parse_roots",
                                side_effect=OSError("volume gone")):
