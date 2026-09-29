@@ -23,6 +23,16 @@ id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
 cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache"
 
+# Canary: guest resolvers pinned to two public anycast resolvers instead of the
+# vmnet DHCP one. The DHCP resolver is this host's Tailscale MagicDNS, whose
+# only global nameserver is one remote AdGuard node; on 2026-09-28 03:48-03:51Z
+# it stopped answering for every fleet host at once and gate VMs failed
+# npm/cargo/curl lookups (providers/tart-macos/guest-dns.lib.sh). Fail-open: a
+# guest whose lookup does not resolve through these keeps its DHCP resolver.
+# Rollback: delete this table.
+[guest_network]
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+
 [stacked_images]
 enabled = false
 minimum_macos_major = 27
