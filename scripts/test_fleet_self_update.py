@@ -1350,6 +1350,35 @@ class IncidentTests(Base):
         self.assertIn("LEFT THIS HOST OFF", su.summary(self.home)["problem"])
         self.assertTrue(any("WAS LEFT OFF" in line for line in su.status_lines(self.cfg.state_dir)))
 
+    def test_a_host_left_off_is_put_back_before_the_same_target_guard(self) -> None:
+        # m3, 2026-09-29: the update and its rollback both left the host OFF,
+        # and the 6 h same-target guard then refused every scheduled run
+        # before it looked at the pool.
+        self.sys.broken_target = True
+        self.sys.on_rcs = [0]
+        self.sys.on_rc = 7
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertTrue(self.last()["host_off"])
+        self.assertEqual(self.sys.pool_state, "off")
+        self.sys.on_rc = 0          # the volume came back
+        self.sys.clock += 600
+        before = len(self.sys.calls)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)   # the guard still holds the target
+        run = [" ".join(a) for a, _ in self.sys.calls[before:]]
+        self.assertTrue(any(c.endswith("pool on") for c in run), run)
+        self.assertFalse(any("pool drain" in c or "--apply" in c for c in run), run)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertFalse(self.last()["host_off"])
+        self.assertNotIn("LEFT THIS HOST", su.summary(self.home)["problem"] or "")
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("host_off_recovered", events)
+
+    def test_a_healthy_host_is_not_touched_by_recovery(self) -> None:
+        # Control: no host_off record, so no extra `pool on` before the update.
+        self.assertEqual(self.apply(), su.EXIT_OK)
+        ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
+        self.assertEqual(len(ons), 1)
+
 
 class OsInterpreterRefreshTests(Base):
     def test_current_host_with_os_changed_interpreter_reinstalls_same_generation(self) -> None:

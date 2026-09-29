@@ -1153,6 +1153,35 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
         (cfg.state_dir / "active.json").unlink(missing_ok=True)
 
 
+def recover_left_off(cfg: Config, sys_: System) -> dict:
+    """Before any update logic: put back in service a host a failed update left OFF.
+
+    `pool on` for the generation installed now, backed off to one attempt per
+    host_off.RECOVERY_BACKOFF_SECONDS. It installs nothing, so the same-target
+    guard does not apply; it is what stood between m3 and six hours OFF.
+    """
+    import host_off  # noqa: PLC0415 - sibling module
+
+    def pool_on() -> tuple[int, str]:
+        result = installed_tartci(cfg, sys_, "pool", "on")
+        return result.rc, result.text
+
+    if not (_read_json(cfg.state_dir / "last.json") or {}).get("host_off"):
+        return {"attempted": False, "ok": None, "reason": "not left off"}
+    status = installed_tartci(cfg, sys_, "pool", "status", "--json")
+    try:
+        pool_state = str(json.loads(status.out).get("state") or "unknown")
+    except (json.JSONDecodeError, AttributeError):
+        pool_state = "unknown"
+    outcome = host_off.recover(cfg.state_dir, host_off.pool_state_file(cfg.home), pool_on,
+                               now=sys_.now(), who="self-update", pool_state=pool_state)
+    if outcome["attempted"]:
+        word = "ON again" if outcome["ok"] else "STILL OFF"
+        print(f"self-update: host was left OFF by a failed update; pool on: {word} "
+              f"({outcome['reason']})")
+    return outcome
+
+
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   scheduled: bool = False) -> int:
     now = sys_.now()
@@ -1168,6 +1197,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         else:
             recover_interrupted(cfg, sys_, interrupted)
             return EXIT_FAILED
+    if apply:
+        recover_left_off(cfg, sys_)
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)

@@ -1683,6 +1683,31 @@ fleet`), and check GitHub's job history against it with
 - **Always visible.** `pool status`, `doctor fleet` (`self_update`) and the
   watchdog show the skew line, `STALE` after 24 h, a failed or rolled-back last
   attempt, and a halt.
+- **A host left OFF is put back, and it is loud** (`scripts/host_off.py`).
+  When `last.json` says a failed update left the host OFF and nobody has
+  changed the pool since (the pool-state file is not newer than that record,
+  or than the last recovery attempt), both the self-update run (before any
+  update logic, so the same-target guard cannot block it) and the launchd
+  watchdog (every 5 min, first thing in its pass) run `pool on` for the
+  generation installed now, at most once per 5 min. Recovery installs nothing,
+  so the one-attempt-per-target guard does not apply to it. While the host is
+  unexpectedly OFF, `pool status` shows `problem: host_off_unexpected` with the
+  cause and duration and the watchdog logs `WARN host-off` every pass. Past
+  15 min, `~/.tartci/state/self-update/events.jsonl` gets one
+  `host_off_unexpected` event per episode and a GitHub issue is opened on
+  danielraffel/tartci through `ghapp`, run from the update checkout
+  (`TARTCI_HOST_OFF_ISSUE=0` turns the issue off). Recovery logs
+  `host_off_recovered` and closes the issue. m3 on 2026-09-29 was OFF from
+  08:40Z to 17:16Z: two updates and their rollbacks could not `pool on`
+  because the launch helper's volume probe timed out on a stalled Workshop
+  volume, and the same-target guard then refused every scheduled run.
+- **Launch helper volume probe.** `pool on` proves the signed launcher can
+  write the VM store (`--probe-store`: write, read back, remove one small file
+  under `tart_home`). It runs at `ProcessType` Standard (a Background job's disk
+  I/O is throttled behind the host's own I/O) with a 60 s deadline
+  (`TARTCI_LAUNCH_HELPER_PROBE_TIMEOUT_SECS`, 10-300). A denial fails at once
+  with an exit code; only a slow volume reaches the deadline, and the error
+  says so.
 - **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
   every 30 min, `--apply --scheduled` with a per-host stagger, ExitTimeOut 120)
   is not installed by default: `scripts/install_self_update_agent.sh` prints
