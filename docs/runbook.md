@@ -1779,8 +1779,14 @@ arrive, and a host that did not get it is loud:
   (studio, m1, m5); with neither, apply refuses. One attempt per release per
   6 hours. Never `shipyard update --refresh-daemon` here: it swaps only the
   CLI and daemon and leaves ghapp on its old generation (m3's ghapp stayed on
-  0.217.0 under a 0.222.0 CLI). The pulp CLI updates itself at session start,
-  so it is measured here but not applied. `~/.config/tartci/tool-freshness.toml`
+  0.217.0 under a 0.222.0 CLI).
+  The pulp CLI is applied too: its own session-start update runs only from a
+  checkout that carries the hook, and m1/m5 agents open primary checkouts
+  thousands of commits behind that do not, which left both 27.8 h STALE. The
+  watchdog fetches `tools/install/install.sh` at the release tag and runs it
+  pinned (`PULP_VERSION`, into `~/.pulp/bin`, no PATH or SDK changes), refusing
+  an installer that still excludes the WebGPU runtime; success is the re-read
+  `pulp version` equal to the release. `~/.config/tartci/tool-freshness.toml`
   overrides per host:
 
       stale_hours = 12
@@ -1788,6 +1794,12 @@ arrive, and a host that did not get it is loud:
       [tools.shipyard]
       auto_apply = false     # stop automatic Shipyard updates on this host
 
+- **A fleet host must carry its maintenance agents.** `tartci doctor fleet`
+  reports `host_agents_missing` (a problem) when a host with an installed
+  fleet profile has no loaded `com.danielraffel.tartci.launchd-watchdog` or
+  `com.danielraffel.tartci.self-update`. m5studio was brought up serving gate
+  VMs with no watchdog, so its freshness was never measured and Shipyard sat
+  on 0.224.2 behind 0.230.0.
 - **The ghapp generation is measured too.** `readlink
   ~/.local/bin/ghapp.shipyard-generation` names the generation; that
   directory's `shipyard --version` is its release. The line reads `shipyard:

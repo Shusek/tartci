@@ -35,7 +35,7 @@ Settings (optional) live in ~/.config/tartci/tool-freshness.toml:
     [tools.shipyard]
     auto_apply = false            # stop automatic Shipyard updates here
     [tools.pulp]
-    enabled = false               # stop measuring the pulp CLI here
+    auto_apply = false            # measure the pulp CLI but never install it here
 
 `{home}`, `{tag}` and `{host_class}` are substituted in commands. A tool whose binary is
 absent is `not_installed`, which is reported but is never a problem.
@@ -88,11 +88,30 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
     "pulp": {
         "repo": "Generous-Corp/pulp",
         "version_command": ["{home}/.pulp/bin/pulp", "version"],
-        # The pulp CLI updates itself at session start; measured here only.
-        "apply_command": None,
-        "auto_apply": False,
+        # The CLI's own session-start update runs only from a checkout that
+        # carries the hook, and a host whose agents open stale checkouts never
+        # gets it. So the watchdog installs the release with that release's
+        # own install.sh, pinned to the tag, the same way the hook does.
+        "apply_command": ["/bin/bash", "-c", "{pulp_install}", "pulp-install", "{tag}", "{home}"],
+        "auto_apply": True,
     },
 }
+
+# Fetches install.sh at the release tag and runs it pinned to that version into
+# ~/.pulp/bin. An installer that still excludes the WebGPU runtime (releases
+# before the fix) would strand pulp-cpp, so it is refused rather than run.
+PULP_INSTALL_SCRIPT = r"""set -euo pipefail
+tag="$1"; home="$2"
+installer="$(mktemp)"; trap 'rm -f "$installer"' EXIT
+curl -fsSL --max-time 60 \
+  "https://raw.githubusercontent.com/Generous-Corp/pulp/$tag/tools/install/install.sh" -o "$installer"
+if grep -q -- "--exclude='libwgpu_native.dylib'" "$installer"; then
+  echo "refused: the $tag installer strands pulp-cpp without its runtime" >&2
+  exit 3
+fi
+PULP_VERSION="${tag#v}" PULP_INSTALL_DIR="$home/.pulp/bin" PULP_NO_MODIFY_PATH=1 \
+  PULP_SKIP_SDK_INSTALL=1 bash "$installer"
+"""
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
@@ -177,7 +196,8 @@ def _expand(argv: list[str] | None, home: Path, tag: str = "",
             host_class: str = "") -> list[str] | None:
     if not argv:
         return None
-    return [part.replace("{home}", str(home)).replace("{tag}", tag)
+    return [PULP_INSTALL_SCRIPT if part == "{pulp_install}" else
+            part.replace("{home}", str(home)).replace("{tag}", tag)
             .replace("{host_class}", host_class) for part in argv]
 
 

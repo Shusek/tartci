@@ -59,6 +59,13 @@ class Host:
         self.calls.append(argv)
         if "auth-generations" in argv[0]:
             return (0, f"shipyard {self.generation}") if self.generation else (1, "exec failed")
+        if "pulp-install" in argv:
+            tag = argv[argv.index("pulp-install") + 1]
+            installed = self.apply_installs.get("pulp")
+            if installed is None:
+                return 1, f"curl: (22) {tag} installer unavailable"
+            self.versions["pulp"] = installed
+            return 0, "Extracting to ~/.pulp/bin..."
         name = Path(argv[0]).name
         if "fleet-update" in argv:
             installed = self.apply_installs.get(name)
@@ -200,8 +207,32 @@ class ToolFreshnessTests(unittest.TestCase):
             "event": "tool_deployed", "tool": "shipyard", "component": "cli", "at": iso(NOW),
             "from": "0.221.0", "to": "0.221.1", "latest": "0.221.1", "by": "auto_apply",
             "downgrade": False, "verify": "current"}])
-        # pulp has no apply command: it is never updated from here.
-        self.assertFalse(any(Path(c[0]).name == "pulp" and len(c) > 2 for c in host.calls))
+        # pulp is already current, so it is not installed.
+        self.assertFalse(any("pulp-install" in c for c in host.calls))
+
+    def test_a_behind_pulp_cli_is_installed_from_its_pinned_release_installer(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
+        host.apply_installs["pulp"] = "0.877.2"
+        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.1", NOW - 30 * HOUR),
+                                               ("v0.877.2", NOW - 28 * HOUR))
+        row = self.refresh(host)["tools"]["pulp"]
+        call = next(c for c in host.calls if "pulp-install" in c)
+        self.assertEqual(call[0:2], ["/bin/bash", "-c"])
+        self.assertEqual(call[2], tf.PULP_INSTALL_SCRIPT)
+        self.assertEqual(call[3:], ["pulp-install", "v0.877.2", str(self.home)])
+        self.assertEqual((row["state"], row["apply"]), ("current", "applied v0.877.2: ok"))
+        self.assertEqual([(e["tool"], e["component"], e["from"], e["to"], e["by"], e["verify"])
+                          for e in self.events()],
+                         [("pulp", "cli", "0.877.1", "0.877.2", "auto_apply", "current")])
+
+    def test_a_pulp_install_that_does_not_land_is_a_failure(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
+        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.1", NOW - 30 * HOUR),
+                                               ("v0.877.2", NOW - 28 * HOUR))
+        row = self.refresh(host)["tools"]["pulp"]
+        self.assertIn("FAILED", row["apply"])
+        self.assertEqual([(e["event"], e["tool"]) for e in self.events()],
+                         [("tool_apply_failed", "pulp")])
 
     def test_a_lagging_ghapp_generation_makes_a_current_cli_stale(self) -> None:
         make_generation(self.home)
@@ -299,9 +330,11 @@ class ToolFreshnessTests(unittest.TestCase):
 
     def test_a_deployment_made_elsewhere_is_observed_and_recorded(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.305.0"})
-        self.refresh(host)
+        off = settings(tools={name: dict(tool, enabled=True, auto_apply=False)
+                              for name, tool in tf.DEFAULT_TOOLS.items()})
+        self.refresh(host, settings=off)
         host.versions["pulp"] = "0.877.2"
-        self.refresh(host, NOW + HOUR)
+        self.refresh(host, NOW + HOUR, settings=off)
         self.assertEqual([(e["tool"], e["from"], e["to"], e["by"], e["verify"])
                           for e in self.events()],
                          [("pulp", "0.305.0", "0.877.2", "observed", "current")])
@@ -401,6 +434,90 @@ class StatusSurfaceTests(unittest.TestCase):
         self.assertEqual((ok.code, ok.state), ("tool_freshness_current", fd.OK))
         for code in ("tool_freshness_current", "tool_freshness_stale", "tool_freshness_unmeasured"):
             self.assertIn(code, fd.CODES)
+
+
+class PulpInstallScriptTests(unittest.TestCase):
+    """PULP_INSTALL_SCRIPT itself, against a stub curl and a stub installer."""
+
+    def run_script(self, installer_body: str) -> tuple[subprocess.CompletedProcess, Path]:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        fixture = tmp / "install.sh"
+        fixture.write_text(installer_body)
+        record = tmp / "record"
+        (bin_dir / "curl").write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            out=""; url=""
+            while [ $# -gt 0 ]; do
+              case "$1" in -o) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac
+            done
+            echo "url=$url" >> {record}
+            cp {fixture} "$out"
+            """))
+        (bin_dir / "curl").chmod(0o755)
+        env = dict(os.environ, PATH=f"{bin_dir}:/usr/bin:/bin", RECORD=str(record))
+        proc = subprocess.run(["/bin/bash", "-c", tf.PULP_INSTALL_SCRIPT, "pulp-install",
+                               "v0.880.0", str(tmp / "home")],
+                              capture_output=True, text=True, env=env, timeout=30)
+        return proc, record
+
+    def test_runs_the_tags_installer_pinned_into_the_home_bin(self) -> None:
+        proc, record = self.run_script(
+            'echo "ran PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
+            'NOPATH=$PULP_NO_MODIFY_PATH NOSDK=$PULP_SKIP_SDK_INSTALL" >> "$RECORD"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = record.read_text().splitlines()
+        self.assertEqual(lines[0], "url=https://raw.githubusercontent.com/Generous-Corp/pulp/"
+                                   "v0.880.0/tools/install/install.sh")
+        home_bin = str(Path(record).parent / "home" / ".pulp" / "bin")
+        self.assertEqual(lines[1], f"ran PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1")
+
+    def test_refuses_an_installer_that_strands_the_runtime(self) -> None:
+        proc, record = self.run_script(
+            "tar --exclude='libwgpu_native.dylib' -xzf x\necho ran >> \"$RECORD\"\n")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("strands pulp-cpp without its runtime", proc.stderr)
+        self.assertNotIn("ran", record.read_text())
+
+
+class HostAgentsTests(unittest.TestCase):
+    def test_a_managed_host_missing_its_watchdog_is_a_problem(self) -> None:
+        import fleet_doctor as fd
+        rows = [{"label": "com.danielraffel.tartci.self-update"},
+                {"label": "com.danielraffel.tartci.tart-runner-macos-fleet.m5studio.pulp-gate"}]
+        missing = fd.check_host_agents(rows, managed=True)
+        self.assertEqual((missing.state, missing.code), (fd.PROBLEM, "host_agents_missing"))
+        self.assertIn("com.danielraffel.tartci.launchd-watchdog", missing.detail)
+        both = rows + [{"label": "com.danielraffel.tartci.launchd-watchdog"}]
+        self.assertEqual(fd.check_host_agents(both, managed=True).code, "host_agents_ok")
+        self.assertEqual(fd.check_host_agents(rows, managed=False).code,
+                         "host_agents_not_applicable")
+        self.assertEqual(fd.check_host_agents(None, managed=True, error="x").state, fd.UNKNOWN)
+        for code in ("host_agents_missing", "host_agents_ok", "host_agents_not_applicable",
+                     "host_agents_unreadable"):
+            self.assertIn(code, fd.CODES)
+
+
+    def test_doctor_fleet_reports_it_on_a_profiled_host(self) -> None:
+        import fleet_doctor as fd
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "Library" / "LaunchAgents").mkdir(parents=True)
+        config = tmp / ".config" / "tartci"
+        config.mkdir(parents=True)
+        (config / "macos-fleet-profile.toml").write_text('[host]\nid = "m5studio"\n')
+
+        def launchd(argv: list[str]) -> tuple[int, str, str]:
+            if argv[1] == "list":
+                return 0, "PID\tStatus\tLabel\n-\t0\tcom.danielraffel.tartci.self-update\n", ""
+            return 0, f"\tpath = {tmp}/Library/LaunchAgents/x.plist\n", ""
+
+        rows = fd.collect(home=tmp, skip_census=True, probe=lambda root: {"error": "stub"},
+                          launchd_run=launchd)
+        agents = next(row for row in rows if row.check == "host_agents")
+        self.assertEqual(agents.code, "host_agents_missing")
 
 
 class HealPassTests(unittest.TestCase):
