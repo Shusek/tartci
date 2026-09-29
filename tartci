@@ -126,6 +126,16 @@ tartci_toml_exec() {
   exec "$python" "$@"
 }
 
+# Like tartci_toml_exec, for a helper that still does useful work without
+# tomllib: the reclaim janitor and status read the fleet profile to find the
+# Tart store's volume, but without a TOML-capable interpreter they fall back to
+# judging every scanned volume rather than refusing to run at all.
+tartci_toml_exec_or_python3() {
+  local python
+  python="$(tartci_toml_python_path 2>/dev/null)" || python=python3
+  exec "$python" "$@"
+}
+
 # check_shipyard_auth — non-fatal onboarding check (see runbook §1).
 # Shipyard's GitHub auth must point at the GitHub-App installation token (the
 # `[github.auth]` source="command" helper in its config.toml). A host that never
@@ -225,7 +235,7 @@ if value["present"]:
 }
 
 cmd_status() {
-  exec python3 "$HERE/scripts/status.py" "$@"
+  tartci_toml_exec_or_python3 "$HERE/scripts/status.py" "$@"
 }
 
 cmd_host_profile() {
@@ -365,7 +375,7 @@ cmd_runtime() {
 }
 
 cmd_reclaim() {
-  exec python3 "$HERE/scripts/disk_reclaim.py" "$@"
+  tartci_toml_exec_or_python3 "$HERE/scripts/disk_reclaim.py" "$@"
 }
 
 # `tartci ccache <scan|quarantine|reset> [--host-cache | --cache DIR] ...`

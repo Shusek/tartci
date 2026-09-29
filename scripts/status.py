@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import pathlib
 import platform
 import plistlib
 import re
@@ -165,13 +166,23 @@ def disk_space(settings: dict[str, Any] | None = None,
     declared = (settings or {}).get("TARTCI_RECLAIM_ROOTS") \
         or os.environ.get("TARTCI_RECLAIM_ROOTS")
 
-    def measure() -> tuple[list[Any], dict[str, Any]]:
+    lease = disk_reclaim.resolve_lease_path(
+        (settings or {}).get("TARTCI_RECLAIM_LEASE_PATH")
+        or os.environ.get("TARTCI_RECLAIM_LEASE_PATH"))
+
+    def measure() -> tuple[list[Any], list[dict[str, Any]], dict[str, Any] | None]:
         found = disk_reclaim.parse_roots(declared)
-        return found, disk_reclaim.volumes_free_bytes(found)
+        # The volume the reclaim floor and lease admission judge, which need
+        # not be one the janitor scans (m3: VMs on Workshop, ~/Code on boot).
+        lease_volume = None
+        if lease:
+            lease_volume = dict(disk_reclaim.volumes_free_bytes(
+                [pathlib.Path(lease["path"])])[0], source=lease["source"])
+        return found, disk_reclaim.volumes_free_bytes(found), lease_volume
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        roots, volumes = executor.submit(measure).result(timeout=timeout)
+        roots, volumes, lease_volume = executor.submit(measure).result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         return {"error": f"volume scan did not answer within {timeout}s; "
                          "a scan root may be on a wedged mount"}
@@ -185,6 +196,7 @@ def disk_space(settings: dict[str, Any] | None = None,
         "volumes": volumes,
         "tightest_free_bytes": disk_reclaim.tightest_free_bytes(volumes),
         "tightest_root": disk_reclaim.tightest_volume_root(volumes),
+        "lease_volume": lease_volume,
     }
 
 
@@ -252,6 +264,12 @@ def main(argv: list[str] | None = None) -> int:
                 free = volume["free_bytes"]
                 figure = "unknown" if free is None else f"{free / GIB:.1f} GiB free"
                 print(f"disk: {volume['root']}  {figure}")
+        lease_volume = disk.get("lease_volume")
+        if not disk.get("error") and lease_volume:
+            free = lease_volume["free_bytes"]
+            figure = "unknown" if free is None else f"{free / GIB:.1f} GiB free"
+            print(f"disk: {lease_volume['root']}  {figure} "
+                  "(Tart store: lease admission and the reclaim floor)")
         for name, _label, _prefix, description in JANITORS:
             agent = data["janitors"][name]
             if not agent["installed"]:
