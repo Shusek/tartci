@@ -1,0 +1,164 @@
+# m5studio (Daniels-M5-Studio, M5 Ultra 30c/256G). Derived 2026-09-28 from M3's live
+# profile; internal-disk interim paths. See pulp-planning
+# 2026-09-28-m5studio-host-bringup-plan.md §9 for what changes on the Workshop SSD.
+schema = 1
+name = "m5studio-macos-fleet"
+
+# Shipyard's durable host tag for M3 is `studio`. The profile name remains M3
+# operator vocabulary, but install authority is bound to that exact live tag.
+[host]
+id = "m5studio"
+# The SSH alias other fleet hosts reach this one by (self-update peers).
+ssh = "m5s"
+home = "/Users/danielraffel"
+tart_home = "/Users/danielraffel/VMs"
+cache_root = "/Users/danielraffel/.cache/pulp-ci"
+log_root = "/Users/danielraffel/Library/Logs/tartci"
+# Measured 2026-09-21: of 209 assignment-scan failures on this host in 24h,
+# 184 (88%) were a single GitHub call exceeding the generic 15-second default,
+# versus 4 (1.9%) attributable to the scan budget. m1, which already sets 30,
+# shows the inverse split. The calls are not slow in isolation; they exceed 15s
+# under concurrent supervisors, which is exactly the case this knob exists for.
+github_api_timeout_seconds = 30
+# Agent core floor (canary). On 2026-09-24/25 about two thirds of this host's
+# tartci-governed builds (63 of 95) were denied and fell to a leaseless -j2
+# while the gate reserve sat idle. A denied non-gate build that asks with
+# `leases acquire --allow-floor` now gets up to 6 cores at background QoS; the
+# floor lease is not charged against gate, VM or other build admission, and
+# the pool is clamped to unleased memory. Remove this line to go back.
+agent_floor_cores = 6
+
+# Daniel-only external-volume execution. The stable Developer-ID identity is
+# the TCC responsible process; public/home-backed profiles do not inherit it.
+# Canary for the report-only cross-host build disagreement check. One host is
+# enough: the detector reads every gate host's jobs from GitHub, and M3 already
+# runs this fleet's other fleet-wide views. The launchd watchdog runs it at most
+# every 15 minutes and only logs; it never resets a cache or changes
+# scheduling. Remove this table to turn it off.
+[stacked_images]
+enabled = false
+minimum_macos_major = 27
+minimum_tart_version = "2.36.0"
+registry_username_file = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-username"
+registry_token_file = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
+flat_rollback = "pulp-build-runner:latest"
+
+# Opt-in: `tartci reclaim` (hourly) also runs Pulp's own reapers from a fresh
+# origin/main checkout of `repo`: clean_build_cov.sh every pass, and
+# clean_worktree_builds.sh while the worktrees_root volume is below
+# pressure_free_gb. Their merged / idle / not-in-use / lineage gates are the
+# safety; tartci adds none and relaxes none (scripts/pulp_reapers.py).
+# m3 keeps its Pulp worktrees on Workshop (CLAUDE.md host policy), and that is
+# the volume that filled on 2026-09-27: 19 GiB free, every gate VM lease refused
+# disk_capacity_exceeded for ~6 h, while 1,330 GB sat in 40 merged worktrees'
+# build dirs that only Pulp's own reaper can prove dead.
+# Remove this table to turn it off.
+[reclaim]
+pulp_worktree_builds = true
+repo = "/Users/danielraffel/Code/pulp"
+worktrees_root = "/Users/danielraffel/Code/agent-worktrees"
+pressure_free_gb = 200
+# Remove finished git checkouts agents left in /private/tmp (48 h idle,
+# clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py
+tmp_checkouts = true
+
+[[lane]]
+id = "pulp-gate"
+repo = "Generous-Corp/pulp"
+runner_group_id = 1
+registration_scope = "repository"
+golden = "pulp-build-runner:latest"
+vm_cores = 12
+min_queued_age_seconds = 0
+assignment_mode = "event-class-v2"
+assignment_omit_labels = ["pulp-gate-fast"]
+assignment_scan_timeout_seconds = 180
+assignment_scan_max_workers = 4
+supervisors = 2
+labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
+replaces_launchd_labels = []
+# The queue scan this supervisor runs is latency-sensitive: a Background
+# supervisor's GitHub API calls measured materially slower than the same calls
+# at normal priority, and every observed scan failure on this lane is a
+# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
+# promote the supervisor out of the background band. Gate lanes only.
+process_type = "Adaptive"
+# Work-conserving idle retarget (trial, both slots): a runner unassigned for
+# 120 s re-observes both classes and is discarded only when its own class has
+# no queued job and the other class has admissible demand. It composes with the
+# slot-2 order below: the runner's own class is resolved by configured tier
+# index, and after a discard the supervisor re-selects in that slot's order.
+# Rollback is removing this key. See docs/assignment-v2-rollout.md.
+assignment_idle_retarget_seconds = 120
+# Per-slot class order (docs/assignment-v2-rollout.md, "Per-slot class
+# preference" and "Release event classes"). Slot 2 keeps the PR-first canary:
+# PR-head before merge-group, the fix for PR-head starvation; releases follow
+# the gate classes there. Slot 1 is this host's release-first slot: both
+# release classes before the gate classes, falling back to gate work whenever
+# no release waits. The release tiers below serve only jobs carrying a release
+# class label, which Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in.
+# Rollback: delete the slot-1 entry and the release tiers (restore slot 2 to
+# the two gate classes), re-render, reload both slots at an idle boundary.
+assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"], 2 = ["pulp-build-pr-head", "pulp-build-merge-group", "pulp-release-tagged", "pulp-release-pr-gate"] }
+
+[[lane.tier]]
+label = "pulp-build-merge-group"
+workflow = "Build and Test"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-build-pr-head"
+workflow = "Build and Test"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Release CLI"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Sign and Release"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-pr-gate"
+workflow = "Release-path PR gate"
+runner_group_id = 1
+
+[[lane]]
+id = "spectr-gate"
+repo = "danielraffel/spectr"
+runner_group_id = 1
+registration_scope = "repository"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
+workflows = ["Spectr M5 Product Acceptance"]
+replaces_launchd_labels = []
+
+[[lane]]
+id = "forge-gate"
+repo = "Generous-Corp/forge"
+runner_group_id = 11
+golden = "pulp-build-runner:latest"
+chrome_app_dir = "/Applications/Google Chrome.app"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
+# PR runs are surfaced as the trigger workflow; protected-main proofs may invoke
+# the reusable callee directly. Watch both names on the same runner contract.
+workflows = ["build", "protected macOS build"]
+replaces_launchd_labels = []
+
+[[lane]]
+id = "vellum-gate"
+repo = "Generous-Corp/vellum"
+runner_group_id = 8
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5studio"]
+workflows = ["Locked macOS GPU proof", "README clean release proof"]
+replaces_launchd_labels = []
