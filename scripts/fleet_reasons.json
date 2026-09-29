@@ -82,6 +82,30 @@
       "summary": "Persistent listeners are covered by an exact held-idle receipt.",
       "why": "The receipt authorizes exactly one drain era and is invalidated when the pool reopens."
     },
+    "host_agents_missing": {
+      "summary": "This managed fleet host is missing the launchd watchdog or the self-update agent.",
+      "why": "A host brought up without them serves jobs but never heals lanes, never refreshes skew or tool freshness, and never updates tartci, Shipyard or the pulp CLI, so it drifts unnoticed (m5studio ran with no watchdog).",
+      "remedy": "Install the watchdog from launchd/README.md (render com.danielraffel.tartci.launchd-watchdog.plist.template with TART_HOME and HOME, bootstrap, kickstart) and the self-update agent with scripts/install_self_update_agent.sh --install.",
+      "do_not": "Do not copy another host's plist; render the template with this host's TART_HOME."
+    },
+    "host_agents_not_applicable": {
+      "summary": "No installed fleet profile, so this is not a managed fleet host.",
+      "why": "Only managed fleet hosts are expected to carry the maintenance agents.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not install fleet agents on a host that is not in the fleet."
+    },
+    "host_agents_ok": {
+      "summary": "The launchd watchdog and self-update agents are loaded on this fleet host.",
+      "why": "They are what keeps a host healed, measured and current without anyone logging in.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read loaded as working; the watchdog's own log and last exit show whether its passes run."
+    },
+    "host_agents_unreadable": {
+      "summary": "launchd could not be asked which agents are loaded.",
+      "why": "Unknown is not the same as present.",
+      "remedy": "Run `launchctl list` as this user and re-run `tartci doctor fleet`.",
+      "do_not": "Do not read unreadable as ok."
+    },
     "installed_generation_unknown": {
       "summary": "Managed agents are installed but no readable receipt says which cohort they should execute.",
       "why": "Without an installed identity there is nothing to compare the executed cohort against, so the comparison is unknown rather than passing by default.",

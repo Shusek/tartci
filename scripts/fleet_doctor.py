@@ -67,6 +67,10 @@ CODES: tuple[str, ...] = (
     "generation_path_exec",
     "hold_receipt_malformed",
     "hold_receipt_present",
+    "host_agents_missing",
+    "host_agents_not_applicable",
+    "host_agents_ok",
+    "host_agents_unreadable",
     "installed_generation_unknown",
     "lane_lease_never_fits",
     "lanes_exceed_lease_capacity",
@@ -780,6 +784,35 @@ def check_launchd_registrations(rows: list[dict] | None, *, home: Path,
                    f"{len(rows)} loaded tartci job(s), all from {agents.rstrip('/')}", facts)
 
 
+# The agents that make a fleet host self-maintaining: the watchdog heals lanes
+# and refreshes skew and tool freshness; self-update installs tartci from main.
+# A host brought up without them runs, serves, and silently never updates.
+REQUIRED_HOST_AGENTS = (
+    "com.danielraffel.tartci.launchd-watchdog",
+    "com.danielraffel.tartci.self-update",
+)
+
+
+def check_host_agents(rows: list[dict] | None, *, managed: bool,
+                      error: str = "") -> Finding:
+    """A managed fleet host must have the watchdog and self-update agents loaded."""
+    if not managed:
+        return Finding("host_agents", NOT_APPLICABLE, "host_agents_not_applicable",
+                       "no installed fleet profile: not a managed fleet host")
+    if rows is None:
+        return Finding("host_agents", UNKNOWN, "host_agents_unreadable",
+                       f"could not list this account's launchd jobs: {error or 'no launchctl'}")
+    loaded = {row.get("label") for row in rows}
+    missing = [label for label in REQUIRED_HOST_AGENTS if label not in loaded]
+    facts = {"required": list(REQUIRED_HOST_AGENTS), "missing": missing}
+    if missing:
+        return Finding("host_agents", PROBLEM, "host_agents_missing",
+                       f"not loaded: {', '.join(missing)}; this host never refreshes skew "
+                       "or tool freshness and never updates itself", facts)
+    return Finding("host_agents", OK, "host_agents_ok",
+                   "watchdog and self-update agents are loaded", facts)
+
+
 def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | None = None
                           ) -> tuple[list[dict] | None, str]:
     """(rows, error) for every loaded job with a tartci label, read from launchd."""
@@ -1147,6 +1180,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     findings.append(check_warm_vm(warm_value))
     rows, launchd_error = launchd_registrations(launchd_run)
     findings.append(check_launchd_registrations(rows, home=home, error=launchd_error))
+    findings.append(check_host_agents(rows, managed=config.is_file(), error=launchd_error))
     if reclaim_value is None:
         try:
             import reclaim_status
