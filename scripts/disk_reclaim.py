@@ -662,6 +662,7 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
             "error": pulp.get("error"),
             "pressure": pulp.get("pressure"),
             "scripts": pulp.get("scripts"),
+            "host_vitals_sensor": pulp.get("host_vitals_sensor"),
             "reclaimed_bytes": pulp.get("reclaimed_bytes", 0),
             "free_bytes_before": pulp.get("free_bytes_before"),
             "free_bytes_after": pulp.get("free_bytes_after"),
