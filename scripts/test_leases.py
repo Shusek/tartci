@@ -337,7 +337,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
     is no waiter queue and no preemption, and a priority at or above the gate
     class only lifts the non-gate budget. So a tagged release at 120 on slot 2
     occupies exactly what a merge-group guest on slot 2 would, and the release
-    PR gate at 100 occupies exactly what a PR-head guest would.
+    PR gate at 115 occupies exactly what a PR-head guest would.
     """
 
     ROOT = Path(__file__).resolve().parents[1]
@@ -367,7 +367,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.prio = dict(zip(("merge", "pr", "tagged", "pr_gate"), proc.stdout.split()))
-        self.assertEqual(self.prio, {"merge": "110", "pr": "100", "tagged": "120", "pr_gate": "100"})
+        self.assertEqual(self.prio, {"merge": "110", "pr": "100", "tagged": "120", "pr_gate": "115"})
 
     def _take(self, lease_id: str, klass: str, cores: int | None = None,
               check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -899,8 +899,8 @@ PY
         )
 
     def test_v2_release_classes_rank_with_the_gate_classes(self) -> None:
-        # A v2 gate registration carries pulp-build-vm: tagged 120 > merge-group
-        # 110 > PR-head 100 = release PR gate 100, all gate class. The legacy
+        # A v2 gate registration carries pulp-build-vm: tagged 120 > release PR
+        # gate 115 > merge-group 110 > PR-head 100, all gate class. The legacy
         # release lane carries pulp-build-vm-release and keeps gate/vm.
         script = textwrap.dedent(
             f"""
@@ -917,6 +917,7 @@ PY
             printf 'explicit=%s\n' "$(TARTCI_VM_LEASE_PRIORITY=vm tartci_vm_lease_priority $v2,pulp-release-tagged)"
             tartci_vm_lease_is_non_gate_priority 120 && echo 120-nongate || echo 120-gate
             tartci_vm_lease_is_non_gate_priority 100 && echo 100-nongate || echo 100-gate
+            tartci_vm_lease_is_non_gate_priority 115 && echo 115-nongate || echo 115-gate
             tartci_vm_lease_is_non_gate_priority 90 && echo 90-nongate || echo 90-gate
             """
         )
@@ -924,9 +925,9 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
             proc.stdout.strip().splitlines(),
-            ["tagged=120", "merge=110", "pr=100", "pr-gate=100",
+            ["tagged=120", "merge=110", "pr=100", "pr-gate=115",
              "legacy-tagged=gate", "legacy-pr-gate=vm", "conflict=vm", "explicit=vm",
-             "120-gate", "100-gate", "90-nongate"],
+             "120-gate", "100-gate", "115-gate", "90-nongate"],
         )
 
     def test_merge_group_lease_sorts_above_pr_head(self) -> None:
