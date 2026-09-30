@@ -122,6 +122,32 @@ class LeaseAcquireReleaseTests(LeaseCliTestCase):
         self.assertTrue(released["ok"])
         self.assertEqual(released["capacity"]["used_cores"], 0)
 
+    def test_releasing_a_lease_whose_vm_guardian_exited_is_not_an_error(self) -> None:
+        # Teardown stops the VM, its guardian (the exec'd `tart run`) exits,
+        # and the next store operation reclaims the record before the
+        # supervisor's own release arrives. That was rc=1 on every release.
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        identity = leases.process_identity(self.pid)
+        self.store.mkdir(parents=True, exist_ok=True)
+        now = leases.iso(leases.utcnow())
+        (self.store / "leases.json").write_text(json.dumps([{
+            "id": "vm-tart-macos-vm-lane-01-123-4", "lease_size_cores": 3, "priority": 110,
+            "priority_class": "gate", "command_kind": "tart-macos-vm", "owner": "unittest",
+            "pid": self.pid, "process_start_time": identity["process_start_time"],
+            "host_boot_time": identity["host_boot_time"], "created_at": now, "heartbeat_at": now,
+            "guardian_pid": exited.pid, "guardian_mode": "exec",
+            "guardian_process_start_time": "Mon Jan  1 00:00:00 2001",
+            "guardian_host_boot_time": identity["host_boot_time"]}]))
+        released = self.run_cli("release", "--id", "vm-tart-macos-vm-lane-01-123-4",
+                                "--capacity", "8")
+        body = json.loads(released.stdout)
+        self.assertEqual((body["ok"], body["already_reclaimed"]), (True, "identity_mismatch"))
+        # The control: an id the store never held is still an error.
+        unknown = self.run_cli("release", "--id", "never-acquired", "--capacity", "8", check=False)
+        self.assertEqual(unknown.returncode, 1)
+        self.assertFalse(json.loads(unknown.stdout)["ok"])
+
     def test_contention_fails_closed_when_capacity_is_exhausted(self) -> None:
         self.acquire("lease-a", 3, capacity=4)
         denied = self.acquire("lease-b", 2, capacity=4, check=False)

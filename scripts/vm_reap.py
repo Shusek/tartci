@@ -353,6 +353,89 @@ def unlink_state(path_text: str) -> str:
 
 
 import fleet_lane_discovery
+import re
+
+
+# A lane names each VM it boots `<runner>-<supervisor pid>-<n>`. A VM whose
+# supervisor died (a signal, a restart, a crash between boot and teardown) is
+# left stopped with no state file pointing at it, because the lane's state
+# file only ever names its CURRENT VM. The marker rule above therefore never
+# owns it, and on m3 four such VMs held ~250 GB on 2026-09-30.
+ORPHAN_NAME_RE = re.compile(r"^(?P<runner>.+)-(?P<pid>[0-9]+)-(?P<n>[0-9]+)$")
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lease_references(store_dir: pathlib.Path | None = None) -> set[str] | None:
+    """Every VM name any lease record names, or None when the store is unreadable."""
+    store = store_dir or pathlib.Path(
+        os.environ.get("TARTCI_LEASE_DIR", str(pathlib.Path.home() / ".tartci/state/leases")))
+    path = store / "leases.json"
+    if not path.exists():
+        return set()
+    try:
+        records = json.loads(path.read_text() or "[]")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(records, list):
+        return None
+    names: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in ("vm_name", "id", "label"):
+            value = record.get(key)
+            if isinstance(value, str) and value:
+                names.add(value)
+    return names
+
+
+def orphan_verdict(
+    name: str,
+    running: bool,
+    lane_runners: set[str],
+    states_by_vm: dict[str, dict[str, Any]],
+    leases: set[str] | None,
+    vm_dir: pathlib.Path,
+    now: float,
+    min_age_secs: int,
+    alive: Any = pid_alive,
+) -> tuple[bool, str]:
+    """(delete?, why) for a VM no state file owns. Every doubt keeps it.
+
+    Deleted only when ALL hold: the name is `<runner>-<pid>-<n>` for a lane
+    loaded on this host right now; that supervisor pid is not alive; no state
+    file names the VM; no lease record (live or stale) names it; it is
+    stopped; and its bundle has not changed for `min_age_secs`.
+    """
+    match = ORPHAN_NAME_RE.match(name)
+    if not match or match.group("runner") not in lane_runners:
+        return False, "not_a_lane_vm"
+    if running:
+        return False, "running"
+    if name in states_by_vm:
+        return False, "state_file_names_it"
+    if leases is None:
+        return False, "lease_store_unreadable"
+    if name in leases or any(ref.endswith(f"-{name}") for ref in leases):
+        return False, "lease_names_it"
+    if alive(int(match.group("pid"))):
+        return False, "supervisor_pid_alive"
+    try:
+        age = now - vm_dir.stat().st_mtime
+    except OSError:
+        return False, "vm_bundle_unreadable"
+    if age < min_age_secs:
+        return False, "recent"
+    return True, f"supervisor {match.group('pid')} gone, stopped {int(age)}s"
 
 
 def split_paths(value: str | None) -> list[str]:
@@ -472,6 +555,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     for derived in fleet_lane_discovery.runner_name_prefixes(lanes or []):
         if derived not in prefixes:
             prefixes.append(derived)
+    lane_runners = {lane.runner_name for lane in lanes or [] if lane.runner_name}
+    leases_seen = lease_references() if lane_runners else set()
+    tart_home = pathlib.Path(os.environ.get("TART_HOME") or pathlib.Path.home() / ".tart").expanduser()
     protected = [p for p in args.protected_names.split(",") if p]
     tart_providers = {"", "tart-macos", "tart-linux"}
 
@@ -553,6 +639,14 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     problems.append(f"suspect_live_owner_stale_heartbeat:{name}")
                 elif marker_ok and not owned and prefix_ok and protected_name:
                     problems.append(f"owned_marker_protected_name:{name}")
+                orphan_reason = ""
+                if not owned and not protected_name:
+                    orphaned, orphan_reason = orphan_verdict(
+                        name, running, lane_runners, states_by_vm, leases_seen,
+                        tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs)
+                    if orphaned:
+                        stale = True
+                        action = "delete_orphaned_stopped_vm"
                 row = {
                     "name": name,
                     "state": state_text,
@@ -563,8 +657,15 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "stale": stale,
                     "action": action,
                     "state_file": (state or {}).get("_path"),
+                    "orphan": orphan_reason or None,
+                    "size_gb": vm.get("Size") if isinstance(vm.get("Size"), (int, float)) else None,
                 }
                 vms.append(row)
+                if args.fix and action == "delete_orphaned_stopped_vm":
+                    try:
+                        fixed.extend(delete_vm(name, False))
+                    except Exception as exc:  # noqa: BLE001
+                        problems.append(f"fix_failed:{action}:{name}:{exc}")
                 if args.fix and action in ("delete_stopped_vm", "stop_delete_ownerless_running_vm"):
                     try:
                         fixed.extend(delete_vm(name, running))
@@ -808,6 +909,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "protected_names": protected,
             "fix": args.fix,
             "stopped_age_secs": args.stopped_age_secs,
+            "orphan_age_secs": args.orphan_age_secs,
             "running_age_secs": args.running_age_secs,
             "heartbeat_stale_secs": args.heartbeat_stale_secs,
             "keep_failed_age_secs": args.keep_failed_age_secs,
@@ -816,6 +918,16 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "observation_timeout_secs": args.observation_timeout_secs,
         },
         "capacity": capacity,
+        # Lane VMs whose supervisor is gone: what this pass deletes (or, in a
+        # dry run, would), and the lane VMs it keeps and why.
+        "orphans": {
+            "delete": sorted(v["name"] for v in vms if v.get("action") == "delete_orphaned_stopped_vm"),
+            "delete_gb": sum(v.get("size_gb") or 0 for v in vms
+                             if v.get("action") == "delete_orphaned_stopped_vm"),
+            "kept": {v["name"]: v["orphan"] for v in vms
+                     if v.get("orphan") and v.get("orphan") != "not_a_lane_vm"
+                     and v.get("action") != "delete_orphaned_stopped_vm"},
+        },
         "supervisor_coverage": supervisor_coverage.as_dict(),
         "supervisors": [
             {
@@ -894,6 +1006,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--protected-names", default=os.environ.get("TARTCI_REAP_PROTECTED_NAMES", "pulp-vm,rosetta-probe"))
     parser.add_argument("--macos-cap", type=int, default=int(os.environ.get("TARTCI_MACOS_VM_CAP", "2")))
     parser.add_argument("--stopped-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_STOPPED_AGE_SECS", "900")))
+    parser.add_argument("--orphan-age-secs", type=int,
+                        default=int(os.environ.get("TARTCI_REAP_ORPHAN_AGE_SECS", "3600")),
+                        help="minimum untouched age of a lane VM whose supervisor is gone")
     parser.add_argument("--running-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_RUNNING_AGE_SECS", "10800")))
     parser.add_argument("--heartbeat-stale-secs", type=int, default=int(os.environ.get("TARTCI_REAP_HEARTBEAT_STALE_SECS", "900")))
     parser.add_argument("--keep-failed-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_KEEP_FAILED_AGE_SECS", "86400")))

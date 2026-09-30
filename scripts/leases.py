@@ -1497,14 +1497,23 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         active, reaped, problems = reclaim(records, int(args.stale_secs))
         kept = [record for record in active if record.get("id") != args.id]
         removed = len(kept) != len(active)
+        # A VM lease is owned by its guardian (the `tart run` it exec'd into).
+        # Teardown stops that VM, so by the time the supervisor releases, the
+        # reclaim above has already removed the record as `identity_mismatch`.
+        # The lease is gone either way; only an id in neither set is an error.
+        # Reporting that case as rc=1 made all 2,670 releases on the fleet read
+        # as failures and hid any real one.
+        already = next((row.get("_reap_reason") for row in reaped
+                        if row.get("id") == args.id), None)
         write_records(store_dir, kept)
         return {
-            "ok": removed,
+            "ok": removed or already is not None,
             "released": args.id if removed else None,
+            "already_reclaimed": already,
             "capacity": usage(kept, cfg),
             "reaped": reaped_summary(reaped),
             "problems": problem_summary(problems),
-        }, 0 if removed else 1
+        }, 0 if removed or already is not None else 1
 
 
 def heartbeat(args: argparse.Namespace) -> tuple[dict[str, Any], int]:

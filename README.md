@@ -693,6 +693,23 @@ fleet-level probes never need to infer health from a partially written JSON
 file. `KEEP_FAILED=1` Windows inspection VMs are left alone for the configured
 keep-failed window before becoming reap candidates.
 
+A lane names each VM it boots `<runner>-<supervisor pid>-<n>`, and its state
+file names only its current VM, so a VM left behind by a supervisor that died
+between boot and teardown has no ownership marker. Such a VM is deleted
+(`delete_orphaned_stopped_vm`) only when every one of these holds:
+- the runner is a fleet lane loaded on this host;
+- that supervisor pid is gone;
+- no state file and no lease record (live or stale) names it;
+- it is stopped;
+- its bundle under `$TART_HOME/vms` is older than `--orphan-age-secs` (3600).
+
+Anything else, including VMs of lanes this host no longer runs, is kept and
+left to a person. The digest's `orphans` field lists what a pass deletes, or
+in a dry run would delete, and the GB. The lane runner names come from the same
+derivation the supervisor uses (`macos_runner_identity`): installed plists set
+only `TARTCI_RUNNER_NAME_PREFIX` and a slot, and reading `TARTCI_RUNNER_NAME`
+alone had left every fleet VM unowned since 2026-08-15.
+
 For a repository-scoped ephemeral lane, do not treat GitHub's `busy` bit as
 proof that a worker still exists. The digest distinguishes
 `offline_busy_live_local_owner`, `offline_busy_unconfirmed_local_state`, and
