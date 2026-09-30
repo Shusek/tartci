@@ -54,6 +54,7 @@ class Host:
         self.apply_installs: dict[str, str | None] = {}
         self.apply_generation: str | None = None  # default: the generation moves with the CLI
         self.verdict = "verified"
+        self.pulp_results: list[tuple[int, str]] = []  # scripted pulp-install outcomes, in order
 
     def run(self, argv: list[str], timeout: float) -> tuple[int, str]:
         self.calls.append(argv)
@@ -61,6 +62,10 @@ class Host:
             return (0, f"shipyard {self.generation}") if self.generation else (1, "exec failed")
         if "pulp-install" in argv:
             tag = argv[argv.index("pulp-install") + 1]
+            if self.pulp_results:
+                rc, out = self.pulp_results.pop(0)
+                if rc != 0:
+                    return rc, out
             installed = self.apply_installs.get("pulp")
             if installed is None:
                 return 1, f"curl: (22) {tag} installer unavailable"
@@ -308,6 +313,38 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertEqual(tf.host_class(self.home, {}), "m5")
         self.assertEqual(tf.host_class(self.home, {"host_class": "m1"}), "m1")
 
+    def test_a_release_not_yet_downloadable_is_retried_not_spent(self) -> None:
+        # v0.884.0 on 2026-09-30: the tag was in the feed an hour before the
+        # release published its archives, the install got a 404, and the
+        # "already attempted" guard then held m1, m3 and m5 back for good.
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
+        host.apply_installs["pulp"] = "0.877.2"
+        host.pulp_results = [(tf.NOT_READY_EXIT, "not ready: https://github.com/Generous-Corp/pulp/"
+                              "releases/download/v0.877.2/pulp-darwin-arm64.tar.gz: 404")]
+        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.1", NOW - 30 * HOUR),
+                                               ("v0.877.2", NOW - 2 * HOUR))
+        installs = lambda: len([c for c in host.calls if "pulp-install" in c])  # noqa: E731
+        row = self.refresh(host)["tools"]["pulp"]
+        self.assertEqual((row["state"], row["apply"]), ("behind", "waiting: v0.877.2 is not downloadable yet"))
+        self.assertEqual([e["event"] for e in self.events()], ["tool_release_not_ready"])
+        row = self.refresh(host, NOW + 10 * 60)["tools"]["pulp"]          # inside the backoff
+        self.assertEqual(installs(), 1)
+        self.assertIn("waiting: not downloadable at v0.877.2", row["apply"])
+        row = self.refresh(host, NOW + 31 * 60)["tools"]["pulp"]          # the asset is up now
+        self.assertEqual(installs(), 2)
+        self.assertEqual((row["state"], row["apply"]), ("current", "applied v0.877.2: ok"))
+        self.assertNotIn("tool_apply_failed", [e["event"] for e in self.events()])
+
+    def test_a_failure_after_install_started_still_waits_the_full_window(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
+        host.pulp_results = [(1, "tar: truncated archive")]
+        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.1", NOW - 30 * HOUR),
+                                               ("v0.877.2", NOW - 2 * HOUR))
+        self.assertIn("FAILED", self.refresh(host)["tools"]["pulp"]["apply"])
+        row = self.refresh(host, NOW + 31 * 60)["tools"]["pulp"]
+        self.assertIn("already attempted v0.877.2", row["apply"])
+        self.assertEqual(len([c for c in host.calls if "pulp-install" in c]), 1)
+
     def test_a_failed_apply_is_recorded_and_not_retried_inside_the_window(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
         row = self.refresh(host)["tools"]["shipyard"]
@@ -439,7 +476,11 @@ class StatusSurfaceTests(unittest.TestCase):
 class PulpInstallScriptTests(unittest.TestCase):
     """PULP_INSTALL_SCRIPT itself, against a stub curl and a stub installer."""
 
-    def run_script(self, installer_body: str) -> tuple[subprocess.CompletedProcess, Path]:
+    INSTALLER_URL = "https://raw.githubusercontent.com/Generous-Corp/pulp/v0.880.0/tools/install/install.sh"
+    ARCHIVE_URL = "https://github.com/Generous-Corp/pulp/releases/download/v0.880.0/pulp-darwin-arm64.tar.gz"
+
+    def run_script(self, installer_body: str, missing: str = "") -> tuple[subprocess.CompletedProcess, Path]:
+        """`missing` is a URL substring the stub curl answers with a 404 (exit 22)."""
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         bin_dir = tmp / "bin"
@@ -454,7 +495,10 @@ class PulpInstallScriptTests(unittest.TestCase):
               case "$1" in -o) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac
             done
             echo "url=$url" >> {record}
-            cp {fixture} "$out"
+            if [ -n "{missing}" ] && [[ "$url" == *"{missing}"* ]]; then
+              echo "curl: (22) The requested URL returned error: 404" >&2; exit 22
+            fi
+            case "$url" in *install.sh) cp {fixture} "$out" ;; *) echo archive > "$out" ;; esac
             """))
         (bin_dir / "curl").chmod(0o755)
         env = dict(os.environ, PATH=f"{bin_dir}:/usr/bin:/bin", RECORD=str(record))
@@ -463,16 +507,37 @@ class PulpInstallScriptTests(unittest.TestCase):
                               capture_output=True, text=True, env=env, timeout=30)
         return proc, record
 
-    def test_runs_the_tags_installer_pinned_into_the_home_bin(self) -> None:
-        proc, record = self.run_script(
-            'echo "ran PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
-            'NOPATH=$PULP_NO_MODIFY_PATH NOSDK=$PULP_SKIP_SDK_INSTALL" >> "$RECORD"\n')
+    # A current installer: answers the platform probe, then installs.
+    CURRENT = ('if [ "${PULP_PRINT_PLATFORM:-0}" = 1 ]; then echo darwin-arm64; exit 0; fi\n'
+               'echo "ran PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
+               'NOPATH=$PULP_NO_MODIFY_PATH NOSDK=$PULP_SKIP_SDK_INSTALL '
+               'ARCHIVE=$(cat "${PULP_INSTALL_ARCHIVE:-/dev/null}")" >> "$RECORD"\n')
+
+    def test_downloads_the_archive_first_then_installs_it_pinned(self) -> None:
+        proc, record = self.run_script(self.CURRENT)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = record.read_text().splitlines()
-        self.assertEqual(lines[0], "url=https://raw.githubusercontent.com/Generous-Corp/pulp/"
-                                   "v0.880.0/tools/install/install.sh")
+        self.assertEqual(lines[:2], [f"url={self.INSTALLER_URL}", f"url={self.ARCHIVE_URL}"])
         home_bin = str(Path(record).parent / "home" / ".pulp" / "bin")
-        self.assertEqual(lines[1], f"ran PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1")
+        self.assertEqual(lines[2], f"ran PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1 "
+                                   "ARCHIVE=archive")
+
+    def test_an_archive_404_is_not_ready_and_installs_nothing(self) -> None:
+        proc, record = self.run_script(self.CURRENT, missing="releases/download")
+        self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
+        self.assertIn("not ready", proc.stderr)
+        self.assertNotIn("ran", record.read_text())
+
+    def test_an_installer_404_is_not_ready(self) -> None:
+        proc, record = self.run_script(self.CURRENT, missing="install.sh")
+        self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
+        self.assertNotIn("ran", record.read_text())
+
+    def test_an_installer_without_the_platform_probe_installs_as_before(self) -> None:
+        proc, record = self.run_script(
+            'echo "ran PULP_VERSION=$PULP_VERSION ARCHIVE=${PULP_INSTALL_ARCHIVE:-none}" >> "$RECORD"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ran PULP_VERSION=0.880.0 ARCHIVE=none", record.read_text().splitlines())
 
     def test_refuses_an_installer_that_strands_the_runtime(self) -> None:
         proc, record = self.run_script(
