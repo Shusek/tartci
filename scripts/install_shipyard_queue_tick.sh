@@ -1,31 +1,35 @@
 #!/usr/bin/env bash
-# Install the queue tick plus its trusted canonical authority configuration.
+# Install the queue-tick ship-state reaper and its canonical configuration.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SUPPORT="$HERE/scripts/shipyard_queue_tick_support.py"
 
 usage() {
   cat <<'EOF'
-usage: install_shipyard_queue_tick.sh --repo-root PATH [--authority]
-       [--mode dry-run|reap-only|live] [--gh-cli APP-WRAPPER] [--install]
+usage: install_shipyard_queue_tick.sh --gh-cli APP-WRAPPER
+       [--mode dry-run|reap] [--repo-root PATH] [--install]
 
 Validates and prints the install plan by default. --install writes the mode-600
 canonical config, renders the LaunchAgent, bootstraps it, and verifies launchd
-received the expected paths and the first tick reports healthy. Exactly one
-fleet host should use --authority. The default mode is dry-run; live requires
---authority. Every mode requires an explicit GitHub App wrapper.
+received the expected paths and the first tick reports healthy. The default
+mode is dry-run; reap discards ship-state for merged, closed or confirmed
+nonexistent pull requests. The tick never merges: landing is the GitHub merge
+queue's job. --repo-root only sets the directory the merge-queue hold check
+runs from. Every mode requires an explicit GitHub App wrapper.
 EOF
 }
 
 REPO_ROOT=""
-AUTHORITY=0
 APPLY=0
 MODE="dry-run"
 GH_CLI=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo-root) REPO_ROOT="${2:-}"; shift 2 ;;
-    --authority) AUTHORITY=1; shift ;;
+    --authority)
+      echo "--authority is retired: the queue tick no longer merges; drop the flag" >&2
+      exit 2
+      ;;
     --mode) MODE="${2:-}"; shift 2 ;;
     --gh-cli) GH_CLI="${2:-}"; shift 2 ;;
     --install) APPLY=1; shift ;;
@@ -34,15 +38,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$MODE" in
-  dry-run) TICK_APPLY=0; REAP_ONLY=0 ;;
-  reap-only) TICK_APPLY=1; REAP_ONLY=1 ;;
+  dry-run) TICK_APPLY=0 ;;
+  reap|reap-only) MODE="reap"; TICK_APPLY=1 ;;
   live)
-    [ "$AUTHORITY" = "1" ] || {
-      echo "--mode live requires --authority" >&2
-      exit 2
-    }
-    TICK_APPLY=1
-    REAP_ONLY=0
+    echo "--mode live is retired: the queue tick no longer merges; use --mode reap" >&2
+    exit 2
     ;;
   *) echo "invalid mode: $MODE" >&2; usage >&2; exit 2 ;;
 esac
@@ -52,16 +52,12 @@ esac
   exit 2
 }
 
-[ -d "$REPO_ROOT/.git" ] || git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || {
-  echo "repo root is not a Git checkout: $REPO_ROOT" >&2
-  exit 2
-}
-REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
-REMOTE="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
-if ! python3 "$SUPPORT" github-origin "$REMOTE" >/dev/null
-then
-  echo "repo root has no supported GitHub origin: $REPO_ROOT" >&2
-  exit 2
+if [ -n "$REPO_ROOT" ]; then
+  [ -d "$REPO_ROOT" ] || {
+    echo "repo root is not a directory: $REPO_ROOT" >&2
+    exit 2
+  }
+  REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 fi
 
 TEMPLATE="$HERE/launchd/com.danielraffel.shipyard.queue-tick.plist.template"
@@ -88,8 +84,7 @@ LABEL="com.danielraffel.shipyard.queue-tick"
 }
 
 echo "queue tick install plan:"
-echo "  repo_root=$REPO_ROOT"
-echo "  authority=$AUTHORITY"
+echo "  repo_root=${REPO_ROOT:-unset (hold check runs from \$HOME)}"
 echo "  mode=$MODE"
 echo "  gh_cli=${GH_CLI:-unset}"
 echo "  executable=$INSTALLED_SCRIPT (mode 755)"
@@ -158,20 +153,18 @@ install -m 644 "$SUPPORT" "$SUPPORT_TMP"
 }
 {
   printf 'SHIPYARD_QUEUE_REPO_ROOT=%s\n' "$REPO_ROOT"
-  printf 'SHIPYARD_QUEUE_AUTHORITY=%s\n' "$AUTHORITY"
   printf 'SHIPYARD_QUEUE_GH_CLI=%s\n' "$GH_CLI"
 } > "$CONFIG_TMP"
 chmod 600 "$CONFIG_TMP"
 
 sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$PLIST_TMP"
-python3 - "$PLIST_TMP" "$TICK_APPLY" "$REAP_ONLY" <<'PY'
+python3 - "$PLIST_TMP" "$TICK_APPLY" <<'PY'
 import plistlib, sys
-path, apply, reap_only = sys.argv[1:]
+path, apply = sys.argv[1:]
 with open(path, "rb") as source:
     value = plistlib.load(source)
 environment = value["EnvironmentVariables"]
 environment["SHIPYARD_TICK_APPLY"] = apply
-environment["SHIPYARD_TICK_REAP_ONLY"] = reap_only
 with open(path, "wb") as destination:
     plistlib.dump(value, destination, sort_keys=False)
 PY

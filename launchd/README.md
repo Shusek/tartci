@@ -742,73 +742,47 @@ ghapp api repos/Generous-Corp/pulp --jq .full_name
 A missing wrapper is a deployment failure; do not let the unattended process
 fall back to ambient `gh`.
 
-## Shipyard queue janitor
+## Shipyard queue tick (ship-state reaper)
 
 `com.danielraffel.shipyard.queue-tick.plist.template` runs
-`scripts/shipyard_queue_tick.sh` every 5 min to make the Shipyard ship-queue
-progress **independent of any interactive session** — so a cmux restart or a
-Claude session running out of quota can no longer strand a validated PR or leak
-ship-state. Per active ship-state whose worker is not live, it: reaps records
-whose PR GitHub reports merged/closed (`shipyard ship-state discard`), drives
-open green PRs to merge via shipyard's own fail-closed `auto-merge` (no-op
-unless all targets green and the live head matches the validated SHA), and
-surfaces (does not auto-rebase) behind/DIRTY PRs.
+`scripts/shipyard_queue_tick.sh` every 5 min so leaked ship-state gets cleaned
+up **independent of any interactive session**. Per ship-state record whose
+worker is not live, it reads the pull request's state from GitHub and discards
+the record (`shipyard ship-state discard`) when the pull request is merged or
+closed, or after three consecutive explicit not-found reads. It keeps OPEN
+records and never merges, enqueues or arms a pull request: landing is the
+GitHub merge queue's job.
 
-Safe-by-construction: acts only on PRs that already have a ship-state record,
-never reimplements merge logic, never edits state files, fails closed on any
-GitHub read error, and skips live/fresh workers. It defaults to **DRY-RUN**
-(`SHIPYARD_TICK_APPLY=0`) — deploy observe-only first, watch
-`~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1`.
-Use the installer to keep the authority checkout in a mode-600 canonical
-configuration that survives LaunchAgent drift:
+It never edits state files, fails closed on any GitHub read error, skips
+live/fresh workers, and logs the first stderr line of every failed GitHub or
+Shipyard call. It defaults to **DRY-RUN** (`SHIPYARD_TICK_APPLY=0`); watch
+`~/Library/Logs/shipyard-queue-tick.log`, then install in reap mode:
 
 ```sh
 scripts/install_shipyard_queue_tick.sh \
-  --repo-root /absolute/path/to/pulp \
-  --authority \
   --gh-cli /absolute/path/to/ghapp \
   --mode dry-run
-# Re-run with --install only after reviewing the plan.
+# Re-run with --mode reap --install after reviewing the plan.
 ```
 
 The installer removes any previous health verdict before kickstart and succeeds
-only after the newly started tick publishes a fresh healthy verdict. After the
-dry-run log and health file are clean, arm the single authority explicitly:
+only after the newly started tick publishes a fresh healthy verdict. Every mode
+requires `--gh-cli` pointing to an executable GitHub App wrapper; unattended
+operation never falls back to ambient `gh`. `--repo-root` is optional and only
+sets the directory the merge-queue hold check runs from. `--mode live` and
+`--authority` are retired and refused. Never hand-edit the installed plist;
+re-run the installer.
 
-```sh
-scripts/install_shipyard_queue_tick.sh \
-  --repo-root /absolute/path/to/pulp \
-  --authority \
-  --gh-cli /absolute/path/to/ghapp \
-  --mode live \
-  --install
-```
-
-Use `--mode reap-only` on a non-authority host that should clean terminal
-ship-state without merging. Every mode requires `--gh-cli` pointing to an
-executable GitHub App wrapper; unattended operation never falls back to ambient
-`gh`. Never hand-edit the installed plist to change mode; re-run the installer
-so the rendered mode and fresh health proof stay coupled.
-
-Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
-exactly one host whose Shipyard runner tag matches
-`[merge_queue].mutation_machine`. Other CI Macs may remain dry-run or reap-only
-but cannot become queue writers. Set `SHIPYARD_QUEUE_REPO_ROOT` to the
-authority's repository checkout; the tick runs Shipyard from that directory
-and requires `authority_matches=true` before full-live operation. An
-authority-local `shipyard merge-queue hold` causes the configured authority
-tick to exit before any GitHub read; during an incident, run it on that
-authority (and propagate it fleet-wide for consistent operator status). This
-integration requires Shipyard 0.80.0 or newer; install that release before
-deploying the script or plist. Missing authority configuration is a hard
-unhealthy exit, never a silent downgrade to reap-only. The last machine verdict
-is written to `~/Library/Logs/shipyard-queue-tick.health.json`; inability to
+An install from before the reaper-only tick may still set
+`SHIPYARD_TICK_REAP_ONLY=0` or `SHIPYARD_QUEUE_AUTHORITY=1`. The tick accepts
+them, reaps only, and writes `legacy_full_live_ignored` into every tick log
+line and health verdict until the installer is re-run. This integration
+requires Shipyard 0.80.0 or newer. The last machine verdict is written to
+`~/Library/Logs/shipyard-queue-tick.health.json`, and its reason says what the
+tick did (`mode=reap reaped=N open=N stalled=N live=N errs=N`); inability to
 write that verdict is itself loud and nonzero. Unreadable or malformed queue
 control and ship-state observations are unhealthy rather than successful
-no-ops. A ship-state is
-recoverably archived only after three consecutive, explicit GitHub not-found
-responses; generic GitHub errors remain fail-closed and do not increment that
-counter. Re-bootstrap after changing the installed plist.
+no-ops. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
 

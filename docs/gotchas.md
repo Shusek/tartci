@@ -680,13 +680,13 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   `pulp-build-vm-release*`, which are *different label strings* from
   `pulp-build-vm`: an idle release VM cannot absorb gate work.
 
-- **The queue tick is running every five minutes but arms or merges nothing.**
-  → *Cause:* full-live Shipyard execution was launched without
-  `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
-  plane exits unhealthy and takes no GitHub action.
-  → *Fix:* repair the single authority's environment and alert on that
-  configuration error. Do not treat repeated `merged=0` as proof the queue is
-  healthy, and do not add Orchard as a fallback scheduler.
+- **The queue tick runs every five minutes and never merges anything.**
+  → *Cause:* by design. The tick is a ship-state reaper; the GitHub merge queue
+  lands pull requests. Its health reason counts what it did
+  (`reaped`, `open`, `stalled`, `errs`), not merges.
+  → *Fix:* none needed. If the log or health names
+  `legacy_full_live_ignored`, the host still carries retired full-live
+  settings; re-run the installer in reap mode to drop them.
 
 - **A newly booted VM runs an optional job instead of the required gate.**
   → *Cause:* GitHub chooses among all queued jobs matching the runner's labels;
