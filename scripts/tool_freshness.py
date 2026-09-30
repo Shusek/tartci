@@ -17,6 +17,9 @@ launchd watchdog, and optionally applies the update itself:
             and `auto_apply`, a behind tool is updated once its newest
             release is `apply_after_minutes` old, at most once per target per
             `apply_retry_hours`, and the result is re-read and verified.
+            An apply that exits NOT_READY_EXIT (75: the release could not be
+            downloaded, nothing installed) is retried after
+            `not_ready_retry_minutes` instead and does not spend the attempt.
   events    every change of an installed version, whoever made it, appends
             one `tool_deployed` event (tool, from, to, verify) to
             events.jsonl; an automatic apply that did not land appends
@@ -97,20 +100,50 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Fetches install.sh at the release tag and runs it pinned to that version into
-# ~/.pulp/bin. An installer that still excludes the WebGPU runtime (releases
-# before the fix) would strand pulp-cpp, so it is refused rather than run.
+# An apply command that exits NOT_READY_EXIT changed nothing because the
+# release could not be downloaded yet. That is not a failed attempt: the tool is
+# retried every NOT_READY_RETRY_MINUTES, and the per-target retry guard is kept
+# for failures that happen after the install has started.
+NOT_READY_EXIT = 75
+NOT_READY_RETRY_MINUTES = 30.0
+
+# Fetches install.sh at the release tag, downloads the release archive, and
+# only then installs it (PULP_INSTALL_ARCHIVE) pinned to that version into
+# ~/.pulp/bin. The pulp repository's Atom feed lists a tag the moment
+# auto-release pushes it, about an hour before the release build publishes
+# the archives (v0.884.0: tag 12:25Z, archive 13:29Z, release 13:32Z), so a
+# download that fails before anything is installed exits NOT_READY_EXIT. An
+# installer that still excludes the WebGPU runtime (releases before the fix)
+# would strand pulp-cpp, so it is refused rather than run.
 PULP_INSTALL_SCRIPT = r"""set -euo pipefail
 tag="$1"; home="$2"
-installer="$(mktemp)"; trap 'rm -f "$installer"' EXIT
-curl -fsSL --max-time 60 \
-  "https://raw.githubusercontent.com/Generous-Corp/pulp/$tag/tools/install/install.sh" -o "$installer"
+work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+installer="$work/install.sh"
+if ! curl -fsSL --max-time 60 \
+    "https://raw.githubusercontent.com/Generous-Corp/pulp/$tag/tools/install/install.sh" -o "$installer"; then
+  echo "not ready: the $tag installer could not be downloaded" >&2
+  exit 75
+fi
 if grep -q -- "--exclude='libwgpu_native.dylib'" "$installer"; then
   echo "refused: the $tag installer strands pulp-cpp without its runtime" >&2
   exit 3
 fi
-PULP_VERSION="${tag#v}" PULP_INSTALL_DIR="$home/.pulp/bin" PULP_NO_MODIFY_PATH=1 \
-  PULP_SKIP_SDK_INSTALL=1 bash "$installer"
+# The probe is confined to a scratch dir and the tag, so an installer that
+# predates PULP_PRINT_PLATFORM can only ever install there.
+platform="$(PULP_PRINT_PLATFORM=1 PULP_VERSION="${tag#v}" PULP_INSTALL_DIR="$work/probe" \
+  PULP_NO_MODIFY_PATH=1 PULP_SKIP_SDK_INSTALL=1 bash "$installer" 2>/dev/null | tail -1 || true)"
+archive_env=()
+if printf '%s' "$platform" | grep -Eqx '[a-z]+-[a-z0-9]+'; then
+  url="https://github.com/Generous-Corp/pulp/releases/download/$tag/pulp-$platform.tar.gz"
+  if ! curl -fsSL --max-time 300 "$url" -o "$work/pulp.tar.gz"; then
+    echo "not ready: $url could not be downloaded (the release may still be building)" >&2
+    exit 75
+  fi
+  archive_env=(PULP_INSTALL_ARCHIVE="$work/pulp.tar.gz")
+fi
+env ${archive_env[@]+"${archive_env[@]}"} PULP_VERSION="${tag#v}" \
+  PULP_INSTALL_DIR="$home/.pulp/bin" PULP_NO_MODIFY_PATH=1 PULP_SKIP_SDK_INSTALL=1 \
+  bash "$installer"
 """
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -180,7 +213,8 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
     if path.is_file() and tomllib is not None:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
-        for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours"):
+        for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours",
+                    "not_ready_retry_minutes"):
             if key in data:
                 settings[key] = float(data[key])
         if isinstance(data.get("host_class"), str):
@@ -360,9 +394,11 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
         row["apply"] = f"waiting: {tag} is younger than {settings['apply_after_minutes']:g} min"
         return None
     last = attempts.get(name) or {}
-    if last.get("target") == tag and now - (_epoch(last.get("at")) or 0) < \
-            float(settings["apply_retry_hours"]) * 3600:
-        row["apply"] = f"already attempted {tag} at {last.get('at')}: {last.get('result')}"
+    retry_hours = (float(settings.get("not_ready_retry_minutes", NOT_READY_RETRY_MINUTES)) / 60
+                   if last.get("not_ready") else float(settings["apply_retry_hours"]))
+    if last.get("target") == tag and now - (_epoch(last.get("at")) or 0) < retry_hours * 3600:
+        word = "waiting: not downloadable at" if last.get("not_ready") else "already attempted"
+        row["apply"] = f"{word} {tag} {last.get('at')}: {last.get('result')}"
         return None
     klass = host_class(home, settings) or ""
     if "{host_class}" in " ".join(tool["apply_command"]) and not klass:
@@ -375,6 +411,15 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     if tool.get("verdict_json"):
         summaries = [doc for doc in json_documents(out) if doc.get("event") == "fleet_summary"]
         verdict = summaries[-1].get("verdict") if summaries else "no fleet_summary"
+    if rc == NOT_READY_EXIT:
+        # Nothing was installed; the release is not downloadable yet. Recorded
+        # with its own short backoff, never as a failed attempt.
+        attempts[name] = {"target": tag, "at": _iso(now), "not_ready": True,
+                          "result": f"not ready: {out.strip()[-200:]}"}
+        row["apply"] = f"waiting: {tag} is not downloadable yet"
+        _append_event(state, {"event": "tool_release_not_ready", "tool": name,
+                              "at": _iso(now), "target": row["latest"], "detail": out[-300:]})
+        return None
     after = read_versions(tool, home, run)
     effective = min(v for v in (after["installed"], after["generation"] or after["installed"]) if v) \
         if after["installed"] else None
