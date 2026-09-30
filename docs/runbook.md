@@ -1816,16 +1816,28 @@ arrive, and a host that did not get it is loud:
   `tool_deployed` event (tool, `component` cli or auth_generation, from, to,
   `by` auto_apply or observed, verify) whenever an installed version changes, whoever changed it, and a
   `tool_apply_failed` event when an automatic apply does not land.
-- **A release that is not downloadable yet is not a failed attempt.** The pulp
-  repository's Atom feed lists a tag the moment auto-release pushes it, about an
-  hour before the release build uploads its archives (v0.884.0: tag 12:25Z,
-  darwin-arm64 archive 13:29Z, release 13:32Z), so the 30-minute minimum age
-  alone does not cover it. The pulp apply downloads the tag's installer and
-  archive before it installs anything and exits 75 when either is missing. An
-  apply that exits 75 logs `tool_release_not_ready` and is retried after
-  `not_ready_retry_minutes` (30), while the one-attempt-per-target guard
-  (`apply_retry_hours`) still covers failures after the install started. m1,
-  m3 and m5 otherwise stayed on 0.881.2 after a 404 on v0.884.0.
+- **A pulp release is installed only when it is complete, and waited for
+  patiently until then.** The pulp repository's Atom feed lists a tag the
+  moment auto-release pushes it, about an hour before the release build uploads
+  its archives (v0.884.0: tag 12:25Z, darwin-arm64 archive 13:29Z, release
+  13:32Z), so the 30-minute minimum age alone does not cover it. Before any
+  install the watchdog checks every asset the install needs
+  (`pulp-<platform>.tar.gz`, `SHA256SUMS`) at its release download URL (HEAD
+  200; no REST quota). Until they are there, `pool status` reads
+  `pulp v0.884.0 not ready yet (asset pulp-darwin-arm64.tar.gz missing),
+  waiting`. That is not an attempt, not an alert and not a problem; it is
+  re-checked on every refresh. Only a release still incomplete after
+  `not_ready_alert_hours` (6) becomes a problem and logs one
+  `tool_release_incomplete` event. The install then downloads the installer,
+  `SHA256SUMS` and the archive, and installs only an archive whose sha256
+  matches. Any download failure exits 75 before anything is installed and is
+  handled the same way. The one-attempt-per-target guard (`apply_retry_hours`)
+  covers only failures after the downloads succeeded (a checksum mismatch, the
+  install, the verify). Attempt records whose text shows a download 404 (written
+  before this change) no longer hold a host back. Optional backup:
+  `[tools.pulp] local_archive_dir` holding `<tag>/pulp-<platform>.tar.gz` is
+  used only while the release archive is not downloadable, and only if its
+  sha256 matches the release's own `SHA256SUMS`.
 - **The watchdog must actually run.** `tartci launchd heal` reconciles the
   relay network profile first, and that reconcile defers whenever any Tart VM
   is running. It used to return 6 before the watchdog, so a busy host with a

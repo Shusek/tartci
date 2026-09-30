@@ -8,6 +8,7 @@ fault present and absent, so a check that can only pass would fail here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -127,9 +128,15 @@ class ToolFreshnessTests(unittest.TestCase):
     def feed(self, repo: str) -> str:
         return self.feeds[repo]
 
+    READY = {"ready": True, "missing": [], "sums": None, "detail": "ready"}
+
     def refresh(self, host: Host, now: float = NOW, **kw) -> dict:
+        release = kw.pop("release", self.READY)
         return tf.refresh(self.home, now, settings=kw.pop("settings", settings()),
-                          run=host.run, feed=self.feed, **kw)
+                          run=host.run, feed=self.feed,
+                          probe=lambda name, tag: {"platform": "darwin-arm64",
+                                                   "result": release() if callable(release) else release},
+                          **kw)
 
     def events(self) -> list[dict]:
         path = self.state / "events.jsonl"
@@ -224,7 +231,7 @@ class ToolFreshnessTests(unittest.TestCase):
         call = next(c for c in host.calls if "pulp-install" in c)
         self.assertEqual(call[0:2], ["/bin/bash", "-c"])
         self.assertEqual(call[2], tf.PULP_INSTALL_SCRIPT)
-        self.assertEqual(call[3:], ["pulp-install", "v0.877.2", str(self.home)])
+        self.assertEqual(call[3:], ["pulp-install", "v0.877.2", str(self.home), "darwin-arm64", ""])
         self.assertEqual((row["state"], row["apply"]), ("current", "applied v0.877.2: ok"))
         self.assertEqual([(e["tool"], e["component"], e["from"], e["to"], e["by"], e["verify"])
                           for e in self.events()],
@@ -313,37 +320,109 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertEqual(tf.host_class(self.home, {}), "m5")
         self.assertEqual(tf.host_class(self.home, {"host_class": "m1"}), "m1")
 
-    def test_a_release_not_yet_downloadable_is_retried_not_spent(self) -> None:
-        # v0.884.0 on 2026-09-30: the tag was in the feed an hour before the
-        # release published its archives, the install got a 404, and the
-        # "already attempted" guard then held m1, m3 and m5 back for good.
+    NOT_READY = {"ready": False, "missing": ["pulp-darwin-arm64.tar.gz"], "sums": None,
+                 "detail": "asset pulp-darwin-arm64.tar.gz missing"}
+
+    def pulp_behind(self) -> Host:
         host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
         host.apply_installs["pulp"] = "0.877.2"
-        host.pulp_results = [(tf.NOT_READY_EXIT, "not ready: https://github.com/Generous-Corp/pulp/"
-                              "releases/download/v0.877.2/pulp-darwin-arm64.tar.gz: 404")]
         self.feeds["Generous-Corp/pulp"] = feed(("v0.877.1", NOW - 30 * HOUR),
                                                ("v0.877.2", NOW - 2 * HOUR))
-        installs = lambda: len([c for c in host.calls if "pulp-install" in c])  # noqa: E731
-        row = self.refresh(host)["tools"]["pulp"]
-        self.assertEqual((row["state"], row["apply"]), ("behind", "waiting: v0.877.2 is not downloadable yet"))
-        self.assertEqual([e["event"] for e in self.events()], ["tool_release_not_ready"])
-        row = self.refresh(host, NOW + 10 * 60)["tools"]["pulp"]          # inside the backoff
-        self.assertEqual(installs(), 1)
-        self.assertIn("waiting: not downloadable at v0.877.2", row["apply"])
-        row = self.refresh(host, NOW + 31 * 60)["tools"]["pulp"]          # the asset is up now
-        self.assertEqual(installs(), 2)
-        self.assertEqual((row["state"], row["apply"]), ("current", "applied v0.877.2: ok"))
-        self.assertNotIn("tool_apply_failed", [e["event"] for e in self.events()])
+        return host
 
-    def test_a_failure_after_install_started_still_waits_the_full_window(self) -> None:
-        host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
-        host.pulp_results = [(1, "tar: truncated archive")]
-        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.1", NOW - 30 * HOUR),
-                                               ("v0.877.2", NOW - 2 * HOUR))
+    def installs(self, host: Host) -> int:
+        return len([c for c in host.calls if "pulp-install" in c])
+
+    def attempts(self) -> dict:
+        return json.loads((self.state / "attempts.json").read_text())
+
+    def test_a_release_whose_asset_404s_then_appears_installs_on_a_later_pass(self) -> None:
+        # v0.884.0 on 2026-09-30: the tag was in the feed an hour before the
+        # release uploaded its archive; the install got a 404 and the
+        # attempt guard then held m1, m3 and m5 back.
+        host = self.pulp_behind()
+        row = self.refresh(host, release=self.NOT_READY)["tools"]["pulp"]
+        self.assertEqual(row["apply"], "pulp v0.877.2 not ready yet "
+                                       "(asset pulp-darwin-arm64.tar.gz missing), waiting")
+        self.assertEqual(self.installs(host), 0)                    # nothing attempted
+        self.assertNotIn("pulp", self.attempts())                   # nothing spent
+        self.assertIsNone(tf.summary(self.home)["problem"])          # nothing alerted
+        line = next(l for l in tf.summary(self.home)["lines"] if l.startswith("pulp:"))
+        self.assertIn("[pulp v0.877.2 not ready yet (asset pulp-darwin-arm64.tar.gz missing), "
+                      "waiting]", line)
+        self.assertNotIn("FAILED", line)
+        row = self.refresh(host, NOW + 30 * 60)["tools"]["pulp"]    # the asset is up now
+        self.assertEqual((row["state"], row["apply"]), ("current", "applied v0.877.2: ok"))
+        self.assertEqual(self.installs(host), 1)
+        self.assertEqual([e["event"] for e in self.events()], ["tool_deployed"])
+
+    def test_a_download_error_during_install_is_not_ready_not_a_spent_attempt(self) -> None:
+        host = self.pulp_behind()
+        host.pulp_results = [(tf.NOT_READY_EXIT, "not ready: .../pulp-darwin-arm64.tar.gz "
+                              "could not be downloaded")]
+        row = self.refresh(host)["tools"]["pulp"]
+        self.assertIn("not ready yet", row["apply"])
+        self.assertNotIn("pulp", self.attempts())
+        row = self.refresh(host, NOW + 30 * 60)["tools"]["pulp"]
+        self.assertEqual(row["state"], "current")
+
+    def test_a_release_that_stays_incomplete_alerts_only_after_the_window(self) -> None:
+        host = self.pulp_behind()
+        for hours in (0, 1, 5.5):
+            self.refresh(host, NOW + hours * HOUR, release=self.NOT_READY)
+            self.assertIsNone(tf.summary(self.home)["problem"], hours)
+            self.assertEqual(self.events(), [])
+        self.refresh(host, NOW + 6.5 * HOUR, release=self.NOT_READY)
+        self.assertIn("pulp v0.877.2 still not ready after 6.5 h", tf.summary(self.home)["problem"])
+        self.refresh(host, NOW + 7.5 * HOUR, release=self.NOT_READY)
+        self.assertEqual([e["event"] for e in self.events()], ["tool_release_incomplete"])
+        self.assertEqual(self.installs(host), 0)
+
+    def test_a_failure_after_the_downloads_still_trips_the_guard(self) -> None:
+        host = self.pulp_behind()
+        host.pulp_results = [(4, "refused: .../pulp-darwin-arm64.tar.gz has sha256 aa, "
+                                 "SHA256SUMS says bb")]
         self.assertIn("FAILED", self.refresh(host)["tools"]["pulp"]["apply"])
         row = self.refresh(host, NOW + 31 * 60)["tools"]["pulp"]
         self.assertIn("already attempted v0.877.2", row["apply"])
-        self.assertEqual(len([c for c in host.calls if "pulp-install" in c]), 1)
+        self.assertEqual(self.installs(host), 1)
+
+    def test_a_legacy_404_record_does_not_hold_the_host_back(self) -> None:
+        # The record m1, m3 and m5 carry for v0.884.0, written before this.
+        host = self.pulp_behind()
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "attempts.json").write_text(json.dumps({"pulp": {
+            "target": "v0.877.2", "at": iso(NOW - 600),
+            "result": "FAILED (exit 1, installed 0.877.1, generation None): ...\n"
+                      "Error: could not download pulp-darwin-arm64 for this version.\n"
+                      "curl: (56) The requested URL returned error: 404"}}))
+        row = self.refresh(host)["tools"]["pulp"]
+        self.assertEqual((row["state"], row["apply"]), ("current", "applied v0.877.2: ok"))
+
+    def test_a_local_archive_is_used_only_when_its_checksum_matches(self) -> None:
+        archive_dir = self.home / "pulp-archives" / "v0.877.2"
+        archive_dir.mkdir(parents=True)
+        local = archive_dir / "pulp-darwin-arm64.tar.gz"
+        local.write_bytes(b"the release archive")
+        good = hashlib.sha256(b"the release archive").hexdigest()
+        tools = {name: dict(tool, enabled=True) for name, tool in tf.DEFAULT_TOOLS.items()}
+        tools["pulp"]["local_archive_dir"] = "{home}/pulp-archives"
+        for sums, expect_local in ((f"{'0' * 64}  pulp-darwin-arm64.tar.gz\n", False),
+                                   (f"{good}  pulp-darwin-arm64.tar.gz\n", True)):
+            with self.subTest(expect_local=expect_local):
+                (self.state / "pending.json").unlink(missing_ok=True)
+                host = self.pulp_behind()
+                release = dict(self.NOT_READY, sums=sums)
+                row = self.refresh(host, release=release,
+                                   settings=settings(tools=tools))["tools"]["pulp"]
+                calls = [c for c in host.calls if "pulp-install" in c]
+                if expect_local:
+                    self.assertEqual(calls[0][-1], str(local))
+                    self.assertEqual(row["state"], "current")
+                else:
+                    self.assertEqual(calls, [])
+                    self.assertIn("refused: sha256", row["local_archive"])
+                    self.assertIn("not ready yet", row["apply"])
 
     def test_a_failed_apply_is_recorded_and_not_retried_inside_the_window(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
@@ -476,17 +555,26 @@ class StatusSurfaceTests(unittest.TestCase):
 class PulpInstallScriptTests(unittest.TestCase):
     """PULP_INSTALL_SCRIPT itself, against a stub curl and a stub installer."""
 
+    BASE = "https://github.com/Generous-Corp/pulp/releases/download/v0.880.0"
     INSTALLER_URL = "https://raw.githubusercontent.com/Generous-Corp/pulp/v0.880.0/tools/install/install.sh"
-    ARCHIVE_URL = "https://github.com/Generous-Corp/pulp/releases/download/v0.880.0/pulp-darwin-arm64.tar.gz"
+    ARCHIVE = "archive\n"
+    INSTALLER = ('echo "ran PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
+                 'NOPATH=$PULP_NO_MODIFY_PATH NOSDK=$PULP_SKIP_SDK_INSTALL '
+                 'ARCHIVE=$(cat "$PULP_INSTALL_ARCHIVE")" >> "$RECORD"\n')
 
-    def run_script(self, installer_body: str, missing: str = "") -> tuple[subprocess.CompletedProcess, Path]:
-        """`missing` is a URL substring the stub curl answers with a 404 (exit 22)."""
+    def run_script(self, installer_body: str | None = None, missing: str = "",
+                   sums: str | None = None, local: str | None = None
+                   ) -> tuple[subprocess.CompletedProcess, Path]:
+        """`missing`: a URL substring the stub curl answers with a 404 (exit 22)."""
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         bin_dir = tmp / "bin"
         bin_dir.mkdir()
-        fixture = tmp / "install.sh"
-        fixture.write_text(installer_body)
+        (tmp / "install.sh").write_text(self.INSTALLER if installer_body is None else installer_body)
+        digest = hashlib.sha256(self.ARCHIVE.encode()).hexdigest()
+        (tmp / "SHA256SUMS").write_text(sums if sums is not None else
+                                        f"{digest}  pulp-darwin-arm64.tar.gz\n{'1' * 64}  x.tgz\n")
+        (tmp / "archive").write_text(self.ARCHIVE)
         record = tmp / "record"
         (bin_dir / "curl").write_text(textwrap.dedent(f"""\
             #!/bin/bash
@@ -498,53 +586,98 @@ class PulpInstallScriptTests(unittest.TestCase):
             if [ -n "{missing}" ] && [[ "$url" == *"{missing}"* ]]; then
               echo "curl: (22) The requested URL returned error: 404" >&2; exit 22
             fi
-            case "$url" in *install.sh) cp {fixture} "$out" ;; *) echo archive > "$out" ;; esac
+            case "$url" in
+              *install.sh) cp {tmp}/install.sh "$out" ;;
+              *SHA256SUMS) cp {tmp}/SHA256SUMS "$out" ;;
+              *) cp {tmp}/archive "$out" ;;
+            esac
             """))
         (bin_dir / "curl").chmod(0o755)
         env = dict(os.environ, PATH=f"{bin_dir}:/usr/bin:/bin", RECORD=str(record))
-        proc = subprocess.run(["/bin/bash", "-c", tf.PULP_INSTALL_SCRIPT, "pulp-install",
-                               "v0.880.0", str(tmp / "home")],
-                              capture_output=True, text=True, env=env, timeout=30)
+        argv = ["/bin/bash", "-c", tf.PULP_INSTALL_SCRIPT, "pulp-install",
+                "v0.880.0", str(tmp / "home"), "darwin-arm64", local or ""]
+        proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        record.touch()
         return proc, record
 
-    # A current installer: answers the platform probe, then installs.
-    CURRENT = ('if [ "${PULP_PRINT_PLATFORM:-0}" = 1 ]; then echo darwin-arm64; exit 0; fi\n'
-               'echo "ran PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
-               'NOPATH=$PULP_NO_MODIFY_PATH NOSDK=$PULP_SKIP_SDK_INSTALL '
-               'ARCHIVE=$(cat "${PULP_INSTALL_ARCHIVE:-/dev/null}")" >> "$RECORD"\n')
-
-    def test_downloads_the_archive_first_then_installs_it_pinned(self) -> None:
-        proc, record = self.run_script(self.CURRENT)
+    def test_verifies_the_downloaded_archive_then_installs_it_pinned(self) -> None:
+        proc, record = self.run_script()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = record.read_text().splitlines()
-        self.assertEqual(lines[:2], [f"url={self.INSTALLER_URL}", f"url={self.ARCHIVE_URL}"])
+        self.assertEqual(lines[:3], [f"url={self.INSTALLER_URL}", f"url={self.BASE}/SHA256SUMS",
+                                     f"url={self.BASE}/pulp-darwin-arm64.tar.gz"])
         home_bin = str(Path(record).parent / "home" / ".pulp" / "bin")
-        self.assertEqual(lines[2], f"ran PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1 "
+        self.assertEqual(lines[3], f"ran PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1 "
                                    "ARCHIVE=archive")
 
-    def test_an_archive_404_is_not_ready_and_installs_nothing(self) -> None:
-        proc, record = self.run_script(self.CURRENT, missing="releases/download")
+    def test_any_download_404_is_not_ready_and_installs_nothing(self) -> None:
+        for missing in ("install.sh", "SHA256SUMS", "pulp-darwin-arm64.tar.gz"):
+            with self.subTest(missing=missing):
+                proc, record = self.run_script(missing=missing)
+                self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
+                self.assertIn("not ready", proc.stderr)
+                self.assertNotIn("ran", record.read_text())
+
+    def test_a_checksum_file_without_this_platform_is_not_ready(self) -> None:
+        proc, record = self.run_script(sums=f"{'1' * 64}  pulp-linux-x64.tar.gz\n")
         self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
-        self.assertIn("not ready", proc.stderr)
         self.assertNotIn("ran", record.read_text())
 
-    def test_an_installer_404_is_not_ready(self) -> None:
-        proc, record = self.run_script(self.CURRENT, missing="install.sh")
-        self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
+    def test_a_downloaded_archive_with_the_wrong_checksum_is_refused(self) -> None:
+        proc, record = self.run_script(sums=f"{'0' * 64}  pulp-darwin-arm64.tar.gz\n")
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn("refused", proc.stderr)
         self.assertNotIn("ran", record.read_text())
 
-    def test_an_installer_without_the_platform_probe_installs_as_before(self) -> None:
-        proc, record = self.run_script(
-            'echo "ran PULP_VERSION=$PULP_VERSION ARCHIVE=${PULP_INSTALL_ARCHIVE:-none}" >> "$RECORD"\n')
+    def test_a_local_archive_is_installed_only_when_its_checksum_matches(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        good, bad = tmp / "good.tar.gz", tmp / "bad.tar.gz"
+        good.write_text(self.ARCHIVE)
+        bad.write_text("tampered\n")
+        proc, record = self.run_script(local=str(good), missing="pulp-darwin-arm64.tar.gz")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("ran PULP_VERSION=0.880.0 ARCHIVE=none", record.read_text().splitlines())
+        self.assertIn("ARCHIVE=archive", record.read_text())
+        self.assertNotIn("url=" + self.BASE + "/pulp-darwin-arm64.tar.gz", record.read_text())
+        proc, record = self.run_script(local=str(bad))
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn("refused: local archive", proc.stderr)
+        self.assertNotIn("ran", record.read_text())
 
     def test_refuses_an_installer_that_strands_the_runtime(self) -> None:
-        proc, record = self.run_script(
-            "tar --exclude='libwgpu_native.dylib' -xzf x\necho ran >> \"$RECORD\"\n")
+        proc, record = self.run_script("tar --exclude='libwgpu_native.dylib' -xzf x\n"
+                                       "echo ran >> \"$RECORD\"\n")
         self.assertEqual(proc.returncode, 3)
         self.assertIn("strands pulp-cpp without its runtime", proc.stderr)
         self.assertNotIn("ran", record.read_text())
+
+
+class ReleaseProbeTests(unittest.TestCase):
+    def test_every_asset_must_answer_head_200(self) -> None:
+        seen = []
+
+        def http(url, method="GET"):
+            seen.append((method, url))
+            if url.endswith("pulp-darwin-arm64.tar.gz"):
+                return (200, b"") if self.uploaded else (404, b"")
+            return (200, b"abc  pulp-darwin-arm64.tar.gz\n")
+        assets = ["pulp-darwin-arm64.tar.gz", "SHA256SUMS"]
+        self.uploaded = False
+        value = tf.probe_release("Generous-Corp/pulp", "v1.0.0", assets, http)
+        self.assertEqual((value["ready"], value["missing"]), (False, ["pulp-darwin-arm64.tar.gz"]))
+        self.assertEqual(value["detail"], "asset pulp-darwin-arm64.tar.gz missing")
+        self.uploaded = True
+        value = tf.probe_release("Generous-Corp/pulp", "v1.0.0", assets, http)
+        self.assertTrue(value["ready"])
+        self.assertIn(("HEAD", "https://github.com/Generous-Corp/pulp/releases/download/v1.0.0/"
+                               "pulp-darwin-arm64.tar.gz"), seen)
+        self.assertEqual(tf.published_sha256(value["sums"], "pulp-darwin-arm64.tar.gz"), None)
+        self.assertEqual(tf.published_sha256(f"{'a' * 64} *pulp-darwin-arm64.tar.gz",
+                                             "pulp-darwin-arm64.tar.gz"), "a" * 64)
+
+    def test_a_network_error_is_not_ready(self) -> None:
+        value = tf.probe_release("o/r", "v1", ["x.tgz"], lambda url, method="GET": (0, b"timed out"))
+        self.assertEqual(value["detail"], "asset x.tgz unreachable (HTTP none)")
 
 
 class HostAgentsTests(unittest.TestCase):
