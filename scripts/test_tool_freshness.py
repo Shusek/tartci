@@ -721,7 +721,9 @@ class HostAgentsTests(unittest.TestCase):
 class HealPassTests(unittest.TestCase):
     """`tartci launchd heal` must run the watchdog even when the relay reconcile fails."""
 
-    def run_heal(self, reconcile_rc: int) -> tuple[subprocess.CompletedProcess, Path]:
+    def run_heal(self, reconcile_rc: int,
+                 line: str = "network-profile: FAIL: authenticated relay probe timed out after 15s",
+                 ) -> tuple[subprocess.CompletedProcess, Path]:
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         root = tmp / "tartci-root"
@@ -730,7 +732,7 @@ class HealPassTests(unittest.TestCase):
         marker = tmp / "watchdog-ran"
         (root / "scripts" / "network_profile.py").write_text(textwrap.dedent(f"""\
             import sys
-            print("network-profile: FAIL: network-profile reload deferred while a Tart VM is running")
+            print({line!r})
             sys.exit({reconcile_rc})
             """))
         (root / "scripts" / "tartci_launchd_watchdog.py").write_text(textwrap.dedent(f"""\
@@ -743,14 +745,26 @@ class HealPassTests(unittest.TestCase):
                               capture_output=True, text=True, env=env, timeout=60)
         return proc, marker
 
-    def test_a_deferred_reconcile_still_runs_the_watchdog_and_reports_why(self) -> None:
+    def test_a_failed_reconcile_still_runs_the_watchdog_and_exits_6(self) -> None:
         if sys.version_info < (3, 11):
             self.skipTest("the tartci shim needs a tomllib interpreter")
         proc, marker = self.run_heal(1)
         self.assertTrue(marker.exists(), proc.stdout + proc.stderr)
         self.assertEqual(marker.read_text(), "--stale-log-seconds 4500")
         self.assertEqual(proc.returncode, 6)
-        self.assertIn("reload deferred while a Tart VM is running", proc.stdout)
+        self.assertIn("relay probe timed out", proc.stdout)
+
+    def test_a_deferred_reconcile_is_printed_but_is_not_exit_6(self) -> None:
+        # Deferral (lock held, a VM running) is the normal state of a busy gate
+        # host. Reporting it as 6 made launchd's last exit look like the relay
+        # was down on nearly every pass.
+        if sys.version_info < (3, 11):
+            self.skipTest("the tartci shim needs a tomllib interpreter")
+        proc, marker = self.run_heal(
+            3, "network-profile: DEFERRED: network-profile reload deferred while a Tart VM is running")
+        self.assertTrue(marker.exists(), proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("DEFERRED: network-profile reload deferred", proc.stdout)
 
     def test_a_clean_reconcile_runs_the_watchdog_quietly(self) -> None:
         if sys.version_info < (3, 11):

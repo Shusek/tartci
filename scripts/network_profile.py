@@ -50,6 +50,14 @@ PROXY_ENV = {
     "TARTCI_GUEST_HTTP_PROXY": GUEST_PROXY,
 }
 _LAST_TART_VM_PROBE_REASON = "Tart VM inventory unavailable"
+# The reconcile did not run because the host was busy (a pool transition held
+# its lock, or a Tart VM was running), and the next pass retries it. Distinct
+# from 1 so a caller can tell "not now" from "the relay is broken".
+EXIT_DEFERRED = 3
+
+
+class TransitionBusy(TimeoutError):
+    """The pool-transition lock stayed held for the whole wait."""
 
 
 @dataclass(frozen=True)
@@ -334,7 +342,7 @@ def admission_lock(lock_path: Path, already_held: bool = False, timeout_seconds:
             break
         except FileExistsError:
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"pool transition busy: {lock_path}")
+                raise TransitionBusy(f"pool transition busy: {lock_path}")
             time.sleep(0.1)
     pid_path = lock_path / "pid"
     try:
@@ -686,7 +694,8 @@ def _reconcile_unlocked(profile_path: Path, agents_dir: Path, *, dry_run: bool =
             )
             return result
         if vm_running:
-            result.update(ok=False, reason="network-profile reload deferred while a Tart VM is running")
+            result.update(ok=False, deferred=True,
+                          reason="network-profile reload deferred while a Tart VM is running")
             return result
 
     unexpectedly_loaded = [
@@ -876,19 +885,26 @@ def main(argv: list[str] | None = None) -> int:
                 participation_path=args.participation_file.expanduser(),
                 admission_lock_held=args.pool_lock_held,
             )
+    except TransitionBusy as exc:
+        # The pool-transition lock is held by a pool transition or a JIT start:
+        # the reconcile did not run, and the next pass retries it.
+        result = {"profile": str(args.profile), "enabled": None, "ok": False,
+                  "deferred": True, "reason": str(exc)}
     except (OSError, TimeoutError, ValueError, plistlib.InvalidFileException) as exc:
         result = {"profile": str(args.profile), "enabled": None, "ok": False, "reason": str(exc)}
     if not args.quiet:
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
         else:
-            state = "ok" if result.get("ok") else "FAIL"
+            state = "ok" if result.get("ok") else "DEFERRED" if result.get("deferred") else "FAIL"
             print(f"network-profile: {state}: {result.get('reason', '')}")
             for change in result.get("changes", []):
                 print(f"  {change['action']}: {change['label']}")
             if result.get("probe"):
                 print(f"  probe: {result['probe']}")
-    return 0 if result.get("ok") else 1
+    if result.get("ok"):
+        return 0
+    return EXIT_DEFERRED if result.get("deferred") else 1
 
 
 if __name__ == "__main__":

@@ -88,6 +88,8 @@ def status(state_dir: pathlib.Path | None = None, *, now: float | None = None,
         pulp_reapers_enabled=bool(pulp.get("enabled")),
         pulp_reclaimed_bytes=pulp.get("reclaimed_bytes", 0),
         pulp_error=pulp.get("error"),
+        vitals_refresh=(pulp.get("host_vitals_sensor") or {})
+        if isinstance(pulp.get("host_vitals_sensor"), dict) else {},
         fail_below_gb=receipt.get("fail_below_gb"),
         tightest_root=receipt.get("tightest_root"),
     )
@@ -114,10 +116,11 @@ def describe(value: dict[str, Any]) -> str:
     hours = value["age_seconds"] / 3600
     pulp = (f", pulp reapers {value['pulp_reclaimed_bytes'] / GIB:.1f} GiB"
             if value.get("pulp_reapers_enabled") else ", pulp reapers off")
-    if value.get("pulp_error"):
-        pulp += f" (error: {value['pulp_error']})"
+    warnings = degraded(value)
     body = (f"last pass {hours:.1f}h ago, exit {value.get('exit_code')}, "
             f"reclaimed {(value.get('reclaimed_bytes') or 0) / GIB:.1f} GiB{pulp}")
+    if warnings:
+        body = "; ".join(warnings) + "; " + body
     if state == "stale":
         return (f"reclaim: STALE, no pass finished in {hours:.1f}h "
                 f"(> {value['stale_after_s'] / 3600:g}h); the reclaim agent is not "
@@ -132,7 +135,29 @@ def describe(value: dict[str, Any]) -> str:
                 f"{floor_text} (nothing left that the reclaimer may delete); {body}")
     if state == "failed":
         return f"reclaim: LAST PASS FAILED; {body}"
+    if warnings:
+        return f"reclaim: WARN {body}"
     return f"reclaim: ok; {body}"
+
+
+def degraded(value: dict[str, Any]) -> list[str]:
+    """What the pass could not do although it exited 0, loudest first.
+
+    A pass whose Pulp reapers never ran (m5studio's profile names a
+    worktrees_root that does not exist) exited 0 and printed `reclaim: ok`,
+    with the reason in a parenthesis nobody reads.
+    """
+    out = []
+    error = value.get("pulp_error")
+    if value.get("pulp_reapers_enabled") and error:
+        if "worktrees_root" in str(error) and "is not a directory" in str(error):
+            out.append(f"pulp reapers: NOT RUNNING (worktrees_root missing: {error})")
+        else:
+            out.append(f"pulp reapers: NOT RUNNING ({error})")
+    vitals = value.get("vitals_refresh") or {}
+    if vitals.get("state") == "refresh_failed":
+        out.append(f"host-vitals sensor: REFRESH FAILED ({vitals.get('detail')})")
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

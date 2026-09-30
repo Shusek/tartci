@@ -106,6 +106,24 @@ class NetworkProfileTests(unittest.TestCase):
         self.assertIn('network_args=(reconcile --json)', body)
         self.assertIn("printf '%s\\n' \"$network_output\"", body)
 
+    def test_a_busy_host_exits_deferred_and_a_failure_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            args = ["reconcile", "--profile", str(Path(td) / "p.toml"), "--quiet"]
+            busy = network.TransitionBusy("pool transition busy: /x/pool-transition.lock")
+            with mock.patch.object(network, "reconcile", side_effect=busy):
+                self.assertEqual(network.main(args), network.EXIT_DEFERRED)
+            deferred = {"ok": False, "deferred": True, "reason": "reload deferred"}
+            with mock.patch.object(network, "reconcile", return_value=deferred):
+                self.assertEqual(network.main(args), network.EXIT_DEFERRED)
+            # Controls: a real failure, including an unrelated timeout, stays 1.
+            with mock.patch.object(network, "reconcile",
+                                   return_value={"ok": False, "reason": "relay probe failed"}):
+                self.assertEqual(network.main(args), 1)
+            with mock.patch.object(network, "reconcile", side_effect=TimeoutError("socket")):
+                self.assertEqual(network.main(args), 1)
+            with mock.patch.object(network, "reconcile", return_value={"ok": True}):
+                self.assertEqual(network.main(args), 0)
+
     def test_controller_scope_matches_pool_controlled_namespaces(self) -> None:
         pulp = {"Label": "com.danielraffel.pulp.tart-runner-macos-gate", "ProgramArguments": ["tartci", "serve", "macos"]}
         generic = {"Label": "com.danielraffel.tartci.tart-runner-macos-fleet.m1.gate", "ProgramArguments": ["tartci", "serve", "macos"]}
