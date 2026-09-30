@@ -94,6 +94,7 @@ CODES: tuple[str, ...] = (
     "reclaim_low_space",
     "reclaim_never_recorded",
     "reclaim_ok",
+    "reclaim_pass_degraded",
     "reclaim_stale",
     "reclaim_unreadable",
     "sealed_launcher_bundle",
@@ -875,6 +876,8 @@ def check_reclaim(value: dict | None) -> Finding:
     detail = reclaim_status.describe(value) if state != "unreadable" or value.get("receipt") \
         else f"reclaim status unreadable: {value.get('error')}"
     facts = {"reclaim": value}
+    if state == "ok" and reclaim_status.degraded(value):
+        return Finding("reclaim", PROBLEM, "reclaim_pass_degraded", detail, facts)
     if state == "ok":
         return Finding("reclaim", OK, "reclaim_ok", detail, facts)
     if state == "low_space":

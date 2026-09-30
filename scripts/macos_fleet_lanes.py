@@ -1717,8 +1717,12 @@ def host_off_problem(pool_state: str) -> dict | None:
         import host_off  # noqa: PLC0415 - sibling module
         value = host_off.status(host_off.state_dir(), host_off.pool_state_file(),
                                 pool_state=pool_state)
-    except Exception:  # noqa: BLE001 - readiness must not fail on this report
-        return None
+    except Exception as exc:  # noqa: BLE001 - readiness must not crash on this report
+        # Not None: None reads as "not left off", which is the one answer a
+        # check that did not run cannot give.
+        return {"code": "host_off_unverified",
+                "detail": f"could not tell whether a failed self-update left this host "
+                          f"off: {type(exc).__name__}: {exc}"}
     if not value.get("unexpected"):
         return None
     return {"code": "host_off_unexpected", "detail": value["detail"],

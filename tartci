@@ -497,10 +497,17 @@ cmd_launchd() {
         # config warnings, which is what `|| return 6` did: the watchdog then
         # never ran at all. Report the reconcile, run the watchdog, and keep
         # exit 6 as the signal only when the watchdog itself succeeded.
+        # Exit 3 is a DEFERRED reconcile (the pool-transition lock was held or
+        # a Tart VM was running): expected on a busy host and retried on the
+        # next pass, so it is printed but not reported as exit 6, which is
+        # reserved for a reconcile or relay probe that actually failed.
         local network_rc=0 network_text
         network_text="$(tartci_toml_python "$HERE/scripts/network_profile.py" "${network_args[@]}")" \
           || network_rc=$?
-        if [ "$network_rc" -ne 0 ]; then
+        if [ "$network_rc" -eq 3 ]; then
+          printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${network_text:-network-profile: DEFERRED (exit 3)}"
+        elif [ "$network_rc" -ne 0 ]; then
           printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "${network_text:-network-profile: FAIL (exit $network_rc)}"
           tartci_toml_python "$HERE/scripts/tartci_launchd_watchdog.py" "$@" || return $?

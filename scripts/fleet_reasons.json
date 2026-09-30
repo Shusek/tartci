@@ -221,6 +221,12 @@
       "summary": "The disk reclaimer finished a pass recently and exited 0.",
       "why": "The receipt is written at the end of every pass, so its age is the reclaimer's real heartbeat regardless of what launchd reports."
     },
+    "reclaim_pass_degraded": {
+      "summary": "The reclaim pass exited 0, but part of it did not run: the Pulp reapers (for example, the profile's worktrees_root does not exist) or the host-vitals sensor reinstall.",
+      "why": "An exit-0 pass printed `reclaim: ok` while the reapers that keep the worktree volume from filling had never run, with the reason only in a parenthesis. A part that silently does nothing is how a volume fills with every status green.",
+      "remedy": "`tartci pool status` names what did not run. For a missing worktrees_root, create the directory or correct [pulp_reapers].worktrees_root in the host profile; for a failed sensor reinstall, read the installer output in the reclaim_pass event.",
+      "do_not": "Do not read `exit 0` as every part of the pass having run."
+    },
     "reclaim_stale": {
       "summary": "No reclaim pass has finished for longer than two missed hourly passes.",
       "why": "The reclaim agent is dead, wedged, unscheduled, or shadowed by a leaked registration. launchd may still report the label loaded. Left alone the data volume fills and every gate VM lease is refused.",

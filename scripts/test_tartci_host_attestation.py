@@ -38,6 +38,7 @@ com.apple.xpc.launchd.user.domain.501.100004.Aqua/actions.runner.x.y = {
 }
 """
 
+PRINT_EXITED_2 = "\tstate = not running\n\truns = 40\n\tlast exit code = 2\n"
 PRINT_HEALTHY = """\
 com.apple.xpc.launchd.user.domain.501.100004.Aqua/actions.runner.x.y = {
 \tactive count = 1
@@ -349,6 +350,47 @@ class SensorCensus(unittest.TestCase):
         att._run = lambda cmd, timeout=20: (0, PRINT_HEALTHY, "")  # noqa: ARG005
         census = att.sensor_census([(label, path)], time.time())
         self.assertIsNone(census[0]["finding"], census[0])
+
+
+    def test_its_own_previous_exit_is_not_a_finding(self):
+        # Every run found its predecessor's non-zero exit, so one bad run kept
+        # the job exiting 2 on m1, m3 and m5 for as long as it ran.
+        path = _write_plist(self.tmp.name, att.SELF_LABEL)
+        att._run = lambda cmd, timeout=20: (0, PRINT_EXITED_2, "")  # noqa: ARG005
+        census = att.sensor_census([(att.SELF_LABEL, path)], time.time())
+        self.assertIsNone(census[0]["finding"], census[0])
+        self.assertEqual(str(census[0]["last_exit_code"]), "2")
+
+    def test_another_sensors_same_exit_is_still_a_finding(self):
+        # The control: the exemption is for this job's own label only.
+        label = "com.danielraffel.tartci.reap"
+        path = _write_plist(self.tmp.name, label)
+        att._run = lambda cmd, timeout=20: (0, PRINT_EXITED_2, "")  # noqa: ARG005
+        census = att.sensor_census([(label, path)], time.time())
+        self.assertEqual(census[0]["finding"], "last exit 2")
+
+
+class FindingsExitCode(unittest.TestCase):
+    """A completed attestation exits 0; its findings are data in the record."""
+
+    def run_main(self, *extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = {"launchd_readable": True, "profile_readable": True,
+                      "persistent_runners": [],
+                      "sensors": [{"label": "com.example.sensor", "finding": "last exit 1"}]}
+            original = att.build_attestation
+            att.build_attestation = lambda *a, **k: record  # noqa: ARG005
+            try:
+                return att.main(["--launch-agents-dir", tmp, "--home", tmp,
+                                 "--out", os.path.join(tmp, "a.json"), "--write", *extra])
+            finally:
+                att.build_attestation = original
+
+    def test_findings_do_not_make_the_job_exit_non_zero(self):
+        self.assertEqual(self.run_main(), 0)
+
+    def test_fail_on_findings_still_reports_them_as_exit_2(self):
+        self.assertEqual(self.run_main("--fail-on-findings"), 2)
 
 
 class ProfileReadability(unittest.TestCase):

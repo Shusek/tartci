@@ -177,6 +177,14 @@ class SurfaceTests(Fixture):
         self.pool.write_text("on\n")
         self.assertIsNone(fleet.host_off_problem("on"))
 
+    def test_a_check_that_raises_is_a_problem_not_a_clean_bill(self) -> None:
+        with mock.patch.object(host_off, "status", side_effect=OSError("state dir unreadable")):
+            problem = fleet.host_off_problem("off")
+            line = wd.host_off_pass(now=time.time())
+        self.assertEqual(problem["code"], "host_off_unverified")
+        self.assertIn("state dir unreadable", problem["detail"])
+        self.assertIn("WARN host-off check FAILED", line)
+
     def test_the_watchdog_recovers_and_warns_every_pass(self) -> None:
         self.left_off()
         with mock.patch.object(wd, "_pool_on", return_value=(9, "volume probe timed out")), \

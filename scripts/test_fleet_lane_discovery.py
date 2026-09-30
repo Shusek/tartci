@@ -40,15 +40,35 @@ LAUNCHCTL_REAL = "\n".join([
 ])
 
 
-def write_plist(agents: Path, label: str, state_dir: str | None, runner: str = "") -> None:
-    env: dict[str, str] = {}
-    if state_dir is not None:
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def installed_plist(label: str) -> dict:
+    """The plist the fleet installer writes for `label`, from the checked-in m3 profile.
+
+    Fixtures are rendered, never hand-written: a hand-written fixture set
+    TARTCI_RUNNER_NAME, which the installer never writes, and kept discovery
+    green while it named no lane on any host.
+    """
+    import tomllib
+    import macos_fleet_lanes as installer
+    profile = tomllib.loads((ROOT / "profiles" / "m3-macos-fleet.toml").read_text())
+    for lane in profile["lane"]:
+        for slot in range(1, lane.get("supervisors", 1) + 1):
+            plist = installer.lane_plist(profile, lane, slot=slot)
+            if plist["Label"] == label:
+                return plist
+    raise AssertionError(f"the m3 profile renders no lane {label}")
+
+
+def write_plist(agents: Path, label: str, state_dir: str | None) -> None:
+    plist = installed_plist(label)
+    env = plist["EnvironmentVariables"]
+    if state_dir is None:
+        env.pop("TARTCI_STATE_DIR", None)
+    else:
         env["TARTCI_STATE_DIR"] = state_dir
-    if runner:
-        env["TARTCI_RUNNER_NAME"] = runner
-    (agents / f"{label}.plist").write_bytes(
-        plistlib.dumps({"Label": label, "EnvironmentVariables": env})
-    )
+    (agents / f"{label}.plist").write_bytes(plistlib.dumps(plist))
 
 
 class TestLabelExtraction(unittest.TestCase):
@@ -70,16 +90,21 @@ class TestLabelExtraction(unittest.TestCase):
 
 class TestLaneFromPlist(unittest.TestCase):
     def test_state_dir_and_identity_come_from_the_plist(self) -> None:
-        lane = fld.lane_from_plist(
-            PREFIX + "studio.pulp-gate",
-            {"EnvironmentVariables": {
-                "TARTCI_STATE_DIR": "/tmp/x/macos-fleet/pulp-gate",
-                "TARTCI_RUNNER_NAME": "studio-pulp-gate-01",
-            }},
-        )
+        label = PREFIX + "studio.pulp-gate"
+        plist = installed_plist(label)
+        self.assertNotIn("TARTCI_RUNNER_NAME", plist["EnvironmentVariables"])
+        plist["EnvironmentVariables"]["TARTCI_STATE_DIR"] = "/tmp/x/macos-fleet/pulp-gate"
+        lane = fld.lane_from_plist(label, plist)
         self.assertEqual(lane.identity, "pulp-gate")
         self.assertEqual(lane.state_dir, Path("/tmp/x/macos-fleet/pulp-gate"))
         self.assertEqual(lane.runner_name, "studio-pulp-gate-01")
+
+    def test_every_discovered_lane_carries_the_supervisors_runner_name(self) -> None:
+        for label, name in (("studio.pulp-gate", "studio-pulp-gate-01"),
+                            ("studio.pulp-gate.slot2", "studio-pulp-gate-slot2-02")):
+            with self.subTest(label=label):
+                lane = fld.lane_from_plist(PREFIX + label, installed_plist(PREFIX + label))
+                self.assertEqual(lane.runner_name, name)
 
     def test_missing_state_dir_is_none_not_a_guessed_default(self) -> None:
         """Guessing a default path is how the stale legacy glob survived."""
@@ -190,8 +215,9 @@ class TestInstalledPlistContract(unittest.TestCase):
     Installed fleet plists set TARTCI_RUNNER_NAME_PREFIX and a slot, never
     TARTCI_RUNNER_NAME. Discovery read only the latter, so every lane was
     nameless, no VM-ownership prefix matched a fleet VM, and the VM janitor
-    deleted no stopped VM from 2026-08-15 on. The fixtures above set
-    TARTCI_RUNNER_NAME, which is why nothing failed. This renders every lane
+    deleted no stopped VM from 2026-08-15 on. The fixtures then set
+    TARTCI_RUNNER_NAME by hand, which is why nothing failed; they are now
+    rendered by installed_plist(). This renders every lane
     and slot of every checked-in profile with the installer's own code and
     asks the supervisor (`runner.sh --print-name`) for its name.
     """
