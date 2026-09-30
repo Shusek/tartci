@@ -3,7 +3,25 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+
+# Nearly every assertion here is a bare `[ ... ]` or `grep -q` under errexit,
+# so a failure used to end the script with exit 1 and no output at all. The ERR
+# trap (inherited into functions by -E) records where the failing command was;
+# the EXIT trap prints it once, from the main shell only, so a failure inside
+# a command substitution that the script tolerates never prints.
+set -E
+FAILED_AT="" FAILED_IN=""
+trap 'if [ -n "${FUNCNAME[0]:-}" ]; then FAILED_IN="${FUNCNAME[0]}() line ${LINENO}: ${BASH_COMMAND}"; else FAILED_AT="line ${LINENO}: ${BASH_COMMAND}"; fi' ERR
+report_exit(){
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "${BASHPID:-$$}" = "$$" ]; then
+    printf 'current job lifecycle: FAIL (exit %s) at %s%s\n' "$rc" \
+      "${FAILED_AT:-an unrecorded line}" "${FAILED_IN:+ (last failure inside ${FAILED_IN})}" >&2
+    [ ! -s "${EVENTS:-/dev/null}" ] || { printf 'events:\n' >&2; sed 's/^/  /' "$EVENTS" >&2; }
+  fi
+  rm -rf "$TMP"
+}
+trap report_exit EXIT
 
 # The scanner defaults its observation lock to the HOST's real one. This suite
 # runs on machines whose fleet lanes are scanning through that lock right now,
@@ -167,7 +185,12 @@ TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=10 capture_current_job revalidate
 [ "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" -gt 0 ]
 
 # Timeout cancellation gets the protected cancel budget even when ordinary
-# discovery exhausted before it learned the run and job IDs.
+# discovery exhausted before it learned the run and job IDs. Each protected
+# budget must be spent on its own counter and never on the exhausted lifecycle
+# one. The budgets are generous rather than tiny: a scan's cost is wall-clock
+# seconds (python start-up plus one fake API call per page), and a one-second
+# budget failed on slower CI runners before the scan could finish, which is a
+# fact about the runner and not about the budget split under test.
 reset_state
 CURRENT_RUN_ID="" CURRENT_JOB_ID=""
 CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
@@ -175,15 +198,17 @@ CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
 printf active >"$LIFECYCLE_STATE"
 posts_before="$(post_count)"
 TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=30 \
-TARTCI_CANCEL_DISCOVERY_BUDGET_SECS=1 \
-TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=1 \
-TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=1 \
-TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
+TARTCI_CANCEL_DISCOVERY_BUDGET_SECS=20 \
+TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=20 cancel_current_run
 [ "$CURRENT_RUN_ID" = 333 ]
 [ "$CURRENT_JOB_ID" = 444 ]
-[ "$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" = 1 ]
-[ "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" = 1 ]
-[ "$CURRENT_CANCEL_TERMINAL_SCAN_SPENT" = 1 ]
+[ "$CURRENT_JOB_SCAN_SPENT" = 30 ]
+for spent in "$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" \
+    "$CURRENT_CANCEL_TERMINAL_SCAN_SPENT"; do
+  [ "$spent" -ge 1 ] && [ "$spent" -le 20 ]
+done
 [ "$(post_count)" = "$((posts_before + 1))" ]
 grep -q '^run_cancel_terminal|.*rerun_eligible=true' "$EVENTS"
 

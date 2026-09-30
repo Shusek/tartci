@@ -54,5 +54,6 @@ jobs:
       - name: Run shell tests
         run: |
           for test_script in tests/test_*.sh; do
-            bash "$test_script"
+            # Name the script: several end on a bare assertion under errexit.
+            bash "$test_script" || { rc=$?; echo "::error::$test_script exited $rc"; exit 1; }
           done
