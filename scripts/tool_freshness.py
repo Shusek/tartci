@@ -408,8 +408,31 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     hours = max(0.0, (now - behind_since) / 3600)
     row.update(state="behind", releases_behind=len(newer), behind_since=_iso(behind_since),
                behind_since_lower_bound=lower_bound, behind_hours=round(hours, 1),
-               stale=hours > stale_hours)
+               stale=hours > stale_hours,
+               # Every release this host could move to, oldest first: the apply
+               # takes the newest one that has finished its soak.
+               candidates=[{"version": _vstr(version), "tag": tag, "published_at": _iso(at)}
+                           for version, tag, at in newer])
     return row
+
+
+def soaked_candidate(row: dict, now: float, soak_minutes: float) -> tuple[dict | None, str]:
+    """(newest release that has soaked, why none has).
+
+    Keying the soak on the NEWEST release starved a host whenever releases came
+    faster than the soak: each one restarted the wait before the previous one
+    could apply (Shipyard v0.232.0 was held back by v0.233.0 being under 30
+    minutes old). Applying the newest SOAKED release moves the host forward,
+    and the next pass takes the newer one once it has soaked too.
+    """
+    candidates = row.get("candidates") or [{"version": row.get("latest"),
+                                            "tag": row.get("latest_tag"),
+                                            "published_at": row.get("latest_published_at")}]
+    soaked = [c for c in candidates
+              if now - (_epoch(c.get("published_at")) or now) >= soak_minutes * 60]
+    if soaked:
+        return soaked[-1], ""
+    return None, f"waiting: {candidates[0]['tag']} is younger than {soak_minutes:g} min"
 
 
 def host_platform() -> str:
@@ -453,9 +476,12 @@ def probe_release(repo: str, tag: str, assets: list[str],
     if "SHA256SUMS" in assets and "SHA256SUMS" not in missing:
         code, text = http(f"{base}/SHA256SUMS")
         sums = text.decode("utf-8", "replace") if code == 200 else None
+    def why(name: str) -> str:
+        code = codes[name]
+        return "missing" if code == 404 else f"unreachable (HTTP {code or 'none'})"
+
     detail = "ready" if not missing else "; ".join(
-        f"asset {name} {'missing' if codes[name] == 404 else f'unreachable (HTTP {codes[name] or 'none'})'}"
-        for name in missing)
+        f"asset {name} {why(name)}" for name in missing)
     return {"ready": not missing, "missing": missing, "sums": sums, "detail": detail}
 
 
@@ -496,8 +522,12 @@ def _not_ready_before_install(record: dict) -> bool:
     if record.get("not_ready"):
         return True
     text = str(record.get("result") or "")
+    # Exit 75 is NOT_READY_EXIT for every tool: for pulp a download that failed,
+    # for Shipyard's fleet-update another rollout holding the controller lock
+    # (m3's v0.231.0 record). Neither installed anything.
     return text.startswith("FAILED") and any(marker in text for marker in (
-        "could not download", "returned error: 404", "could not be downloaded"))
+        "could not download", "returned error: 404", "could not be downloaded",
+        f"exit {NOT_READY_EXIT},", f"exit {NOT_READY_EXIT})"))
 
 
 def _wait_not_ready(name: str, tag: str, detail: str, row: dict, now: float, state: Path,
@@ -535,11 +565,11 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     pending = {} if pending is None else pending
     if row.get("state") != "behind" or not tool.get("auto_apply") or not tool.get("apply_command"):
         return None
-    tag = str(row["latest_tag"])
-    published = _epoch(row.get("latest_published_at")) or now
-    if now - published < float(settings["apply_after_minutes"]) * 60:
-        row["apply"] = f"waiting: {tag} is younger than {settings['apply_after_minutes']:g} min"
+    candidate, waiting = soaked_candidate(row, now, float(settings["apply_after_minutes"]))
+    if candidate is None:
+        row["apply"] = waiting
         return None
+    tag, target_version = str(candidate["tag"]), candidate["version"]
     last = attempts.get(name) or {}
     if last.get("target") == tag and not _not_ready_before_install(last) and \
             now - (_epoch(last.get("at")) or 0) < float(settings["apply_retry_hours"]) * 3600:
@@ -576,7 +606,7 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     after = read_versions(tool, home, run)
     effective = min(v for v in (after["installed"], after["generation"] or after["installed"]) if v) \
         if after["installed"] else None
-    landed = _vstr(effective) == row["latest"] and verdict in (None, "verified")
+    landed = _vstr(effective) == target_version and verdict in (None, "verified")
     detail = f"verdict {verdict}, " if verdict is not None else ""
     result = "ok" if landed else (f"FAILED ({detail}exit {rc}, installed {_vstr(after['installed'])}"
                                   f", generation {_vstr(after['generation'])}): {out[-300:]}")
@@ -584,7 +614,7 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     row["apply"] = f"applied {tag}: {result}" if landed else f"applied {tag}: {result[:200]}"
     if not landed:
         _append_event(state, {"event": "tool_apply_failed", "tool": name, "at": _iso(now),
-                              "from": row["effective"], "target": row["latest"],
+                              "from": row["effective"], "target": target_version,
                               "installed_after": _vstr(after["installed"]),
                               "generation_after": _vstr(after["generation"]),
                               "verdict": verdict, "exit": rc, "detail": out[-300:]})
