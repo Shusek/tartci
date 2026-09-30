@@ -17,13 +17,18 @@ launchd watchdog, and optionally applies the update itself:
             and `auto_apply`, a behind tool is updated once its newest
             release is `apply_after_minutes` old, at most once per target per
             `apply_retry_hours`, and the result is re-read and verified.
-            An apply that exits NOT_READY_EXIT (75: the release could not be
-            downloaded, nothing installed) is retried after
-            `not_ready_retry_minutes` instead and does not spend the attempt.
+            A tool with `release_assets` (pulp) is first checked for readiness:
+            every asset listed on the GitHub release and HEAD 200. A release
+            that is not ready, or an apply that exits NOT_READY_EXIT (75: a
+            download failed, nothing installed), is "not ready yet": re-checked
+            on the next refresh, never recorded as an attempt, and reported as
+            a problem only after `not_ready_alert_hours` (6). The per-target
+            guard covers only failures after the downloads succeeded.
   events    every change of an installed version, whoever made it, appends
             one `tool_deployed` event (tool, from, to, verify) to
             events.jsonl; an automatic apply that did not land appends
-            `tool_apply_failed`.
+            `tool_apply_failed`; a release still not ready after the alert
+            window appends one `tool_release_incomplete`.
   summary   reads only the cached state; it never runs a tool or fetches.
 
 A tool with a `generation_link` (Shipyard's ghapp auth generation) is also
@@ -39,6 +44,8 @@ Settings (optional) live in ~/.config/tartci/tool-freshness.toml:
     auto_apply = false            # stop automatic Shipyard updates here
     [tools.pulp]
     auto_apply = false            # measure the pulp CLI but never install it here
+    local_archive_dir = "{home}/pulp-archives"   # optional <tag>/pulp-<platform>.tar.gz,
+                                  # used only when its sha256 matches the release
 
 `{home}`, `{tag}` and `{host_class}` are substituted in commands. A tool whose binary is
 absent is `not_installed`, which is reported but is never a problem.
@@ -48,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -55,6 +63,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -95,55 +104,75 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
         # carries the hook, and a host whose agents open stale checkouts never
         # gets it. So the watchdog installs the release with that release's
         # own install.sh, pinned to the tag, the same way the hook does.
-        "apply_command": ["/bin/bash", "-c", "{pulp_install}", "pulp-install", "{tag}", "{home}"],
+        "apply_command": ["/bin/bash", "-c", "{pulp_install}", "pulp-install", "{tag}", "{home}",
+                          "{platform}", "{local_archive}"],
         "auto_apply": True,
+        # Every release asset the install needs; checked (listed on the release
+        # and HEAD 200) before any host attempts it. SHA256SUMS is what the
+        # install verifies the archive against.
+        "release_assets": ["pulp-{platform}.tar.gz", "SHA256SUMS"],
+        # Optional backup: a directory holding <tag>/pulp-<platform>.tar.gz, used
+        # only when the release archive is not downloadable and only when its
+        # sha256 matches the release's own SHA256SUMS.
+        "local_archive_dir": None,
     },
 }
 
-# An apply command that exits NOT_READY_EXIT changed nothing because the
-# release could not be downloaded yet. That is not a failed attempt: the tool is
-# retried every NOT_READY_RETRY_MINUTES, and the per-target retry guard is kept
-# for failures that happen after the install has started.
+# A pulp apply that exits NOT_READY_EXIT changed nothing because something it
+# needed could not be downloaded (a 404 or a network error). That is "not
+# ready yet", never a failed attempt: the per-target guard is kept for
+# failures after every download succeeded (checksum, install, verify).
 NOT_READY_EXIT = 75
-NOT_READY_RETRY_MINUTES = 30.0
+# How long a behind release may stay incomplete (assets missing or not
+# downloadable) before that is reported as a problem. Until then the host
+# waits quietly and re-checks on every refresh.
+NOT_READY_ALERT_HOURS = 6.0
 
-# Fetches install.sh at the release tag, downloads the release archive, and
-# only then installs it (PULP_INSTALL_ARCHIVE) pinned to that version into
-# ~/.pulp/bin. The pulp repository's Atom feed lists a tag the moment
-# auto-release pushes it, about an hour before the release build publishes
-# the archives (v0.884.0: tag 12:25Z, archive 13:29Z, release 13:32Z), so a
-# download that fails before anything is installed exits NOT_READY_EXIT. An
-# installer that still excludes the WebGPU runtime (releases before the fix)
-# would strand pulp-cpp, so it is refused rather than run.
+# Installs one pulp release into ~/.pulp/bin, pinned to the tag:
+#   $1 tag  $2 home  $3 platform (darwin-arm64)  $4 optional local archive
+# It downloads the tag's install.sh and the release's SHA256SUMS, takes the
+# archive from the release (or, when given, a local copy), and installs only
+# an archive whose sha256 matches SHA256SUMS. Any download failure exits
+# NOT_READY_EXIT before anything is installed. A checksum mismatch after a
+# successful download exits 4. An installer that still excludes the WebGPU
+# runtime (releases before the fix) would strand pulp-cpp, so it is refused.
 PULP_INSTALL_SCRIPT = r"""set -euo pipefail
-tag="$1"; home="$2"
+tag="$1"; home="$2"; platform="$3"; local_archive="${4:-}"
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
-installer="$work/install.sh"
-if ! curl -fsSL --max-time 60 \
-    "https://raw.githubusercontent.com/Generous-Corp/pulp/$tag/tools/install/install.sh" -o "$installer"; then
-  echo "not ready: the $tag installer could not be downloaded" >&2
-  exit 75
-fi
-if grep -q -- "--exclude='libwgpu_native.dylib'" "$installer"; then
+base="https://github.com/Generous-Corp/pulp/releases/download/$tag"
+fetch(){
+  if ! curl -fsSL --max-time "$3" "$1" -o "$2"; then
+    echo "not ready: $1 could not be downloaded" >&2
+    exit 75
+  fi
+}
+fetch "https://raw.githubusercontent.com/Generous-Corp/pulp/$tag/tools/install/install.sh" \
+  "$work/install.sh" 60
+if grep -q -- "--exclude='libwgpu_native.dylib'" "$work/install.sh"; then
   echo "refused: the $tag installer strands pulp-cpp without its runtime" >&2
   exit 3
 fi
-# The probe is confined to a scratch dir and the tag, so an installer that
-# predates PULP_PRINT_PLATFORM can only ever install there.
-platform="$(PULP_PRINT_PLATFORM=1 PULP_VERSION="${tag#v}" PULP_INSTALL_DIR="$work/probe" \
-  PULP_NO_MODIFY_PATH=1 PULP_SKIP_SDK_INSTALL=1 bash "$installer" 2>/dev/null | tail -1 || true)"
-archive_env=()
-if printf '%s' "$platform" | grep -Eqx '[a-z]+-[a-z0-9]+'; then
-  url="https://github.com/Generous-Corp/pulp/releases/download/$tag/pulp-$platform.tar.gz"
-  if ! curl -fsSL --max-time 300 "$url" -o "$work/pulp.tar.gz"; then
-    echo "not ready: $url could not be downloaded (the release may still be building)" >&2
-    exit 75
-  fi
-  archive_env=(PULP_INSTALL_ARCHIVE="$work/pulp.tar.gz")
+fetch "$base/SHA256SUMS" "$work/SHA256SUMS" 60
+want="$(awk -v f="pulp-$platform.tar.gz" '$2 == f || $2 == "*" f { print $1; exit }' "$work/SHA256SUMS")"
+if [ -z "$want" ]; then
+  echo "not ready: SHA256SUMS for $tag lists no pulp-$platform.tar.gz" >&2
+  exit 75
 fi
-env ${archive_env[@]+"${archive_env[@]}"} PULP_VERSION="${tag#v}" \
+if [ -n "$local_archive" ]; then
+  cp "$local_archive" "$work/pulp.tar.gz"
+  source="local archive $local_archive"
+else
+  fetch "$base/pulp-$platform.tar.gz" "$work/pulp.tar.gz" 300
+  source="$base/pulp-$platform.tar.gz"
+fi
+got="$(shasum -a 256 "$work/pulp.tar.gz" | awk '{ print $1 }')"
+if [ "$got" != "$want" ]; then
+  echo "refused: $source has sha256 $got, SHA256SUMS says $want" >&2
+  exit 4
+fi
+PULP_INSTALL_ARCHIVE="$work/pulp.tar.gz" PULP_VERSION="${tag#v}" \
   PULP_INSTALL_DIR="$home/.pulp/bin" PULP_NO_MODIFY_PATH=1 PULP_SKIP_SDK_INSTALL=1 \
-  bash "$installer"
+  bash "$work/install.sh"
 """
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -214,7 +243,7 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
         for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours",
-                    "not_ready_retry_minutes"):
+                    "not_ready_alert_hours"):
             if key in data:
                 settings[key] = float(data[key])
         if isinstance(data.get("host_class"), str):
@@ -227,11 +256,12 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
 
 
 def _expand(argv: list[str] | None, home: Path, tag: str = "",
-            host_class: str = "") -> list[str] | None:
+            host_class: str = "", platform: str = "", local_archive: str = "") -> list[str] | None:
     if not argv:
         return None
     return [PULP_INSTALL_SCRIPT if part == "{pulp_install}" else
             part.replace("{home}", str(home)).replace("{tag}", tag)
+            .replace("{platform}", platform).replace("{local_archive}", local_archive)
             .replace("{host_class}", host_class) for part in argv]
 
 
@@ -382,10 +412,127 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     return row
 
 
+def host_platform() -> str:
+    """The release platform suffix this host installs (pulp-<platform>.tar.gz)."""
+    arch = os.uname().machine
+    os_name = "darwin" if sys.platform == "darwin" else "linux"
+    return f"{os_name}-{'arm64' if arch in ('arm64', 'aarch64') else 'x64'}"
+
+
+def _http(url: str, method: str = "GET", timeout: float = FEED_TIMEOUT_S) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, method=method,
+                                     headers={"User-Agent": "tartci-tool-freshness"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            return response.status, response.read() if method == "GET" else b""
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+    except (OSError, ValueError) as exc:
+        return 0, str(exc).encode()
+
+
+def probe_release(repo: str, tag: str, assets: list[str],
+                  http: Callable[..., tuple[int, bytes]] = _http) -> dict:
+    """Whether every asset the install needs is downloadable from the release.
+
+    Each asset's release download URL must answer HEAD 200: that URL exists
+    only for an asset uploaded to a published release, so it answers both
+    "listed" and "downloadable" without the REST API (whose unauthenticated
+    quota a fleet behind one address shares). SHA256SUMS is fetched as well,
+    for the checksum. {"ready", "missing", "sums", "detail"}; every failure is
+    "not ready", never an error.
+    """
+    base = f"https://github.com/{repo}/releases/download/{tag}"
+    missing, codes = [], {}
+    for name in assets:
+        code, _ = http(f"{base}/{name}", "HEAD")
+        codes[name] = code
+        if code != 200:
+            missing.append(name)
+    sums = None
+    if "SHA256SUMS" in assets and "SHA256SUMS" not in missing:
+        code, text = http(f"{base}/SHA256SUMS")
+        sums = text.decode("utf-8", "replace") if code == 200 else None
+    detail = "ready" if not missing else "; ".join(
+        f"asset {name} {'missing' if codes[name] == 404 else f'unreachable (HTTP {codes[name] or 'none'})'}"
+        for name in missing)
+    return {"ready": not missing, "missing": missing, "sums": sums, "detail": detail}
+
+
+def published_sha256(sums: str | None, name: str) -> str | None:
+    for line in (sums or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == name and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+            return parts[0]
+    return None
+
+
+def verified_local_archive(tool: dict, tag: str, platform: str, sums: str | None,
+                           home: Path) -> tuple[str | None, str | None]:
+    """(path, None) for a local archive whose sha256 matches the release, else (None, why)."""
+    directory = tool.get("local_archive_dir")
+    if not directory:
+        return None, None
+    name = f"pulp-{platform}.tar.gz"
+    path = Path(str(directory).replace("{home}", str(home))).expanduser() / tag / name
+    if not path.is_file():
+        return None, None
+    want = published_sha256(sums, name)
+    if want is None:
+        return None, f"local {path} not used: the release publishes no checksum for {name} yet"
+    got = hashlib.sha256(path.read_bytes()).hexdigest()
+    if got != want:
+        return None, f"local {path} refused: sha256 {got[:12]} != release {want[:12]}"
+    return str(path), None
+
+
+def _not_ready_before_install(record: dict) -> bool:
+    """A recorded attempt that never got past its downloads.
+
+    Records written before not-ready handling existed carry the download
+    failure only in their text (v0.884.0 on m1, m3 and m5: "could not download
+    ... returned error: 404"); they must not keep holding the host back.
+    """
+    if record.get("not_ready"):
+        return True
+    text = str(record.get("result") or "")
+    return text.startswith("FAILED") and any(marker in text for marker in (
+        "could not download", "returned error: 404", "could not be downloaded"))
+
+
+def _wait_not_ready(name: str, tag: str, detail: str, row: dict, now: float, state: Path,
+                    settings: dict, pending: dict) -> None:
+    """Record a release that is not ready yet; loud only past the alert window."""
+    entry = pending.get(name) if isinstance(pending.get(name), dict) else {}
+    if entry.get("target") != tag:
+        entry = {"target": tag, "since": _iso(now)}
+    entry.update(checked_at=_iso(now), detail=detail)
+    hours = (now - (_epoch(entry["since"]) or now)) / 3600
+    window = float(settings.get("not_ready_alert_hours", NOT_READY_ALERT_HOURS))
+    row["apply"] = f"{name} {tag} not ready yet ({detail}), waiting"
+    row["not_ready"] = {"target": tag, "since": entry["since"], "hours": round(hours, 1)}
+    if hours >= window:
+        row["release_incomplete"] = (f"{name} {tag} still not ready after {hours:.1f} h "
+                                     f"(> {window:g} h): {detail}")
+        if not entry.get("alerted"):
+            entry["alerted"] = _iso(now)
+            _append_event(state, {"event": "tool_release_incomplete", "tool": name,
+                                  "at": _iso(now), "target": tag, "since": entry["since"],
+                                  "hours": round(hours, 1), "detail": detail})
+    pending[name] = entry
+    return None
+
+
 def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state: Path,
                 settings: dict, attempts: dict,
-                run: Callable[[list[str], float], tuple[int, str]]) -> dict | None:
-    """Apply a behind tool's update when allowed; return the re-measured version."""
+                run: Callable[[list[str], float], tuple[int, str]],
+                pending: dict | None = None, probe: dict | None = None) -> dict | None:
+    """Apply a behind tool's update when allowed; return the re-measured version.
+
+    `pending` holds releases that are not ready yet (never attempts); `probe`
+    replaces the release check in tests ({"platform", "result"}).
+    """
+    pending = {} if pending is None else pending
     if row.get("state") != "behind" or not tool.get("auto_apply") or not tool.get("apply_command"):
         return None
     tag = str(row["latest_tag"])
@@ -394,32 +541,38 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
         row["apply"] = f"waiting: {tag} is younger than {settings['apply_after_minutes']:g} min"
         return None
     last = attempts.get(name) or {}
-    retry_hours = (float(settings.get("not_ready_retry_minutes", NOT_READY_RETRY_MINUTES)) / 60
-                   if last.get("not_ready") else float(settings["apply_retry_hours"]))
-    if last.get("target") == tag and now - (_epoch(last.get("at")) or 0) < retry_hours * 3600:
-        word = "waiting: not downloadable at" if last.get("not_ready") else "already attempted"
-        row["apply"] = f"{word} {tag} {last.get('at')}: {last.get('result')}"
+    if last.get("target") == tag and not _not_ready_before_install(last) and \
+            now - (_epoch(last.get("at")) or 0) < float(settings["apply_retry_hours"]) * 3600:
+        row["apply"] = f"already attempted {tag} at {last.get('at')}: {last.get('result')}"
         return None
+    platform = host_platform() if probe is None else probe.get("platform", host_platform())
+    local = ""
+    if tool.get("release_assets"):
+        assets = [a.replace("{platform}", platform) for a in tool["release_assets"]]
+        ready = (probe or {}).get("result") or probe_release(str(tool["repo"]), tag, assets)
+        if not ready["ready"]:
+            local, refusal = verified_local_archive(tool, tag, platform, ready.get("sums"), home)
+            if refusal:
+                row["local_archive"] = refusal
+            if not local:
+                return _wait_not_ready(name, tag, ready["detail"], row, now, state, settings, pending)
+    pending.pop(name, None)
     klass = host_class(home, settings) or ""
     if "{host_class}" in " ".join(tool["apply_command"]) and not klass:
         row["apply"] = ("refused: no host class (set host_class in tool-freshness.toml "
                         "or install a fleet profile)")
         return None
-    argv = _expand(tool["apply_command"], home, tag, klass)
+    argv = _expand(tool["apply_command"], home, tag, klass, platform, local or "")
     rc, out = run(argv, APPLY_TIMEOUT_S)  # type: ignore[arg-type]
     verdict = None
     if tool.get("verdict_json"):
         summaries = [doc for doc in json_documents(out) if doc.get("event") == "fleet_summary"]
         verdict = summaries[-1].get("verdict") if summaries else "no fleet_summary"
     if rc == NOT_READY_EXIT:
-        # Nothing was installed; the release is not downloadable yet. Recorded
-        # with its own short backoff, never as a failed attempt.
-        attempts[name] = {"target": tag, "at": _iso(now), "not_ready": True,
-                          "result": f"not ready: {out.strip()[-200:]}"}
-        row["apply"] = f"waiting: {tag} is not downloadable yet"
-        _append_event(state, {"event": "tool_release_not_ready", "tool": name,
-                              "at": _iso(now), "target": row["latest"], "detail": out[-300:]})
-        return None
+        # A download failed before anything was installed (a 404 or a network
+        # error): not ready yet, never a spent attempt.
+        return _wait_not_ready(name, tag, out.strip()[-200:] or "download failed", row, now,
+                               state, settings, pending)
     after = read_versions(tool, home, run)
     effective = min(v for v in (after["installed"], after["generation"] or after["installed"]) if v) \
         if after["installed"] else None
@@ -441,7 +594,8 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
 def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             settings: dict | None = None,
             run: Callable[[list[str], float], tuple[int, str]] = run_command,
-            feed: Callable[[str], str] = fetch_feed) -> dict:
+            feed: Callable[[str], str] = fetch_feed,
+            probe: Callable[[str, str], dict] | None = None) -> dict:
     """Measure every enabled tool, apply where allowed, record deployments."""
     now = time.time() if now is None else now
     settings = settings or load_settings(home)
@@ -453,6 +607,7 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             return cached
     previous = cached.get("tools") or {}
     attempts = _read_json(state / "attempts.json") or {}
+    pending = _read_json(state / "pending.json") or {}
     tools: dict[str, dict] = {}
     for name, tool in settings["tools"].items():
         if not tool.get("enabled", True):
@@ -460,7 +615,8 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
         prior = previous.get(name) if isinstance(previous.get(name), dict) else None
         row = measure(name, tool, home, now, prior, run, feed, float(settings["stale_hours"]))
         before = {key: prior.get(key) for key in ("installed", "generation")} if prior else {}
-        applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run)
+        applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run,
+                              pending, probe(name, str(row.get("latest_tag"))) if probe else None)
         if applied and applied.get("installed"):
             before = {key: row.get(key) for key in ("installed", "generation")}
             note = row.get("apply")
@@ -480,6 +636,7 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
     value = {"measured_at": _iso(now), "stale_hours": settings["stale_hours"], "tools": tools}
     _write_json(state / "state.json", value)
     _write_json(state / "attempts.json", attempts)
+    _write_json(state / "pending.json", pending)
     return value
 
 
@@ -516,6 +673,7 @@ def summary(home: Path | None = None) -> dict:
                 for row in rows if row.get("stale")]
     problems += [f"{row['tool']} freshness unknown" for row in rows
                  if row.get("state") == "unknown"]
+    problems += [row["release_incomplete"] for row in rows if row.get("release_incomplete")]
     return {"state": value, "lines": [render_row(row) for row in rows],
             "problem": "; ".join(problems) or None}
 
