@@ -198,6 +198,19 @@ class TestInstalledPlistContract(unittest.TestCase):
 
     ROOT = Path(__file__).resolve().parents[1]
 
+    def fake_chrome(self) -> Path:
+        import tempfile
+        if not hasattr(self, "_chrome"):
+            tmp = Path(tempfile.mkdtemp())
+            self.addCleanup(__import__("shutil").rmtree, tmp, True)
+            app = tmp / "Google Chrome.app"
+            binary = app / "Contents" / "MacOS" / "Google Chrome"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            self._chrome = app
+        return self._chrome
+
     def rendered(self):
         import os
         import tomllib
@@ -220,6 +233,10 @@ class TestInstalledPlistContract(unittest.TestCase):
                 env = {**{k: str(v) for k, v in env_vars.items()},
                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                        "HOME": os.environ.get("HOME", "/tmp")}
+                if "TARTCI_RUNNER_CHROME_APP_DIR" in env:
+                    # The supervisor refuses to start without the host's Chrome;
+                    # a stand-in executable satisfies that on a host without it.
+                    env["TARTCI_RUNNER_CHROME_APP_DIR"] = str(self.fake_chrome())
                 supervisor = subprocess.run(["bash", str(runner), "--print-name"], env=env,
                                             capture_output=True, text=True, timeout=60)
                 self.assertEqual(supervisor.returncode, 0, supervisor.stderr[-400:])
