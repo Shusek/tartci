@@ -449,6 +449,87 @@ else:
             delete_runner.assert_not_called()
 
 
+class OrphanedLaneVmTests(unittest.TestCase):
+    """Stopped lane VMs whose supervisor is gone are deleted; any doubt keeps one.
+
+    No state file names such a VM (a lane's state file names only its current
+    VM), so the marker rule never owned them: on 2026-09-30 m3 held four
+    (250 GB), m1 two (94 GB), and nothing had deleted a stopped VM since 08-15.
+    """
+
+    RUNNERS = {"studio-pulp-gate-01"}
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def bundle(self, name: str, age: float) -> Path:
+        path = self.tmp / "vms" / name
+        path.mkdir(parents=True, exist_ok=True)
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def verdict(self, name="studio-pulp-gate-01-11643-2", running=False, states=None,
+                leases=frozenset(), alive=lambda pid: False, age=7200):
+        return vm_reap.orphan_verdict(name, running, self.RUNNERS, states or {},
+                                      None if leases is None else set(leases),
+                                      self.bundle(name, age), time.time(), 3600, alive)
+
+    def test_a_stopped_lane_vm_with_a_dead_supervisor_is_deleted(self) -> None:
+        self.assertTrue(self.verdict()[0])
+
+    def test_every_doubt_keeps_it(self) -> None:
+        cases = {
+            "not_a_lane_vm": dict(name="pulp-preamble-m1-target-06-99292-1"),
+            "running": dict(running=True),
+            "state_file_names_it": dict(states={"studio-pulp-gate-01-11643-2": {}}),
+            "lease_store_unreadable": dict(leases=None),
+            "lease_names_it": dict(leases={"vm-tart-macos-vm-studio-pulp-gate-01-11643-2"}),
+            "supervisor_pid_alive": dict(alive=lambda pid: pid == 11643),
+            "recent": dict(age=60),
+        }
+        for reason, kwargs in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(self.verdict(**kwargs), (False, reason))
+        self.assertEqual(vm_reap.orphan_verdict(
+            "studio-pulp-gate-01-11643-2", False, self.RUNNERS, {}, set(),
+            self.tmp / "vms" / "absent", time.time(), 3600, lambda pid: False),
+            (False, "vm_bundle_unreadable"))
+
+    def test_the_digest_deletes_only_the_orphan_and_reports_it(self) -> None:
+        import fleet_lane_discovery as fld
+        lane = fld.Lane("com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate",
+                        "pulp-gate", self.tmp / "state" / "pulp-gate", "studio-pulp-gate-01")
+        (self.tmp / "state" / "pulp-gate").mkdir(parents=True)
+        (self.tmp / "leases").mkdir()
+        (self.tmp / "leases" / "leases.json").write_text("[]")
+        vms = [{"Name": "studio-pulp-gate-01-11643-2", "State": "stopped", "Size": 66},
+               {"Name": "pulp-preamble-m1-target-06-99292-1", "State": "stopped", "Size": 44},
+               {"Name": "pulp-build-runner:latest", "State": "stopped", "Size": 46}]
+        for vm in vms[:2]:
+            self.bundle(vm["Name"], 7200)
+        deleted = []
+        args = vm_reap.parse_args(["--repo", "danielraffel/pulp", "--fix"])
+        with mock.patch.dict(os.environ, {"TART_HOME": str(self.tmp),
+                                          "TARTCI_LEASE_DIR": str(self.tmp / "leases")}), \
+             mock.patch.object(vm_reap, "scoped_view", return_value=False), \
+             mock.patch.object(fld, "discover_lanes", return_value=([lane], [])), \
+             mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(vm_reap, "tart_vms", return_value=vms), \
+             mock.patch.object(vm_reap, "macos_running_count", return_value=0), \
+             mock.patch.object(vm_reap, "github_runners", return_value=[]), \
+             mock.patch.object(vm_reap, "pid_alive", return_value=False), \
+             mock.patch.object(vm_reap, "delete_vm",
+                               side_effect=lambda name, running: deleted.append(name) or
+                               [f"vm_deleted:{name}"]):
+            digest, _ = vm_reap.build_digest(args)
+        self.assertEqual(deleted, ["studio-pulp-gate-01-11643-2"])
+        self.assertEqual(digest["orphans"]["delete"], ["studio-pulp-gate-01-11643-2"])
+        self.assertEqual(digest["orphans"]["delete_gb"], 66)
+        self.assertIn("vm_deleted:studio-pulp-gate-01-11643-2", digest["fixed"])
+
+
 class SupervisorServingDigestTests(unittest.TestCase):
     """The digest every observer reads has to carry the serve-less streak.
 

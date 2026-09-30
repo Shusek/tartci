@@ -183,5 +183,54 @@ class TestRunnerPrefixes(unittest.TestCase):
         self.assertIn("studio-pulp-gate-", prefixes)
 
 
+class TestInstalledPlistContract(unittest.TestCase):
+    """Discovery reads the runner name the supervisor itself derives, from the
+    plists the installer actually writes.
+
+    Installed fleet plists set TARTCI_RUNNER_NAME_PREFIX and a slot, never
+    TARTCI_RUNNER_NAME. Discovery read only the latter, so every lane was
+    nameless, no VM-ownership prefix matched a fleet VM, and the VM janitor
+    deleted no stopped VM from 2026-08-15 on. The fixtures above set
+    TARTCI_RUNNER_NAME, which is why nothing failed. This renders every lane
+    and slot of every checked-in profile with the installer's own code and
+    asks the supervisor (`runner.sh --print-name`) for its name.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def rendered(self):
+        import os
+        import tomllib
+        import macos_fleet_lanes as installer
+        for profile in sorted((self.ROOT / "profiles").glob("*-macos-fleet.toml")):
+            data = tomllib.loads(profile.read_text())
+            for lane in data.get("lane", []):
+                for slot in range(1, lane.get("supervisors", 1) + 1):
+                    yield profile.name, installer.lane_plist(data, lane, slot=slot), os
+
+    def test_discovery_names_every_rendered_lane_as_its_supervisor_does(self) -> None:
+        import subprocess
+        runner = self.ROOT / "providers" / "tart-macos" / "runner.sh"
+        checked = 0
+        for profile, plist, os in self.rendered():
+            with self.subTest(profile=profile, label=plist["Label"]):
+                env_vars = plist["EnvironmentVariables"]
+                self.assertNotIn("TARTCI_RUNNER_NAME", env_vars)   # the installer's real shape
+                lane = fld.lane_from_plist(plist["Label"], plist)
+                env = {**{k: str(v) for k, v in env_vars.items()},
+                       "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                       "HOME": os.environ.get("HOME", "/tmp")}
+                supervisor = subprocess.run(["bash", str(runner), "--print-name"], env=env,
+                                            capture_output=True, text=True, timeout=60)
+                self.assertEqual(supervisor.returncode, 0, supervisor.stderr[-400:])
+                self.assertTrue(lane.runner_name)
+                self.assertEqual(lane.runner_name, supervisor.stdout.strip())
+                # A VM that lane boots is `<runner>-<pid>-<n>`; its prefix must own it.
+                vm = f"{lane.runner_name}-12345-7"
+                self.assertTrue(any(vm.startswith(p) for p in fld.runner_name_prefixes([lane])), vm)
+                checked += 1
+        self.assertGreater(checked, 10)   # every profile's lanes were actually rendered
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

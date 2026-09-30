@@ -30,9 +30,14 @@ from __future__ import annotations
 import os
 import plistlib
 import re
+import socket
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable, NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import macos_runner_identity  # noqa: E402
 
 # A loaded LaunchAgent is a macOS fleet lane when its label carries this
 # prefix. Installed by macos_fleet_lanes.py as
@@ -46,7 +51,7 @@ class Lane(NamedTuple):
     label: str
     identity: str          # the lane name, e.g. "pulp-gate"
     state_dir: Path | None  # from the plist's TARTCI_STATE_DIR
-    runner_name: str        # TARTCI_RUNNER_NAME when the plist declares one
+    runner_name: str        # the supervisor's runner name, derived as it derives it
 
 
 class Coverage(NamedTuple):
@@ -107,7 +112,17 @@ def lane_from_plist(label: str, plist: dict[str, Any], prefix: str = FLEET_LABEL
         if isinstance(raw_state_dir, str) and raw_state_dir.strip()
         else None
     )
-    runner_name = env.get("TARTCI_RUNNER_NAME")
+    # The runner name is what the supervisor derives from the plist (an
+    # explicit TARTCI_RUNNER_NAME, else TARTCI_RUNNER_NAME_PREFIX plus the
+    # slot), so it is resolved by that same code. Installed fleet plists set
+    # only the prefix: reading TARTCI_RUNNER_NAME alone left every lane
+    # nameless, which left the VM janitor with no prefix that matched a fleet
+    # VM, and it deleted no stopped VM from 2026-08-15 on.
+    try:
+        runner_name = macos_runner_identity.resolve_plist_identity(
+            plist, hostname=socket.gethostname()).runner_name
+    except (ValueError, TypeError, AttributeError):
+        runner_name = env.get("TARTCI_RUNNER_NAME")
     identity = label[len(prefix):] if label.startswith(prefix) else label
     # `<host_id>.<identity>` -- the identity is everything after the first dot.
     if "." in identity:
