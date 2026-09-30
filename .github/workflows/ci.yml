@@ -57,3 +57,19 @@ jobs:
             # Name the script: several end on a bare assertion under errexit.
             bash "$test_script" || { rc=$?; echo "::error::$test_script exited $rc"; exit 1; }
           done
+
+  python-floor:
+    # Fleet hosts run these scripts under their own Homebrew python3, and the
+    # oldest one in service is 3.11 (the tomllib floor). The lint job's
+    # ubuntu-latest python accepts 3.12+ syntax (PEP 701 nested f-string
+    # quotes) that 3.11 rejects at import, so compile under the floor itself.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile every tracked Python file under Python 3.11
+        run: |
+          python --version
+          git ls-files -z '*.py' | xargs -0 python -m py_compile

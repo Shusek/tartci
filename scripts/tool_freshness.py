@@ -453,9 +453,12 @@ def probe_release(repo: str, tag: str, assets: list[str],
     if "SHA256SUMS" in assets and "SHA256SUMS" not in missing:
         code, text = http(f"{base}/SHA256SUMS")
         sums = text.decode("utf-8", "replace") if code == 200 else None
+    def why(name: str) -> str:
+        code = codes[name]
+        return "missing" if code == 404 else f"unreachable (HTTP {code or 'none'})"
+
     detail = "ready" if not missing else "; ".join(
-        f"asset {name} {'missing' if codes[name] == 404 else f'unreachable (HTTP {codes[name] or 'none'})'}"
-        for name in missing)
+        f"asset {name} {why(name)}" for name in missing)
     return {"ready": not missing, "missing": missing, "sums": sums, "detail": detail}
 
 
