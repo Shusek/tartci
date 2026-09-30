@@ -15,10 +15,13 @@ no new mechanics; every step is a command that already exists:
      write, fleet-macos validate, install dry-run, and on a sealed host the
      launcher build (signing identity EXTRACTED from the live bundle's leaf
      certificate) plus its verification. Nothing on the host changes yet.
-  3. One host at a time: announce, then read every other published host's
-     pool state and self-update marker over SSH; any peer not `on`, or
-     updating, refuses. Two hosts that announce together both see each other
-     and the lower host id proceeds.
+  3. One host at a time, in queue order: read every other published host's
+     pool state, self-update marker and waiting ticket over SSH. Any peer not
+     `on`, or updating, or waiting longer than this host, DEFERS this host: it
+     keeps its place (waiting.json), exits 0, and becomes loud (exit 3, a
+     self_update_starved event) only past STARVED_AFTER_SECONDS. Then
+     announce, settle, and re-read: of two hosts updating at once the earlier
+     announcement proceeds, and only a near-tie falls back to the lower id.
   4. Capacity floor: drain passes --allow-last-serving-host ONLY when every
      last-serving label is on the explicit idle-by-design list, and the rule
      is written to the receipt. Capacity unknown refuses.
@@ -73,6 +76,18 @@ SETTLING_PROBLEM_CODES = frozenset({"heartbeat_missing", "supervisor_not_running
 VERIFY_SETTLE_SECONDS = 180
 VERIFY_SETTLE_POLL_SECONDS = 10
 ACTIVE_MARKER_TTL = 3 * 3600
+# After writing its marker a host waits this long, then re-reads every peer.
+# It must exceed ANNOUNCE_TIE_SECONDS plus an SSH read, so that of two hosts
+# that announce close together each one sees the other's marker.
+ANNOUNCE_SETTLE_SECONDS = 30
+# Two markers written within this many seconds of each other are simultaneous
+# and the lower host id proceeds; otherwise the EARLIER announcement proceeds.
+ANNOUNCE_TIE_SECONDS = 10
+# A waiting ticket not refreshed within this long belongs to a host that has
+# stopped trying (halted, off the network, profile removed) and is ignored.
+WAITING_TICKET_TTL = 2 * 3600
+# Deferred this long without a turn is starvation: loud, and exit 3.
+STARVED_AFTER_SECONDS = 6 * 3600
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
@@ -102,12 +117,25 @@ DEFAULT_IDLE_BY_DESIGN = ("pulp-release-tagged", "pulp-release-pr-gate")
 EXIT_OK = 0            # updated, already current, or plan says it would proceed
 EXIT_NOTHING = 0
 EXIT_REFUSED = 3       # a precondition refused; the host was not touched
+# A peer was busy or had waited longer, so this host deferred its turn. That is
+# the protocol working, so it exits 0 and launchd's last exit stays clean;
+# waiting.json and `pool status` carry it, and it becomes EXIT_REFUSED plus a
+# self_update_starved event once it has lasted STARVED_AFTER_SECONDS.
+EXIT_DEFERRED = 0
+# `tartci pool off` exits these when a precondition refuses before it stops
+# anything: 11 the capacity floor (including an unreadable census), 12 a lane
+# that could not be proven idle.
+POOL_OFF_REFUSALS = (11, 12)
 EXIT_FAILED = 4        # a mutation ran and failed; see the receipt for what was restored
 EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
 
 class Refused(Exception):
     """A precondition failed before anything on the host changed."""
+
+
+class Deferred(Refused):
+    """Refused only because another host holds, or has waited longer for, a turn."""
 
 
 class Failed(Exception):
@@ -323,6 +351,9 @@ def summary(home: Path | None = None) -> dict:
         failed = (f"last self-update {last['status'].upper().replace('_', ' ')} for "
                   f"{str(last.get('target'))[:12]}: {last.get('error')}")
         problem = f"{problem}; {failed}" if problem else failed
+    waiting = waiting_line(state)
+    if waiting and "STARVED" in waiting:
+        problem = f"{problem}; {waiting}" if problem else waiting
     halted = halt_reason(state)
     if halted:
         problem = f"{problem}; {halted}" if problem else halted
@@ -609,44 +640,138 @@ def self_host_id(cfg: Config) -> str:
 
 # Printed by the peer: its own clock, then its marker. Ages are computed on
 # the peer's clock so host clock skew cannot make a live marker look stale.
+WAITING_SEPARATOR = "--- waiting ---"
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
-                '2>/dev/null || true')
+                '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
+                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true')
 
 
-def peer_state(cfg: Config, sys_: System, host_id: str, target: str) -> tuple[bool, str]:
-    """(busy, evidence). Unreachable or unreadable peers are busy: fail closed."""
+def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str, Any]:
+    """One peer's pool state, update marker and waiting ticket.
+
+    {"busy": bool, "evidence": str, "active_age": seconds | None,
+     "waited": seconds | None}. Ages are computed on the PEER's clock, so host
+    clock skew cannot make a live marker look stale or a long wait look short.
+    Unreachable or unreadable peers are busy: fail closed.
+    """
+    out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "waited": None}
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
         value = json.loads(status.out)
     except json.JSONDecodeError:
-        return True, (f"peer {host_id} ({target}) pool status unreadable (exit {status.rc}): "
-                      f"{status.text[:160]}")
-    if value.get("state") != "on" or value.get("participating") is not True:
-        return True, f"peer {host_id} is {value.get('state')} (participating={value.get('participating')})"
+        out["evidence"] = (f"peer {host_id} ({target}) pool status unreadable (exit {status.rc}): "
+                           f"{status.text[:160]}")
+        return out
     marker = sys_.run([*ssh, _PEER_MARKER], timeout=60)
     first, _, rest = marker.out.partition("\n")
-    if marker.rc != 0 or not first.strip().isdigit():
-        return True, f"peer {host_id} self-update marker unreadable (exit {marker.rc})"
+    clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
+    active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
+    if clock is not None and waiting_text.strip():
+        try:
+            ticket = json.loads(waiting_text)
+        except json.JSONDecodeError:
+            ticket = None
+        # A peer that stopped refreshing its ticket has stopped trying.
+        if isinstance(ticket, dict) and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL:
+            out["waited"] = max(0.0, clock - float(ticket.get("since", clock)))
+    if value.get("state") != "on" or value.get("participating") is not True:
+        out["evidence"] = (f"peer {host_id} is {value.get('state')} "
+                           f"(participating={value.get('participating')})")
+        return out
+    if clock is None:
+        out["evidence"] = f"peer {host_id} self-update marker unreadable (exit {marker.rc})"
+        return out
     active = None
     try:
-        active = json.loads(rest) if rest.strip() else None
+        active = json.loads(active_text) if active_text.strip() else None
     except json.JSONDecodeError:
-        return True, f"peer {host_id} self-update marker unreadable"
-    if isinstance(active, dict) and int(first) - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
-        return True, f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}"
-    return False, f"peer {host_id} on, not updating"
+        out["evidence"] = f"peer {host_id} self-update marker unreadable"
+        return out
+    if isinstance(active, dict) and clock - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
+        out.update(evidence=f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}",
+                   active_age=max(0.0, clock - float(active.get("ts", 0))))
+        return out
+    out.update(busy=False, evidence=f"peer {host_id} on, not updating")
+    return out
+
+
+def peer_state(cfg: Config, sys_: System, host_id: str, target: str) -> tuple[bool, str]:
+    """(busy, evidence). Unreachable or unreadable peers are busy: fail closed."""
+    peer = read_peer(cfg, sys_, host_id, target)
+    return peer["busy"], peer["evidence"]
 
 
 def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
-    busy = []
+    return survey_peers(cfg, sys_, me)[0]
+
+
+def survey_peers(cfg: Config, sys_: System, me: str) -> tuple[list[str], dict[str, float]]:
+    """(why each busy peer is busy, {peer: seconds it has waited for its turn})."""
+    busy: list[str] = []
+    waiting: dict[str, float] = {}
     for peer, target in published_peers(cfg, sys_).items():
         if peer == me:
             continue
-        is_busy, evidence = peer_state(cfg, sys_, peer, target)
-        if is_busy:
-            busy.append(evidence)
-    return busy
+        info = read_peer(cfg, sys_, peer, target)
+        if info["busy"]:
+            busy.append(info["evidence"])
+        if info["waited"] is not None:
+            waiting[peer] = info["waited"]
+    return busy, waiting
+
+
+def queue_ahead(me: str, my_wait: float, waiting: dict[str, float]) -> list[str]:
+    """Peers that have waited longer than this host and so go first.
+
+    Without an order, the host whose stagger comes first in the window won
+    every contended turn: m3 was refused at every attempt for hours while a
+    peer updated. The longest waiter goes first; a tie goes to the lower id.
+    """
+    ahead = []
+    for peer, waited in sorted(waiting.items()):
+        if waited > my_wait + ANNOUNCE_TIE_SECONDS or (
+                abs(waited - my_wait) <= ANNOUNCE_TIE_SECONDS and peer < me):
+            ahead.append(f"{peer} (waiting {waited / 3600:.1f} h)")
+    return ahead
+
+
+def waiting_ticket(cfg: Config) -> dict | None:
+    value = _read_json(cfg.state_dir / "waiting.json")
+    return value if isinstance(value, dict) else None
+
+
+def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> dict:
+    """Keep this host's place in the queue: `since` survives new targets."""
+    ticket = waiting_ticket(cfg) or {}
+    since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
+    ticket = {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
+              "starved_evented": ticket.get("starved_evented")}
+    _write_json(cfg.state_dir / "waiting.json", ticket)
+    return ticket
+
+
+def clear_waiting(cfg: Config) -> None:
+    (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
+
+
+def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
+    """Record the deferral; EXIT_DEFERRED until it has lasted STARVED_AFTER_SECONDS."""
+    ticket = note_waiting(cfg, me, target, reason, now)
+    waited = max(0.0, now - float(ticket["since"]))
+    if waited < STARVED_AFTER_SECONDS:
+        print(f"self-update: DEFERRED ({waited / 3600:.1f} h in the update queue): {reason}")
+        return EXIT_DEFERRED
+    print(f"self-update: STARVED: no update turn for {waited / 3600:.1f} h "
+          f"(since {_iso(float(ticket['since']))}): {reason}")
+    if not ticket.get("starved_evented"):
+        import host_off  # noqa: PLC0415 - sibling module; owns the event log format
+        host_off.event(cfg.state_dir, "self_update_starved",
+                       f"no update turn for {waited / 3600:.1f} h: {reason[:200]}",
+                       {"since": _iso(float(ticket["since"])), "target": target[:12]}, now)
+        ticket["starved_evented"] = now
+        _write_json(cfg.state_dir / "waiting.json", ticket)
+    return EXIT_REFUSED
 
 
 def stagger_seconds(host_id: str, window: int = 600) -> int:
@@ -1227,6 +1352,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             target = installed
             print(f"self-update: same-generation reinstall needed: {refresh}")
     if not target:
+        clear_waiting(cfg)
         print("self-update: nothing to do" + {
             "soaking": " (undeployed commits are still soaking)",
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
@@ -1280,11 +1406,21 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy = check_peers(cfg, sys_, me)
+        busy, waiting = survey_peers(cfg, sys_, me)
+        ticket = waiting_ticket(cfg)
+        my_wait = max(0.0, now - float(ticket["since"])) if ticket else 0.0
+        ahead = queue_ahead(me, my_wait, waiting)
         if busy:
             refusal = "another fleet host is not serving normally: " + "; ".join(busy)
             if apply:
-                raise Refused(refusal)
+                raise Deferred(refusal)
+            refusals.append(refusal)
+            receipt.step("peers", refusal, ok=False)
+        elif ahead:
+            refusal = ("yielding the update turn to a host that has waited longer: "
+                       + ", ".join(ahead))
+            if apply:
+                raise Deferred(refusal)
             refusals.append(refusal)
             receipt.step("peers", refusal, ok=False)
         else:
@@ -1323,6 +1459,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   profile=profile, install_args=install_args, allow=allow,
                   helper=helper, approval=approval)
         return run.execute()
+    except Deferred as exc:
+        receipt.step("refused", str(exc), ok=False)
+        receipt.value["deferred"] = True
+        receipt.finish("refused", str(exc))
+        return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
     except Refused as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))
@@ -1391,6 +1532,9 @@ class Run:
         try:
             _announce(self.cfg, self.sys, self.me, self.target)
             self.receipt.step("announce", str(self.cfg.state_dir / "active.json"))
+            # This host has its turn: whatever the update's outcome, it no
+            # longer holds a place in the queue.
+            clear_waiting(self.cfg)
             self._snapshot()
             try:
                 self._update()
@@ -1408,6 +1552,10 @@ class Run:
             return EXIT_OK
         except Refused as exc:  # announce lost the race: nothing was touched
             self.receipt.step("refused", str(exc), ok=False)
+            if isinstance(exc, Deferred):
+                self.receipt.value["deferred"] = True
+                self.receipt.finish("refused", str(exc))
+                return defer(self.cfg, self.me, self.target, str(exc), self.sys.now())
             self.receipt.finish("refused", str(exc))
             return EXIT_REFUSED
         finally:
@@ -1465,6 +1613,12 @@ class Run:
         self._wait_idle()
         self.phase = "off"
         off = tartci(cfg, sys_, "pool", "off", *self.flag)
+        if off.rc in POOL_OFF_REFUSALS:
+            # pool off checked a precondition and stopped nothing (on m3 the
+            # capacity census timed out). The drain is undone by the recovery,
+            # so this is a refusal: it must not spend the 6 h attempt or count
+            # toward the halt the way a failed install does.
+            raise Refused(f"pool off refused (exit {off.rc}), nothing stopped: {off.text}")
         if off.rc != 0:
             raise Failed(f"pool off failed: {off.text}")
         self.receipt.step("off")
@@ -1749,17 +1903,31 @@ class Run:
 
 def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
     marker = cfg.state_dir / "active.json"
-    _write_json(marker, {"host_id": me, "target": target, "ts": sys_.now(),
+    announced = sys_.now()
+    _write_json(marker, {"host_id": me, "target": target, "ts": announced,
                          "pid": os.getpid(), "pid_start": sys_.process_start(os.getpid())})
-    # Re-read peers AFTER announcing: two hosts that announce together both
-    # see each other here, and only the lower host id proceeds.
+    # Re-read peers AFTER announcing and after a settle long enough that a peer
+    # announcing close behind is visible. Between two self-updating hosts the
+    # EARLIER announcement proceeds; only markers within ANNOUNCE_TIE_SECONDS
+    # of each other fall back to the lower host id. The id alone was not
+    # enough: a lower-id host announcing minutes after a peer had re-checked
+    # and moved on also proceeded, and both drained.
+    sys_.sleep(ANNOUNCE_SETTLE_SECONDS)
     for peer, ssh_target in published_peers(cfg, sys_).items():
         if peer == me:
             continue
-        busy, evidence = peer_state(cfg, sys_, peer, ssh_target)
-        if busy and ("self-updating" not in evidence or peer < me):
+        info = read_peer(cfg, sys_, peer, ssh_target)
+        if not info["busy"]:
+            continue
+        theirs = info["active_age"]
+        if theirs is None:
             marker.unlink(missing_ok=True)
-            raise Refused(f"peer changed after announcing: {evidence}")
+            raise Deferred(f"peer changed after announcing: {info['evidence']}")
+        mine = max(0.0, sys_.now() - announced)
+        if theirs > mine + ANNOUNCE_TIE_SECONDS or (
+                abs(theirs - mine) <= ANNOUNCE_TIE_SECONDS and peer < me):
+            marker.unlink(missing_ok=True)
+            raise Deferred(f"peer announced first (or won the tie): {info['evidence']}")
 
 
 def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool]:
@@ -1832,10 +2000,28 @@ def status_lines(state_dir: Path) -> list[str]:
         lines.append(f"self-update: THIS HOST WAS LEFT {str(last.get('pool_state') or 'off').upper()} "
                      "(pool on failed after a failed update); check `tartci pool status`, "
                      "then `tartci pool on`")
+    waiting = waiting_line(state_dir)
+    if waiting:
+        lines.append(waiting)
     halted = halt_reason(state_dir)
     if halted:
         lines.append(halted)
     return lines
+
+
+def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
+    """This host's place in the update queue, when it has one."""
+    ticket = _read_json(state_dir / "waiting.json")
+    if not isinstance(ticket, dict) or not isinstance(ticket.get("since"), (int, float)):
+        return None
+    now = time.time() if now is None else now
+    waited = max(0.0, now - float(ticket["since"]))
+    # The run that crossed the bound records it, so a reader whose clock is
+    # behind the run's still says STARVED.
+    starved = waited >= STARVED_AFTER_SECONDS or bool(ticket.get("starved_evented"))
+    word = "STARVED" if starved else "deferred"
+    return (f"self-update: {word}, {waited / 3600:.1f} h in the update queue (since "
+            f"{_iso(float(ticket['since']))}): {ticket.get('reason')}")
 
 
 def main(argv: list[str] | None = None) -> int:

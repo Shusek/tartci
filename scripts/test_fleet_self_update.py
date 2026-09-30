@@ -53,6 +53,7 @@ class FakeSystem(su.System):
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
         self.peer_markers: dict[str, dict] = {}
+        self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
@@ -61,6 +62,8 @@ class FakeSystem(su.System):
         self.broken_target = False     # the new generation fails verification
         self.broken_previous = False   # ...and so does the restored one
         self.on_rc = 0
+        self.off_rc = 0                # `pool off` refusing before it stops anything
+        self.on_sleep = None           # called with the seconds of every sleep()
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
         self.critical: list[list[str]] = []
@@ -105,6 +108,8 @@ class FakeSystem(su.System):
 
     def sleep(self, seconds: float) -> None:
         self.clock += seconds
+        if self.on_sleep:
+            self.on_sleep(seconds)
 
     def mutations(self) -> list[str]:
         out = []
@@ -164,7 +169,9 @@ class FakeSystem(su.System):
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
-            return ok(f"{clock}\n" + (json.dumps(marker) if marker else ""))
+            ticket = self.peer_waiting.get(peer)
+            return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
+                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -227,6 +234,10 @@ class FakeSystem(su.System):
             rc = self.offplan.pop(0) if len(self.offplan) > 1 else self.offplan[0]
             return su.Result(rc, "plan")
         if args[:2] == ["pool", "off"]:
+            if self.off_rc:
+                return su.Result(self.off_rc, "", "refusing pool off: capacity for required label "
+                                 "'pulp-build-merge-group' could not be determined: "
+                                 "runner_census_timeout")
             self.pool_state = "off"
             return ok("off")
         raise AssertionError(f"unexpected ./tartci {args}")
@@ -371,6 +382,17 @@ class Base(unittest.TestCase):
     def last(self) -> dict:
         return json.loads((self.cfg.state_dir / "last.json").read_text())
 
+    def assertUpdated(self, rc: int) -> None:
+        """Took its turn and updated. EXIT_DEFERRED is also 0, so rc alone cannot say."""
+        self.assertEqual(rc, su.EXIT_OK)
+        self.assertEqual(self.last()["status"], "succeeded", self.last())
+
+    def assertDeferred(self, rc: int) -> None:
+        """Deferred to a peer: exit 0, nothing mutated, a place kept in the queue."""
+        self.assertEqual(rc, su.EXIT_DEFERRED)
+        ticket = json.loads((self.cfg.state_dir / "waiting.json").read_text())
+        self.assertTrue(ticket.get("reason"), ticket)
+
 
 class SkewTests(Base):
     def test_target_is_newest_first_parent_commit_past_the_soak(self) -> None:
@@ -449,28 +471,28 @@ class HappyPathTests(Base):
 class OneAtATimeTests(Base):
     def test_peer_draining_refuses_before_any_mutation(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
 
     def test_peer_updating_or_unreachable_or_unmapped_refuses(self) -> None:
         # This fake host is m1, so m5 and studio are its peers.
         self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 60}
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.sys.peer_markers.clear()
         del self.sys.peers["m5"]  # unreachable
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
 
     def test_stale_peer_marker_is_ignored(self) -> None:
         self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
     def test_marker_age_uses_the_peer_clock(self) -> None:
         # The peer wrote its marker a minute ago on ITS clock, which runs 5h
         # behind ours; comparing against our clock would call it stale.
         self.sys.peer_clock["m5"] = NOW - 5 * 3600
         self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 5 * 3600 - 60}
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
 
     def test_stagger_is_stable_and_bounded(self) -> None:
@@ -482,7 +504,7 @@ class FloorTests(Base):
     def test_idle_by_design_last_server_passes_the_flag_and_logs_the_rule(self) -> None:
         self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
             {"label": "pulp-release-tagged", "verdict": "last_serving_host"}]}
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         drain = next(a for a, _ in self.sys.calls if a[:3] == ["./tartci", "pool", "drain"])
         self.assertIn("--allow-last-serving-host", drain)
         receipt = json.loads(Path(self.last()["receipt"]).read_text())
@@ -526,7 +548,7 @@ class OnDemandSupplyTests(Base):
         self.sys.peers["m3"] = healthy_peer()
 
     def test_healthy_peer_publishing_the_label_lets_the_update_proceed(self) -> None:
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         drain = next(a for a, _ in self.sys.calls if a[:3] == ["./tartci", "pool", "drain"])
         self.assertIn("--allow-last-serving-host", drain)
         receipt = json.loads(Path(self.last()["receipt"]).read_text())
@@ -586,7 +608,7 @@ class OnDemandSupplyTests(Base):
              "verdict": "last_serving_host"})
         self.assertRefusedWithoutMutation("pulp-build-merge-group")
         self.sys.published["registrations"][1]["labels"].append("pulp-build-merge-group")
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
     def test_plan_reports_the_same_decision(self) -> None:
         self.assertEqual(self.plan(), su.EXIT_OK)
@@ -594,11 +616,117 @@ class OnDemandSupplyTests(Base):
         self.assertEqual(self.plan(), su.EXIT_REFUSED)
 
 
+class UpdateQueueTests(Base):
+    """One host at a time, in the order hosts started waiting."""
+
+    def ticket(self, **fields) -> None:
+        value = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600, "ts": NOW - 1800,
+                 "reason": "peer m5 is draining"}
+        value.update(fields)
+        su._write_json(self.cfg.state_dir / "waiting.json", value)
+
+    def test_a_peer_that_has_waited_longer_goes_first(self) -> None:
+        # m3 on 2026-09-30: refused at every attempt while a peer took each turn.
+        self.ticket(since=NOW - 1800)
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 3 * 3600, "ts": NOW - 60}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("yielding the update turn", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_this_host_goes_first_when_it_has_waited_longer(self) -> None:
+        # Control, same instrument: only the order of the two waits changed.
+        self.ticket(since=NOW - 3 * 3600)
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 1800, "ts": NOW - 60}
+        self.assertUpdated(self.apply())
+        self.assertIsNone(su.waiting_ticket(self.cfg), "a host that had its turn leaves the queue")
+
+    def test_a_ticket_its_host_stopped_refreshing_is_ignored(self) -> None:
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 9 * 3600,
+                                       "ts": NOW - su.WAITING_TICKET_TTL - 60}
+        self.assertUpdated(self.apply())
+
+    def test_the_place_in_the_queue_survives_a_new_target(self) -> None:
+        self.ticket(since=NOW - 2 * 3600, target="c" * 40)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], NOW - 2 * 3600)
+
+    def test_deferral_past_the_bound_is_starvation_and_loud_once(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(events.count("self_update_starved"), 1)
+        self.assertTrue(any("STARVED" in line for line in su.status_lines(self.cfg.state_dir)))
+        self.assertIn("STARVED", su.summary(self.home)["problem"])
+
+    def test_a_short_deferral_is_quiet(self) -> None:
+        # Control for the bound: the same deferral an hour in is not a problem.
+        self.ticket(since=NOW - 3600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists()
+                         and "self_update_starved" in (self.cfg.state_dir / "events.jsonl").read_text())
+        self.assertIsNone(su.summary(self.home)["problem"])
+
+
+class AnnounceOrderTests(Base):
+    """Between two self-updating hosts the earlier announcement proceeds."""
+
+    def peer_announces(self, offset: float) -> None:
+        # m5 writes its marker while this host (m1) settles after announcing;
+        # `offset` is when, relative to this host's announcement.
+        def hook(seconds: float) -> None:
+            if seconds == su.ANNOUNCE_SETTLE_SECONDS:
+                announced = self.sys.clock - seconds
+                self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD,
+                                               "ts": announced + offset}
+        self.sys.on_sleep = hook
+
+    def test_a_higher_id_that_announced_first_wins(self) -> None:
+        # The lower id used to proceed whenever it saw a self-updating peer,
+        # even one that had announced a minute earlier and already moved on.
+        self.peer_announces(-60)
+        self.assertDeferred(self.apply())
+        self.assertFalse(any("pool drain" in m for m in self.sys.mutations()))
+        self.assertIn("announced first", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_this_host_proceeds_when_it_announced_first(self) -> None:
+        self.peer_announces(su.ANNOUNCE_TIE_SECONDS + 5)
+        self.assertUpdated(self.apply())
+
+    def test_a_tie_goes_to_the_lower_id(self) -> None:
+        self.peer_announces(2)
+        self.assertUpdated(self.apply())  # m1 < m5
+
+
+class PoolOffRefusalTests(Base):
+    def test_a_pool_off_refusal_restores_the_host_and_does_not_spend_the_attempt(self) -> None:
+        # m3, 2026-09-30 21:12Z: the census timed out inside `pool off`; the run
+        # recorded "failed", which spent the 6 h attempt and counted to the halt.
+        self.sys.off_rc = 11
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        receipts = [json.loads(path.read_text())
+                    for path in (self.cfg.state_dir / "attempts").glob("*.json")]
+        self.assertEqual([r["status"] for r in receipts], ["refused"])
+        self.assertIn("pool off refused (exit 11)", receipts[0]["error"])
+        self.assertIsNone(su.halt_reason(self.cfg.state_dir))
+        self.sys.off_rc = 0
+        self.assertUpdated(self.apply())
+
+    def test_any_other_pool_off_failure_is_still_a_failure(self) -> None:
+        self.sys.off_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "failed")
+
+
 class MidJobWaitTests(Base):
     def test_waits_while_mid_job_then_proceeds(self) -> None:
         self.sys.offplan = [12, 12, 0]
-        self.assertEqual(self.apply(), su.EXIT_OK)
-        self.assertEqual(self.sys.clock - NOW, 2 * 45)
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.sys.clock - NOW, 2 * 45 + su.ANNOUNCE_SETTLE_SECONDS)
 
     def test_timeout_restores_the_host_to_on(self) -> None:
         self.sys.offplan = [12]
@@ -613,7 +741,7 @@ class MidJobWaitTests(Base):
 class InstallFailureTests(Base):
     def test_transient_install_failure_is_retried(self) -> None:
         self.sys.install_rcs = [1, 1, 0]
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
     def test_persistent_install_failure_restores_on_and_reports(self) -> None:
         self.sys.install_rcs = [1]
@@ -632,13 +760,13 @@ class InstallFailureTests(Base):
         self.assertEqual(len(self.sys.mutations()), calls_before)
         self.sys.clock += 7 * 3600
         self.sys.install_rcs = [0]
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
     def test_refusal_does_not_spend_the_attempt(self) -> None:
         self.sys.peers["m5"] = {"state": "off", "participating": False}
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.sys.peers["m5"] = {"state": "on", "participating": True}
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
 
 class VerificationTests(Base):
@@ -667,7 +795,7 @@ class RelayTests(Base):
     relay = True
 
     def test_relay_reconciled_after_install(self) -> None:
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         joined = [" ".join(a) for a, _ in self.sys.calls]
         relay = next(i for i, c in enumerate(joined) if "network_profile.py reconcile" in c)
         install = next(i for i, c in enumerate(joined) if "--apply" in c)
@@ -733,7 +861,7 @@ class SealedTests(Base):
 
     def test_build_happens_only_after_the_gates(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.assertFalse(any(a[:2] == ["bash", "scripts/build_macos_launcher.sh"]
                              for a, _ in self.sys.calls))
         receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
@@ -827,7 +955,7 @@ class VerifySettleTests(Base):
     def test_a_first_heartbeat_still_pending_is_waited_for(self) -> None:
         self.sys.settling_reads = 3
         start = self.sys.clock
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         self.assertEqual(self.last()["status"], "succeeded")
         self.assertNotEqual(self.sys.running(), INSTALLED)
         self.assertGreaterEqual(self.sys.clock - start, 3 * su.VERIFY_SETTLE_POLL_SECONDS)
@@ -996,11 +1124,11 @@ class RecordTests(Base):
         su._write_json(self.cfg.state_dir / "halt-cleared.json", {"at": su._iso(self.sys.clock)})
         self.sys.clock += 1
         self.sys.install_rcs = [0]
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
     def test_old_refusal_receipts_are_pruned(self) -> None:
         self.sys.peers["m5"] = {"state": "off", "participating": False}
-        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertDeferred(self.apply())
         self.assertEqual(len(list((self.cfg.state_dir / "attempts").glob("*.json"))), 1)
         self.sys.clock += 8 * 86400
         self.sys.peers["m5"] = {"state": "on", "participating": True}
@@ -1042,7 +1170,7 @@ class ScaleTests(Base):
         peers = su.published_peers(self.cfg, self.sys)
         self.assertEqual(peers["x9"], "tartci-x9")
         self.assertEqual(peers["studio"], "m3")
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         self.assertTrue(any(a[:1] == ["ssh"] and "tartci-x9" in a for a, _ in self.sys.calls))
         # [peers] is an override only.
         self.cfg.peers = {"x9": "x9.lan"}
@@ -1106,7 +1234,7 @@ class InterruptedRecoveryTests(Base):
         self.assertIn("self-update --verify", self.last()["error"])
 
     def test_install_runs_as_a_critical_section(self) -> None:
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         self.assertEqual(len(self.sys.critical), 1)
         self.assertIn("--apply", self.sys.critical[0])
 
@@ -1121,7 +1249,7 @@ class InterruptedRecoveryTests(Base):
         for i in range(su.KEEP_SNAPSHOTS + 3):
             (rollback / f"2026010{i}T000000Z-old").mkdir(parents=True)
             os.utime(rollback / f"2026010{i}T000000Z-old", (i, i))
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         self.assertEqual(len(list(rollback.iterdir())), su.KEEP_SNAPSHOTS)
 
 
@@ -1222,7 +1350,7 @@ class InterruptedRunTests(Base):
         self.assertEqual(self.sys.mutations(), [])
         # Control: once the installer has exited (or its pid was reused), runs proceed.
         self.sys.procs[777] = "a different process"
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
 
     def test_plan_reports_but_does_not_recover(self) -> None:
         path = self._killed_receipt()
@@ -1238,7 +1366,7 @@ class InterruptedRunTests(Base):
                 seen.extend(json.loads(p.read_text())["status"]
                             for p in (self.cfg.state_dir / "attempts").glob("*.json"))
         self.sys.hook = peek
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         self.assertIn("running", seen)
 
 
@@ -1375,7 +1503,7 @@ class IncidentTests(Base):
 
     def test_a_healthy_host_is_not_touched_by_recovery(self) -> None:
         # Control: no host_off record, so no extra `pool on` before the update.
-        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertUpdated(self.apply())
         ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
         self.assertEqual(len(ons), 1)
 

@@ -124,7 +124,8 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
         4: "process table unreadable, so no build directory could be proven idle",
     },
     "com.danielraffel.tartci.self-update": {
-        3: "a precondition refused (peer updating, capacity floor, rate limit); host untouched",
+        3: ("a precondition refused (capacity floor, rate limit, halt), or the host has been "
+            "deferred in the update queue past the starvation bound; host untouched"),
         4: "an update failed and the host was restored to the previous generation",
         5: "tartci skew could not be measured",
     },

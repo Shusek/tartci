@@ -56,6 +56,7 @@ class Host:
         self.apply_generation: str | None = None  # default: the generation moves with the CLI
         self.verdict = "verified"
         self.pulp_results: list[tuple[int, str]] = []  # scripted pulp-install outcomes, in order
+        self.fleet_update_results: list[tuple[int, str]] = []  # scripted fleet-update outcomes
 
     def run(self, argv: list[str], timeout: float) -> tuple[int, str]:
         self.calls.append(argv)
@@ -74,6 +75,10 @@ class Host:
             return 0, "Extracting to ~/.pulp/bin..."
         name = Path(argv[0]).name
         if "fleet-update" in argv:
+            if self.fleet_update_results:
+                rc, out = self.fleet_update_results.pop(0)
+                if rc != 0:
+                    return rc, out
             installed = self.apply_installs.get(name)
             if installed is None:
                 return 1, json.dumps({"event": "fleet_summary", "verdict": "failed"}, indent=2)
@@ -206,6 +211,62 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertEqual(row["state"], "behind")
         self.assertIn("waiting", row["apply"])
         self.assertFalse(any("fleet-update" in call for call in host.calls))
+
+    def test_releases_faster_than_the_soak_still_apply_the_newest_soaked_one(self) -> None:
+        # Shipyard v0.232.0 was held back because v0.233.0 was under 30 minutes
+        # old; with a release every 20 minutes the host never updated at all.
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.229.0", NOW - 30 * HOUR), ("v0.230.0", NOW - 60 * 60),
+            ("v0.231.0", NOW - 40 * 60), ("v0.232.0", NOW - 20 * 60), ("v0.233.0", NOW))
+        host = Host({"shipyard": "0.229.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.231.0"
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertIn("v0.231.0", [c[c.index("--to") + 1] for c in host.calls if "--to" in c])
+        self.assertEqual(row["apply"], "applied v0.231.0: ok")
+        self.assertEqual(row["installed"], "0.231.0")
+        # Twenty minutes and one more release later, the next soaked one lands.
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.229.0", NOW - 30 * HOUR), ("v0.231.0", NOW - 40 * 60),
+            ("v0.232.0", NOW - 20 * 60), ("v0.233.0", NOW), ("v0.234.0", NOW + 20 * 60))
+        host.apply_installs["shipyard"] = "0.232.0"
+        row = self.refresh(host, NOW + 20 * 60 + 1)["tools"]["shipyard"]
+        self.assertEqual(row["apply"], "applied v0.232.0: ok")
+
+    def test_a_shipyard_rollout_lock_is_not_a_spent_attempt(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+        host.fleet_update_results = [(tf.NOT_READY_EXIT, "another fleet rollout holds the "
+                                      "controller lock; not starting a second one")]
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertIn("not ready yet", row["apply"])
+        self.assertNotIn("shipyard", json.loads((self.state / "attempts.json").read_text()))
+        row = self.refresh(host, NOW + 31 * 60)["tools"]["shipyard"]
+        self.assertEqual(row["apply"], "applied v0.221.1: ok")
+
+    def test_a_legacy_exit_75_shipyard_record_does_not_hold_the_host_back(self) -> None:
+        # m3's record for v0.231.0, written before exit 75 was "not ready".
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "attempts.json").write_text(json.dumps({"shipyard": {
+            "target": "v0.221.1", "at": iso(NOW - 600),
+            "result": "FAILED (verdict no fleet_summary, exit 75, installed 0.221.0, generation "
+                      "0.221.0): another fleet rollout holds the controller lock; not starting "
+                      "a second one"}}))
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["apply"], "applied v0.221.1: ok")
+
+    def test_a_legacy_failure_that_is_not_exit_75_still_holds(self) -> None:
+        # Control: the same record with a real failure keeps the 6 h guard.
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "attempts.json").write_text(json.dumps({"shipyard": {
+            "target": "v0.221.1", "at": iso(NOW - 600),
+            "result": "FAILED (verdict failed, exit 1, installed 0.221.0, generation 0.221.0): "
+                      "probe failed"}}))
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertIn("already attempted v0.221.1", row["apply"])
 
     def test_auto_apply_installs_verifies_and_records_one_deploy_event(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
