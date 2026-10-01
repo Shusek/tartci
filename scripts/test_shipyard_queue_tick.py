@@ -20,26 +20,18 @@ class QueueTickControlTests(unittest.TestCase):
         self,
         *,
         held: bool,
-        authority: bool,
-        authority_matches: bool | None = None,
+        legacy_full_live: bool = False,
         apply: bool = True,
         repo_root: bool = True,
         states: list[dict[str, object]] | None = None,
-        reconcile_rc: int = 0,
-        reconcile_ok: bool = True,
-        reconcile_output: str | None = None,
-        reconcile_sleep: int = 0,
-        reconcile_child_sleep: int = 0,
-        auto_merge_rc: int = 3,
-        auto_merge_output: str | None = None,
         discard_rc: int = 0,
+        discard_error: str = "",
         gh_state: str = "OPEN",
         gh_state_rc: int = 0,
         gh_state_error: str = "",
         ledger_seed: object | None = None,
         extra_env: dict[str, str] | None = None,
         invalid_tmpdir: bool = False,
-        remote_url: str = "https://github.com/owner/repo.git",
     ) -> tuple[subprocess.CompletedProcess[str], str, object | None]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -52,7 +44,7 @@ class QueueTickControlTests(unittest.TestCase):
                     "remote",
                     "add",
                     "origin",
-                    remote_url,
+                    "https://github.com/owner/repo.git",
                 ],
                 check=True,
             )
@@ -66,23 +58,12 @@ if [ "$1" = "--version" ]; then
 elif [ "$1 $2" = "auth export" ]; then
   printf '{"schema_version":1,"command":"auth.export","bundle":{"version":2}}\\n'
 elif [ "$1 $2" = "merge-queue status" ]; then
-  printf '{"held":%s,"authority_matches":%s}\\n' "$HELD" "$AUTHORITY_MATCHES"
+  printf '{"held":%s,"authority_matches":false}\\n' "$HELD"
 elif [ "$1 $2" = "ship-state list" ]; then
   printf '%s\\n' "$STATES"
-elif [ "$1 $2" = "ship-state reconcile" ]; then
-  printf 'reconcile-gh-token=%s\\n' "${GH_TOKEN:+set}" >> "$CALLS"
-  if [ "$RECONCILE_CHILD_SLEEP" -gt 0 ]; then
-    sleep "$RECONCILE_CHILD_SLEEP" &
-  fi
-  sleep "$RECONCILE_SLEEP"
-  printf '%s\\n' "$RECONCILE_OUTPUT"
-  exit "$RECONCILE_RC"
 elif [ "$1 $2" = "ship-state discard" ]; then
+  [ -z "$DISCARD_ERROR" ] || printf '%s\\n' "$DISCARD_ERROR" >&2
   exit "$DISCARD_RC"
-elif [ "$1" = "auto-merge" ]; then
-  printf 'auto-merge-gh-token=%s\\n' "${GH_TOKEN:+set}" >> "$CALLS"
-  printf '%s\\n' "$AUTO_MERGE_OUTPUT"
-  exit "$AUTO_MERGE_RC"
 else
   exit 97
 fi
@@ -95,10 +76,6 @@ fi
                 """#!/bin/sh
 printf 'ghapp %s\\n' "$*" >> "$CALLS"
 case "$*" in
-  "auth token")
-    printf 'app-token\\n'
-    exit "$GH_TOKEN_RC"
-    ;;
   "pr list "*)
     printf '[]\\n'
     exit "$GH_REPO_RC"
@@ -108,7 +85,6 @@ case "$*" in
     printf '%s\\n' "$GH_STATE_ERROR" >&2
     exit "$GH_STATE_RC"
     ;;
-  *"--json mergeable,mergeStateStatus,isDraft"*) printf '%s\\n' "$GH_INFO"; exit "$GH_INFO_RC" ;;
 esac
 exit 98
 """,
@@ -120,67 +96,33 @@ exit 98
                 for key, value in os.environ.items()
                 if not key.startswith(("SHIPYARD_", "TARTCI_"))
             }
-            if auto_merge_output is None:
-                auto_merge_output = json.dumps(
-                    {
-                        "schema_version": 1,
-                        "command": "auto-merge",
-                        "event": "in-flight",
-                        "pr": 42,
-                        "evidence": {},
-                    }
-                )
-            if reconcile_output is None:
-                reconcile_output = json.dumps(
-                    {
-                        "schema_version": 1,
-                        "command": "ship-state:reconcile",
-                        "results": [
-                            {
-                                "pr": 42,
-                                "ok": reconcile_ok,
-                                "changes": [],
-                            }
-                        ],
-                    }
-                )
             env.update(
                 {
                     "PATH": f"{root}:/usr/bin:/bin",
                     "HOME": str(root),
                     "CALLS": str(calls),
                     "HELD": "true" if held else "false",
-                    "AUTHORITY_MATCHES": "true"
-                    if (authority if authority_matches is None else authority_matches)
-                    else "false",
                     "SHIPYARD_TICK_APPLY": "1" if apply else "0",
-                    "SHIPYARD_TICK_REAP_ONLY": "0",
-                    "SHIPYARD_QUEUE_AUTHORITY": "1" if authority else "0",
                     "SHIPYARD_QUEUE_GH_CLI": "ghapp",
                     "STATES": json.dumps({"states": states or []}),
-                    "RECONCILE_RC": str(reconcile_rc),
-                    "RECONCILE_OK": "true" if reconcile_ok else "false",
-                    "RECONCILE_OUTPUT": reconcile_output,
-                    "RECONCILE_SLEEP": str(reconcile_sleep),
-                    "RECONCILE_CHILD_SLEEP": str(reconcile_child_sleep),
                     "DISCARD_RC": str(discard_rc),
-                    "AUTO_MERGE_RC": str(auto_merge_rc),
-                    "AUTO_MERGE_OUTPUT": auto_merge_output,
+                    "DISCARD_ERROR": discard_error,
                     "GH_STATE": gh_state,
                     "GH_STATE_RC": str(gh_state_rc),
                     "GH_STATE_ERROR": gh_state_error,
-                    "GH_INFO": json.dumps(
-                        {
-                            "mergeable": "MERGEABLE",
-                            "mergeStateStatus": "CLEAN",
-                            "isDraft": False,
-                        }
-                    ),
-                    "GH_INFO_RC": "0",
                     "GH_REPO_RC": "0",
-                    "GH_TOKEN_RC": "0",
                 }
             )
+            if legacy_full_live:
+                # What an install from before the reaper-only tick carries.
+                env.update(
+                    {
+                        "SHIPYARD_TICK_REAP_ONLY": "0",
+                        "SHIPYARD_QUEUE_AUTHORITY": "1",
+                        "SHIPYARD_TICK_MERGE_METHOD": "merge",
+                        "SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS": "45",
+                    }
+                )
             if extra_env:
                 env.update(extra_env)
             if invalid_tmpdir:
@@ -205,6 +147,10 @@ exit 98
                 if ledger_path.exists()
                 else None
             )
+            health_path = root / "Library/Logs/shipyard-queue-tick.health.json"
+            self.last_health = (
+                health_path.read_text(encoding="utf-8") if health_path.exists() else "{}"
+            )
             return (
                 result,
                 calls.read_text(encoding="utf-8") if calls.exists() else "",
@@ -212,92 +158,88 @@ exit 98
             )
 
     def test_central_hold_exits_before_ship_state_or_github_reads(self) -> None:
-        result, calls, _ = self.run_tick(held=True, authority=True)
+        result, calls, _ = self.run_tick(held=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("local merge-queue hold active", result.stdout)
         self.assertEqual(calls.splitlines(), ["--version", "merge-queue status --json"])
         self.assertNotIn("ghapp", calls)
 
-    def test_non_authority_full_live_is_unhealthy(self) -> None:
-        result, calls, _ = self.run_tick(held=False, authority=False)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("FULL-LIVE requires SHIPYARD_QUEUE_AUTHORITY=1", result.stdout)
-        self.assertNotIn("ship-state list --json", calls)
-        self.assertNotIn("ghapp", calls)
-
-    def test_explicit_authority_can_enter_live_mode(self) -> None:
-        result, calls, _ = self.run_tick(held=False, authority=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("FULL-LIVE refused", result.stdout)
-        self.assertIn("mode=live", result.stdout)
-        self.assertIn("ship-state list --json", calls)
-        self.assertIn("ghapp pr list --repo owner/repo", calls)
-
-    def test_authority_remote_requires_exact_github_hostname(self) -> None:
+    def test_open_pr_is_kept_and_never_merged(self) -> None:
         result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            remote_url="https://evilgithub.com/owner/repo.git",
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("has no GitHub origin", result.stdout)
-        self.assertNotIn("ghapp", calls)
-
-    def test_authority_remote_accepts_canonical_ssh_form(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            remote_url="git@github.com:owner/repo.git",
+            held=False, states=self.stale_open_state(), gh_state="OPEN"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("ghapp pr list --repo owner/repo", calls)
+        self.assertIn("owner/repo#42: open", result.stdout)
+        self.assertIn("mode=reap reaped=0 open=1", result.stdout)
+        # Control: the tick did read the PR, so the absences below are real.
+        self.assertIn("ghapp pr view 42", calls)
+        for forbidden in ("auto-merge", "ship-state reconcile", "ship-state discard"):
+            self.assertNotIn(forbidden, calls)
 
-    def test_live_mode_requires_configured_app_wrapper(self) -> None:
+    def test_legacy_full_live_install_only_reaps_and_says_so(self) -> None:
         result, calls, _ = self.run_tick(
             held=False,
-            authority=True,
+            legacy_full_live=True,
+            states=self.stale_open_state(),
+            gh_state="OPEN",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ghapp pr view 42", calls)
+        self.assertNotIn("auto-merge", calls)
+        self.assertNotIn("ship-state reconcile", calls)
+        self.assertNotIn("auth token", calls)
+        self.assertIn("legacy_full_live_ignored", result.stdout)
+        health = json.loads(self.last_health)
+        self.assertEqual(health["status"], "healthy")
+        self.assertIn("legacy_full_live_ignored", health["reason"])
+
+    def test_merged_pr_is_reaped(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, states=self.stale_open_state(), gh_state="MERGED"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reaped (MERGED)", result.stdout)
+        self.assertIn("ship-state discard 42", calls)
+
+    def test_failed_discard_names_its_reason(self) -> None:
+        result, _, _ = self.run_tick(
+            held=False,
+            states=self.stale_open_state(),
+            gh_state="MERGED",
+            discard_rc=8,
+            discard_error="ship-state for #42 is locked by another writer",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            "discard failed (ship-state for #42 is locked by another writer)",
+            result.stdout,
+        )
+
+    def test_failed_pr_read_names_its_reason(self) -> None:
+        result, _, _ = self.run_tick(
+            held=False,
+            states=self.stale_open_state(),
+            gh_state="",
+            gh_state_rc=1,
+            gh_state_error="gh: Bad credentials (HTTP 401)",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            "GitHub read failed (exit 1: gh: Bad credentials (HTTP 401))",
+            result.stdout,
+        )
+
+    def test_requires_configured_app_wrapper(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
             extra_env={"SHIPYARD_QUEUE_GH_CLI": ""},
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("requires SHIPYARD_QUEUE_GH_CLI", result.stdout)
         self.assertNotIn("ship-state list", calls)
 
-    def test_live_mode_broken_app_auth_fails_even_with_empty_state(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=[],
-            extra_env={"GH_REPO_RC": "1"},
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("authority-repo read failed", result.stdout)
-        self.assertIn("ghapp pr list --repo owner/repo", calls)
-        self.assertNotIn("ship-state list", calls)
-
-    def test_live_mode_broken_app_token_fails_before_state(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=[],
-            extra_env={"GH_TOKEN_RC": "1"},
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("could not provide a bounded token", result.stdout)
-        self.assertIn("ghapp auth token", calls)
-        self.assertNotIn("ship-state list", calls)
-
-    def test_authority_flag_without_machine_match_is_unhealthy(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False, authority=True, authority_matches=False
-        )
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("runner tag does not match merge_queue.mutation_machine", result.stdout)
-        self.assertNotIn("ghapp", calls)
-
     def test_dry_run_ignores_missing_repo_root_placeholder(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False, authority=False, apply=False, repo_root=False
-        )
+        result, calls, _ = self.run_tick(held=False, apply=False, repo_root=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mode=dry-run", result.stdout)
         self.assertIn("ship-state list --json", calls)
@@ -338,11 +280,8 @@ exit 98
     def test_invalid_tunables_fail_before_shipyard_or_github_reads(self) -> None:
         for key, value, expected in (
             ("SHIPYARD_TICK_APPLY", "yes", "APPLY must be 0 or 1"),
-            ("SHIPYARD_TICK_REAP_ONLY", "2", "REAP_ONLY must be 0 or 1"),
             ("SHIPYARD_TICK_HEARTBEAT_FRESH_SECS", "-1", "freshness must be"),
             ("SHIPYARD_QUEUE_INVALID_THRESHOLD", "0", "invalid threshold"),
-            ("SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS", "0", "command timeout"),
-            ("SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS", "301", "command timeout"),
             (
                 "SHIPYARD_TICK_HEARTBEAT_FRESH_SECS",
                 "9223372036854775808",
@@ -353,12 +292,10 @@ exit 98
                 "9223372036854775808",
                 "invalid threshold",
             ),
-            ("SHIPYARD_TICK_MERGE_METHOD", "octopus", "must be merge, squash, or rebase"),
         ):
             with self.subTest(key=key):
                 result, calls, _ = self.run_tick(
                     held=False,
-                    authority=True,
                     extra_env={key: value},
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -368,7 +305,6 @@ exit 98
     def test_mktemp_failure_is_unhealthy_not_success(self) -> None:
         result, calls, _ = self.run_tick(
             held=False,
-            authority=True,
             invalid_tmpdir=True,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -387,122 +323,9 @@ exit 98
             }
         ]
 
-    def test_reconcile_failure_blocks_auto_merge_and_degrades_tick(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=self.stale_open_state(),
-            reconcile_rc=9,
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("ship-state reconcile failed", result.stdout)
-        self.assertIn("ship-state reconcile 42", calls)
-        self.assertNotIn("auto-merge 42", calls)
-
-    def test_reconcile_timeout_blocks_auto_merge_without_wedging_tick(self) -> None:
-        started = time.monotonic()
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=self.stale_open_state(),
-            reconcile_sleep=2,
-            reconcile_child_sleep=5,
-            extra_env={"SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS": "1"},
-        )
-        self.assertLess(time.monotonic() - started, 4)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("ship-state reconcile failed", result.stdout)
-        self.assertIn("ship-state reconcile 42", calls)
-        self.assertNotIn("auto-merge 42", calls)
-
-    def test_reconcile_json_error_blocks_auto_merge_even_with_zero_exit(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=self.stale_open_state(),
-            reconcile_ok=False,
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("ship-state reconcile failed", result.stdout)
-        self.assertNotIn("auto-merge 42", calls)
-
-    def test_reconcile_requires_exact_typed_envelope(self) -> None:
-        malformed = (
-            '{"results":[{"pr":42,"ok":true,"changes":[]}]}',
-            '{"schema_version":true,"command":"ship-state:reconcile","results":[{"pr":42,"ok":true,"changes":[]}]}',
-            '{"schema_version":1,"command":"wrong","results":[{"pr":42,"ok":true,"changes":[]}]}',
-            '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":true,"ok":true,"changes":[]}]}',
-            '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":42,"ok":true,"changes":[1]}]}',
-            '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":42,"ok":true,"changes":[]}]} trailing',
-        )
-        for payload in malformed:
-            with self.subTest(payload=payload):
-                result, calls, _ = self.run_tick(
-                    held=False,
-                    authority=True,
-                    states=self.stale_open_state(),
-                    reconcile_output=payload,
-                )
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("ship-state reconcile failed", result.stdout)
-                self.assertNotIn("auto-merge 42", calls)
-
-    def test_auto_merge_failure_degrades_tick(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=self.stale_open_state(),
-            auto_merge_rc=1,
-            auto_merge_output='{"error":"boom"}',
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("auto-merge failed (exit 1)", result.stdout)
-        self.assertIn("auto-merge 42", calls)
-
-    def test_auto_merge_in_flight_is_healthy_waiting(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=self.stale_open_state(),
-            auto_merge_rc=3,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("not green yet / in flight", result.stdout)
-        self.assertIn("reconcile-gh-token=set", calls)
-        self.assertIn("auto-merge-gh-token=set", calls)
-
-    def test_routine_auto_merge_exit_one_events_are_healthy_waiting_or_stalled(self) -> None:
-        for event, message in (
-            ("target-failed", "waiting for a new green head"),
-            ("superseded-sha", "stalled pending re-validation"),
-        ):
-            with self.subTest(event=event):
-                result, _, _ = self.run_tick(
-                    held=False,
-                    authority=True,
-                    states=self.stale_open_state(),
-                    auto_merge_rc=1,
-                    auto_merge_output=json.dumps(
-                        {
-                            "schema_version": 1,
-                            "command": "auto-merge",
-                            "event": event,
-                            "pr": 42,
-                            **(
-                                {"failing_targets": ["macos"], "evidence": {}}
-                                if event == "target-failed"
-                                else {"validated": "old", "current": "new"}
-                            ),
-                        }
-                    ),
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(message, result.stdout)
-
     def test_dry_run_not_found_does_not_advance_quarantine_ledger(self) -> None:
         result, _, ledger = self.run_tick(
             held=False,
-            authority=True,
             apply=False,
             states=self.stale_open_state(),
             gh_state="",
@@ -517,7 +340,6 @@ exit 98
     def test_generic_github_error_resets_not_found_confirmation(self) -> None:
         result, _, ledger = self.run_tick(
             held=False,
-            authority=True,
             states=self.stale_open_state(),
             gh_state="",
             gh_state_rc=1,
@@ -532,81 +354,26 @@ exit 98
             with self.subTest(state=state):
                 result, calls, _ = self.run_tick(
                     held=False,
-                    authority=True,
                     states=self.stale_open_state(),
                     gh_state=state,
                     gh_state_rc=1,
                     gh_state_error="network timeout",
                 )
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("GitHub read failed — skip (fail closed)", result.stdout)
+                self.assertIn("GitHub read failed (exit 1: network timeout) — skip (fail closed)", result.stdout)
                 self.assertNotIn("ship-state discard 42", calls)
                 self.assertNotIn("ship-state reconcile 42", calls)
                 self.assertNotIn("auto-merge 42", calls)
 
-    def test_failed_mergeability_read_never_trusts_partial_stdout(self) -> None:
-        result, calls, _ = self.run_tick(
-            held=False,
-            authority=True,
-            states=self.stale_open_state(),
-            extra_env={"GH_INFO_RC": "1"},
-        )
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("mergeability read failed — skip (fail closed)", result.stdout)
-        self.assertNotIn("ship-state reconcile 42", calls)
-        self.assertNotIn("auto-merge 42", calls)
-
-    def test_malformed_mergeability_types_block_mutation(self) -> None:
-        malformed = (
-            '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":"false"}',
-            '{"mergeable":"BOGUS","mergeStateStatus":"CLEAN","isDraft":false}',
-            '{"mergeable":"MERGEABLE","mergeStateStatus":"BOGUS","isDraft":false}',
-            '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":false} trailing',
-        )
-        for payload in malformed:
-            with self.subTest(payload=payload):
-                result, calls, _ = self.run_tick(
-                    held=False,
-                    authority=True,
-                    states=self.stale_open_state(),
-                    extra_env={"GH_INFO": payload},
-                )
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("mergeability schema malformed", result.stdout)
-                self.assertNotIn("ship-state reconcile 42", calls)
-                self.assertNotIn("auto-merge 42", calls)
-
-    def test_auto_merge_success_requires_exact_single_json_verdict(self) -> None:
-        malformed = (
-            '{"event":"merged"} trailing',
-            '{"event":"merged","status":"merged"}',
-            '{"event":true}',
-            '{"message":"already-merged"}',
-            'already-merged',
-            '{"schema_version":true,"command":"auto-merge","event":"merged","pr":42}',
-        )
-        for payload in malformed:
-            with self.subTest(payload=payload):
-                result, _, _ = self.run_tick(
-                    held=False,
-                    authority=True,
-                    states=self.stale_open_state(),
-                    auto_merge_rc=0,
-                    auto_merge_output=payload,
-                )
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("success without a merged verdict", result.stdout)
-
     def test_unreadable_repo_does_not_confirm_pr_not_found(self) -> None:
         result, _, ledger = self.run_tick(
             held=False,
-            authority=True,
             states=self.stale_open_state(),
             gh_state="",
             gh_state_rc=1,
             gh_state_error="HTTP 404: pull request not found",
             ledger_seed={"owner/repo#42": 2},
-            extra_env={"GH_REPO_RC": "1", "SHIPYARD_TICK_REAP_ONLY": "1"},
+            extra_env={"GH_REPO_RC": "1"},
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("not confirmed by a readable repository", result.stdout)
@@ -615,7 +382,6 @@ exit 98
     def test_failed_quarantine_discard_preserves_confirmation_ledger(self) -> None:
         result, calls, ledger = self.run_tick(
             held=False,
-            authority=True,
             states=self.stale_open_state(),
             discard_rc=8,
             gh_state="",
@@ -631,7 +397,6 @@ exit 98
     def test_successful_quarantine_discard_then_resets_ledger(self) -> None:
         result, calls, ledger = self.run_tick(
             held=False,
-            authority=True,
             states=self.stale_open_state(),
             gh_state="",
             gh_state_rc=1,
@@ -646,7 +411,6 @@ exit 98
     def test_existing_pr_resets_not_found_ledger_even_when_discard_fails(self) -> None:
         result, calls, ledger = self.run_tick(
             held=False,
-            authority=True,
             states=self.stale_open_state(),
             discard_rc=8,
             gh_state="MERGED",
@@ -659,7 +423,6 @@ exit 98
     def test_corrupt_ledger_blocks_discard_before_ship_state_or_github(self) -> None:
         result, calls, ledger = self.run_tick(
             held=False,
-            authority=True,
             states=[
                 {
                     "pr": 42,
@@ -708,7 +471,6 @@ exit 98
             with self.subTest(state=state):
                 result, calls, _ = self.run_tick(
                     held=False,
-                    authority=True,
                     # A valid record before the malformed one proves validation
                     # is all-or-nothing: no partial row may become actionable.
                     states=[base, state],
@@ -723,18 +485,11 @@ exit 98
                 self.assertNotIn("auto-merge", calls)
 
     def test_control_requires_exact_json_booleans(self) -> None:
-        for held, authority in (('"false"', "true"), ("false", '"true"')):
-            with self.subTest(held=held, authority=authority):
-                result, calls, _ = self.run_tick(
-                    held=False,
-                    authority=True,
-                    extra_env={"HELD": held, "AUTHORITY_MATCHES": authority},
-                )
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("merge-queue control schema malformed", result.stdout)
-                self.assertNotIn("ship-state list", calls)
-                self.assertNotIn("ghapp", calls)
-
+        result, calls, _ = self.run_tick(held=False, extra_env={"HELD": '"false"'})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("merge-queue control schema malformed", result.stdout)
+        self.assertNotIn("ship-state list", calls)
+        self.assertNotIn("ghapp", calls)
 
 if __name__ == "__main__":
     unittest.main()

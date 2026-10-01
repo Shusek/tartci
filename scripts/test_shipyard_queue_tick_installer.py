@@ -17,42 +17,6 @@ INSTALLER = Path(__file__).with_name("install_shipyard_queue_tick.sh")
 
 
 class QueueTickInstallerTests(unittest.TestCase):
-    def test_installer_rejects_evilgithub_origin(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            repo = home / "repo"
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo),
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://evilgithub.com/owner/repo.git",
-                ],
-                check=True,
-            )
-            wrapper = home / "ghapp"
-            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            wrapper.chmod(0o755)
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    str(INSTALLER),
-                    "--repo-root",
-                    str(repo),
-                    "--gh-cli",
-                    str(wrapper),
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("no supported GitHub origin", result.stderr)
-
     def test_reap_only_requires_explicit_app_wrapper(self) -> None:
         result = subprocess.run(
             [
@@ -61,7 +25,7 @@ class QueueTickInstallerTests(unittest.TestCase):
                 "--repo-root",
                 ".",
                 "--mode",
-                "reap-only",
+                "reap",
             ],
             cwd=SCRIPT.parents[1],
             text=True,
@@ -128,9 +92,8 @@ exit 0
                     str(INSTALLER),
                     "--repo-root",
                     "repo",
-                    "--authority",
                     "--mode",
-                    "live",
+                    "reap",
                     "--gh-cli",
                     "ghapp",
                     "--install",
@@ -159,8 +122,8 @@ exit 0
                 f"SHIPYARD_QUEUE_REPO_ROOT={repo.resolve()}",
                 config.read_text(encoding="utf-8"),
             )
-            self.assertIn(
-                "SHIPYARD_QUEUE_AUTHORITY=1",
+            self.assertNotIn(
+                "SHIPYARD_QUEUE_AUTHORITY",
                 config.read_text(encoding="utf-8"),
             )
             self.assertIn("fresh health verdict is healthy", result.stdout)
@@ -172,27 +135,27 @@ exit 0
                 plist = plistlib.load(source)
             environment = plist["EnvironmentVariables"]
             self.assertEqual(environment["SHIPYARD_TICK_APPLY"], "1")
-            self.assertEqual(environment["SHIPYARD_TICK_REAP_ONLY"], "0")
+            for retired in (
+                "SHIPYARD_TICK_REAP_ONLY",
+                "SHIPYARD_QUEUE_AUTHORITY",
+                "SHIPYARD_TICK_MERGE_METHOD",
+            ):
+                self.assertNotIn(retired, environment)
 
-    def test_live_mode_requires_authority(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    str(INSTALLER),
-                    "--repo-root",
-                    str(repo),
-                    "--mode",
-                    "live",
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("requires --authority", result.stderr)
+    def test_merge_modes_are_retired(self) -> None:
+        for args, message in (
+            (["--mode", "live"], "--mode live is retired"),
+            (["--authority"], "--authority is retired"),
+        ):
+            with self.subTest(args=args):
+                result = subprocess.run(
+                    ["/bin/bash", str(INSTALLER), *args],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
 
     def test_failed_candidate_rolls_back_prior_bytes_and_loaded_state(
         self,
@@ -269,9 +232,8 @@ exit 0
                     str(INSTALLER),
                     "--repo-root",
                     str(repo),
-                    "--authority",
                     "--mode",
-                    "live",
+                    "reap",
                     "--gh-cli",
                     "ghapp",
                     "--install",
