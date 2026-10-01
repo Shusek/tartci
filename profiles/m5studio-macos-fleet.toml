@@ -62,7 +62,10 @@ flat_rollback = "pulp-build-runner:latest"
 [reclaim]
 pulp_worktree_builds = true
 repo = "/Users/danielraffel/Code/pulp"
-worktrees_root = "/Users/danielraffel/Code/agent-worktrees"
+# m5studio has no Workshop volume yet, so Pulp worktrees are siblings of the
+# primary checkout under ~/Code (the reapers only touch worktrees of `repo`).
+# Move to /Volumes/Workshop/Code/agent-worktrees with the volume migration.
+worktrees_root = "/Users/danielraffel/Code"
 pressure_free_gb = 200
 # Remove finished git checkouts agents left in /private/tmp (48 h idle,
 # clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py
