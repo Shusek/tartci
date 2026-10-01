@@ -404,7 +404,7 @@ class DiskReclaimIntegration(Isolated):
         out = io.StringIO()
         with redirect_stdout(out), redirect_stderr(io.StringIO()) as err:
             code = dr.main(["--roots", str(scan), "--json", "--fix",
-                            "--state-dir", str(state)])
+                            "--state-dir", str(state), "--boot-floor-gb", "0"])
         self.assertEqual(code, 0, err.getvalue())
         self.assertFalse(cov.exists())
         report = json.loads(out.getvalue())

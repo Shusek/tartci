@@ -613,6 +613,27 @@ and nothing was certified. Both are failures, but 3 asks for disk and 4 asks why
 the janitor cannot see. Exit 2 means no scan root resolved, and 0 means the pass
 ran and the host is above its floor.
 
+The boot data volume (`/System/Volumes/Data`) has its own floor,
+`TARTCI_RECLAIM_BOOT_FLOOR_GB` (30), judged whenever the lease floor above does
+not already cover that volume. That is m3, whose Tart store is on Workshop:
+judging the lease floor on the Tart store's volume is right for leases, but it
+left nothing watching m3's boot disk, which went from 57 GiB free to 2 GiB on
+2026-10-01. A pass that leaves the boot volume below its floor exits 5 (the
+lease volume wins with 3 when both are low), status reports `boot_low`, and the
+doctor reports `reclaim_boot_low`. On hosts whose Tart store is on the boot
+disk the lease floor already judges it, and the receipt says `lease_floor`.
+
+The same pass removes test and validation scratch from the two temp roots on
+the boot volume, which no scan root reaches (`scripts/scratch_dirs.py`, opt-in
+with `[reclaim] scratch_dirs = true`): Shipyard's per-run
+`/private/tmp/shipyard-validation-*`, the Pulp test prefixes it names in the
+per-user temp dir, and Chrome's `code_sign_clone.*` app-bundle copies. Only
+named patterns are examined; an entry goes only when it is ours, nothing has a
+file open in it, no process command line or environment names it, and nothing
+in it changed for `scratch_idle_hours` (12; 4 while the boot volume is below its
+floor). Directories a test left read-only are made writable first, which is
+what every earlier cleanup lacked.
+
 This agent prevents a slow fill; it does not rescue a host that filled today.
 The age gates are the binding constraint, by design: measured against m5's real
 tree on 2026-09-10, right after the outage was cleared by hand, a 30-day pass

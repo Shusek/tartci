@@ -122,6 +122,7 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
         2: "unusable scan root or bad arguments",
         3: "free space still below the floor after reclaiming",
         4: "process table unreadable, so no build directory could be proven idle",
+        5: "boot data volume still below its own floor after reclaiming",
     },
     "com.danielraffel.tartci.self-update": {
         3: ("a precondition refused (capacity floor, rate limit, halt), or the host has been "

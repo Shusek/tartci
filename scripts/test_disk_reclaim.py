@@ -51,7 +51,10 @@ def setUpModule():
         _SAVED_ENV[key] = os.environ.pop(key, None)
     for key, value in (("TARTCI_HOME", str(iso / "tartci")),
                        ("TARTCI_RECLAIM_STATE_DIR", str(iso / "tartci" / "state" / "reclaim")),
-                       ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml"))):
+                       ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml")),
+                       # The boot-volume watch would judge the real boot disk;
+                       # test_scratch_dirs.BootVolumeWatch covers it hermetically.
+                       ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0")):
         _SAVED_ENV[key] = os.environ.get(key)
         os.environ[key] = value
 

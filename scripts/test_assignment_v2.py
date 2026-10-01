@@ -677,6 +677,75 @@ class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
         self.assertIn("retained required legacy selector", result.stderr)
 
 
+class PreCloneProbeTests(RunnerFixture, unittest.TestCase):
+    """`--print-pre-clone-selection` against the real scanner and a fake GitHub:
+    1 = the lane would clone for that tier now, 0 = it would not."""
+
+    def _events(self, name: str) -> list[dict]:
+        path = self.root / "state" / "events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if f'"event":"{name}"' in line]
+
+    def _probe(self, tier: str) -> str:
+        result = self._runner("--print-pre-clone-selection", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_live_demand_clones(self) -> None:
+        self._state(pr=True)
+        self.assertEqual(self._probe("1"), "1")
+        self.assertEqual(self._events("assignment_v2_pre_clone_denied"), [])
+
+    def test_a_job_taken_after_selection_is_not_cloned(self) -> None:
+        self._state(pr=True)
+        selected = self._runner("--print-selection")
+        self.assertTrue(selected.stdout.startswith("1\t"), selected.stderr)
+        # Another host minted for the job; keep the cached selection.
+        self.state.write_text("{}", encoding="utf-8")
+        self.assertEqual(self._probe("1"), "0")
+        denied = self._events("assignment_v2_pre_clone_denied")
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0]["fields"]["blocker_reason"], "own_class_empty")
+        self.assertEqual(list((self.root / "state").glob("*.assignment-v2-selection.cache")), [],
+                         "a denial must drop the cached selection")
+
+    def test_a_preferred_class_arriving_is_not_cloned_for_the_lower_one(self) -> None:
+        self._state(pr=True)
+        self.state.write_text(json.dumps({"pr": True, "merge": True}), encoding="utf-8")
+        self.assertEqual(self._probe("1"), "0")
+        denied = self._events("assignment_v2_pre_clone_denied")
+        self.assertEqual(denied[0]["fields"]["blocker_reason"], "higher_class_demand")
+
+    def test_a_blind_scan_fails_open(self) -> None:
+        self._state(pr=True, api_fail=True)
+        self.assertEqual(self._probe("1"), "1")
+        self.assertEqual(len(self._events("assignment_v2_pre_clone_uncertain")), 1)
+        self.assertEqual(self._events("assignment_v2_pre_clone_denied"), [])
+
+    def test_the_top_tier_receipt_does_not_satisfy_it(self) -> None:
+        """Pre-mint may reuse a fresh tier-0 receipt; the pre-clone check must
+        not, because that receipt is the selection it exists to re-check."""
+        self.env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = "180"
+        self._state(merge=True)
+        self._runner("--print-selection")
+        self.state.write_text("{}", encoding="utf-8")
+        self.assertEqual(self._probe("0"), "0")
+        # Control: the same cache and queue DO satisfy pre-mint via the receipt.
+        self._state(merge=True)
+        self._runner("--print-selection")
+        self.state.write_text("{}", encoding="utf-8")
+        premint = self._runner("--print-pre-mint-selection", "0")
+        self.assertEqual(premint.stdout.strip(), "1", premint.stderr)
+
+    def test_the_knob_value_is_validated(self) -> None:
+        self.env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "yes"
+        result = self._runner("--print-selection")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", result.stderr)
+
+
 class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
     """A per-slot class preference order (TARTCI_ASSIGNMENT_V2_TIER_ORDER).
 

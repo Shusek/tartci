@@ -85,6 +85,10 @@ pressure_free_gb = 1100
 # Remove finished git checkouts agents left in /private/tmp (48 h idle,
 # clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py
 tmp_checkouts = true
+# Remove test and validation scratch from /private/tmp, the per-user temp dir
+# and Chrome's code-sign clones (12 h idle, nothing open, no live process
+# naming it; 4 h while the boot volume is below its floor). scripts/scratch_dirs.py
+scratch_dirs = true
 # The same checkout rules on the worktree root above (agent territory on this
 # host): 232 idle, clean, pushed worktrees there held ~143 GiB on 2026-09-29.
 # Dirty, unpushed, recent, in-use and lineage-active checkouts stay.
@@ -121,6 +125,14 @@ process_type = "Adaptive"
 # index, and after a discard the supervisor re-selects in that slot's order.
 # Rollback is removing this key. See docs/assignment-v2-rollout.md.
 assignment_idle_retarget_seconds = 120
+# Canary: pre-clone demand check (both slots). Before cloning, re-ask the
+# pre-mint question live and skip the clone when the selected class is proven
+# empty or a preferred class waits; an uncertain scan clones as before.
+# Baseline 2026-09-27..2026-10-01: 74 booted VMs discarded at pre-mint against
+# 270 served, 61 of them own_class_empty, 42 of those after another lane had
+# already minted for the class. Rollback is removing this key.
+# See docs/assignment-v2-rollout.md, "Pre-clone demand check".
+assignment_pre_clone_demand_check = true
 # Per-slot class order (docs/assignment-v2-rollout.md, "Per-slot class
 # preference" and "Release event classes"). Slot 2 keeps the PR-first canary:
 # PR-head before merge-group, the fix for PR-head starvation; releases follow

@@ -53,6 +53,7 @@ import time
 from typing import Any, Callable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import scratch_dirs  # noqa: E402
 import tmp_checkouts  # noqa: E402
 
 try:
@@ -68,7 +69,9 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            # read by tmp_checkouts.py; validated here so one
                            # install-time check covers the whole table
                            "tmp_checkouts", "tmp_checkout_idle_hours",
-                           "worktree_root_checkouts"})
+                           "worktree_root_checkouts",
+                           # read by scratch_dirs.py
+                           "scratch_dirs", "scratch_idle_hours"})
 # How long a merged worktree's build tree must sit unwritten before the worktree
 # reaper may take it (its own PULP_WORKTREE_BUILD_IDLE_HOURS gate). The ceiling
 # is a disk-arithmetic fact, not a preference. Measured on m3, 2026-09-27: one
@@ -147,6 +150,7 @@ def validate_table(table: Any) -> list[str]:
         problems.append("reclaim.worktree_build_idle_hours must be an integer from "
                         f"{MIN_IDLE_HOURS} through {MAX_IDLE_HOURS}")
     problems.extend(tmp_checkouts.validate(table))
+    problems.extend(scratch_dirs.validate(table))
     return problems
 
 

@@ -429,6 +429,7 @@ after stripping any preserved copies so a golden cannot forge them:
   gate on a small host comes from a larger lease (`vm_pool_cores`, the
   `TARTCI_VM_LEASE_MAX_MEM_MB` ceiling), not from these keys.
 - `TARTCI_PIP_WHEELHOUSE` — set only when a host wheelhouse was mounted (below).
+- `TARTCI_ARTIFACT_CACHE` — set only when a host artifact cache was mounted (below).
 
 ### Optional pip wheelhouse (no rebake)
 
@@ -453,6 +454,47 @@ not the host's. The sync refuses an unhashed lock, never rewrites a wheel in
 place (a guest may be reading it), and is additive: re-run it after the lock
 changes. The consuming job still installs with `--require-hashes`, so the
 wheelhouse decides where the bytes come from, never which bytes are accepted.
+
+### Optional artifact cache: git mirrors and pinned archives (no rebake)
+
+Every job on a disposable guest otherwise re-downloads the same bytes. Measured
+on Pulp's required `macos` gate (2026-09-30): a depth-2 checkout (56 MiB) plus
+the GPU-provenance `--unshallow` (57 MiB) on every job, the pinned Chrome for
+Testing archive (187 MB) and the prebuilt Skia archive (57 MB), and the iOS
+simulator Skia slice (69 MB) whenever the iOS gate runs. A host directory
+shared read-only lets the guest take those bytes from local disk:
+
+```bash
+scripts/artifact-cache.sh git-sync --repo Generous-Corp/pulp
+scripts/artifact-cache.sh add --url <archive url> --sha256 <pinned digest>
+scripts/artifact-cache.sh status
+scripts/artifact-cache.sh prune --older-than-days 30
+```
+
+This fills `${TARTCI_CI_CACHE:-~/.cache/pulp-ci}/artifact-cache` (override with
+`TARTCI_ARTIFACT_CACHE_DIR` or `--dir`). The next VM boot mounts it read-only
+as `artifact-cache` and declares `TARTCI_ARTIFACT_CACHE`; no service restart is
+needed, and an empty or absent directory leaves boots unchanged.
+
+- `git/<owner>/<repo>.git` is a bare mirror of one branch. A job adds its
+  `objects` directory as a Git alternate before fetching, so the server sends
+  only what the mirror lacks. A stale mirror still saves every byte it holds;
+  re-run `git-sync` to keep the saving near total. The mirror never collects
+  garbage on its own and `git-sync` only adds packs; fold them with
+  `compact --repo ...`, which refuses while any Tart VM is running because a
+  guest reads the packs through the share for its whole job. Never delete a
+  mirror while VMs are running.
+- `sha256/<hex>` holds a file whose SHA-256 is `<hex>`. `add` takes the digest
+  the consuming job already pins and refuses bytes that do not match it, and a
+  consuming job must re-verify the digest and fall back to its own download
+  when the entry is absent: the cache decides where the bytes come from, never
+  which bytes are accepted. Re-adding a present blob re-verifies it and
+  refreshes its age; `prune` removes blobs nobody re-added within the window.
+
+Nothing is rewritten in place (a guest may be reading it): blobs and new mirrors
+are staged beside their destination and renamed into place, and one writer runs
+at a time per cache. Size is bounded by what you add: one mirror per repository
+plus the pinned archives you list.
 
 ### Optional per-job ccache write isolation
 
@@ -2132,7 +2174,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Exit 3 means the pass ran and a scanned volume is still below the
   `--fail-below-gb` floor. `pool status` and `doctor fleet`
   (`reclaim_low_space`) name the volume and its free space instead of calling
-  the pass failed.
+  the pass failed. Exit 5 means the lease volume is fine but the boot data
+  volume, which no lease floor covers (m3), is still below
+  `--boot-floor-gb` (30); status says `boot_low` and the doctor
+  `reclaim_boot_low`. Look in `/private/tmp` and the per-user temp dir: the
+  pass's `scratch_dirs` field shows what the scratch reaper removed and why it
+  kept the rest.
 
   The same origin/main checkout carries Pulp's host-vitals sensor. Its
   installer copies `host_vitals.sh` and `host_vitals_sensor.sh` into

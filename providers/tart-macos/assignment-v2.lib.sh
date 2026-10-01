@@ -28,6 +28,10 @@ tartci_assignment_v2_configure(){
     *) [ "${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}" -le 300 ] \
       || die "TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS must be at most 300" ;;
   esac
+  case "${TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK:-0}" in
+    0|1) ;;
+    *) die "invalid TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK: expected 0 or 1" ;;
+  esac
   # Work-conserving idle retarget (opt-in; 0 = off). Bounded below so an idle
   # runner is never re-observed faster than GitHub ordinarily assigns a job to
   # a fresh registration, and never more often than one exhaustive scan per
@@ -452,6 +456,63 @@ tartci_assignment_v2_pre_mint_admit(){
   fi
   tartci_assignment_v2_invalidate_selection
   return 1
+}
+
+# Pre-clone demand check (opt-in: TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK=1).
+#
+# The selection a lane boots for can be up to the selection-cache TTL old, and
+# the admission precheck between selection and clone takes tens of seconds
+# more. A job of the selected class that another lane or host takes in that
+# window is only noticed at the pre-mint check, after a full clone and boot,
+# and the booted VM is then discarded unused (`assignment_v2_pre_mint_denied
+# blocker_reason=own_class_empty`). This asks the pre-mint question once more
+# immediately before the clone, live (the top-tier receipt shortcut is
+# disabled here: the receipt is the very selection being re-checked), and
+# answers whether to clone:
+#
+#   0 -> clone. The selected class still has demand and no preferred class
+#        does, OR the observation was uncertain (fail open: an unanswerable
+#        scan boots exactly as it did without this check, and the pre-mint
+#        check stays the authority).
+#   1 -> do not clone. The live queue proves the selected class empty or a
+#        preferred class waiting. The cached selection is dropped so the next
+#        pass re-selects live.
+#
+# It can only remove a clone the pre-mint check would refuse on the same
+# observation; it never admits anything, never touches a lease, and never
+# changes which class is preferred.
+tartci_assignment_v2_pre_clone_check_enabled(){
+  [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
+    && [ "${TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK:-0}" = 1 ]
+}
+
+tartci_assignment_v2_pre_clone_skip(){
+  local selected_tier="$1" selected_labels="${2:-}" reason fields=()
+  # Dynamic scoping: pre_mint_valid reads this name, so the shortcut is off for
+  # this call only and the lane's configured value is untouched.
+  local TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS=0
+  ASSIGNMENT_V2_PRE_MINT_BLOCKER=""
+  if tartci_assignment_v2_pre_mint_valid "$selected_tier"; then
+    return 1
+  fi
+  read -r -a fields <<< "$ASSIGNMENT_V2_PRE_MINT_BLOCKER"
+  case " $ASSIGNMENT_V2_PRE_MINT_BLOCKER " in
+    *" blocker_reason=own_class_empty "*) reason=own_class_empty ;;
+    *" blocker_reason=higher_class_demand "*) reason=higher_class_demand ;;
+    *) reason="" ;;
+  esac
+  if [ -z "$reason" ]; then
+    event assignment_v2_pre_clone_uncertain \
+      "selected_tier=$selected_tier labels=$selected_labels $ASSIGNMENT_V2_PRE_MINT_BLOCKER" \
+      "selected_tier=$selected_tier" ${fields[@]+"${fields[@]}"}
+    ASSIGNMENT_V2_PRE_MINT_BLOCKER=""
+    return 1
+  fi
+  tartci_assignment_v2_invalidate_selection
+  event assignment_v2_pre_clone_denied \
+    "selected_tier=$selected_tier labels=$selected_labels $ASSIGNMENT_V2_PRE_MINT_BLOCKER" \
+    "selected_tier=$selected_tier" ${fields[@]+"${fields[@]}"}
+  return 0
 }
 
 # Work-conserving idle retarget. A registered JIT runner advertises exactly one

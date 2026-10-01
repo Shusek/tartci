@@ -37,6 +37,14 @@ the janitor must never touch, so failing on the boot disk reported a host that
 leases fine as one that refuses every lease. Only when no Tart store is
 declared does the floor fall back to every scanned volume.
 
+The boot data volume is judged on its own floor, `--boot-floor-gb`, whenever
+the floor above does not already cover it. Moving the lease floor to the Tart
+store left m3's boot disk watched by nothing: it went from 57 GiB free to 2
+GiB in a day on 2026-10-01 and no pass said so. The boot volume does not
+refuse leases, so it has its own exit code (5) rather than sharing 3, and
+while it is below its floor the scratch reaper (scratch_dirs.py) uses its
+shorter idle gate.
+
 Exit codes:
 
   0  the pass ran and the host is above its floor,
@@ -46,6 +54,9 @@ Exit codes:
   4  a measurement the decision depends on could not be taken (the process
      table or the free-space figure). Nothing was deleted. This is distinct
      from 3 on purpose: 3 means the host is full, 4 means we do not know.
+  5  the lease volume is fine, but the boot data volume (a different volume)
+     is STILL below `--boot-floor-gb` after the pass. Leases are unaffected;
+     the machine itself is running out of disk.
 """
 
 from __future__ import annotations
@@ -64,6 +75,7 @@ import time
 from typing import Any, Iterable
 
 import pulp_reapers
+import scratch_dirs
 import tmp_checkouts
 
 try:
@@ -85,6 +97,12 @@ SOURCE_MARKERS = (".git", "CMakeLists.txt", "Cargo.toml", "package.json")
 BUILD_PROCESS_PATTERN = r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
 
 GIB = 1024**3
+
+# The volume macOS keeps user data, /private/tmp and /var/folders on. `/` is
+# the sealed system volume, whose free figure is the same container's but
+# whose device id is not the data volume's.
+DEFAULT_BOOT_VOLUME = "/System/Volumes/Data"
+DEFAULT_BOOT_FLOOR_GB = 30.0
 
 # A --fix pass can run for minutes with nothing to say, and the watchdog reads
 # this agent's liveness from the mtime of its log. A pass that is working but
@@ -532,6 +550,43 @@ def tightest_volume_root(volumes: list[dict[str, Any]]) -> str | None:
     return min(known, key=lambda v: v["free_bytes"])["root"]
 
 
+def resolve_boot_volume(explicit: str | None) -> pathlib.Path:
+    """The boot data volume: the explicit path, else macOS's data volume, else /."""
+    if explicit:
+        return pathlib.Path(os.path.expanduser(explicit))
+    data = pathlib.Path(DEFAULT_BOOT_VOLUME)
+    return data if data.is_dir() else pathlib.Path("/")
+
+
+def boot_volume_report(path: pathlib.Path, before: dict[str, Any],
+                       after: dict[str, Any], floor_gb: float,
+                       floor_devices: set[Any], lease_floor_gb: float) -> dict[str, Any]:
+    """How the boot data volume was judged this pass.
+
+    `lease_floor` when the main floor already measured the same device (every
+    host whose Tart store is on the boot disk), `own_floor` when only this
+    check covers it (m3: Tart store on Workshop), `disabled` at floor 0.
+    """
+    device = after.get("device")
+    if lease_floor_gb > 0 and device is not None and device in floor_devices:
+        judged_by = "lease_floor"
+    elif floor_gb > 0:
+        judged_by = "own_floor"
+    else:
+        judged_by = "disabled"
+    free_after = after.get("free_bytes")
+    return {
+        "path": str(path),
+        "device": device,
+        "free_bytes_before": before.get("free_bytes"),
+        "free_bytes_after": free_after,
+        "floor_gb": floor_gb,
+        "judged_by": judged_by,
+        "below_floor": (judged_by == "own_floor" and free_after is not None
+                        and free_after < floor_gb * GIB),
+    }
+
+
 def resolve_lease_path(explicit: str | None) -> dict[str, Any] | None:
     """The Tart store lease admission probes, and where that answer came from.
 
@@ -684,9 +739,17 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
         "broken_checkouts", "broken_paths", "root", "by_root")}
         if tmp else None)
     tmp_freed = int(tmp.get("removed_bytes") or 0) if receipt.get("mode") == "fix" else 0
+    scratch = receipt.get("scratch_dirs") or report.get("scratch_dirs") or {}
+    summary["scratch_dirs"] = ({key: scratch.get(key) for key in (
+        "enabled", "reason", "error", "errors", "mode", "idle_hours", "pressure",
+        "candidates", "removed", "removed_bytes", "removed_paths", "kept",
+        "deferred", "by_pattern")} if scratch else None)
+    scratch_freed = (int(scratch.get("removed_bytes") or 0)
+                     if receipt.get("mode") == "fix" else 0)
+    summary["boot_volume"] = report.get("boot_volume")
     summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
                                   + int(summary["pulp_reapers"]["reclaimed_bytes"] or 0)
-                                  + tmp_freed)
+                                  + tmp_freed + scratch_freed)
     if "error" in receipt:
         summary["error"] = receipt["error"]
     return summary
@@ -713,6 +776,30 @@ def tmp_checkout_detail(tmp: dict[str, Any] | None) -> str:
     return text
 
 
+def scratch_detail(scratch: dict[str, Any] | None) -> str:
+    """"; scratch removed 12 (31.4 GiB), kept open_files=2 recent=5"."""
+    if not scratch or not scratch.get("enabled"):
+        return ""
+    if scratch.get("error") and scratch.get("candidates") is None:
+        return f"; scratch: {scratch['error']}"
+    verb = "removed" if scratch.get("mode") == "fix" else "would remove"
+    kept = " ".join(f"{k}={v}" for k, v in sorted((scratch.get("kept") or {}).items()))
+    text = (f"; scratch {verb} {scratch.get('removed', 0)} "
+            f"({int(scratch.get('removed_bytes') or 0) / GIB:.1f} GiB)")
+    if kept:
+        text += f", kept {kept}"
+    if scratch.get("error"):
+        text += f", {scratch['error']}"
+    return text
+
+
+def boot_detail(boot: dict[str, Any] | None) -> str:
+    if not boot or not boot.get("below_floor"):
+        return ""
+    return (f"; BOOT VOLUME LOW {int(boot['free_bytes_after']) / GIB:.1f} GiB on "
+            f"{boot['path']} < {boot['floor_gb']:g} GiB")
+
+
 def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
                 code: int | None, stream: Any = None) -> dict[str, Any] | None:
     """Write the last-run receipt and append one reclaim_pass event.
@@ -729,7 +816,9 @@ def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
         "event": "reclaim_pass",
         "detail": (f"exit {code}; reclaimed {summary['reclaimed_bytes'] / GIB:.1f} GiB "
                    f"(pulp {summary['pulp_reapers']['reclaimed_bytes'] / GIB:.1f} GiB)"
-                   + tmp_checkout_detail(summary.get("tmp_checkouts"))),
+                   + tmp_checkout_detail(summary.get("tmp_checkouts"))
+                   + scratch_detail(summary.get("scratch_dirs"))
+                   + boot_detail(summary.get("boot_volume"))),
         "fields": summary,
     }
     print(f"disk_reclaim: {json.dumps(event, sort_keys=True)}", file=stream, flush=True)
@@ -777,6 +866,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-path",
                         default=os.environ.get("TARTCI_RECLAIM_LEASE_PATH"),
                         help="the Tart store whose volume --fail-below-gb judges (default: $TARTCI_RECLAIM_LEASE_PATH, else $TART_HOME, else the fleet profile's [host].tart_home; with none, every scanned volume)")
+    parser.add_argument("--boot-volume",
+                        default=os.environ.get("TARTCI_RECLAIM_BOOT_VOLUME"),
+                        help=f"the boot data volume judged on its own floor (default: $TARTCI_RECLAIM_BOOT_VOLUME, else {DEFAULT_BOOT_VOLUME} when it exists, else /)")
+    parser.add_argument("--boot-floor-gb", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_BOOT_FLOOR_GB",
+                                                     str(DEFAULT_BOOT_FLOOR_GB))),
+                        help=f"exit 5 when the boot data volume is still below this after the pass and no other floor covers it (default {DEFAULT_BOOT_FLOOR_GB:g}; 0 disables)")
     parser.add_argument("--log-path",
                         default=os.environ.get("TARTCI_RECLAIM_LOG"),
                         help="log file to rotate aside at startup once it reaches --log-max-bytes (default: $TARTCI_RECLAIM_LOG; unset disables rotation)")
@@ -863,6 +959,19 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     floor_roots = [pathlib.Path(lease["path"])] if lease else roots
     floor_before = volumes_free_bytes(floor_roots) if lease else volumes_before
     free_before = tightest_free_bytes(floor_before)
+    boot_path = resolve_boot_volume(args.boot_volume)
+    # A disabled watch measures nothing, so it cannot fail on a stat either.
+    unmeasured = {"root": str(boot_path), "device": None, "free_bytes": None}
+
+    def measure_boot() -> dict[str, Any]:
+        return (volumes_free_bytes([boot_path])[0] if args.boot_floor_gb > 0
+                else unmeasured)
+
+    boot_before = measure_boot()
+    # Below its floor selects the scratch reaper's shorter idle gate. Unknown
+    # keeps the longer one, the same direction the build-dir gate takes.
+    boot_pressure = (args.boot_floor_gb > 0 and boot_before["free_bytes"] is not None
+                     and boot_before["free_bytes"] < args.boot_floor_gb * GIB)
     # An unknown free figure selects the LONGER gate. Guessing "full" here
     # would make an unreadable volume delete more aggressively than a healthy
     # one, which is exactly backwards.
@@ -976,8 +1085,15 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         in_use=None if active is None
         else (lambda path: names_candidate(active, path_spellings(path))))
     receipt["tmp_checkouts"] = tmp
+    # Test and validation scratch in /private/tmp and the per-user temp dir
+    # (scratch_dirs.py): on the boot volume, outside every root above.
+    progress.emit("scratch: checking the fleet profile", force=True)
+    scratch = scratch_dirs.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
+                               pressure=boot_pressure)
+    receipt["scratch_dirs"] = scratch
 
-    remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed"))
+    remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed")
+                     or scratch.get("removed"))
     volumes_after = volumes_free_bytes(roots) if remeasure else volumes_before
     if lease:
         floor_after = volumes_free_bytes(floor_roots) if remeasure else floor_before
@@ -985,6 +1101,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         floor_after = volumes_after
     free_after = tightest_free_bytes(floor_after)
     floor_devices = {volume["device"] for volume in floor_after}
+    boot = boot_volume_report(
+        boot_path, boot_before,
+        measure_boot() if remeasure else boot_before,
+        args.boot_floor_gb, floor_devices, args.fail_below_gb)
     # Scanned volumes the floor does not judge, reported so a low boot disk
     # stays visible without failing a host whose lease volume is healthy.
     scan_below_floor = [
@@ -1022,6 +1142,8 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         "scan_volumes_below_floor": scan_below_floor,
         "pulp_reapers": pulp,
         "tmp_checkouts": tmp,
+        "scratch_dirs": scratch,
+        "boot_volume": boot,
         # Exit 3 means the pass ran and this volume is still below the floor;
         # status names it rather than calling the pass "failed".
         "fail_below_gb": args.fail_below_gb,
@@ -1078,6 +1200,20 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
               f"This host will refuse leases (disk_capacity_exceeded).",
               file=sys.stderr)
         return 3
+
+    if boot["judged_by"] == "own_floor" and boot["free_bytes_after"] is None:
+        print(f"disk_reclaim: could not read free space on the boot volume "
+              f"{boot['path']}, so its {args.boot_floor_gb:g} GiB floor could not "
+              "be checked.", file=sys.stderr)
+        return 4
+    if boot["below_floor"]:
+        print(f"disk_reclaim: BOOT VOLUME STILL LOW after reclaim: "
+              f"{boot['free_bytes_after'] / GIB:.1f} GiB on {boot['path']} < "
+              f"{args.boot_floor_gb:g} GiB floor. Leases are judged on the Tart "
+              "store and are unaffected; the machine itself is running out of "
+              "disk (check /private/tmp and the per-user temp dir).",
+              file=sys.stderr)
+        return 5
     return 0
 
 

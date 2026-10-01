@@ -186,6 +186,73 @@ inverts the stated preference on the class that lands code, and the observed
 starvation was an idle hold, not merge-group work consuming both slots. Both
 stay open until a measurement shows the retarget leaves either problem behind.
 
+## Pre-clone demand check (opt-in, m3 canary)
+
+A V2 lane acquires its VM lease before it clones (`boot_vm_to_ssh` in
+`providers/tart-macos/runner.sh`), and lease acquisition never waits, so no VM
+is cloned without a lease. What the clone does not hold is current *demand*:
+the class was selected from a cache up to the selection TTL old (120 s), and
+the Shipyard admission precheck between selection and clone takes tens of
+seconds more. Demand that another lane or host takes in that window is only
+noticed at the pre-mint check, after the clone and boot, and the booted VM is
+discarded with `assignment_v2_pre_mint_denied`.
+
+Measured from the hosts' events logs, 2026-09-27 to 2026-10-01 (all hosts):
+262 VMs were discarded at pre-mint, 208 with `blocker_reason=own_class_empty`
+and 40 with `higher_class_demand`. 175 of the own-class denials had selected a
+class with exactly one queued job, and for 164 another lane minted a runner for
+the same class inside the window (136 of them on another host). Each such VM
+cost 91-185 s (per-host median across m1, m3, m5, m5s) of clone, boot and
+preflight before the discard, plus the delete. For 126 of the
+own-class denials the competing lane had minted at least 15 s *before* this
+lane started its clone, so the job was already gone when the clone began.
+
+`assignment_pre_clone_demand_check = true` on an event-class-v2 lane (env
+`TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK=1`; absent = off) asks the pre-mint
+question once more, live, immediately before the clone (after the admission
+precheck; a parked warm VM's hand-off has no clone and is not checked):
+
+| live observation | verdict |
+|---|---|
+| selected class has demand, every preferred class empty | clone |
+| selected class empty (`own_class_empty`) | **skip**: `assignment_v2_pre_clone_denied`, drop the cached selection, back off one poll |
+| a preferred class has demand (`higher_class_demand`) | **skip**: as above; the next pass re-selects that class |
+| scan uncertain or failed | clone (`assignment_v2_pre_clone_uncertain`), exactly as without the check |
+
+The top-tier receipt shortcut (`assignment_top_tier_receipt_max_age_seconds`)
+is disabled for this one call: that receipt is the selection being re-checked.
+Lease acquisition, ranked waiters, the gate reserve, the agent floor and class
+preference are unchanged; the check only removes a clone the pre-mint check
+would refuse on the same observation, and costs one exhaustive scan per clone
+attempt. A skip counts as an idle pass, not a blocked one (like a contended job
+claim), and withdraws the lane's ranked lease waiter. `--print-pre-clone-selection
+<tier>` reports the decision as a safe preflight.
+
+What it does not fix: two hosts that both clone for the same single job inside
+the same few seconds. Neither can see the other's boot until one mints, so the
+loser still discards at pre-mint. Removing that needs a fleet-wide boot claim
+(today `job_claim.py` sees only this host's boots and the fleet's minted idle
+runners).
+
+**Canary: m3 `pulp-gate` (both slots).** m3 has the highest share of
+catchable denials (42 of 74 pre-mint discards in the baseline) and the most
+served jobs per day, so the sample accrues fastest; m5, with more discards,
+also carries the ranked-waiter canary, and this check changes which lanes wait
+for a lease, so measuring either there would confound the other.
+
+Proxy, before vs after on the canary host, from `tartci pool status --usage
+--range ...` and the events log: discards per served job and clone-seconds per
+served job, with served jobs per day as the control. Expected: pre-mint
+`own_class_empty` discards fall by roughly half, `assignment_v2_pre_clone_denied`
+appears in their place, and served jobs per day stay flat. A rise in median
+queue wait for the pulp classes, or `assignment_v2_pre_clone_denied` with no
+matching fall in pre-mint denials, means the check is refusing real work: roll
+back.
+
+Rollback: delete `assignment_pre_clone_demand_check` from
+`profiles/m3-macos-fleet.toml`, re-render, and reload the pulp-gate slots at an
+idle boundary.
+
 ## Per-slot class preference (opt-in, PR-first canary on m3)
 
 Every slot consults the classes in configured tier order, merge-group first.

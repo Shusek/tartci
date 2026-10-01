@@ -39,6 +39,11 @@
 # selection, so the slot serves the waiting class instead of idling to the
 # full idle timeout. Uncertainty holds; merge-group still wins when both wait.
 # `--print-idle-retarget <tier>` reports that decision as a safe preflight.
+# Pre-clone demand check (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK=1
+# re-asks the pre-mint question live immediately before the clone and skips
+# the clone when the selected class is proven empty or a preferred class
+# waits; an uncertain scan clones as before. `--print-pre-clone-selection
+# <tier>` reports that decision as a safe preflight.
 # Per-slot class preference (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_TIER_ORDER
 # is a comma-separated permutation of the configured class labels. Selection,
 # pre-mint admission, and idle retarget consult classes in that order instead
@@ -113,6 +118,10 @@ FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/C
 # that never ran scripts/pip-wheelhouse.sh boots exactly as before.
 PIP_WHEELHOUSE_ROOT="${TARTCI_PIP_WHEELHOUSE_DIR:-$CACHE_ROOT/pip-wheelhouse}"
 GUEST_PIP_WHEELHOUSE="/Volumes/My Shared Files/pip-wheelhouse"
+# Optional read-only artifact cache (git mirrors and digest-named archives),
+# opt-in by content exactly like the wheelhouse; see artifact-cache.lib.sh.
+ARTIFACT_CACHE_ROOT="${TARTCI_ARTIFACT_CACHE_DIR:-$CACHE_ROOT/artifact-cache}"
+GUEST_ARTIFACT_CACHE="/Volumes/My Shared Files/artifact-cache"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
@@ -217,6 +226,7 @@ PRINT_RUNNER_CONTRACT=""
 PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
+PRINT_PRE_CLONE_SELECTION=""
 PRINT_IDLE_RETARGET=""
 PRINT_FALLBACK_DECISION=""
 PRINT_HIGHER_PRIORITY=""
@@ -257,6 +267,7 @@ CURRENT_AQUA_LABEL=""
 CURRENT_GUEST_CORES=""
 CURRENT_GUEST_MEM_MB=""
 CURRENT_PIP_WHEELHOUSE=0
+CURRENT_ARTIFACT_CACHE=0
 CLEANED_UP=0
 # Set when a work entry ends without serving a job, cleared when a job is
 # actually assigned or when the queue drains. Carries the START of the blocked
@@ -276,6 +287,9 @@ SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
+# 1 when the last work entry declined to clone because the opt-in pre-clone
+# demand check found its class empty or a preferred class waiting.
+PRE_CLONE_DEMAND_GONE=0
 # The queued count the loop selected with; the per-job claim reads it.
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
@@ -424,6 +438,8 @@ source "$TARTCI_ROOT/providers/tart-macos/heartbeat-keepalive.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/pip-wheelhouse.lib.sh"
+# shellcheck source=providers/tart-macos/artifact-cache.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/artifact-cache.lib.sh"
 # shellcheck source=providers/tart-macos/ccache-layer.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 # shellcheck source=providers/tart-macos/guest-dns.lib.sh
@@ -491,6 +507,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-selection) PRINT_SELECTION=1; shift;;
   --print-assignment-parity) PRINT_ASSIGNMENT_PARITY=1; shift;;
   --print-pre-mint-selection) PRINT_PRE_MINT_SELECTION="$2"; shift 2;;
+  --print-pre-clone-selection) PRINT_PRE_CLONE_SELECTION="$2"; shift 2;;
   --print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;
   --print-fallback-decision) PRINT_FALLBACK_DECISION="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
@@ -1595,7 +1612,7 @@ run_runner_until_done_unlayered(){
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      printf 'PULP_CONFIGURE_CHECK_CACHE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/configure-checks\" >> .env.tartci && \
@@ -1603,6 +1620,7 @@ run_runner_until_done_unlayered(){
      if [ -n '$CURRENT_GUEST_CORES' ]; then printf 'TARTCI_GUEST_CORES=%s\n' '$CURRENT_GUEST_CORES' >> .env.tartci; fi && \
      if [ -n '$CURRENT_GUEST_MEM_MB' ]; then printf 'TARTCI_GUEST_MEM_MB=%s\n' '$CURRENT_GUEST_MEM_MB' >> .env.tartci; fi && \
      if [ '$CURRENT_PIP_WHEELHOUSE' = 1 ]; then printf 'TARTCI_PIP_WHEELHOUSE=%s\n' '$GUEST_PIP_WHEELHOUSE' >> .env.tartci; fi && \
+     if [ '$CURRENT_ARTIFACT_CACHE' = 1 ]; then printf 'TARTCI_ARTIFACT_CACHE=%s\n' '$GUEST_ARTIFACT_CACHE' >> .env.tartci; fi && \
      ${CCACHE_LAYER_GUEST_ENV}mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
@@ -1788,6 +1806,11 @@ boot_vm_to_ssh(){
     tart_dirs+=(--dir="pip-wheelhouse:$PIP_WHEELHOUSE_ROOT:ro")
     CURRENT_PIP_WHEELHOUSE=1
   fi
+  CURRENT_ARTIFACT_CACHE=0
+  if artifact_cache_ready "$ARTIFACT_CACHE_ROOT"; then
+    tart_dirs+=(--dir="artifact-cache:$ARTIFACT_CACHE_ROOT:ro")
+    CURRENT_ARTIFACT_CACHE=1
+  fi
   tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
@@ -1829,6 +1852,7 @@ run_one(){
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
+  PRE_CLONE_DEMAND_GONE=0
   LAST_RUN_LEASE_DENIED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l ip="" rc=0
@@ -1953,6 +1977,16 @@ run_one(){
     fi
   fi
   if [ -z "$CURRENT_VM" ]; then
+    # Opt-in: re-ask the pre-mint question live right before the clone, after
+    # the admission precheck above has spent its time, so demand that another
+    # lane or host took meanwhile costs a scan instead of a clone, a boot and
+    # a discard. Fail-open; see tartci_assignment_v2_pre_clone_skip.
+    if tartci_assignment_v2_pre_clone_check_enabled \
+       && tartci_assignment_v2_pre_clone_skip "$selected_tier" "$selected_labels"; then
+      PRE_CLONE_DEMAND_GONE=1
+      note "[$i] selected class demand is gone or a preferred class is waiting (${ASSIGNMENT_V2_PRE_MINT_BLOCKER}) — not cloning"
+      return 75
+    fi
     reclaim_runner_name "$vm" "$selected_runner_api_root"
     sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
     lease_rc=0
@@ -2219,6 +2253,14 @@ i=0
   else printf '0\n'; printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2; fi
   exit 0
 }
+[ -n "$PRINT_PRE_CLONE_SELECTION" ] && {
+  # The pre-clone decision as a safe preflight, independent of the opt-in knob:
+  # 1 means the lane would clone for this tier now, 0 means it would not.
+  if tartci_assignment_v2_pre_clone_skip "$PRINT_PRE_CLONE_SELECTION"; then printf '0\n'
+    printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2
+  else printf '1\n'; fi
+  exit 0
+}
 [ -n "$PRINT_IDLE_RETARGET" ] && {
   # The same decision the idle-wait loop makes, minus its interval gating: 1
   # means an idle runner of this tier would be discarded to serve another
@@ -2431,7 +2473,8 @@ if [ "$LOOP" = 1 ]; then
       # per error: a lane that alternates a failure with a served job never
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
-      if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ]; then
+      if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
+         || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
