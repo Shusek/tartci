@@ -90,6 +90,7 @@ LANE_KEYS = {
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
+    "assignment_pre_clone_demand_check",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -653,6 +654,14 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_feed_rescue must be a boolean on "
                 "an event-class-v2 lane"
+            )
+        pre_clone = lane.get("assignment_pre_clone_demand_check")
+        if pre_clone is not None and (
+                assignment_mode != "event-class-v2"
+                or type(pre_clone) is not bool):
+            fail(
+                f"lane {lane_id}: assignment_pre_clone_demand_check must be a "
+                "boolean on an event-class-v2 lane"
             )
         idle_retarget = lane.get("assignment_idle_retarget_seconds")
         if idle_retarget is not None and (
@@ -2322,6 +2331,8 @@ def lane_plist(
         )
     if lane.get("assignment_feed_rescue"):
         env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+    if lane.get("assignment_pre_clone_demand_check"):
+        env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "1"
     if lane.get("assignment_idle_retarget_seconds"):
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]
