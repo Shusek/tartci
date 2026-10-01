@@ -201,6 +201,12 @@
       "remedy": "Read the installed generation's verdict as authoritative, since that is the tree the running supervisors execute. Run the installed CLI, not a checkout, when asking whether the fleet is up.",
       "do_not": "Do not report a checkout's readiness verdict as the host's."
     },
+    "reclaim_boot_low": {
+      "summary": "The reclaimer's last pass ran; the Tart store's volume is fine, but the boot data volume, which no lease floor covers, is still below its own floor (exit 5).",
+      "why": "On a host whose Tart store is on another volume (m3: Workshop), the lease floor never looks at the boot disk, so it could fill to zero unseen; m3 went from 57 GiB to 2 GiB free on 2026-10-01. Leases keep working, but a full boot disk stops commands from starting.",
+      "remedy": "Read the reclaim_pass event's scratch_dirs (what the scratch reaper removed and kept, by pattern), then look in /private/tmp and the per-user temp dir for scratch it does not name; add a pattern to scripts/scratch_dirs.py rather than deleting by hand repeatedly.",
+      "do_not": "Do not move the lease floor back to the boot volume to make this visible, and do not delete user data (iCloud, Messages, Library/Developer) to clear it."
+    },
     "reclaim_failed": {
       "summary": "The disk reclaimer's last pass finished recently with a non-zero exit.",
       "why": "Exit 3 means free space is still below the floor after reclaiming, 4 means the process table or free space could not be read (nothing deleted), 2 means an unusable scan root. A full data volume refuses every lease (disk_capacity_exceeded).",

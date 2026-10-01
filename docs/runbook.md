@@ -2174,7 +2174,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Exit 3 means the pass ran and a scanned volume is still below the
   `--fail-below-gb` floor. `pool status` and `doctor fleet`
   (`reclaim_low_space`) name the volume and its free space instead of calling
-  the pass failed.
+  the pass failed. Exit 5 means the lease volume is fine but the boot data
+  volume, which no lease floor covers (m3), is still below
+  `--boot-floor-gb` (30); status says `boot_low` and the doctor
+  `reclaim_boot_low`. Look in `/private/tmp` and the per-user temp dir: the
+  pass's `scratch_dirs` field shows what the scratch reaper removed and why it
+  kept the rest.
 
   The same origin/main checkout carries Pulp's host-vitals sensor. Its
   installer copies `host_vitals.sh` and `host_vitals_sensor.sh` into

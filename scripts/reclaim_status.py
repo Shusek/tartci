@@ -13,7 +13,10 @@ States:
   ok          the last pass finished recently and exited 0
   low_space   the last pass ran (exit 3) and a scanned volume is still below
               the free-space floor: the reclaimer worked, the disk is still full
-  failed      the last pass finished recently and did not exit 0 or 3
+  boot_low    the last pass ran (exit 5): the Tart store's volume is fine but
+              the boot data volume, which no lease floor covers, is still
+              below its own floor
+  failed      the last pass finished recently and did not exit 0, 3 or 5
   stale       no pass has finished within STALE_AFTER_S: the agent is dead,
               shadowed, wedged, or never scheduled, whatever launchd says
   never       no receipt yet (a host that has not run a pass since this shipped)
@@ -92,11 +95,17 @@ def status(state_dir: pathlib.Path | None = None, *, now: float | None = None,
         if isinstance(pulp.get("host_vitals_sensor"), dict) else {},
         fail_below_gb=receipt.get("fail_below_gb"),
         tightest_root=receipt.get("tightest_root"),
+        boot_volume=receipt.get("boot_volume")
+        if isinstance(receipt.get("boot_volume"), dict) else None,
+        scratch_removed_bytes=(receipt.get("scratch_dirs") or {}).get("removed_bytes")
+        if isinstance(receipt.get("scratch_dirs"), dict) else None,
     )
     if age > stale_after_s:
         out["state"] = "stale"
     elif receipt.get("exit_code") == 3:
         out["state"] = "low_space"
+    elif receipt.get("exit_code") == 5:
+        out["state"] = "boot_low"
     elif receipt.get("exit_code") != 0:
         out["state"] = "failed"
     else:
@@ -133,6 +142,16 @@ def describe(value: dict[str, Any]) -> str:
         floor_text = f" < {floor:g} GiB floor" if isinstance(floor, (int, float)) else ""
         return (f"reclaim: FREE SPACE STILL LOW after the pass: {amount} on {where}"
                 f"{floor_text} (nothing left that the reclaimer may delete); {body}")
+    if state == "boot_low":
+        boot = value.get("boot_volume") or {}
+        free = boot.get("free_bytes_after")
+        amount = "unknown" if free is None else f"{free / GIB:.1f} GiB"
+        floor = boot.get("floor_gb")
+        floor_text = f" < {floor:g} GiB floor" if isinstance(floor, (int, float)) else ""
+        return (f"reclaim: BOOT VOLUME LOW after the pass: {amount} on "
+                f"{boot.get('path') or 'the boot volume'}{floor_text} (leases are judged on "
+                f"the Tart store and unaffected; look in /private/tmp and the per-user "
+                f"temp dir); {body}")
     if state == "failed":
         return f"reclaim: LAST PASS FAILED; {body}"
     if warnings:
