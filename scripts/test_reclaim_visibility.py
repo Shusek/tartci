@@ -143,6 +143,22 @@ class LastPass(unittest.TestCase):
                       finding.detail)
         self.assertNotIn("LAST PASS FAILED", finding.detail)
 
+    def test_exit_5_names_the_low_boot_volume(self):
+        # m3, 2026-10-01: the Tart store on Workshop was healthy, the boot data
+        # volume was at 2 GiB, and nothing said so.
+        boot = {"path": "/System/Volumes/Data", "free_bytes_after": 2 * rs.GIB,
+                "floor_gb": 30, "judged_by": "own_floor", "below_floor": True}
+        self.write(exit_code=5, boot_volume=boot,
+                   scratch_dirs={"enabled": True, "removed_bytes": 3 * rs.GIB})
+        value = rs.status(self.dir)
+        self.assertEqual(value["state"], "boot_low")
+        self.assertEqual(value["scratch_removed_bytes"], 3 * rs.GIB)
+        finding = fd.check_reclaim(value)
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "reclaim_boot_low"))
+        self.assertIn("BOOT VOLUME LOW after the pass: 2.0 GiB on /System/Volumes/Data "
+                      "< 30 GiB floor", finding.detail)
+        self.assertNotIn("LAST PASS FAILED", finding.detail)
+
     def test_reapers_that_never_ran_are_not_ok(self):
         # m5studio, 2026-09-30: the profile's worktrees_root did not exist, the
         # pass exited 0, and pool status printed "reclaim: ok" with the reason
