@@ -403,6 +403,12 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         if getattr(args, "agent_floor_pool_cores", None) is not None
         else int(profile.get("agent_floor_pool_cores", floor_cores))
     )
+    qos_override = getattr(args, "agent_floor_qos", None)
+    floor_qos = (
+        qos_override
+        if qos_override in host_profile.AGENT_FLOOR_QOS_VALUES
+        else str(profile.get("agent_floor_qos", host_profile.AGENT_FLOOR_QOS_DEFAULT))
+    )
     floor_cores = max(0, floor_cores)
     floor_pool = max(floor_cores, floor_pool) if floor_cores else 0
     rank_override = getattr(args, "rank_vm_waiters", None)
@@ -454,6 +460,7 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         "waiter_fresh_secs": max(1, waiter_fresh),
         "agent_floor_cores": floor_cores,
         "agent_floor_pool_cores": floor_pool,
+        "agent_floor_qos": floor_qos,
         "reserved_gate_cores": reserved,
         "gate_priority": gate_priority,
         "total_mem_mb": total_mem,
@@ -1499,7 +1506,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         }
         if floor is not None:
             record.update(
-                {"floor": True, "qos": "background", "requested_cores": requested_cores}
+                {"floor": True, "qos": cfg["agent_floor_qos"], "requested_cores": requested_cores}
             )
         if memory_only:
             record["memory_only"] = True
@@ -1542,7 +1549,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         return {
             "ok": True,
             "floor": floor is not None,
-            "qos": "background" if floor is not None else None,
+            "qos": cfg["agent_floor_qos"] if floor is not None else None,
             "partial": lease_size < requested_full,
             "requested_cores": requested_full,
             "qos_actions": [action["summary"] for action in qos_actions],
