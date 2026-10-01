@@ -2785,13 +2785,25 @@ def config_verdicts(config: Path, support_root: Path,
 
 
 def tool_freshness_summary() -> dict:
-    """Cached installed-vs-released freshness of Shipyard and the pulp CLI."""
+    """Cached installed-vs-released freshness of Shipyard and the pulp CLI.
+
+    Also carries the queue tick's line when its installed copy is not this
+    tartci's (scripts/queue_tick_refresh.py).
+    """
     try:
         import tool_freshness
-        return tool_freshness.summary()
+        value = tool_freshness.summary()
     except Exception as exc:  # noqa: BLE001 - a status line must not break status
-        return {"lines": [f"tools: freshness UNKNOWN ({type(exc).__name__}: {exc})"],
-                "problem": None}
+        value = {"lines": [f"tools: freshness UNKNOWN ({type(exc).__name__}: {exc})"],
+                 "problem": None}
+    try:
+        import queue_tick_refresh  # noqa: PLC0415 - sibling module
+        line = queue_tick_refresh.status_line()
+    except Exception as exc:  # noqa: BLE001
+        line = f"queue tick: UNVERIFIED ({type(exc).__name__}: {exc})"
+    if line:
+        value["lines"] = [*value.get("lines", []), line]
+    return value
 
 
 FSEVENTSD_WARN_MB = 1024

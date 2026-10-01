@@ -2520,6 +2520,12 @@ if [ "$LOOP" = 1 ]; then
         # Demand this lane could not place (no VM slot): a parked warm VM on
         # this host, if any, yields to it.
         tartci_warm_note_demand slot_full
+        # Observability only, one sample per poll: matching demand this lane
+        # saw and did not place. `tartci pool status --usage` turns these into
+        # demand-waiting time and splits it by whether a VM slot was free
+        # (running < cap means a reservation, not a guest, held the slot).
+        event demand_waiting "queued=$q running=$r/$cap reason=slot_full" \
+          queued="$q" running="$r" cap="$cap" poll="$POLL" reason=slot_full
       fi
       if [ -n "$WARM_VM" ]; then
         heartbeat warm-parked

@@ -915,6 +915,30 @@ def refresh_tools(interval_s: int = 1800, timeout_s: int = 600) -> str | None:
     return None
 
 
+def queue_tick_pass() -> str | None:
+    """Reinstall a loaded Shipyard queue tick whose copy is not this tartci's.
+
+    The installer copies the tick out of the generation, so a self-update never
+    reached it (scripts/queue_tick_refresh.py). Returns the line to log, or None
+    when there is nothing to say. Never raises.
+    """
+    try:
+        import queue_tick_refresh  # noqa: PLC0415 - sibling module
+        result = queue_tick_refresh.refresh(fix=True)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return f"{_iso(utcnow())} launchd-watchdog: WARN queue-tick refresh FAILED ({exc})"
+    state = result.get("state")
+    # An unloaded stale copy was switched off by someone: pool status names it,
+    # and repeating it every five minutes here would only bury the log.
+    if state in ("current", "not_installed", "drift_unloaded"):
+        return None
+    if state == "refreshed":
+        return (f"{_iso(utcnow())} launchd-watchdog: queue tick reinstalled from this tartci "
+                f"({', '.join(result.get('files', []))}; {' '.join(result.get('args', []))})")
+    return (f"{_iso(utcnow())} launchd-watchdog: WARN queue tick {state}: "
+            f"{result.get('detail')}")
+
+
 def config_problem(value: dict) -> str | None:
     """One-line summary when anything is not ok, else None."""
     parts = []
@@ -1182,6 +1206,9 @@ def main(argv: list[str] | None = None) -> int:
         if tools_error:
             print(f"{_iso(utcnow())} launchd-watchdog: WARN tool-freshness refresh failed: "
                   f"{tools_error}")
+        tick_line = queue_tick_pass()
+        if tick_line:
+            print(tick_line)
     config = config_verdicts(args.fleet_config, args.fleet_receipt)
     config_summary = config_problem(config)
     config["warned"] = False
