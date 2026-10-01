@@ -36,6 +36,7 @@
 #   tartci runtime <summary|export|recent|backfill|prune|complete>
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci pool <on|drain|off|status> # durable host admission and participation
+#   tartci pool status --usage [--range 24h] [--json] # slot occupancy, idle-with-demand, discards
 #                              # --plan: print the transition, write nothing;
 #                              # off refuses a mid-job lane (exit 12) unless --now
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
@@ -729,6 +730,9 @@ cmd_pool() {
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  status --usage [--range DUR] [--until TS] [--json] [--peer HOST=SSH_TARGET]: slot
+           occupancy, idle-with-demand, JIT discards and lease denials from the
+           lane event logs (read-only; see scripts/pool_usage.py)
   supply --repo OWNER/REPO --class LABEL [--json]: free, leasable gate slots
            for one event class on this host (read-only; see gate_supply.py)
   exit 11 capacity floor refused; 12 off refused because a lane is mid-job;
@@ -1107,6 +1111,16 @@ EOF
       done
       ;;
     status)
+      # --usage is a different, read-only report (scripts/pool_usage.py) with
+      # its own flags (--range DUR takes a value), so it is dispatched before
+      # status's own strict flag check.
+      local usage_arg want_usage=0 usage_args=()
+      for usage_arg in "$@"; do [ "$usage_arg" = --usage ] && want_usage=1; done
+      if [ "$want_usage" = 1 ]; then
+        for usage_arg in "$@"; do [ "$usage_arg" = --usage ] || usage_args+=("$usage_arg"); done
+        python3 "$HERE/scripts/pool_usage.py" ${usage_args[@]+"${usage_args[@]}"}
+        return $?
+      fi
       local status_json=0 require_ready=0 require_serving=0
       for arg in "$@"; do
         case "$arg" in
@@ -1291,6 +1305,8 @@ PY
 $(tartci_pool_runner_agents "$agents_dir")
 EOF
         [ "$any" = 1 ] || echo "  (no runner agents installed on this host)"
+        # One line of the last 24h; `pool status --usage` has the breakdown.
+        python3 "$HERE/scripts/pool_usage.py" --summary 2>/dev/null || true
       fi
       if [ "$require_ready" = 1 ] && ! python3 - "$fleet_readiness" <<'PY'
 import json, sys
