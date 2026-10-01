@@ -68,7 +68,9 @@ repo = "Generous-Corp/pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
-vm_cores = 12
+# 8, not 12: two 12-core gate VMs leased 24 of 28 cores and left agent builds the
+# background-QoS floor (6-8 min per file). 2 x 8 = the 16-core gate reserve.
+vm_cores = 8
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]
