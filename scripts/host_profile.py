@@ -250,6 +250,12 @@ def resolve_role(
 # memory limit. 0 (the default) keeps today's behaviour.
 FLEET_PROFILE_ENV = "TARTCI_FLEET_PROFILE"
 AGENT_FLOOR_KEYS = ("agent_floor_cores", "agent_floor_pool_cores")
+# QoS a floor lease runs at. "background" also throttles disk I/O and biases the
+# work to the lowest core tier, which made floor builds on m5studio (2026-09-30)
+# take minutes per file; "utility" still yields to CI at default QoS without the
+# I/O throttle. Anything else falls back to the default.
+AGENT_FLOOR_QOS_VALUES = ("utility", "background")
+AGENT_FLOOR_QOS_DEFAULT = "background"
 
 
 def fleet_profile_path(path: str | None = None) -> Path:
@@ -320,6 +326,50 @@ def agent_floor_settings(fleet_profile: str | None = None) -> tuple[dict[str, in
             settings[key] = int(raw.strip())
             source = "environment"
     return settings, source
+
+
+def _parse_host_str(text: str, key: str) -> str | None:
+    """Read one string key from the [host] table (same contract as _parse_host_ints)."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            value = (tomllib.loads(text).get("host") or {}).get(key)
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return None
+        return value if isinstance(value, str) else None
+    in_host = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_host = line == "[host]"
+            continue
+        if in_host and "=" in line:
+            name, _, value = line.partition("=")
+            value = value.strip()
+            if name.strip() == key and len(value) >= 2 and value[0] == value[-1] == '"':
+                return value[1:-1]
+    return None
+
+
+def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
+    """Return the floor-lease QoS: TARTCI_AGENT_FLOOR_QOS, then [host], then default.
+
+    An unknown value is ignored rather than raised, like the integer knobs: this
+    runs on every lease admission.
+    """
+    raw = os.environ.get("TARTCI_AGENT_FLOOR_QOS")
+    if raw is not None and raw.strip() in AGENT_FLOOR_QOS_VALUES:
+        return raw.strip()
+    try:
+        value = _parse_host_str(
+            fleet_profile_path(fleet_profile).read_text(encoding="utf-8"), "agent_floor_qos"
+        )
+    except OSError:
+        value = None
+    return value if value in AGENT_FLOOR_QOS_VALUES else AGENT_FLOOR_QOS_DEFAULT
 
 
 # --- VM lease waiter ranking ---------------------------------------------------
@@ -599,7 +649,7 @@ def build_profile(
         "qos": defaults.qos,
         "agent_floor_cores": agent_floor,
         "agent_floor_pool_cores": agent_floor_pool,
-        "agent_floor_qos": "background",
+        "agent_floor_qos": agent_floor_qos_setting(fleet_profile),
         "agent_floor_source": floor_source,
         **lease_policy_settings(fleet_profile),
         **guest_network_settings(fleet_profile),

@@ -124,7 +124,8 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
         4: "process table unreadable, so no build directory could be proven idle",
     },
     "com.danielraffel.tartci.self-update": {
-        3: "a precondition refused (peer updating, capacity floor, rate limit); host untouched",
+        3: ("a precondition refused (capacity floor, rate limit, halt), or the host has been "
+            "deferred in the update queue past the starvation bound; host untouched"),
         4: "an update failed and the host was restored to the previous generation",
         5: "tartci skew could not be measured",
     },
@@ -619,6 +620,20 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     effective_stale_s = stale_log_s
     if interval_s is not None:
         effective_stale_s = max(stale_log_s, 2 * interval_s)
+    # classify() reads "non-zero exit, fresh log" as a KeepAlive job mid-restart.
+    # An interval agent does not restart: it ran, wrote its log, and exited
+    # non-zero, so the fresh log is the failing run itself. That used to print
+    # a checkmark over it ("reap exited 1 but log fresh"). It is reported, and
+    # never healed, because a reload would only repeat the run.
+    if (interval_s is not None and last_exit not in (None, 0)
+            and state != "running" and log_age is not None
+            and log_age <= effective_stale_s):
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "attention",
+            f"exited {last_exit} on its last run (an interval agent, so the fresh "
+            f"log is that run, {int(log_age)}s ago, not a restart); a reload would "
+            "only repeat it — read its log",
+        )
     expected_loaded = pool_participating and pool_runner
     verdict, reason = classify(
         state, last_exit, log_age, effective_stale_s, vm_running, expected_loaded,
@@ -1001,7 +1016,8 @@ def host_off_pass(status_only: bool = False, now: float | None = None) -> str | 
             host_off.alert(sdir, pool_file, host=os.uname().nodename.split(".")[0], now=now)
         current = host_off.status(sdir, pool_file, now)
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
-        return f"{_iso(utcnow())} launchd-watchdog: host-off check failed: {exc}"
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-off check FAILED "
+                f"({type(exc).__name__}: {exc}); recovery of a host left OFF did not run")
     if outcome and outcome.get("attempted") and outcome.get("ok"):
         return f"{_iso(now)} launchd-watchdog: host was left OFF by a failed self-update; pool on succeeded"
     if current.get("unexpected"):

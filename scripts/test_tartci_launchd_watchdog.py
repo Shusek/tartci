@@ -667,6 +667,38 @@ with tempfile.TemporaryDirectory() as td:
     check(label_control.verdict == "wedged",
           f"control: exit 3 from another label is still a wedge, got {label_control}")
 
+# An interval agent that exited non-zero and wrote its log a minute ago FAILED
+# a minute ago; the fresh log is that run, not a restart in progress. This
+# printed a checkmark ("reap exited 1 but log fresh") on every pass.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    log = root / "reap.log"
+    log.write_text("reap: failed\n")
+    os.utime(log, (wd.utcnow() - 60, wd.utcnow() - 60))
+    label = "com.danielraffel.tartci.reap"        # not in APPLICATION_EXIT_CODES
+    interval = _agent_plist(root, label, log, interval=3600)
+    keepalive = _agent_plist(root, label + "-keepalive", log)
+    original_run = wd._run
+    try:
+        wd._run = lambda _cmd: (0, _print_output("not running", "1"), "")
+        failed_run = wd.gather_health(label, str(interval), STALE, vm_running=False)
+        # Control, same exit and log age: a KeepAlive job mid-restart.
+        restarting = wd.gather_health(label + "-keepalive", str(keepalive), STALE,
+                                      vm_running=False)
+        # Control, same interval agent and log: a clean exit is healthy.
+        wd._run = lambda _cmd: (0, _print_output("not running", "0"), "")
+        clean = wd.gather_health(label, str(interval), STALE, vm_running=False)
+    finally:
+        wd._run = original_run
+    check(failed_run.verdict == "attention",
+          f"an interval agent's non-zero exit must not render healthy, got {failed_run}")
+    check("exited 1" in failed_run.reason,
+          f"the reason must name the exit: {failed_run.reason}")
+    check(restarting.verdict == "healthy",
+          f"control: a KeepAlive job with a fresh log is mid-restart, got {restarting}")
+    check(clean.verdict == "healthy",
+          f"control: a clean interval run is healthy, got {clean}")
+
 # A running agent declared uninterruptible must not be cut: bootout lands
 # mid-rmtree and leaves a half-deleted tree no later pass can classify. The
 # controls pin the refusal to the DECLARATION, not to the plist shape -- every

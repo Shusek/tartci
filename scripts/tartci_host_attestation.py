@@ -79,6 +79,11 @@ from datetime import datetime, timezone
 
 SCHEMA = 1
 WRITER = "tartci_host_attestation.py@1"
+# The launchd label this script is installed under (install_host_attestation.sh).
+# Its own "last exit" is the previous run of this very process, not a sensor
+# fault it can observe: reporting it as a finding made one bad run keep the
+# job non-zero forever, because each run then found its predecessor's exit.
+SELF_LABEL = "com.danielraffel.shipyard.host-attestation"
 
 DEFAULT_INTERVAL_SECS = 300
 #: A supervisor heartbeat older than this is not evidence of supervision.
@@ -431,7 +436,8 @@ def assess_jit_lane(lane: dict, home: str, now: float, stale_secs: int) -> dict:
 
 
 def sensor_census(agents: list[tuple[str, str]], now: float,
-                  expected_labels: set[str] | None = None) -> list[dict]:
+                  expected_labels: set[str] | None = None,
+                  self_label: str = SELF_LABEL) -> list[dict]:
     """Every sensor on this host with its launchd state and log age.
 
     This is the meta-detector whose absence let five sensors die unnoticed —
@@ -469,7 +475,7 @@ def sensor_census(agents: list[tuple[str, str]], now: float,
             finding = None if retired_leftover else "not loaded"
         elif parsed.get("state") == "spawn scheduled" and int(parsed.get("runs", 0) or 0) > CRASH_LOOP_RUNS_PER_HOUR:
             finding = f"crash loop after {parsed.get('runs')} spawns"
-        elif exit_code not in (None, "0", 0):
+        elif exit_code not in (None, "0", 0) and label != self_label:
             finding = f"last exit {exit_code}"
         elif interval and log_age is not None and log_age > 3 * int(interval):
             finding = f"log {log_age}s old against a {interval}s interval"
@@ -697,6 +703,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--fail-on-findings",
+        action="store_true",
+        help=(
+            "exit 2 when the record carries findings. Without it a completed "
+            "attestation exits 0: findings are data in the written record, and a "
+            "non-zero launchd exit is reserved for this job failing to attest"
+        ),
+    )
+    parser.add_argument(
         "--self-check",
         action="store_true",
         help="exit non-zero unless the launchd domain proved readable",
@@ -760,7 +775,8 @@ def main(argv: list[str] | None = None) -> int:
             name = record.get("label", "?")
             detail = record.get("reason") or record.get("finding")
             print(f"finding: {name}: {detail}", file=sys.stderr)
-        return 2
+        if args.fail_on_findings:
+            return 2
     return 0
 
 

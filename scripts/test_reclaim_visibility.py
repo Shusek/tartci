@@ -143,6 +143,41 @@ class LastPass(unittest.TestCase):
                       finding.detail)
         self.assertNotIn("LAST PASS FAILED", finding.detail)
 
+    def test_reapers_that_never_ran_are_not_ok(self):
+        # m5studio, 2026-09-30: the profile's worktrees_root did not exist, the
+        # pass exited 0, and pool status printed "reclaim: ok" with the reason
+        # in a parenthesis.
+        root = "/Users/x/Code/agent-worktrees"
+        self.write(pulp_reapers={"enabled": True, "reclaimed_bytes": 0,
+                                 "error": f"worktrees_root {root} is not a directory",
+                                 "host_vitals_sensor": {"state": "current"}})
+        value = rs.status(self.dir, log_path=self.dir / "none.log")
+        line = rs.describe(value)
+        self.assertTrue(line.startswith("reclaim: WARN pulp reapers: NOT RUNNING "
+                                        "(worktrees_root missing"), line)
+        finding = fd.check_reclaim(value)
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "reclaim_pass_degraded"))
+
+    def test_a_failed_sensor_reinstall_is_not_ok(self):
+        self.write(pulp_reapers={"enabled": True, "reclaimed_bytes": 0,
+                                 "host_vitals_sensor": {"state": "refresh_failed",
+                                                        "detail": "installer exit 3: denied"}})
+        value = rs.status(self.dir, log_path=self.dir / "none.log")
+        self.assertIn("host-vitals sensor: REFRESH FAILED (installer exit 3: denied)",
+                      rs.describe(value))
+        self.assertEqual(fd.check_reclaim(value).code, "reclaim_pass_degraded")
+
+    def test_reapers_off_by_profile_and_a_current_sensor_stay_ok(self):
+        # The controls: reapers not enabled is a choice, not a fault, and a
+        # sensor that is current or was refreshed is not a warning.
+        for pulp in ({"enabled": False, "reason": "[pulp_reapers] not enabled"},
+                     {"enabled": True, "reclaimed_bytes": 0,
+                      "host_vitals_sensor": {"state": "refreshed"}}):
+            self.write(pulp_reapers=pulp)
+            value = rs.status(self.dir, log_path=self.dir / "none.log")
+            self.assertTrue(rs.describe(value).startswith("reclaim: ok;"), rs.describe(value))
+            self.assertEqual(fd.check_reclaim(value).code, "reclaim_ok")
+
     def test_no_receipt_is_unknown_and_garbage_is_unreadable(self):
         self.assertEqual(fd.check_reclaim(rs.status(self.dir)).code, "reclaim_never_recorded")
         (self.dir / "last-run.json").write_text("{nope")

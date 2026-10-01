@@ -25,8 +25,14 @@ github_api_timeout_seconds = 30
 # while the gate reserve sat idle. A denied non-gate build that asks with
 # `leases acquire --allow-floor` now gets up to 6 cores at background QoS; the
 # floor lease is not charged against gate, VM or other build admission, and
-# the pool is clamped to unleased memory. Remove this line to go back.
-agent_floor_cores = 6
+# the pool is clamped to unleased memory. Remove these lines to go back.
+# 2026-09-30: raised 6 -> 10 (the memory clamp on this host: 16 GiB unleased /
+# 1.5 GiB per job) and moved from background to utility QoS. Background QoS
+# also throttles disk I/O and biases work to the slower core tier; floor builds
+# here took 6-8 minutes per file while two gate VMs used 2.5-4.2 of their 24
+# leased cores. Utility still yields to the gate VMs, which run at default QoS.
+agent_floor_cores = 10
+agent_floor_qos = "utility"
 
 # Daniel-only external-volume execution. The stable Developer-ID identity is
 # the TCC responsible process; public/home-backed profiles do not inherit it.
@@ -68,7 +74,9 @@ repo = "Generous-Corp/pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
-vm_cores = 12
+# 8, not 12: two 12-core gate VMs leased 24 of 28 cores and left agent builds the
+# background-QoS floor (6-8 min per file). 2 x 8 = the 16-core gate reserve.
+vm_cores = 8
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]

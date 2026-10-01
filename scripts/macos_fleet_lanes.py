@@ -66,7 +66,7 @@ HOST_KEYS = {
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
     "ssh",
-    "agent_floor_cores", "agent_floor_pool_cores",
+    "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -369,6 +369,9 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    agent_floor_qos = host.get("agent_floor_qos")
+    if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
+        fail('host.agent_floor_qos must be "utility" or "background"')
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:
@@ -1717,8 +1720,12 @@ def host_off_problem(pool_state: str) -> dict | None:
         import host_off  # noqa: PLC0415 - sibling module
         value = host_off.status(host_off.state_dir(), host_off.pool_state_file(),
                                 pool_state=pool_state)
-    except Exception:  # noqa: BLE001 - readiness must not fail on this report
-        return None
+    except Exception as exc:  # noqa: BLE001 - readiness must not crash on this report
+        # Not None: None reads as "not left off", which is the one answer a
+        # check that did not run cannot give.
+        return {"code": "host_off_unverified",
+                "detail": f"could not tell whether a failed self-update left this host "
+                          f"off: {type(exc).__name__}: {exc}"}
     if not value.get("unexpected"):
         return None
     return {"code": "host_off_unexpected", "detail": value["detail"],
