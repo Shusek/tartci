@@ -83,6 +83,9 @@ CODES: tuple[str, ...] = (
     "no_managed_launchagents",
     "no_persistent_runners",
     "persistent_runners_without_hold_receipt",
+    "power_ok",
+    "power_sleeps",
+    "power_unknown",
     "profile_drift",
     "profile_drift_unknown",
     "profile_in_sync",
@@ -894,6 +897,20 @@ def check_reclaim(value: dict | None) -> Finding:
     return Finding("reclaim", UNKNOWN, "reclaim_unreadable", detail, facts)
 
 
+def check_power(value: dict | None) -> Finding:
+    """Whether the host stays awake on AC (scripts/power_status.py)."""
+    import power_status
+
+    value = value or {"state": "unknown"}
+    detail = power_status.describe(value)
+    facts = {"power": value}
+    if value.get("state") == "ok":
+        return Finding("power", OK, "power_ok", detail, facts)
+    if value.get("state") == "sleeps":
+        return Finding("power", PROBLEM, "power_sleeps", detail, facts)
+    return Finding("power", UNKNOWN, "power_unknown", detail, facts)
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -1112,6 +1129,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
+            power_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
@@ -1202,6 +1220,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             reclaim_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_reclaim(reclaim_value))
+    if power_value is None:
+        try:
+            import power_status
+            power_value = power_status.status()
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            power_value = {"state": "unknown", "error": str(exc)}
+    findings.append(check_power(power_value))
 
     def default_tmp_probe(profile: Path) -> tuple[dict | None, str]:
         import pulp_reapers
