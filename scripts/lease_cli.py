@@ -48,6 +48,11 @@ def parse_args(
             type=int,
             help="override the host-wide cap on concurrent floor-lease cores",
         )
+        command_parser.add_argument(
+            "--agent-floor-qos",
+            choices=("utility", "background"),
+            help="override the QoS a floor lease runs at",
+        )
         command_parser.add_argument("--gate-priority", type=int, default=priority_classes["gate"])
         command_parser.add_argument("--stale-secs", type=int, default=stale_secs)
         command_parser.add_argument("--role", choices=valid_roles)

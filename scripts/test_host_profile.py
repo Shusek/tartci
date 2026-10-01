@@ -166,6 +166,32 @@ class HostProfileRoleTests(unittest.TestCase):
         self.assertEqual(profile["agent_floor_pool_cores"], 6)
         self.assertEqual(profile["agent_floor_qos"], "background")
 
+    def test_agent_floor_qos_reads_host_table_and_env_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TARTCI_AGENT_FLOOR_QOS", None)
+            path = Path(td) / "fleet.toml"
+            path.write_text('schema = 1\n[host]\nagent_floor_qos = "utility"\n'
+                            '[[lane]]\nagent_floor_qos = "background"\n')
+            profile = host_profile.build_profile(
+                role="dedicated-builder", cores=28, memory_mb=98304, fleet_profile=str(path))
+            self.assertEqual(profile["agent_floor_qos"], "utility")
+            self.assertIn("TARTCI_AGENT_FLOOR_QOS=utility", host_profile.shell_exports(profile))
+            os.environ["TARTCI_AGENT_FLOOR_QOS"] = "background"
+            self.assertEqual(host_profile.agent_floor_qos_setting(str(path)), "background")
+
+    def test_agent_floor_qos_ignores_unknown_values(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {}, clear=False):
+            path = Path(td) / "fleet.toml"
+            path.write_text('[host]\nagent_floor_qos = "maintenance"\n')
+            os.environ["TARTCI_AGENT_FLOOR_QOS"] = "realtime"
+            self.assertEqual(host_profile.agent_floor_qos_setting(str(path)), "background")
+
+    def test_agent_floor_qos_fallback_parser_matches_tomllib(self) -> None:
+        text = '[host]\nagent_floor_qos = "utility" # less throttled\n[lane]\nagent_floor_qos = "x"\n'
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            self.assertEqual(host_profile._parse_host_str(text, "agent_floor_qos"), "utility")
+        self.assertEqual(host_profile._parse_host_str(text, "agent_floor_qos"), "utility")
+
     def test_agent_floor_pool_is_clamped_to_unleased_memory(self) -> None:
         # dedicated-builder leaves 8 GiB OS headroom + 8 GiB link reserve
         # unleased: 16384 // 1536 = 10 compile jobs, whatever the knob says.

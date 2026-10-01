@@ -180,12 +180,14 @@ class AgentFloorTests(LeaseCliTestCase):
                       allow: bool = True, priority: str = "build", kind: str = "test",
                       capacity: int = 26, reserved: int = 14, capacity_mem_mb: int = 0,
                       reserved_mem_mb: int = 0, mem_mb: int | None = None,
-                      check: bool = False) -> subprocess.CompletedProcess[str]:
+                      qos: str | None = None, check: bool = False) -> subprocess.CompletedProcess[str]:
         extra = ["--capacity-mem-mb", str(capacity_mem_mb),
                  "--reserved-gate-mem-mb", str(reserved_mem_mb),
                  "--agent-floor-cores", str(floor), "--agent-floor-pool-cores", str(pool)]
         if mem_mb is not None:
             extra += ["--mem-mb", str(mem_mb)]
+        if qos is not None:
+            extra += ["--agent-floor-qos", qos]
         if allow:
             extra.append("--allow-floor")
         return self.run_cli(
@@ -221,6 +223,14 @@ class AgentFloorTests(LeaseCliTestCase):
         self.assertEqual(body["lease"]["lease_size_cores"], 6)
         self.assertEqual(body["lease"]["requested_cores"], 12)
         self.assertEqual(body["capacity"]["floor_used_cores"], 6)
+
+    def test_floor_lease_carries_the_configured_qos(self) -> None:
+        self.fill_non_gate()
+        granted = self.floor_acquire("agent-2", 12, qos="utility")
+        self.assertEqual(granted.returncode, 0, granted.stdout + granted.stderr)
+        body = json.loads(granted.stdout)
+        self.assertEqual(body["qos"], "utility")
+        self.assertEqual(body["lease"]["qos"], "utility")
 
     def test_floor_does_not_take_gate_capacity(self) -> None:
         self.fill_non_gate()
