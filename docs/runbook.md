@@ -1967,6 +1967,50 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Gate and VM requests never take a floor. `TARTCI_AGENT_FLOOR_CORES` /
   `TARTCI_AGENT_FLOOR_POOL_CORES` override the profile for one shell; `tartci
   host-profile` exports the effective values.
+- **One config surface: `tartci governor`** — every tuning knob lives in
+  `~/.config/tartci/governor.toml` (flat `[governor]` table; override the path
+  with `TARTCI_GOVERNOR_FILE`). `tartci governor show` prints each knob, its
+  value and where it came from, plus the derived budget; `tartci governor set
+  KEY=VALUE ...` edits the file (validated) and re-shows; `unset KEY` returns a
+  key to its default; `explain` says what an interactive build, a background
+  build, a class-less build and a gate VM would be granted right now; `fleet
+  --hosts a,b` reads `show` from each host over SSH; `keys` lists every knob.
+  Precedence per key: CLI flag > `TARTCI_GOV_<KEY>` env > governor.toml >
+  legacy source (the role file; the fleet profile's `[host]
+  agent_floor_cores`) > role default. Knobs: `role`, `human_reserved_cores`
+  (headroom), `gate_guarantee_cores` (static gate reserve S),
+  `gate_prompt_reserve_cores` (P), `interactive_share_cores`,
+  `background_share_cores`, `interactive_min_cores`, `interactive_wait_secs`,
+  `agent_floor_cores`, `agent_floor_pool_cores`, `dynamic_lending`,
+  `fleet_hosts`.
+- **Build classes** — `leases acquire --class interactive|background`.
+  *Interactive* (someone is waiting: `pulp build`, a release build) runs at
+  normal QoS, may take a partial lease (`--min-cores`), may wait locally for one
+  (`--wait-secs`, retried every 2 s, no remote calls) and is never given a
+  background-QoS floor lease. *Background* (Shipyard-local PR validations,
+  opportunistic work) is capped at `background_share_cores` in total (defaults:
+  dedicated builder half of N, laptop 4, light 2), never borrows, and keeps the
+  role QoS and the agent floor. A lease without `--class` follows the exact
+  pre-class rule. `host-profile` exports `TARTCI_GOVERNOR_SCHEMA=1` so a caller
+  can tell the store accepts `--class`.
+- **Dynamic gate lending (opt-in per host, default off)** — with
+  `dynamic_lending = true`, an interactive lease may grow non-gate use past the
+  guaranteed budget N = T - S, up to `max(N, T - G - P)` where G is the cores
+  gate leases hold and P is the prompt reserve kept free for the next gate job
+  (`auto`: one gate VM on a host whose fleet profile declares a gate lane — the
+  size of the last gate lease admitted here, recorded in `gate_hint.json` — else
+  0; a live gate-priority VM waiter raises it to the waiting cores). Non-gate
+  use above N is **lent**: gate admission does not count it, so a gate lease is
+  never admitted less often than without lending. When a gate grant overlaps
+  lent cores, the store marks the newest borrowers `preempted` and moves their
+  whole process tree to background QoS (`taskpolicy -b -p`); nothing is killed,
+  and new non-gate admissions are already denied. The next acquire, release or
+  heartbeat after the overlap clears moves them back (`taskpolicy -B -p`).
+  `TARTCI_QOS_ACTION_LOG=<file>` records those calls instead of making them.
+  Status reports `gate_used_cores`, `lent_cores`, `interactive_used_cores`,
+  `background_used_cores` and `preempted_lease_ids`. Memory is not lent: the
+  static gate memory reserve is unchanged. Turning lending off does not strand a
+  live borrower; it stays preemptible until it ends.
 - **Ranked VM lease waiters (opt-in, default off; m5 canary)** — `[leases]
   rank_vm_waiters = true` in a fleet profile lets a VM lane register as a
   waiter (`leases wait` / `leases withdraw`) and defers a VM `acquire` or
