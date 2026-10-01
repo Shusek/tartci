@@ -21,6 +21,7 @@
 #   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
 #   tartci network-profile [status|reconcile|rollback] # opt-in host relay convergence
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
+#   tartci governor [show|set K=V|unset K|explain|fleet|keys] # one per-host governor config
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
@@ -249,6 +250,10 @@ cmd_network_profile() {
 
 cmd_leases() {
   exec python3 "$HERE/scripts/leases.py" "$@"
+}
+
+cmd_governor() {
+  tartci_toml_exec_or_python3 "$HERE/scripts/governor.py" "$@"
 }
 
 cmd_profile() {
@@ -1337,6 +1342,7 @@ case "${1:-help}" in
   host-profile) shift; cmd_host_profile "$@" ;;
   network-profile) shift; cmd_network_profile "$@" ;;
   leases)  shift; cmd_leases "$@" ;;
+  governor) shift; cmd_governor "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;
   support-manifest) shift; cmd_support_manifest "$@" ;;

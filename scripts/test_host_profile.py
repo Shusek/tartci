@@ -18,6 +18,27 @@ from unittest import mock
 import host_profile
 
 
+# This host's own governor file (~/.config/tartci/governor.toml) must never
+# leak into these tests: point the governor at a path that does not exist.
+_GOVERNOR_ENV_SAVED = None
+
+
+def setUpModule() -> None:  # noqa: N802 - unittest hook
+    global _GOVERNOR_ENV_SAVED
+    _GOVERNOR_ENV_SAVED = os.environ.get("TARTCI_GOVERNOR_FILE")
+    os.environ["TARTCI_GOVERNOR_FILE"] = os.path.join(
+        tempfile.gettempdir(), "tartci-test-absent-governor.toml"
+    )
+
+
+def tearDownModule() -> None:  # noqa: N802 - unittest hook
+    if _GOVERNOR_ENV_SAVED is None:
+        os.environ.pop("TARTCI_GOVERNOR_FILE", None)
+    else:
+        os.environ["TARTCI_GOVERNOR_FILE"] = _GOVERNOR_ENV_SAVED
+
+
+
 HOST_PROFILE_PATH = Path(host_profile.__file__).resolve()
 
 

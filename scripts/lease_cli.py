@@ -69,6 +69,26 @@ def parse_args(
             type=int,
             help="override how long an unrefreshed VM lease waiter still counts",
         )
+        command_parser.add_argument(
+            "--dynamic-lending",
+            choices=("on", "off"),
+            help="override the governor's dynamic_lending knob",
+        )
+        command_parser.add_argument(
+            "--gate-prompt-reserve-cores",
+            type=int,
+            help="override cores kept free for the next gate job while lending",
+        )
+        command_parser.add_argument(
+            "--interactive-share-cores",
+            type=int,
+            help="override the cap on all interactive build leases together",
+        )
+        command_parser.add_argument(
+            "--background-share-cores",
+            type=int,
+            help="override the cap on all background build leases together",
+        )
         command_parser.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", aliases=["list"], help="show active leases")
@@ -94,6 +114,32 @@ def parse_args(
             "floor lease that runs at background QoS and is not charged against "
             "other leases; the caller must honour the granted size and qos"
         ),
+    )
+    acquire_parser.add_argument(
+        "--class",
+        dest="build_class",
+        choices=("interactive", "background"),
+        help=(
+            "build class: interactive (someone is waiting; normal QoS, may borrow "
+            "idle gate cores when lending is on, never floored) or background "
+            "(validations/opportunistic; capped at the background share). "
+            "Omitted: the class-less rule every caller had before classes"
+        ),
+    )
+    acquire_parser.add_argument(
+        "--min-cores",
+        type=int,
+        default=0,
+        help=(
+            "accept a partial lease of at least this many cores when the full "
+            "request does not fit; the caller must honour the granted size"
+        ),
+    )
+    acquire_parser.add_argument(
+        "--wait-secs",
+        type=int,
+        default=0,
+        help="retry a denied acquire (locally, every 2 s) for up to this long",
     )
     acquire_parser.add_argument(
         "--memory-only",
