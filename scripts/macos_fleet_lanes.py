@@ -1743,6 +1743,9 @@ def host_off_problem(pool_state: str) -> dict | None:
 
 DISK_WARN_PERCENT = 85
 DISK_PROBLEM_PERCENT = 92
+# The home volume holds builds, the per-user temp dir and every tool's state:
+# at this fill a Shipyard release build on m3 failed with ENOSPC (2026-10-01).
+HOME_DISK_PROBLEM_PERCENT = 97
 
 
 def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
@@ -1752,9 +1755,11 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
     same window its I/O stalled for hours (a directory scan took 70-204 min
     instead of 1-2) under the system's own space-reclaim pressure. A volume
     this full is a readiness fact about the host, not only a lease denial.
-    At DISK_PROBLEM_PERCENT the VM store volume is a readiness problem; the
-    home volume only warns, because what fills it (iCloud, caches, Chrome's
-    code-sign clones) is outside what this fleet can act on or wait out.
+    At DISK_PROBLEM_PERCENT the VM store volume is a readiness problem. The
+    home volume warns from DISK_WARN_PERCENT, because much of what fills it
+    (iCloud, caches) is outside what this fleet can act on, and becomes a
+    problem only at HOME_DISK_PROBLEM_PERCENT, where builds start failing
+    with ENOSPC.
     """
     rows = []
     seen: set[int] = set()
@@ -1778,7 +1783,8 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
                          "detail": str(exc)})
             continue
         percent = 100.0 * (usage.total - usage.free) / usage.total if usage.total else 0.0
-        state = ("problem" if role == "vm_store" and percent >= DISK_PROBLEM_PERCENT
+        limit = DISK_PROBLEM_PERCENT if role == "vm_store" else HOME_DISK_PROBLEM_PERCENT
+        state = ("problem" if percent >= limit
                  else "warn" if percent >= DISK_WARN_PERCENT else "ok")
         rows.append({"role": role, "path": str(path), "state": state,
                      "used_percent": round(percent, 1),
@@ -1842,7 +1848,9 @@ def fleet_readiness(
             problems.append({
                 "code": "disk_pressure", "label": disk["path"],
                 "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB free "
-                           f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"),
+                           + (f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"
+                              if disk["role"] == "vm_store" else
+                              f"(>= {HOME_DISK_PROBLEM_PERCENT}% fails builds with ENOSPC)")),
             })
     if participating != (pool_state == "on"):
         problems.append({
