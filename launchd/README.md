@@ -766,7 +766,18 @@ scripts/install_shipyard_queue_tick.sh \
 ```
 
 The installer removes any previous health verdict before kickstart and succeeds
-only after the newly started tick publishes a fresh healthy verdict. Every mode
+only after the newly started tick publishes a fresh healthy verdict. It waits
+for that tick to finish however long it runs (a tick reads every open pull
+request), up to `SHIPYARD_QUEUE_INSTALL_TICK_MAX_SECS` (default 3600). It
+fails after `SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS` (default 120) only when
+the tick is not running and has published nothing. A failed install restores
+the prior files and re-bootstraps the prior agent, retrying the bootstrap
+that races launchd's asynchronous bootout. If the agent still is not loaded,
+the installer says `ROLLBACK FAILED … NOT LOADED`, writes an `unhealthy`
+`agent_unloaded` health verdict, and exits 4, so the host is never left
+without a tick in silence. The launchd watchdog reinstalls a loaded tick
+whose copy differs from the running tartci (`scripts/queue_tick_refresh.py`),
+and never switches an unloaded one back on. Every mode
 requires `--gh-cli` pointing to an executable GitHub App wrapper; unattended
 operation never falls back to ambient `gh`. `--repo-root` is optional and only
 sets the directory the merge-queue hold check runs from. `--mode live` and

@@ -30,8 +30,12 @@ from typing import Any, Callable
 LABEL = "com.danielraffel.shipyard.queue-tick"
 FILES = ("shipyard_queue_tick.sh", "shipyard_queue_tick_support.py")
 INSTALLER = "install_shipyard_queue_tick.sh"
-INSTALL_TIMEOUT_S = 420
+# The installer waits for its first tick to finish (up to TICK_MAX_S while
+# the tick runs, HEALTH_WAIT_S while it does not) and rolls back on its own.
+# The timeout here must outlast both, or a kill would skip that rollback.
 HEALTH_WAIT_S = "180"
+TICK_MAX_S = "900"
+INSTALL_TIMEOUT_S = 1500
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -146,7 +150,8 @@ def refresh(fix: bool, root: Path | None = None, install_dir: Path | None = None
     if not fix:
         return {"state": "would_refresh", "files": before["files"], "detail": before["detail"],
                 "args": args}
-    env = dict(os.environ, SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS=HEALTH_WAIT_S)
+    env = dict(os.environ, SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS=HEALTH_WAIT_S,
+               SHIPYARD_QUEUE_INSTALL_TICK_MAX_SECS=TICK_MAX_S)
     try:
         proc = runner(["/bin/bash", str(root / "scripts" / INSTALLER), *args, "--install"],
                       capture_output=True, text=True, timeout=INSTALL_TIMEOUT_S, check=False,
