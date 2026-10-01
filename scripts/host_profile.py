@@ -219,6 +219,9 @@ def resolve_role(
     env_role = os.environ.get("TARTCI_ROLE")
     if env_role:
         return normalize_role(env_role), "environment"
+    governor_role = governor_settings().values.get("role")
+    if isinstance(governor_role, str) and governor_role.strip():
+        return normalize_role(governor_role), f"file:{governor_file_path()}"
     path = role_file_path(role_file)
     try:
         text = path.read_text(encoding="utf-8").strip()
@@ -232,6 +235,203 @@ def resolve_role(
     if host_cores <= 10 or "macbook" in host_model:
         return "light", "default"
     return "dev-overflow", "default"
+
+
+# --- governor: one per-host config surface --------------------------------
+#
+# Every tuning knob of the build governor lives in ONE host-local file,
+# ~/.config/tartci/governor.toml, flat `[governor]` table. `tartci governor
+# show|set|explain` reads and edits it; `tartci host-profile` derives every
+# exported number from it. Precedence per key: CLI flag > TARTCI_GOV_<KEY>
+# environment > governor.toml > legacy source (role file; fleet profile
+# `[host] agent_floor_cores`) > role default. The TARTCI_GOV_ prefix keeps the
+# overrides apart from host-profile's own exported names, so a shell that
+# evaluated `tartci host-profile` cannot feed its outputs back in as inputs.
+#
+# A malformed value is ignored (with a note in `problems`), never raised: this
+# runs on every lease admission, and a typo in an optional knob must never
+# deny a lease.
+GOVERNOR_ENV = "TARTCI_GOVERNOR_FILE"
+GOVERNOR_ENV_PREFIX = "TARTCI_GOV_"
+AUTO = "auto"
+BUILD_CLASSES = ("interactive", "background")
+
+# key -> kind. "cores" accepts a non-negative int or "auto"; "int" is a plain
+# non-negative int; "bool" true/false; "role" one of VALID_ROLES.
+GOVERNOR_KEYS: dict[str, str] = {
+    "role": "role",
+    "human_reserved_cores": "int",
+    "gate_guarantee_cores": "cores",
+    "gate_prompt_reserve_cores": "cores",
+    "interactive_share_cores": "cores",
+    "background_share_cores": "cores",
+    "interactive_min_cores": "int",
+    "interactive_wait_secs": "int",
+    "agent_floor_cores": "int",
+    "agent_floor_pool_cores": "int",
+    "dynamic_lending": "bool",
+    "fleet_hosts": "str",
+}
+
+GOVERNOR_HELP: dict[str, str] = {
+    "role": "dedicated-builder | dev-overflow | light; picks the defaults below",
+    "human_reserved_cores": "cores never leased: left for the person at the keyboard",
+    "gate_guarantee_cores": "static cores a gate lease is always guaranteed (today's reserve)",
+    "gate_prompt_reserve_cores": "cores kept free for the NEXT gate job while lending (auto: one gate VM)",
+    "interactive_share_cores": "cap on all interactive build leases together (auto: lease capacity)",
+    "background_share_cores": "cap on all background build leases together",
+    "interactive_min_cores": "smallest partial lease an interactive build accepts",
+    "interactive_wait_secs": "how long an interactive build waits for that before going leaseless",
+    "agent_floor_cores": "background-QoS floor lease for a denied background build (0 = off)",
+    "agent_floor_pool_cores": "host-wide cap on concurrent floor-lease cores",
+    "dynamic_lending": "lend idle gate-reserved cores to interactive builds (preemptible)",
+    "fleet_hosts": "comma-separated SSH aliases `tartci governor fleet` reads",
+}
+
+
+def governor_file_path(path: str | None = None) -> Path:
+    if path:
+        return Path(path).expanduser()
+    return Path(
+        os.environ.get(
+            GOVERNOR_ENV,
+            str(Path.home() / ".config" / "tartci" / "governor.toml"),
+        )
+    ).expanduser()
+
+
+def parse_governor_value(key: str, raw: Any) -> Any:
+    """Validate one governor value. Raises ValueError with a reason."""
+    kind = GOVERNOR_KEYS.get(key)
+    if kind is None:
+        raise ValueError(f"unknown governor key {key!r}; known: {', '.join(GOVERNOR_KEYS)}")
+    text = raw.strip() if isinstance(raw, str) else raw
+    if kind == "role":
+        return normalize_role(str(text))
+    if kind == "str":
+        return str(text)
+    if kind == "bool":
+        if isinstance(text, bool):
+            return text
+        lowered = str(text).lower()
+        if lowered in ("true", "1", "on", "yes"):
+            return True
+        if lowered in ("false", "0", "off", "no"):
+            return False
+        raise ValueError(f"{key} must be true or false, got {raw!r}")
+    if kind == "cores" and isinstance(text, str) and text.lower() == AUTO:
+        return AUTO
+    if isinstance(text, bool):
+        raise ValueError(f"{key} must be a non-negative integer, got {raw!r}")
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        allowed = "a non-negative integer or \"auto\"" if kind == "cores" else "a non-negative integer"
+        raise ValueError(f"{key} must be {allowed}, got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{key} must be non-negative, got {raw!r}")
+    return value
+
+
+def _parse_governor_table(text: str) -> dict[str, Any]:
+    """Raw [governor] table. tomllib when present; a flat scan on 3.9."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            table = tomllib.loads(text).get("governor") or {}
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return {"__invalid__": True}
+        return dict(table) if isinstance(table, dict) else {}
+    values: dict[str, Any] = {}
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_table = line == "[governor]"
+            continue
+        if in_table and "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                values[key.strip()] = value[1:-1]
+            elif value in ("true", "false"):
+                values[key.strip()] = value == "true"
+            else:
+                values[key.strip()] = value
+    return values
+
+
+class GovernorSettings:
+    """Resolved governor.toml + TARTCI_GOV_* values, with their sources."""
+
+    def __init__(self, values: dict[str, Any], sources: dict[str, str],
+                 problems: list[str], path: Path) -> None:
+        self.values = values
+        self.sources = sources
+        self.problems = problems
+        self.path = path
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.values.get(key, default)
+
+
+def governor_settings(path: str | None = None) -> GovernorSettings:
+    file_path = governor_file_path(path)
+    values: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    problems: list[str] = []
+    try:
+        table = _parse_governor_table(file_path.read_text(encoding="utf-8"))
+    except OSError:
+        table = {}
+    if table.pop("__invalid__", False):
+        problems.append(f"governor_file_unparseable:{file_path}")
+    for key, raw in table.items():
+        try:
+            values[key] = parse_governor_value(key, raw)
+            sources[key] = f"file:{file_path}"
+        except ValueError as exc:
+            problems.append(f"governor_value_ignored:{exc}")
+    for key in GOVERNOR_KEYS:
+        raw_env = os.environ.get(GOVERNOR_ENV_PREFIX + key.upper())
+        if raw_env is None or not raw_env.strip():
+            continue
+        try:
+            values[key] = parse_governor_value(key, raw_env)
+            sources[key] = "environment"
+        except ValueError as exc:
+            problems.append(f"governor_env_ignored:{exc}")
+    return GovernorSettings(values, sources, problems, file_path)
+
+
+def fleet_profile_serves_gate(fleet_profile: str | None = None) -> bool:
+    """True when the installed fleet profile declares a gate-priority lane.
+
+    Read from the profile text, not from live state: a host whose gate lanes
+    are momentarily idle still serves the gate and must keep a prompt reserve.
+    """
+    import re
+
+    try:
+        text = fleet_profile_path(fleet_profile).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    in_lane = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_lane = line == "[[lane]]"
+            continue
+        if not in_lane:
+            continue
+        if re.match(r'^priority\s*=\s*"gate"', line):
+            return True
+        if re.match(r'^id\s*=\s*"[^"]*-gate"', line):
+            return True
+    return False
 
 
 # --- agent core floor --------------------------------------------------------
@@ -320,6 +520,12 @@ def agent_floor_settings(fleet_profile: str | None = None) -> tuple[dict[str, in
             source = f"file:{path}"
     except OSError:
         settings = {}
+    # The governor file supersedes the fleet profile's legacy [host] keys.
+    governor = governor_settings()
+    for key in AGENT_FLOOR_KEYS:
+        if isinstance(governor.get(key), int):
+            settings[key] = governor.get(key)
+            source = governor.sources.get(key, source)
     for key in AGENT_FLOOR_KEYS:
         raw = os.environ.get(f"TARTCI_{key.upper()}")
         if raw is not None and raw.strip().isdigit():
@@ -544,6 +750,82 @@ def _clamp_at_least(value: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), max(minimum, maximum))
 
 
+# Background-class share per role, as a function of the guaranteed non-gate
+# budget N. A laptop keeps opportunistic validations small so the person's own
+# builds find cores; a dedicated builder gives them half.
+def _default_background_share(role: str, non_gate_capacity: int) -> int:
+    if role == "dedicated-builder":
+        return max(1, non_gate_capacity // 2)
+    if role == "dev-overflow":
+        return max(1, min(4, non_gate_capacity))
+    return max(1, min(2, non_gate_capacity))
+
+
+INTERACTIVE_MIN_CORES_DEFAULT = 2
+INTERACTIVE_WAIT_SECS_DEFAULT = 90
+
+
+def build_class_settings(
+    governor: GovernorSettings,
+    *,
+    role: str,
+    lease_capacity: int,
+    reserved_gate: int,
+    non_gate_capacity: int,
+    vm_pool: int,
+    fleet_profile: str | None = None,
+) -> dict[str, Any]:
+    """Derive the build-class and lending numbers (see leases.py admission).
+
+    * interactive: a person or agent is waiting. Normal QoS, may accept a
+      partial lease, and with dynamic_lending may borrow idle gate-reserved
+      cores (that excess is "lent" and preemptible by a gate lease).
+    * background: Shipyard-local validations and other opportunistic work.
+      Capped at background_share_cores, never borrows, keeps the role QoS.
+    """
+    serves_gate = fleet_profile_serves_gate(fleet_profile)
+    lending = governor.get("dynamic_lending")
+    lending = bool(lending) if isinstance(lending, bool) else False
+
+    prompt = governor.get("gate_prompt_reserve_cores", AUTO)
+    prompt_auto = prompt == AUTO
+    if prompt_auto:
+        # One gate VM while this host serves gate lanes; the lease store
+        # refines this with the size of the last gate lease it admitted.
+        prompt = min(vm_pool, reserved_gate) if serves_gate else 0
+    prompt = min(max(0, int(prompt)), reserved_gate)
+
+    interactive_share = governor.get("interactive_share_cores", AUTO)
+    if interactive_share == AUTO:
+        interactive_share = lease_capacity
+    interactive_share = _clamp_at_least(int(interactive_share), 1, lease_capacity)
+
+    background_share = governor.get("background_share_cores", AUTO)
+    if background_share == AUTO:
+        background_share = _default_background_share(role, non_gate_capacity)
+    background_share = _clamp_at_least(int(background_share), 1, non_gate_capacity)
+
+    min_cores = governor.get("interactive_min_cores")
+    min_cores = min_cores if isinstance(min_cores, int) and min_cores > 0 else INTERACTIVE_MIN_CORES_DEFAULT
+    min_cores = min(min_cores, interactive_share)
+    wait_secs = governor.get("interactive_wait_secs")
+    wait_secs = wait_secs if isinstance(wait_secs, int) else INTERACTIVE_WAIT_SECS_DEFAULT
+
+    return {
+        "governor_schema": 1,
+        "serves_gate": serves_gate,
+        "dynamic_lending": lending,
+        "gate_prompt_reserve_cores": prompt,
+        "gate_prompt_reserve_auto": prompt_auto,
+        "interactive_share_cores": interactive_share,
+        "interactive_build_jobs": interactive_share,
+        "interactive_min_cores": min_cores,
+        "interactive_wait_secs": wait_secs,
+        "interactive_qos": "normal",
+        "background_share_cores": background_share,
+    }
+
+
 def build_profile(
     *,
     role: str | None = None,
@@ -567,14 +849,34 @@ def build_profile(
         model=host_model,
     )
     defaults = ROLE_DEFAULTS[resolved_role]
+    governor = governor_settings()
 
-    headroom = _clamp_at_least(defaults.headroom_cores, 1, max(1, host_cores - 1))
+    human_reserved = governor.get("human_reserved_cores")
+    headroom = _clamp_at_least(
+        human_reserved if isinstance(human_reserved, int) else defaults.headroom_cores,
+        1,
+        max(1, host_cores - 1),
+    )
     lease_capacity = max(1, host_cores - headroom)
     agent_cap = _clamp_at_least(defaults.agent_build_cap_cores, 1, lease_capacity)
     vm_pool = _clamp_at_least(defaults.vm_pool_cores, 1, lease_capacity)
     reserved_gate = max(0, lease_capacity - agent_cap)
+    guarantee = governor.get("gate_guarantee_cores")
+    if isinstance(guarantee, int):
+        # An explicit static gate guarantee; non-gate keeps at least one core.
+        reserved_gate = min(guarantee, max(0, lease_capacity - 1))
+        agent_cap = min(agent_cap, max(1, lease_capacity - reserved_gate))
     non_gate_capacity = max(1, lease_capacity - reserved_gate)
     runner_job_cores = agent_cap
+    classes = build_class_settings(
+        governor,
+        role=resolved_role,
+        lease_capacity=lease_capacity,
+        reserved_gate=reserved_gate,
+        non_gate_capacity=non_gate_capacity,
+        vm_pool=vm_pool,
+        fleet_profile=fleet_profile,
+    )
 
     # Memory axis. lease_capacity_mem = physical - headroom - flat link/LTO
     # reserve. 0 when RAM can't be read → the axis stays off and admission is
@@ -653,6 +955,9 @@ def build_profile(
         "agent_floor_source": floor_source,
         **lease_policy_settings(fleet_profile),
         **guest_network_settings(fleet_profile),
+        **classes,
+        "governor_file": str(governor.path),
+        "governor_problems": list(governor.problems),
         "watch_lock_limit": defaults.watch_lock_limit,
         "macos_vm_cap": defaults.macos_vm_cap,
         "notes": [
@@ -687,6 +992,19 @@ def shell_exports(profile: dict[str, Any]) -> str:
         "TARTCI_LINK_LTO_RESERVE_MEM_MB": profile["link_lto_reserve_mem_mb"],
         "TARTCI_PER_JOB_MEM_MB": profile["per_compile_job_mem_mb"],
         "PULP_BUILD_MEM_BUDGET_MB": profile["pulp_build_mem_budget_mb"],
+        # Build classes + dynamic lending (tartci governor). A consumer that
+        # sees TARTCI_GOVERNOR_SCHEMA may pass `leases acquire --class`.
+        "TARTCI_GOVERNOR_SCHEMA": profile["governor_schema"],
+        "TARTCI_DYNAMIC_LENDING": int(bool(profile["dynamic_lending"])),
+        "TARTCI_SERVES_GATE": int(bool(profile["serves_gate"])),
+        "TARTCI_GATE_PROMPT_RESERVE_CORES": profile["gate_prompt_reserve_cores"],
+        "TARTCI_INTERACTIVE_SHARE_CORES": profile["interactive_share_cores"],
+        "TARTCI_INTERACTIVE_BUILD_JOBS": profile["interactive_build_jobs"],
+        "TARTCI_INTERACTIVE_MIN_CORES": profile["interactive_min_cores"],
+        "TARTCI_INTERACTIVE_WAIT_SECS": profile["interactive_wait_secs"],
+        "TARTCI_INTERACTIVE_QOS": profile["interactive_qos"],
+        "TARTCI_BACKGROUND_SHARE_CORES": profile["background_share_cores"],
+        "TARTCI_BACKGROUND_QOS": profile["qos"],
     }
     return "\n".join(f"{key}={value}" for key, value in values.items())
 

@@ -423,8 +423,39 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         if fresh_override is not None and int(fresh_override) > 0
         else int(profile.get("vm_waiter_fresh_secs", host_profile.LEASE_POLICY_DEFAULT_FRESH_SECS))
     )
+    lending_override = getattr(args, "dynamic_lending", None)
+    dynamic_lending = (
+        lending_override == "on"
+        if lending_override in ("on", "off")
+        else bool(profile.get("dynamic_lending", False))
+    )
+
+    def _override(name: str, key: str, default: int) -> int:
+        value = getattr(args, name, None)
+        return max(0, int(value)) if value is not None else int(profile.get(key, default))
+
+    prompt_override = getattr(args, "gate_prompt_reserve_cores", None)
     return {
         "total": max(1, total),
+        "dynamic_lending": int(dynamic_lending),
+        "serves_gate": int(bool(profile.get("serves_gate", False))),
+        "gate_prompt_reserve_cores": min(
+            _override("gate_prompt_reserve_cores", "gate_prompt_reserve_cores", 0), reserved
+        ),
+        "gate_prompt_reserve_auto": int(
+            prompt_override is None and bool(profile.get("gate_prompt_reserve_auto", False))
+        ),
+        "interactive_share_cores": max(
+            1, _override("interactive_share_cores", "interactive_share_cores", max(1, total))
+        ),
+        "background_share_cores": max(
+            1,
+            _override(
+                "background_share_cores",
+                "background_share_cores",
+                max(1, max(1, total) - reserved),
+            ),
+        ),
         "rank_vm_waiters": int(rank_vm_waiters),
         "waiter_fresh_secs": max(1, waiter_fresh),
         "agent_floor_cores": floor_cores,
@@ -435,6 +466,319 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         "total_mem_mb": total_mem,
         "reserved_gate_mem_mb": reserved_mem,
         "per_job_mem_mb": per_job_mem,
+    }
+
+
+# --- build classes and dynamic gate lending ----------------------------------
+#
+# The static model withholds `reserved_gate_cores` (S) from every non-gate
+# lease whether or not any gate work exists, so on a host whose gate lanes are
+# idle those cores sit unused while an awaited build crawls. Dynamic lending
+# lets an INTERACTIVE build borrow them, under one invariant: a gate lease is
+# never admitted less often than under the static model.
+#
+#   T = lease capacity, N = T - S (the guaranteed non-gate budget),
+#   G = cores held by gate-priority leases, P = cores kept free for the NEXT
+#   gate job (the prompt reserve; one gate VM while the host serves gate lanes,
+#   plus any live gate-priority VM lease waiter = imminent demand).
+#
+#   * non-gate usage beyond N is LENT. Gate admission does not count lent
+#     cores, so the gate always finds its S cores exactly as before.
+#   * an interactive lease may grow non-gate usage to max(N, T - G - P);
+#     background and class-less leases stay within N, as before, and
+#     background leases together are further capped at the background share.
+#   * when a gate grant overlaps lent cores (used > T), the store PREEMPTS the
+#     newest borrowers: their process trees move to background QoS
+#     (`taskpolicy -b -p`), nothing is killed, and new non-gate admissions are
+#     already denied by the shrunken limit. The next acquire/release/heartbeat
+#     after the overlap clears moves them back (`taskpolicy -B -p`).
+#
+# With dynamic_lending off (the default) and no borrowed lease in the store,
+# lent is always 0 and every admission is exactly the class-less rule.
+BUILD_CLASSES = host_profile.BUILD_CLASSES
+
+
+def is_gate_record(record: dict[str, Any], cfg: dict[str, int]) -> bool:
+    return record_int(record, "priority") >= cfg["gate_priority"]
+
+
+def lending_active(records: list[dict[str, Any]], cfg: dict[str, int]) -> bool:
+    """Lent cores exist only while lending is on or a borrower is still live.
+
+    Turning lending off must not strand a borrower the gate could otherwise
+    preempt, so a live `borrowed` record keeps the accounting on until it ends.
+    """
+    return bool(cfg.get("dynamic_lending")) or any(
+        record.get("borrowed") is True for record in records if not is_floor(record)
+    )
+
+
+def class_usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
+    """Class and lending figures over non-floor records."""
+    guaranteed_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
+    gate_used = 0
+    non_gate_used = 0
+    by_class = {name: 0 for name in BUILD_CLASSES}
+    for record in records:
+        cores = record_int(record, "lease_size_cores")
+        if is_gate_record(record, cfg):
+            gate_used += cores
+            continue
+        non_gate_used += cores
+        build_class = record.get("build_class")
+        if build_class in by_class:
+            by_class[build_class] += cores
+    lent = (
+        max(0, non_gate_used - guaranteed_limit) if lending_active(records, cfg) else 0
+    )
+    return {
+        "dynamic_lending": bool(cfg.get("dynamic_lending")),
+        "gate_used_cores": gate_used,
+        "lent_cores": lent,
+        "interactive_used_cores": by_class["interactive"],
+        "background_used_cores": by_class["background"],
+        "interactive_share_cores": int(cfg.get("interactive_share_cores", cfg["total"])),
+        "background_share_cores": int(cfg.get("background_share_cores", guaranteed_limit)),
+        "preempted_lease_ids": sorted(
+            str(record.get("id")) for record in records if record.get("preempted") is True
+        ),
+    }
+
+
+def gate_hint_file(store_dir: pathlib.Path) -> pathlib.Path:
+    return store_dir / "gate_hint.json"
+
+
+def read_gate_hint(store_dir: pathlib.Path) -> int:
+    """Cores of the last gate lease this host admitted, or 0 (fail-open)."""
+    try:
+        data = json.loads(gate_hint_file(store_dir).read_text(encoding="utf-8"))
+        cores = int(data.get("cores") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+    return max(0, cores)
+
+
+def write_gate_hint(store_dir: pathlib.Path, cores: int) -> None:
+    if cores <= 0 or cores == read_gate_hint(store_dir):
+        return
+    path = gate_hint_file(store_dir)
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(
+            json.dumps({"cores": cores, "seen_at": iso(utcnow())}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def prompt_reserve(
+    store_dir: pathlib.Path | None, cfg: dict[str, int]
+) -> tuple[int, str]:
+    """Effective prompt reserve P and where it came from. Under the store lock.
+
+    auto + gate host: the size of the last gate lease admitted here (falls back
+    to the profile's one-VM default). Live gate-priority VM lease waiters are
+    gate demand that is about to arrive, so P is at least their total.
+    """
+    reserve = int(cfg.get("gate_prompt_reserve_cores", 0))
+    source = "configured"
+    if store_dir is not None and cfg.get("gate_prompt_reserve_auto") and cfg.get("serves_gate"):
+        hint = read_gate_hint(store_dir)
+        if hint:
+            reserve, source = hint, "last_gate_lease"
+        else:
+            source = "profile_default"
+    if store_dir is not None and cfg.get("rank_vm_waiters"):
+        waiters, _ = load_waiters(store_dir)
+        live, _ = live_waiters(waiters, int(cfg.get("waiter_fresh_secs", 90)))
+        waiting = sum(
+            record_int(row, "lease_size_cores")
+            for row in live
+            if record_int(row, "priority") >= cfg["gate_priority"]
+        )
+        if waiting > reserve:
+            reserve, source = waiting, "gate_waiters"
+    return min(max(0, reserve), int(cfg["reserved_gate_cores"])), source
+
+
+def interactive_limit(
+    records: list[dict[str, Any]], cfg: dict[str, int], reserve: int
+) -> int:
+    """How far non-gate usage may grow for an interactive lease right now."""
+    guaranteed_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
+    if not cfg.get("dynamic_lending"):
+        return guaranteed_limit
+    gate_used = sum(
+        record_int(record, "lease_size_cores")
+        for record in records
+        if not is_floor(record) and is_gate_record(record, cfg)
+    )
+    return max(guaranteed_limit, cfg["total"] - gate_used - reserve)
+
+
+def reconcile_borrowers(
+    records: list[dict[str, Any]], cfg: dict[str, int]
+) -> list[dict[str, Any]]:
+    """Mark which borrowers must yield CPU to a gate, and which may resume.
+
+    Called under the store lock after the record set changes. Lent cores are
+    attributed to interactive leases newest first (the most recent borrower
+    yields first). While the host is oversubscribed (used > T, which only a
+    gate grant over lent cores can cause) the borrowers covering the overlap
+    are marked `preempted`; once it clears they are unmarked. Returns the QoS
+    changes to apply after the records are written. Never kills anything.
+    """
+    live = [record for record in records if not is_floor(record)]
+    total = cfg["total"]
+    guaranteed_limit = max(1, total - cfg["reserved_gate_cores"])
+    used = sum(record_int(record, "lease_size_cores") for record in live)
+    non_gate = [record for record in live if not is_gate_record(record, cfg)]
+    non_gate_used = sum(record_int(record, "lease_size_cores") for record in non_gate)
+    lent = max(0, non_gate_used - guaranteed_limit) if lending_active(live, cfg) else 0
+    overlap = used - total
+    # Store order is admission order (records are appended), which breaks
+    # created_at ties inside one second.
+    borrowers = [
+        record
+        for _, _, record in sorted(
+            (
+                (str(record.get("created_at") or ""), index, record)
+                for index, record in enumerate(non_gate)
+                if record.get("build_class") == "interactive"
+            ),
+            key=lambda row: (row[0], row[1]),
+            reverse=True,
+        )
+    ]
+    to_preempt: set[str] = set()
+    for record in borrowers:
+        if lent <= 0 or overlap <= 0:
+            break
+        share = min(record_int(record, "lease_size_cores"), lent)
+        lent -= share
+        if share > 0:
+            to_preempt.add(str(record.get("id")))
+            overlap -= share
+    now = iso(utcnow())
+    actions: list[dict[str, Any]] = []
+    for record in live:
+        lease_id = str(record.get("id"))
+        wanted = lease_id in to_preempt
+        current = record.get("preempted") is True
+        if wanted and not current:
+            record["preempted"] = True
+            record["preempted_at"] = now
+            qos = "background"
+        elif current and not wanted:
+            record.pop("preempted", None)
+            record.pop("preempted_at", None)
+            qos = "normal"
+        else:
+            continue
+        actions.append(
+            {
+                "pid": record_int(record, "pid"),
+                "qos": qos,
+                "summary": {"id": lease_id, "qos": qos, "pid": record_int(record, "pid")},
+            }
+        )
+    return actions
+
+
+QOS_ACTION_LOG_ENV = "TARTCI_QOS_ACTION_LOG"
+
+
+def process_tree(root: int) -> list[int]:
+    """root and every live descendant (ps snapshot); [] if root is not live."""
+    if root <= 0:
+        return []
+    proc = run(["ps", "-axo", "pid=,ppid="])
+    children: dict[int, list[int]] = {}
+    seen_root = False
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        pid, ppid = int(parts[0]), int(parts[1])
+        seen_root = seen_root or pid == root
+        children.setdefault(ppid, []).append(pid)
+    if not seen_root:
+        return []
+    tree, queue = [], [root]
+    while queue:
+        pid = queue.pop()
+        if pid in tree:
+            continue
+        tree.append(pid)
+        queue.extend(children.get(pid, []))
+    return tree
+
+
+def apply_qos_actions(actions: list[dict[str, Any]]) -> None:
+    """Move each action's process tree into (or out of) background QoS.
+
+    Best-effort and never raises: a borrower that already exited needs
+    nothing, and a host without taskpolicy (Linux) keeps its accounting but
+    cannot re-prioritise. New children of a re-prioritised process (ninja's
+    next clang) inherit its policy. TARTCI_QOS_ACTION_LOG records the intended
+    calls instead of making them (tests, dry runs).
+    """
+    if not actions:
+        return
+    log_path = os.environ.get(QOS_ACTION_LOG_ENV)
+    for action in actions:
+        flag = "-b" if action["qos"] == "background" else "-B"
+        if log_path:
+            with contextlib.suppress(OSError):
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({**action["summary"], "flag": flag}) + "\n")
+            continue
+        if host_profile.resolve_system_binary("taskpolicy") is None:
+            continue
+        for pid in process_tree(int(action["pid"])):
+            proc = run(["taskpolicy", flag, "-p", str(pid)])
+            if proc.returncode != 0:
+                # Logged, never fatal: a process that exited between the ps
+                # snapshot and this call is the common case.
+                detail = (proc.stderr or "").strip().splitlines()
+                print(
+                    f"leases: taskpolicy {flag} -p {pid} failed rc={proc.returncode}"
+                    + (f": {detail[-1]}" if detail else "")
+                    + f" (lease {action['summary']['id']})",
+                    file=sys.stderr,
+                )
+
+
+def class_available(
+    records: list[dict[str, Any]], cfg: dict[str, int], reserve: int
+) -> dict[str, int]:
+    """Cores a new interactive / background lease could get right now (cores
+    axis only; memory can still bind). What governed builds probe."""
+    live = [record for record in records if not is_floor(record)]
+    current = usage(live, cfg)
+    total = cfg["total"]
+    host_free = max(0, total - current["used_cores"])
+    guaranteed_limit = max(1, total - cfg["reserved_gate_cores"])
+    non_gate_used = current["non_gate_used_cores"]
+    interactive = min(
+        host_free,
+        max(0, interactive_limit(live, cfg, reserve) - non_gate_used),
+        max(0, int(cfg.get("interactive_share_cores", total))
+            - int(current.get("interactive_used_cores", 0))),
+    )
+    background = min(
+        host_free,
+        max(0, guaranteed_limit - non_gate_used),
+        max(0, int(cfg.get("background_share_cores", guaranteed_limit))
+            - int(current.get("background_used_cores", 0))),
+    )
+    return {
+        "interactive_available_cores": interactive,
+        "background_available_cores": background,
+        "gate_prompt_reserve_cores": reserve,
     }
 
 
@@ -460,6 +804,8 @@ def usage(all_records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, A
         "non_gate_used_cores": non_gate_used,
         "non_gate_available_cores": max(0, non_gate_limit - non_gate_used),
     }
+    if "dynamic_lending" in cfg:
+        result.update(class_usage(records, cfg))
     floor_pool = int(cfg.get("agent_floor_pool_cores", 0))
     if floor_pool > 0 or floor_records:
         floor_used = sum(record_int(record, "lease_size_cores") for record in floor_records)
@@ -888,12 +1234,16 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
                                      str(row.get("waiting_since") or "")),
                 )
             ]
+        capacity = usage(active, cfg)
+        if "dynamic_lending" in cfg:
+            reserve, _ = prompt_reserve(store_dir, cfg)
+            capacity.update(class_available(active, cfg, reserve))
         return {
             **waiter_rows,
             "schema": 3,
             "store_dir": str(store_dir),
             "mode": "provider VM runners atomically acquire host core, memory, and per-volume disk-growth leases when enabled",
-            "capacity": usage(active, cfg),
+            "capacity": capacity,
             "disk_volumes": sorted(disk_volumes, key=lambda row: row["device_id"]),
             "leases": sort_records(active),
             "reaped": reaped_summary(reaped),
@@ -1003,40 +1353,47 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "problems": problem_summary(problems),
             }, 75
         current_usage = usage(active, cfg)
-        limit = cfg["total"]
-        used_for_limit = current_usage["used_cores"]
-        if priority < cfg["gate_priority"]:
-            limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
-            used_for_limit = current_usage["non_gate_used_cores"]
-        total_exceeded = current_usage["used_cores"] + lease_size > cfg["total"]
-        class_exceeded = used_for_limit + lease_size > limit
+        build_class = getattr(args, "build_class", None)
+        if build_class is not None and priority >= cfg["gate_priority"]:
+            raise ValueError("--class applies to non-gate build leases only")
+        reserve, reserve_source = prompt_reserve(store_dir, cfg)
         # Memory is the second admission axis. A build lease that omits --mem-mb
         # is charged its cores * per-job estimate so the axis engages even before
         # every caller passes memory explicitly. The axis is skipped entirely when
         # total_mem_mb is 0 (RAM unknown / old profile) → core-only, fail-open.
-        req_mem = (
-            int(args.mem_mb)
-            if getattr(args, "mem_mb", None) is not None
-            else lease_size * cfg["per_job_mem_mb"]
+        explicit_mem = getattr(args, "mem_mb", None) is not None
+        req_mem = int(args.mem_mb) if explicit_mem else lease_size * cfg["per_job_mem_mb"]
+        verdict = core_and_memory_verdict(
+            cfg, current_usage, priority, lease_size, req_mem,
+            build_class=build_class, reserve=reserve,
         )
-        # Two memory checks, mirroring the two core checks above: the host-wide
-        # budget binds every lease, and a non-gate lease is additionally held to
-        # total - reserved_gate_mem_mb so it cannot spend the gate's reserve.
-        mem_axis_on = cfg["total_mem_mb"] > 0
-        mem_limit = cfg["total_mem_mb"]
-        used_mem_for_limit = current_usage.get("used_mem_mb", 0)
-        if priority < cfg["gate_priority"]:
-            mem_limit = max(
-                cfg["per_job_mem_mb"],
-                cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],
-            )
-            used_mem_for_limit = current_usage.get("non_gate_used_mem_mb", 0)
-        total_mem_exceeded = (
-            mem_axis_on
-            and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
-        )
-        class_mem_exceeded = mem_axis_on and used_mem_for_limit + req_mem > mem_limit
-        mem_exceeded = total_mem_exceeded or class_mem_exceeded
+        min_cores = int(getattr(args, "min_cores", 0) or 0)
+        requested_full = lease_size
+        if (
+            min_cores > 0
+            and lease_size > min_cores
+            and not memory_only
+            and (verdict["total_exceeded"] or verdict["class_exceeded"] or verdict["mem_exceeded"])
+        ):
+            # Partial grant: the largest size >= --min-cores that fits every
+            # axis. Memory scales with the cores actually granted.
+            for size in range(lease_size - 1, min_cores - 1, -1):
+                size_mem = (
+                    max(1, req_mem * size // lease_size) if explicit_mem
+                    else size * cfg["per_job_mem_mb"]
+                )
+                trial = core_and_memory_verdict(
+                    cfg, current_usage, priority, size, size_mem,
+                    build_class=build_class, reserve=reserve,
+                )
+                if not (trial["total_exceeded"] or trial["class_exceeded"] or trial["mem_exceeded"]):
+                    lease_size, req_mem, verdict = size, size_mem, trial
+                    break
+        total_exceeded = verdict["total_exceeded"]
+        class_exceeded = verdict["class_exceeded"]
+        mem_exceeded = verdict["mem_exceeded"]
+        mem_axis_on = verdict["mem_axis_on"]
+        mem_limit = verdict["mem_limit"]
         disk_state = (
             disk_capacity(active, disk, requested_disk_bytes, disk_floor_bytes)
             if disk is not None
@@ -1046,7 +1403,9 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             disk_state is not None and disk_state["free_bytes"] < disk_state["required_bytes"]
         )
         floor = None
-        if (total_exceeded or class_exceeded) and not disk_exceeded:
+        # An interactive build is never handed a background-QoS floor lease:
+        # someone is waiting on it. Its caller decides what to do on denial.
+        if (total_exceeded or class_exceeded) and not disk_exceeded and build_class != "interactive":
             floor = floor_grant(args, cfg, active, priority, lease_size, req_mem)
         if floor is not None:
             requested_cores = lease_size
@@ -1074,6 +1433,12 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 },
                 "requested_cores": lease_size,
                 "requested_mem_mb": req_mem,
+                "build_class": build_class,
+                "core_limit": verdict["core_limit"],
+                "core_limit_class": verdict["core_limit_class"],
+                "class_share_exceeded": verdict["share_exceeded"],
+                "gate_prompt_reserve_cores": reserve,
+                "gate_prompt_reserve_source": reserve_source,
                 "memory_limit_mb": mem_limit if mem_axis_on else 0,
                 "memory_limit_class": (
                     "non_gate" if priority < cfg["gate_priority"] else "host"
@@ -1145,6 +1510,18 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         if memory_only:
             record["memory_only"] = True
+        if build_class is not None and floor is None:
+            record["build_class"] = build_class
+            if lease_size < requested_full:
+                record["requested_cores"] = requested_full
+            guaranteed_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
+            if (
+                build_class == "interactive"
+                and current_usage["non_gate_used_cores"] + lease_size > guaranteed_limit
+            ):
+                # Some of this lease sits above the guaranteed non-gate budget:
+                # it is borrowed, and a gate grant may preempt it.
+                record["borrowed"] = True
         if disk is not None:
             record.update(
                 {
@@ -1163,12 +1540,19 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 }
             )
         active.append(record)
+        if priority >= cfg["gate_priority"] and lease_size > 0:
+            write_gate_hint(store_dir, lease_size)
+        qos_actions = reconcile_borrowers(active, cfg)
         write_records(store_dir, active)
         settle_waiter(store_dir, cfg, waiter_id, granted=True)
+        apply_qos_actions(qos_actions)
         return {
             "ok": True,
             "floor": floor is not None,
             "qos": cfg["agent_floor_qos"] if floor is not None else None,
+            "partial": lease_size < requested_full,
+            "requested_cores": requested_full,
+            "qos_actions": [action["summary"] for action in qos_actions],
             "lease": record,
             "capacity": usage(active, cfg),
             # Preserve the admission-time view: reserved is the pre-existing
@@ -1364,23 +1748,52 @@ def core_and_memory_verdict(
     priority: int,
     lease_size: int,
     req_mem: int,
+    *,
+    build_class: str | None = None,
+    reserve: int = 0,
 ) -> dict[str, Any]:
-    """Whether a lease of this size and priority exceeds the core or memory axis.
+    """Whether a lease of this size, priority and class exceeds an axis.
 
-    The same two-axis rule `acquire` applies: the host-wide totals bind every
-    lease, and a non-gate lease is additionally held to the non-gate budget.
+    Cores: the host-wide total binds every lease. A gate lease does not count
+    lent cores (see "build classes and dynamic gate lending"), so its check is
+    never stricter than the class-less rule. A non-gate lease is held to the
+    guaranteed non-gate budget N, an interactive one to its lending limit,
+    and a classed one additionally to its class share.
+
+    Memory is unchanged by classes: host total for every lease, and the static
+    non-gate memory limit for non-gate leases (QoS cannot arbitrate RAM).
     """
-    limit = cfg["total"]
-    used_for_limit = current_usage["used_cores"]
-    if priority < cfg["gate_priority"]:
-        limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
-        used_for_limit = current_usage["non_gate_used_cores"]
-    total_exceeded = current_usage["used_cores"] + lease_size > cfg["total"]
-    class_exceeded = used_for_limit + lease_size > limit
+    total = cfg["total"]
+    guaranteed_limit = max(1, total - cfg["reserved_gate_cores"])
+    used = current_usage["used_cores"]
+    non_gate_used = current_usage["non_gate_used_cores"]
+    lent = int(current_usage.get("lent_cores", 0))
+    gate = priority >= cfg["gate_priority"]
+    share_exceeded = False
+    if gate:
+        core_limit = total
+        core_limit_class = "host"
+        total_exceeded = (used - lent) + lease_size > total
+        class_exceeded = total_exceeded
+    else:
+        core_limit = guaranteed_limit
+        core_limit_class = "non_gate"
+        if build_class == "interactive" and cfg.get("dynamic_lending"):
+            gate_used = int(current_usage.get("gate_used_cores", 0))
+            core_limit = max(guaranteed_limit, total - gate_used - reserve)
+            core_limit_class = "interactive_lending"
+        total_exceeded = used + lease_size > total
+        class_exceeded = non_gate_used + lease_size > core_limit
+        if build_class in BUILD_CLASSES:
+            share = int(cfg.get(f"{build_class}_share_cores", total))
+            class_used = int(current_usage.get(f"{build_class}_used_cores", 0))
+            if class_used + lease_size > share:
+                share_exceeded = True
+                class_exceeded = True
     mem_axis_on = cfg["total_mem_mb"] > 0
     mem_limit = cfg["total_mem_mb"]
     used_mem_for_limit = current_usage.get("used_mem_mb", 0)
-    if priority < cfg["gate_priority"]:
+    if not gate:
         mem_limit = max(
             cfg["per_job_mem_mb"],
             cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],
@@ -1394,6 +1807,9 @@ def core_and_memory_verdict(
     return {
         "total_exceeded": total_exceeded,
         "class_exceeded": class_exceeded,
+        "share_exceeded": share_exceeded,
+        "core_limit": core_limit,
+        "core_limit_class": core_limit_class,
         "mem_exceeded": total_mem_exceeded or class_mem_exceeded,
         "mem_axis_on": mem_axis_on,
         "mem_limit": mem_limit,
@@ -1484,8 +1900,12 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         record.pop("memory_only", None)
         if getattr(args, "label", None):
             record["label"] = args.label
+        if priority >= cfg["gate_priority"]:
+            write_gate_hint(store_dir, lease_size)
+        qos_actions = reconcile_borrowers(active, cfg)
         write_records(store_dir, active)
         settle_waiter(store_dir, cfg, waiter_id, granted=True)
+        apply_qos_actions(qos_actions)
         return {
             "ok": True,
             "lease": record,
@@ -1512,7 +1932,19 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         # as failures and hid any real one.
         already = next((row.get("_reap_reason") for row in reaped
                         if row.get("id") == args.id), None)
+        qos_actions = reconcile_borrowers(kept, cfg)
+        # A borrower released while preempted keeps running (a `pulp dev` loop
+        # outlives each build's lease), so its tree must leave background QoS
+        # here: reconcile only sees the records that remain.
+        for record in active:
+            if record.get("id") == args.id and record.get("preempted") is True:
+                pid = record_int(record, "pid")
+                qos_actions.append(
+                    {"pid": pid, "qos": "normal",
+                     "summary": {"id": str(args.id), "qos": "normal", "pid": pid}}
+                )
         write_records(store_dir, kept)
+        apply_qos_actions(qos_actions)
         return {
             "ok": removed or already is not None,
             "released": args.id if removed else None,
@@ -1536,7 +1968,9 @@ def heartbeat(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 record["heartbeat_at"] = now
                 updated = True
                 break
+        qos_actions = reconcile_borrowers(active, cfg)
         write_records(store_dir, active)
+        apply_qos_actions(qos_actions)
         return {
             "ok": updated,
             "heartbeat": args.id if updated else None,
@@ -1592,6 +2026,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
 
+WAIT_POLL_SECS = 2.0
+
+
+def acquire_with_wait(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """`acquire`, retried locally until it is granted or --wait-secs elapses.
+
+    Only a capacity-style denial (rc 75) is retried; the lock is released
+    between attempts, so a waiting build never blocks a gate's acquire. No
+    remote call is made: the store is local.
+    """
+    deadline = time.monotonic() + max(0, int(getattr(args, "wait_secs", 0) or 0))
+    attempts = 0
+    while True:
+        attempts += 1
+        result, rc = acquire(args)
+        if rc != 75 or time.monotonic() + WAIT_POLL_SECS > deadline:
+            if attempts > 1:
+                result["wait_attempts"] = attempts
+            return result, rc
+        time.sleep(WAIT_POLL_SECS)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -1599,7 +2055,7 @@ def main(argv: list[str] | None = None) -> int:
             result = status_digest(args)
             rc = 0 if not result["problems"] else 1
         elif args.command == "acquire":
-            result, rc = acquire(args)
+            result, rc = acquire_with_wait(args)
         elif args.command == "release":
             result, rc = release(args)
         elif args.command == "resize":

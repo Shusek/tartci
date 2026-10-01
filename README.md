@@ -65,6 +65,13 @@ hardware. Without a shared budget they oversubscribe — two hosts melted in Jul
   a lease before starting. Priority classes (`background` < `build` < `vm` <
   `runner` < `gate`) order contention, and a reserved gate-core headroom keeps
   the required `macos` gate schedulable even when non-gate work fills the host.
+- **One governor config per host** — `~/.config/tartci/governor.toml`, edited
+  with `tartci governor set KEY=VALUE` and read with `tartci governor
+  show|explain|fleet`. Builds declare a class (`interactive`: someone is
+  waiting, normal QoS, never floored; `background`: validations, capped share),
+  and with per-host `dynamic_lending` an interactive build borrows idle
+  gate-reserved cores that any gate lease preempts by QoS. See
+  `docs/runbook.md`, "Host resource governance".
 - **Memory as a second admission axis** — leases carry a memory weight
   (`--mem-mb`, capacity via `--capacity-mem-mb`); admission is
   `min(core-budget, memory-budget)`, so a build that would exhaust RAM is refused
