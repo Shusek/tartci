@@ -204,7 +204,7 @@ def explain_text(payload: dict[str, Any]) -> str:
         "",
         f"an interactive build asking {req['interactive']} would get {grant['interactive']} (normal QoS)",
         f"a background build asking {req['background']} would get {grant['background']}"
-        + (" (else the background-QoS floor)" if grant["background"] == 0 else ""),
+        + (" (else the agent-floor lease)" if grant["background"] == 0 else ""),
         f"a class-less build asking {req['background']} would get {grant['classless']}",
         f"a gate VM asking {req['gate_vm']} would get {grant['gate_vm']}"
         + ("" if grant["gate_vm"] >= req["gate_vm"] else "  <-- gate would be DENIED"),

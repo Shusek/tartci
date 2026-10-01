@@ -406,26 +406,16 @@ Tart CI owns disposable VM capacity and bounded job discovery; Shipyard owns
 queue ordering, required-context classification, enrollment repair, and
 superseded-run policy. Do not add Orchard as a second scheduler.
 
-The Shipyard queue janitor is a separate control-plane role from Tart CI runner
-capacity. Never enable its full-live mode fleet-wide. Exactly one host may set
-`SHIPYARD_QUEUE_AUTHORITY=1`, and its stored Shipyard runner tag must match the
-repo's `[merge_queue].mutation_machine`. This integration requires Shipyard
-0.80.0 or newer and must be deployed only after that binary is installed. A
-Shipyard hold on the configured authority stops its tick before GitHub reads;
-non-authority hosts must explicitly use dry-run or
-`SHIPYARD_TICK_REAP_ONLY=1`; an old plist that requests full-live without
-authority now exits unhealthy rather than silently changing modes. Full-live also requires
-`SHIPYARD_QUEUE_REPO_ROOT` to name the authoritative checkout; the tick runs
-Shipyard there and verifies its runner tag matches that repo's
-`mutation_machine`.
-Treat a full-live tick missing either `SHIPYARD_QUEUE_REPO_ROOT` or
-`SHIPYARD_QUEUE_AUTHORITY=1` as a failed control plane, not a healthy reap-only
-tick. Alert on the nonzero exit and
-`~/Library/Logs/shipyard-queue-tick.health.json`.
-Each Shipyard reconcile and auto-merge subprocess is bounded to 45 seconds so
-a wedged GitHub child cannot stop the five-minute cadence. Override that bound
-only with `SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS=1..300`; a timeout fails closed
-and publishes degraded health without attempting the mutation.
+The Shipyard queue tick is a separate control-plane role from Tart CI runner
+capacity, and it is a reaper only. It discards ship-state for pull requests
+that are merged, closed, or confirmed nonexistent, and it never merges,
+enqueues or arms a pull request: landing is the GitHub merge queue's job. It
+requires Shipyard 0.80.0 or newer. A Shipyard merge-queue hold stops a tick
+before any GitHub read. An install that still carries the retired full-live
+settings (`SHIPYARD_TICK_REAP_ONLY=0`, `SHIPYARD_QUEUE_AUTHORITY=1`) keeps
+running as a reaper and names `legacy_full_live_ignored` in every tick log and
+in `~/Library/Logs/shipyard-queue-tick.health.json`; re-run the installer to
+drop them. Every failed GitHub or Shipyard call logs its first stderr line.
 
 To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
