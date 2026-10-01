@@ -113,6 +113,10 @@ FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/C
 # that never ran scripts/pip-wheelhouse.sh boots exactly as before.
 PIP_WHEELHOUSE_ROOT="${TARTCI_PIP_WHEELHOUSE_DIR:-$CACHE_ROOT/pip-wheelhouse}"
 GUEST_PIP_WHEELHOUSE="/Volumes/My Shared Files/pip-wheelhouse"
+# Optional read-only artifact cache (git mirrors and digest-named archives),
+# opt-in by content exactly like the wheelhouse; see artifact-cache.lib.sh.
+ARTIFACT_CACHE_ROOT="${TARTCI_ARTIFACT_CACHE_DIR:-$CACHE_ROOT/artifact-cache}"
+GUEST_ARTIFACT_CACHE="/Volumes/My Shared Files/artifact-cache"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
@@ -257,6 +261,7 @@ CURRENT_AQUA_LABEL=""
 CURRENT_GUEST_CORES=""
 CURRENT_GUEST_MEM_MB=""
 CURRENT_PIP_WHEELHOUSE=0
+CURRENT_ARTIFACT_CACHE=0
 CLEANED_UP=0
 # Set when a work entry ends without serving a job, cleared when a job is
 # actually assigned or when the queue drains. Carries the START of the blocked
@@ -424,6 +429,8 @@ source "$TARTCI_ROOT/providers/tart-macos/heartbeat-keepalive.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/pip-wheelhouse.lib.sh"
+# shellcheck source=providers/tart-macos/artifact-cache.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/artifact-cache.lib.sh"
 # shellcheck source=providers/tart-macos/ccache-layer.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 # shellcheck source=providers/tart-macos/guest-dns.lib.sh
@@ -1595,7 +1602,7 @@ run_runner_until_done_unlayered(){
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      printf 'PULP_CONFIGURE_CHECK_CACHE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/configure-checks\" >> .env.tartci && \
@@ -1603,6 +1610,7 @@ run_runner_until_done_unlayered(){
      if [ -n '$CURRENT_GUEST_CORES' ]; then printf 'TARTCI_GUEST_CORES=%s\n' '$CURRENT_GUEST_CORES' >> .env.tartci; fi && \
      if [ -n '$CURRENT_GUEST_MEM_MB' ]; then printf 'TARTCI_GUEST_MEM_MB=%s\n' '$CURRENT_GUEST_MEM_MB' >> .env.tartci; fi && \
      if [ '$CURRENT_PIP_WHEELHOUSE' = 1 ]; then printf 'TARTCI_PIP_WHEELHOUSE=%s\n' '$GUEST_PIP_WHEELHOUSE' >> .env.tartci; fi && \
+     if [ '$CURRENT_ARTIFACT_CACHE' = 1 ]; then printf 'TARTCI_ARTIFACT_CACHE=%s\n' '$GUEST_ARTIFACT_CACHE' >> .env.tartci; fi && \
      ${CCACHE_LAYER_GUEST_ENV}mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
@@ -1787,6 +1795,11 @@ boot_vm_to_ssh(){
   if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
     tart_dirs+=(--dir="pip-wheelhouse:$PIP_WHEELHOUSE_ROOT:ro")
     CURRENT_PIP_WHEELHOUSE=1
+  fi
+  CURRENT_ARTIFACT_CACHE=0
+  if artifact_cache_ready "$ARTIFACT_CACHE_ROOT"; then
+    tart_dirs+=(--dir="artifact-cache:$ARTIFACT_CACHE_ROOT:ro")
+    CURRENT_ARTIFACT_CACHE=1
   fi
   tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
     "$vm" >"$boot_log" 2>&1 & rpid=$!

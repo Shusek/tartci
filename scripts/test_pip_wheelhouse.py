@@ -156,7 +156,7 @@ class RunnerWiringTests(unittest.TestCase):
         self.assertIn('GUEST_PIP_WHEELHOUSE="/Volumes/My Shared Files/pip-wheelhouse"', self.body)
 
     def test_preserved_env_cannot_forge_the_declarations(self) -> None:
-        self.assertIn("TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE)$/", self.body)
+        self.assertIn("TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|", self.body)
 
     def test_declared_lease_is_the_size_applied_to_the_clone(self) -> None:
         sized = self.body.index('tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"')
