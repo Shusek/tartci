@@ -217,6 +217,17 @@ def explain_text(payload: dict[str, Any]) -> str:
 
 def cmd_set(pairs: list[str], unset: bool = False) -> int:
     path = host_profile.governor_file_path()
+    try:
+        unparseable = "__invalid__" in host_profile._parse_governor_table(
+            path.read_text(encoding="utf-8")
+        )
+    except OSError:
+        unparseable = False
+    if unparseable:
+        # Rewriting would silently drop every key in the broken file.
+        print(f"governor: {path} is not valid TOML; fix or remove it first "
+              "(the host is running on role defaults until then)", file=sys.stderr)
+        return 2
     values = file_values(path)
     for item in pairs:
         if unset:

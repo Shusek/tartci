@@ -732,7 +732,17 @@ def apply_qos_actions(actions: list[dict[str, Any]]) -> None:
         if host_profile.resolve_system_binary("taskpolicy") is None:
             continue
         for pid in process_tree(int(action["pid"])):
-            run(["taskpolicy", flag, "-p", str(pid)])
+            proc = run(["taskpolicy", flag, "-p", str(pid)])
+            if proc.returncode != 0:
+                # Logged, never fatal: a process that exited between the ps
+                # snapshot and this call is the common case.
+                detail = (proc.stderr or "").strip().splitlines()
+                print(
+                    f"leases: taskpolicy {flag} -p {pid} failed rc={proc.returncode}"
+                    + (f": {detail[-1]}" if detail else "")
+                    + f" (lease {action['summary']['id']})",
+                    file=sys.stderr,
+                )
 
 
 def class_available(
@@ -1916,6 +1926,16 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         already = next((row.get("_reap_reason") for row in reaped
                         if row.get("id") == args.id), None)
         qos_actions = reconcile_borrowers(kept, cfg)
+        # A borrower released while preempted keeps running (a `pulp dev` loop
+        # outlives each build's lease), so its tree must leave background QoS
+        # here: reconcile only sees the records that remain.
+        for record in active:
+            if record.get("id") == args.id and record.get("preempted") is True:
+                pid = record_int(record, "pid")
+                qos_actions.append(
+                    {"pid": pid, "qos": "normal",
+                     "summary": {"id": str(args.id), "qos": "normal", "pid": pid}}
+                )
         write_records(store_dir, kept)
         apply_qos_actions(qos_actions)
         return {

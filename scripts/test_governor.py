@@ -115,6 +115,95 @@ class LendingOffIsTheStaticModel(StoreTestCase):
                     self.assertEqual(rc == 0, static_admits, body)
 
 
+def main_branch_verdict(cfg: dict, current: dict, priority: int, size: int, mem: int) -> tuple:
+    """The admission rule exactly as main had it before build classes (the
+    class-less two-axis check `acquire` inlined), kept verbatim as the oracle."""
+    limit = cfg["total"]
+    used_for_limit = current["used_cores"]
+    if priority < cfg["gate_priority"]:
+        limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
+        used_for_limit = current["non_gate_used_cores"]
+    total_exceeded = current["used_cores"] + size > cfg["total"]
+    class_exceeded = used_for_limit + size > limit
+    mem_on = cfg["total_mem_mb"] > 0
+    mem_limit = cfg["total_mem_mb"]
+    used_mem_for_limit = current.get("used_mem_mb", 0)
+    if priority < cfg["gate_priority"]:
+        mem_limit = max(cfg["per_job_mem_mb"], cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"])
+        used_mem_for_limit = current.get("non_gate_used_mem_mb", 0)
+    mem_exceeded = mem_on and (
+        current.get("used_mem_mb", 0) + mem > cfg["total_mem_mb"]
+        or used_mem_for_limit + mem > mem_limit
+    )
+    return total_exceeded, class_exceeded, mem_exceeded
+
+
+class LendingOffEquivalence(unittest.TestCase):
+    """Differential check of the production admission function against main's
+    rule: with lending off and no --class, every verdict (gate and non-gate,
+    cores and memory, with floor leases in the store) must be identical."""
+
+    def cfg(self, mem_mb: int) -> dict:
+        env = {"TARTCI_GOVERNOR_FILE": "/nonexistent/governor.toml",
+               "TARTCI_FLEET_PROFILE": "/nonexistent/fleet.toml"}
+        with mock.patch.dict(os.environ, env):
+            args = leases.parse_args([
+                "status", "--capacity", str(T), "--reserved-gate-cores", str(S),
+                "--capacity-mem-mb", str(mem_mb), "--reserved-gate-mem-mb", str(mem_mb // 4),
+            ])
+            cfg = leases.capacity_config(args)
+        self.assertEqual(cfg["dynamic_lending"], 0)
+        return cfg
+
+    def test_every_verdict_matches_main(self) -> None:
+        import random
+        rng = random.Random(20260930)
+        checked = 0
+        for mem_mb in (0, 65536):
+            cfg = self.cfg(mem_mb)
+            gate_p = cfg["gate_priority"]
+            for _ in range(400):
+                records = []
+                for index in range(rng.randint(0, 5)):
+                    priority = rng.choice((10, 50, 90, gate_p, gate_p + 10))
+                    record = {"id": f"r{index}", "priority": priority,
+                              "lease_size_cores": rng.randint(1, 8),
+                              "lease_size_mem_mb": rng.randint(1, 20000)}
+                    if rng.random() < 0.2 and priority < gate_p:
+                        record["floor"] = True
+                    records.append(record)
+                current = leases.usage(records, cfg)
+                self.assertEqual(current.get("lent_cores"), 0)
+                for priority in (50, gate_p, gate_p + 5):
+                    for size in range(1, T + 2):
+                        mem = rng.choice((size * cfg["per_job_mem_mb"], rng.randint(1, 70000)))
+                        new = leases.core_and_memory_verdict(cfg, current, priority, size, mem)
+                        self.assertEqual(
+                            (new["total_exceeded"], new["class_exceeded"], new["mem_exceeded"]),
+                            main_branch_verdict(cfg, current, priority, size, mem),
+                            (records, priority, size, mem),
+                        )
+                        checked += 1
+        self.assertGreater(checked, 10000)  # positive control: the loop really ran
+
+
+class LendingOffNonGateMatrix(StoreTestCase):
+    def test_classless_build_admission_matches_static_rule(self) -> None:
+        # The CLI (production acquire) path for non-gate, class-less leases.
+        for fill in range(0, T - S + 1):
+            for size in (1, 3, 6, 7):
+                with self.subTest(fill=fill, size=size):
+                    store = self.store / "leases.json"
+                    for record in json.loads(store.read_text()) if store.exists() else []:
+                        self.cli("release", "--id", record["id"])
+                    if fill:
+                        self.assertEqual(self.acquire("ng", fill)[1], 0)
+                    body, rc = self.acquire("b", size)
+                    self.assertEqual(rc == 0, fill + size <= T - S, body)
+                    self.assertNotIn("build_class", body.get("lease", {}))
+        self.assertEqual(self.qos_actions(), [])
+
+
 class InteractiveBorrowing(StoreTestCase):
     def test_interactive_borrows_idle_gate_reserve_minus_prompt_reserve(self) -> None:
         body, rc = self.acquire("i1", 14, build_class="interactive", min_cores=2, lending="on")
@@ -152,6 +241,18 @@ class InteractiveBorrowing(StoreTestCase):
                          [("i1", "-b"), ("i1", "-B")])
         status, _ = self.cli("status", lending="on")
         self.assertEqual(status["capacity"]["preempted_lease_ids"], [])
+
+    def test_releasing_a_preempted_borrower_restores_its_qos(self) -> None:
+        # The lease owner can outlive its lease (a watch loop), so release must
+        # take it back out of background QoS.
+        self.acquire("i1", 8, build_class="interactive", lending="on")
+        self.gate("g1", 6, lending="on")
+        self.gate("g2", 2, lending="on")
+        self.assertEqual([(a["id"], a["flag"]) for a in self.qos_actions()], [("i1", "-b")])
+        body, rc = self.cli("release", "--id", "i1", lending="on")
+        self.assertEqual(rc, 0, body)
+        self.assertEqual([(a["id"], a["flag"]) for a in self.qos_actions()],
+                         [("i1", "-b"), ("i1", "-B")])
 
     def test_gate_never_admitted_less_than_static_model_with_borrowers(self) -> None:
         # Fill the guaranteed budget with background work, then borrow.
@@ -326,6 +427,21 @@ class GovernorConfig(unittest.TestCase):
         self.assertFalse(p["dynamic_lending"])
         self.assertEqual(p["background_share_cores"], 4)
         self.assertTrue(any("background_share_cores" in x for x in p["governor_problems"]))
+
+    def test_unparseable_file_falls_back_to_defaults_and_says_so(self) -> None:
+        baseline = self.profile(role="dev-overflow")
+        self.gov.write_text("[governor\ndynamic_lending = true\nrole = \"light\"\n")
+        broken = self.profile(role="dev-overflow")
+        if sys.version_info >= (3, 11):
+            self.assertTrue(any(x.startswith("governor_file_unparseable:")
+                                for x in broken["governor_problems"]), broken["governor_problems"])
+        for key in ("lease_capacity_cores", "reserved_gate_cores", "non_gate_capacity_cores",
+                    "dynamic_lending", "background_share_cores", "agent_floor_cores"):
+            self.assertEqual(broken[key], baseline[key], key)
+        if sys.version_info >= (3, 11):
+            with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                self.assertEqual(governor.cmd_set(["background_share_cores=3"]), 2)
+            self.assertIn("[governor\n", self.gov.read_text())  # not overwritten
 
     def test_set_validates_and_round_trips(self) -> None:
         with mock.patch("sys.stdout"):
