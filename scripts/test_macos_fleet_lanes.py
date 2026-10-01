@@ -1766,6 +1766,64 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn(key, result.stderr)
 
+    def test_pre_clone_check_is_a_v2_boolean(self) -> None:
+        key = "assignment_pre_clone_demand_check"
+        base = CONFIG.read_text()
+        self.assertNotIn(key, base)
+        anchor = "assignment_feed_rescue = true"
+        self.assertEqual(base.count(anchor), 1)
+        fixtures = {
+            "wrong-type": base.replace(anchor, f'{anchor}\n{key} = "true"', 1),
+            "int": base.replace(anchor, f"{anchor}\n{key} = 1", 1),
+            "non-v2": base.replace('priority = "vm"', f'priority = "vm"\n{key} = true', 1),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(key, result.stderr)
+            for value, expected in (("true", "1"), ("false", None)):
+                with self.subTest(accepted=value):
+                    path = Path(td) / f"ok-{value}.toml"
+                    path.write_text(base.replace(anchor, f"{anchor}\n{key} = {value}", 1))
+                    rendered = fleet.rendered_plists(fleet.load(path))
+                    pulp_slots = 0
+                    for body in rendered.values():
+                        env = plistlib.loads(body)["EnvironmentVariables"]
+                        if env["TARTCI_QUEUE_LANE_ID"].startswith("m1-pulp-gate"):
+                            pulp_slots += 1
+                            self.assertEqual(env.get("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"), expected)
+                        else:
+                            self.assertNotIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", env)
+                    self.assertEqual(pulp_slots, 2)
+
+    def test_pre_clone_check_canary_is_m3_pulp_gate_only(self) -> None:
+        """One canary host: m3's two pulp-gate slots, and no other shipped
+        host or lane."""
+        env_key = "TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"
+        profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertGreaterEqual(len(profiles), 4)
+        enabled = []
+        for profile in profiles:
+            with self.subTest(profile=profile.name):
+                cfg = fleet.load(profile)
+                for body in fleet.rendered_plists(cfg).values():
+                    env = plistlib.loads(body)["EnvironmentVariables"]
+                    if env_key in env:
+                        enabled.append((profile.name, env["TARTCI_QUEUE_LANE_ID"]))
+                        self.assertEqual(env[env_key], "1")
+                        self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
+        self.assertEqual(sorted(enabled), [
+            ("m3-macos-fleet.toml", "studio-pulp-gate"),
+            ("m3-macos-fleet.toml", "studio-pulp-gate-slot2"),
+        ])
+
     @staticmethod
     def _profile_without_idle_retarget() -> str:
         """The m1 profile with its canary knob removed, so fixtures can inject

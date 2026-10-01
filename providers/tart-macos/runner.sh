@@ -39,6 +39,11 @@
 # selection, so the slot serves the waiting class instead of idling to the
 # full idle timeout. Uncertainty holds; merge-group still wins when both wait.
 # `--print-idle-retarget <tier>` reports that decision as a safe preflight.
+# Pre-clone demand check (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK=1
+# re-asks the pre-mint question live immediately before the clone and skips
+# the clone when the selected class is proven empty or a preferred class
+# waits; an uncertain scan clones as before. `--print-pre-clone-selection
+# <tier>` reports that decision as a safe preflight.
 # Per-slot class preference (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_TIER_ORDER
 # is a comma-separated permutation of the configured class labels. Selection,
 # pre-mint admission, and idle retarget consult classes in that order instead
@@ -217,6 +222,7 @@ PRINT_RUNNER_CONTRACT=""
 PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
+PRINT_PRE_CLONE_SELECTION=""
 PRINT_IDLE_RETARGET=""
 PRINT_FALLBACK_DECISION=""
 PRINT_HIGHER_PRIORITY=""
@@ -276,6 +282,9 @@ SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
+# 1 when the last work entry declined to clone because the opt-in pre-clone
+# demand check found its class empty or a preferred class waiting.
+PRE_CLONE_DEMAND_GONE=0
 # The queued count the loop selected with; the per-job claim reads it.
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
@@ -491,6 +500,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-selection) PRINT_SELECTION=1; shift;;
   --print-assignment-parity) PRINT_ASSIGNMENT_PARITY=1; shift;;
   --print-pre-mint-selection) PRINT_PRE_MINT_SELECTION="$2"; shift 2;;
+  --print-pre-clone-selection) PRINT_PRE_CLONE_SELECTION="$2"; shift 2;;
   --print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;
   --print-fallback-decision) PRINT_FALLBACK_DECISION="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
@@ -1829,6 +1839,7 @@ run_one(){
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
+  PRE_CLONE_DEMAND_GONE=0
   LAST_RUN_LEASE_DENIED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l ip="" rc=0
@@ -1953,6 +1964,16 @@ run_one(){
     fi
   fi
   if [ -z "$CURRENT_VM" ]; then
+    # Opt-in: re-ask the pre-mint question live right before the clone, after
+    # the admission precheck above has spent its time, so demand that another
+    # lane or host took meanwhile costs a scan instead of a clone, a boot and
+    # a discard. Fail-open; see tartci_assignment_v2_pre_clone_skip.
+    if tartci_assignment_v2_pre_clone_check_enabled \
+       && tartci_assignment_v2_pre_clone_skip "$selected_tier" "$selected_labels"; then
+      PRE_CLONE_DEMAND_GONE=1
+      note "[$i] selected class demand is gone or a preferred class is waiting (${ASSIGNMENT_V2_PRE_MINT_BLOCKER}) — not cloning"
+      return 75
+    fi
     reclaim_runner_name "$vm" "$selected_runner_api_root"
     sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
     lease_rc=0
@@ -2219,6 +2240,14 @@ i=0
   else printf '0\n'; printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2; fi
   exit 0
 }
+[ -n "$PRINT_PRE_CLONE_SELECTION" ] && {
+  # The pre-clone decision as a safe preflight, independent of the opt-in knob:
+  # 1 means the lane would clone for this tier now, 0 means it would not.
+  if tartci_assignment_v2_pre_clone_skip "$PRINT_PRE_CLONE_SELECTION"; then printf '0\n'
+    printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2
+  else printf '1\n'; fi
+  exit 0
+}
 [ -n "$PRINT_IDLE_RETARGET" ] && {
   # The same decision the idle-wait loop makes, minus its interval gating: 1
   # means an idle runner of this tier would be discarded to serve another
@@ -2431,7 +2460,8 @@ if [ "$LOOP" = 1 ]; then
       # per error: a lane that alternates a failure with a served job never
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
-      if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ]; then
+      if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
+         || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
