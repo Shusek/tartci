@@ -39,6 +39,18 @@ this receipt; do not create it by hand. Persistent-runner drains therefore stay
 fail-closed until an authoritative producer is deployed. `pool off` remains
 immediate and may terminate work.
 
+**How the slots were used** comes from `tartci pool status --usage [--range 24h]
+[--until TS] [--json] [--peer HOST=SSH_TARGET]` (read-only; `pool status` prints
+a one-line summary). From the lane event logs it reports per lane, host and
+fleet: slot occupancy (VM-minutes against slots x window), idle-with-demand (a
+lane saw matching queued work, did not boot, and a VM slot was free), full-host
+wait, VMs discarded without a job by cause, lease denials by axis and lease-fit
+hold time. Demand is sampled by the per-poll `demand_waiting` event; before it
+existed only the yield branches sampled demand, so older windows are a lower
+bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
+and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
+needs no tartci update to be read.
+
 Both `drain` and `off` run a **capacity floor** first
 (`scripts/capacity_floor.py`): they refuse when no host other than this one
 serves a required gate label, because that mutation takes the label to zero
