@@ -66,7 +66,7 @@ HOST_KEYS = {
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
     "ssh",
-    "agent_floor_cores", "agent_floor_pool_cores",
+    "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -369,6 +369,9 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    agent_floor_qos = host.get("agent_floor_qos")
+    if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
+        fail('host.agent_floor_qos must be "utility" or "background"')
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:

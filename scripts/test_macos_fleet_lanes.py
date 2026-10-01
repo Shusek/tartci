@@ -1564,6 +1564,8 @@ class MacosFleetLaneTests(unittest.TestCase):
             ),
             "wrong-type": (f'{knob}\nagent_floor_cores = "6"', 2),
             "negative": (f"{knob}\nagent_floor_cores = -1", 2),
+            "qos-utility": (f'{knob}\nagent_floor_qos = "utility"', 0),
+            "qos-unknown": (f'{knob}\nagent_floor_qos = "maintenance"', 2),
         }
         with tempfile.TemporaryDirectory() as td:
             for name, (replacement, expected) in cases.items():
