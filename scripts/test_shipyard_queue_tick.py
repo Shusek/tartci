@@ -62,6 +62,10 @@ elif [ "$1 $2" = "merge-queue status" ]; then
 elif [ "$1 $2" = "ship-state list" ]; then
   printf '%s\\n' "$STATES"
 elif [ "$1 $2" = "ship-state discard" ]; then
+  if [ "$FAKE_NO_REPO_FLAG" = "1" ] && [ "$4" = "--repo" ]; then
+    printf "error: unexpected argument '--repo' found\\n" >&2
+    exit 2
+  fi
   [ -z "$DISCARD_ERROR" ] || printf '%s\\n' "$DISCARD_ERROR" >&2
   exit "$DISCARD_RC"
 else
@@ -81,6 +85,9 @@ case "$*" in
     exit "$GH_REPO_RC"
     ;;
   *"--json state"*)
+    case "$*" in
+      *"--repo $GH_MERGED_REPO "*) [ -n "$GH_MERGED_REPO" ] && { printf 'MERGED\\n'; exit 0; } ;;
+    esac
     printf '%s\\n' "$GH_STATE"
     printf '%s\\n' "$GH_STATE_ERROR" >&2
     exit "$GH_STATE_RC"
@@ -111,6 +118,8 @@ exit 98
                     "GH_STATE_RC": str(gh_state_rc),
                     "GH_STATE_ERROR": gh_state_error,
                     "GH_REPO_RC": "0",
+                    "FAKE_NO_REPO_FLAG": "0",
+                    "GH_MERGED_REPO": "",
                 }
             )
             if legacy_full_live:
@@ -200,6 +209,37 @@ exit 98
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("reaped (MERGED)", result.stdout)
         self.assertIn("ship-state discard 42", calls)
+
+    def test_a_shared_pr_number_archives_only_that_repos_record(self) -> None:
+        # Shipyard 0.254.0 refuses a bare PR number two repositories share.
+        states = [dict(self.stale_open_state()[0], repo="owner/a"),
+                  dict(self.stale_open_state()[0], repo="owner/b")]
+        result, calls, _ = self.run_tick(
+            held=False, states=states, gh_state="OPEN",
+            extra_env={"GH_MERGED_REPO": "owner/a"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        discards = [line for line in calls.splitlines() if line.startswith("ship-state discard")]
+        self.assertEqual(discards, ["ship-state discard 42 --repo owner/a"])
+        self.assertIn("owner/b#42: open", result.stdout)
+
+    def test_a_shipyard_without_repo_falls_back_to_the_bare_discard(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, states=self.stale_open_state(), gh_state="MERGED",
+            extra_env={"FAKE_NO_REPO_FLAG": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        discards = [line for line in calls.splitlines() if line.startswith("ship-state discard")]
+        self.assertEqual(discards, ["ship-state discard 42 --repo owner/repo",
+                                    "ship-state discard 42"])
+        self.assertIn("reaped (MERGED)", result.stdout)
+
+    def test_any_other_discard_failure_is_not_retried_bare(self) -> None:
+        # Control: only an unrecognised --repo falls back. A new Shipyard that
+        # refuses for a real reason must not be retried without the repo.
+        result, calls, _ = self.run_tick(
+            held=False, states=self.stale_open_state(), gh_state="MERGED",
+            discard_rc=8, discard_error="ship-state for #42 is locked by another writer")
+        discards = [line for line in calls.splitlines() if line.startswith("ship-state discard")]
+        self.assertEqual(discards, ["ship-state discard 42 --repo owner/repo"])
 
     def test_failed_discard_names_its_reason(self) -> None:
         result, _, _ = self.run_tick(

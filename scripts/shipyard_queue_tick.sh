@@ -184,10 +184,18 @@ MODE="dry-run"; [ "$APPLY" = "1" ] && MODE="reap"
 log "$HOST: $total active record(s); mode=$MODE${LEGACY_NOTE:+ ($LEGACY_NOTE: SHIPYARD_TICK_REAP_ONLY=0 / SHIPYARD_QUEUE_AUTHORITY=1 no longer merge anything; this tick only reaps)}"
 reaped=0; open=0; stalled=0; live=0; errs=0
 
-# Reap one record; a failed discard names its reason.
+# Reap one record; a failed discard names its reason. The record is named by
+# repo and PR: from Shipyard 0.254.0 a bare PR number that two repositories
+# share is refused, and with --repo only that repository's record is archived.
+# A Shipyard that predates --repo rejects the flag as an unexpected argument;
+# only then is the bare form used, which is what it accepted before.
 discard() {
-  local pr="$1" error="$TMP/discard-$1.err"
-  if "$SY" ship-state discard "$pr" >/dev/null 2>"$error"; then
+  local pr="$1" repo="$2" error="$TMP/discard-$1.err"
+  if "$SY" ship-state discard "$pr" --repo "$repo" >/dev/null 2>"$error"; then
+    return 0
+  fi
+  if grep -q "unexpected argument '--repo'" "$error" 2>/dev/null \
+    && "$SY" ship-state discard "$pr" >/dev/null 2>"$error"; then
     return 0
   fi
   DISCARD_REASON="$(first_line "$error")"
@@ -227,7 +235,7 @@ while IFS=$'\t' read -r pr repo hbe; do
       count="$(invalid_count "$repo" "$pr" not_found 2>/dev/null)" \
         || unhealthy "invalid-ledger not-found update failed for $repo#$pr"
       if [ "$count" -ge "$INVALID_THRESHOLD" ] 2>/dev/null; then
-        if discard "$pr"; then
+        if discard "$pr" "$repo"; then
           invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
             || unhealthy "invalid-ledger reset failed after durable discard for $repo#$pr"
           log "  $repo#$pr: quarantined recoverably after $count confirmed not-found reads"
@@ -253,7 +261,7 @@ while IFS=$'\t' read -r pr repo hbe; do
   case "$state" in
     MERGED|CLOSED)
       if [ "$APPLY" = "1" ]; then
-        if discard "$pr"; then
+        if discard "$pr" "$repo"; then
           log "  $repo#$pr: reaped ($state)"
           reaped=$((reaped+1))
         else
