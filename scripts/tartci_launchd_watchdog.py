@@ -1210,6 +1210,11 @@ def main(argv: list[str] | None = None) -> int:
         tick_line = queue_tick_pass()
         if tick_line:
             print(tick_line)
+        try:
+            import power_status  # noqa: PLC0415 - sibling module
+            power_status.refresh_sleep_events()
+        except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+            print(f"{_iso(utcnow())} launchd-watchdog: WARN sleep count refresh failed: {exc}")
     config = config_verdicts(args.fleet_config, args.fleet_receipt)
     config_summary = config_problem(config)
     config["warned"] = False

@@ -358,6 +358,15 @@ class Base(unittest.TestCase):
         # No [peers]: targets come from the published supply.
         self.cfg = su.Config(home=self.home, poll_seconds=45, wait_seconds=600)
         self.sys = FakeSystem(self.home, sealed=self.sealed)
+        # Starvation opens and closes a GitHub issue through host_off; record,
+        # never call ghapp.
+        import host_off
+        self.issues: list[tuple[str, str]] = []
+        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t)) or (0, "77")),
+                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed"))):
+            original = getattr(host_off, name)
+            setattr(host_off, name, fake)
+            self.addCleanup(setattr, host_off, name, original)
         if self.sealed:
             helper = {"path": str(self.home / "libexec" / "TartCILauncher.app"),
                       "approval_sha256_path": str(self.home / ".config/tartci/m3-launcher-approved.sha256")}
@@ -661,6 +670,19 @@ class UpdateQueueTests(Base):
         self.assertTrue(any("STARVED" in line for line in su.status_lines(self.cfg.state_dir)))
         self.assertIn("STARVED", su.summary(self.home)["problem"])
 
+    def test_starvation_opens_one_issue_and_the_next_turn_closes_it(self) -> None:
+        # 2026-10-01: three hosts starved for 7-9 h and wrote events nobody read.
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("self-update starved", self.issues[0][1])
+        self.assertEqual(su.waiting_ticket(self.cfg)["issue"], "77")
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.issues[-1], ("close", "77"))
+
     def test_a_short_deferral_is_quiet(self) -> None:
         # Control for the bound: the same deferral an hour in is not a problem.
         self.ticket(since=NOW - 3600)
@@ -669,6 +691,7 @@ class UpdateQueueTests(Base):
         self.assertFalse((self.cfg.state_dir / "events.jsonl").exists()
                          and "self_update_starved" in (self.cfg.state_dir / "events.jsonl").read_text())
         self.assertIsNone(su.summary(self.home)["problem"])
+        self.assertEqual(self.issues, [])
 
 
 class AnnounceOrderTests(Base):
@@ -712,6 +735,16 @@ class PoolOffRefusalTests(Base):
                     for path in (self.cfg.state_dir / "attempts").glob("*.json")]
         self.assertEqual([r["status"] for r in receipts], ["refused"])
         self.assertIn("pool off refused (exit 11)", receipts[0]["error"])
+        self.assertIsNone(su.halt_reason(self.cfg.state_dir))
+        self.sys.off_rc = 0
+        self.assertUpdated(self.apply())
+
+    def test_lanes_launchd_still_holds_are_a_refusal_too(self) -> None:
+        # m5studio, 2026-10-01 10:51Z: "launchd still holds ... forge-gate
+        # after 40s" (exit 13) was recorded as a failed update and spent 6 h.
+        self.sys.off_rc = 13
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
         self.assertIsNone(su.halt_reason(self.cfg.state_dir))
         self.sys.off_rc = 0
         self.assertUpdated(self.apply())

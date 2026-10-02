@@ -124,8 +124,10 @@ EXIT_REFUSED = 3       # a precondition refused; the host was not touched
 EXIT_DEFERRED = 0
 # `tartci pool off` exits these when a precondition refuses before it stops
 # anything: 11 the capacity floor (including an unreadable census), 12 a lane
-# that could not be proven idle.
-POOL_OFF_REFUSALS = (11, 12)
+# that could not be proven idle, 13 lanes launchd still held after the unload
+# wait (m5studio, 2026-10-01: "launchd still holds ... forge-gate after 40s").
+# In every case nothing was installed and the recovery puts the pool back on.
+POOL_OFF_REFUSALS = (11, 12, 13)
 EXIT_FAILED = 4        # a mutation ran and failed; see the receipt for what was restored
 EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
@@ -746,13 +748,41 @@ def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> 
     ticket = waiting_ticket(cfg) or {}
     since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
     ticket = {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
-              "starved_evented": ticket.get("starved_evented")}
+              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue")}
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return ticket
 
 
 def clear_waiting(cfg: Config) -> None:
+    ticket = waiting_ticket(cfg) or {}
+    if ticket.get("issue"):
+        # The host has its turn again: the starvation issue closes itself.
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        host_off._close_issue(str(ticket["issue"]))
     (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
+
+
+def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str) -> None:
+    """Once per episode, a GitHub issue: the event log alone was read by nobody.
+
+    During the 2026-10-01 stall three hosts crossed the bound and wrote
+    self_update_starved, and nobody saw it for hours. Best effort, like
+    host_off: a failure is recorded on the ticket and retried next run.
+    """
+    if ticket.get("issue") or os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    title = (f"[tartci] {me} self-update starved for {waited / 3600:.1f} h "
+             f"since {_iso(float(ticket['since']))}")
+    body = (f"{me} has deferred its tartci self-update for {waited / 3600:.1f} h: {reason}\n\n"
+            "A busy, unreachable or longer-waiting peer holds the update turn. Check "
+            "`tartci pool status` on every host. This issue closes itself when the host "
+            "gets its turn.")
+    rc, text = host_off._open_issue(title, body)
+    if rc == 0 and text.strip().isdigit():
+        ticket["issue"] = text.strip()
+    else:
+        ticket["issue_error"] = text[:300]
 
 
 def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
@@ -770,7 +800,8 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
                        f"no update turn for {waited / 3600:.1f} h: {reason[:200]}",
                        {"since": _iso(float(ticket["since"])), "target": target[:12]}, now)
         ticket["starved_evented"] = now
-        _write_json(cfg.state_dir / "waiting.json", ticket)
+    starvation_issue(cfg, me, ticket, waited, reason)
+    _write_json(cfg.state_dir / "waiting.json", ticket)
     return EXIT_REFUSED
 
 
