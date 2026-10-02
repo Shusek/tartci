@@ -204,6 +204,25 @@
     "power_ok": {
       "summary": "The host never sleeps on AC power (pmset AC `sleep` is 0)."
     },
+    "signing_prompts_not_applicable": {
+      "summary": "No dedicated signing keychain is configured on this host (no ~/.config/pulp/secrets/keychain.env).",
+      "why": "Nothing on this host signs unattended, so there is no keychain to keep from prompting."
+    },
+    "signing_prompts_ok": {
+      "summary": "Only the dedicated signing keychain and login are on the user search list, the dedicated keychain unlocks with keychain.env's password, and it does not re-lock on its own.",
+      "why": "Read without prompting: list-keychains, then unlock-keychain -p, and only then show-keychain-info."
+    },
+    "signing_prompts_risk": {
+      "summary": "This host's keychain setup can put a password dialog on screen.",
+      "why": "A process in the GUI session that touches a locked non-login keychain makes securityd start SecurityAgent and ask for that keychain's password, which only keychain.env holds. On 2026-10-02 a legacy pulp-signing keychain beside its -unattended replacement, walked by an unpinned codesign, put such dialogs on m5studio at each self-update attempt.",
+      "remedy": "Run `pulp ship doctor` on the host. Then keep only the dedicated keychain and login on the search list (`security list-keychains -d user -s <dedicated> ~/Library/Keychains/login.keychain-db`), leaving the legacy file on disk.",
+      "do_not": "Never answer the dialog, never type a password into it, and never put the login keychain to work for signing."
+    },
+    "signing_prompts_unknown": {
+      "summary": "The keychain setup could not be read.",
+      "why": "An unreadable search list cannot be told apart from a safe one.",
+      "remedy": "Run `python3 scripts/signing_prompt_guard.py --json` on the host and read the detail."
+    },
     "power_sleeps": {
       "summary": "The host is configured to sleep after N idle minutes on AC power.",
       "why": "A sleeping Mac takes its runners, SSH, lease store and VMs with it while launchd still reports every lane loaded. m5studio ran for days with the setting off and spent 4-6 hours a day asleep. `pmset -g` can print `sleep N (sleep prevented by ...)` while an app holds an assertion, which hides it until that app lets go.",

@@ -1209,6 +1209,8 @@ EOF
         python3 "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
         python3 "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
         python3 "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
+        python3 "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
+          || echo "signing prompts: UNREADABLE"
         # The readiness payload is already computed above; JSON formatting does
         # not require tomllib, so legacy/unmanaged hosts can still report status.
         python3 - "$lock_health_json" <<'PY'

@@ -86,6 +86,10 @@ CODES: tuple[str, ...] = (
     "power_ok",
     "power_sleeps",
     "power_unknown",
+    "signing_prompts_not_applicable",
+    "signing_prompts_ok",
+    "signing_prompts_risk",
+    "signing_prompts_unknown",
     "profile_drift",
     "profile_drift_unknown",
     "profile_in_sync",
@@ -911,6 +915,28 @@ def check_power(value: dict | None) -> Finding:
     return Finding("power", UNKNOWN, "power_unknown", detail, facts)
 
 
+def check_signing_prompts(value: dict | None, home: Path) -> Finding:
+    """Whether the keychain setup can raise a password dialog (signing_prompt_guard.py)."""
+    import signing_prompt_guard
+
+    if value is None:
+        try:
+            value = signing_prompt_guard.status(home)
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            value = {"state": "unknown", "detail": str(exc)}
+    facts = {"signing_prompts": value}
+    state = value.get("state")
+    if state == "not_applicable":
+        return Finding("signing_prompts", NOT_APPLICABLE, "signing_prompts_not_applicable",
+                       "no dedicated signing keychain configured", facts)
+    detail = signing_prompt_guard.describe(value)
+    if state == "ok":
+        return Finding("signing_prompts", OK, "signing_prompts_ok", detail, facts)
+    if state == "risk":
+        return Finding("signing_prompts", PROBLEM, "signing_prompts_risk", detail, facts)
+    return Finding("signing_prompts", UNKNOWN, "signing_prompts_unknown", detail, facts)
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -1130,6 +1156,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
             power_value: dict | None = None,
+            signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
@@ -1227,6 +1254,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unknown
             power_value = {"state": "unknown", "error": str(exc)}
     findings.append(check_power(power_value))
+    findings.append(check_signing_prompts(signing_prompts_value, home))
 
     def default_tmp_probe(profile: Path) -> tuple[dict | None, str]:
         import pulp_reapers

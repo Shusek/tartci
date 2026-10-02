@@ -1,12 +1,16 @@
 #!/bin/bash
 set -euo pipefail
-usage(){ echo "usage: $0 --output PATH.app --approval-output PATH --identity STRING --support-root PATH --profile PATH" >&2; exit 64; }
-output="" approval_output="" identity="" support_root="" profile=""
+usage(){ echo "usage: $0 --output PATH.app --approval-output PATH --identity STRING --support-root PATH --profile PATH [--keychain PATH]" >&2; exit 64; }
+output="" approval_output="" identity="" support_root="" profile="" keychain=""
 while [[ $# -gt 0 ]]; do case "$1" in
   --output) output="${2:-}"; shift 2;; --identity) identity="${2:-}"; shift 2;;
   --approval-output) approval_output="${2:-}"; shift 2;;
   --support-root) support_root="${2:-}"; shift 2;;
-  --profile) profile="${2:-}"; shift 2;; *) usage;; esac; done
+  --profile) profile="${2:-}"; shift 2;;
+  --keychain) keychain="${2:-}"; shift 2;; *) usage;; esac; done
+# Name the keychain when given: a bare --sign walks the search list, and a
+# locked keychain there raises a password dialog in the GUI session.
+keychain_args=(); [[ -n "$keychain" ]] && keychain_args=(--keychain "$keychain")
 [[ -n "$output" && -n "$approval_output" && -n "$identity" && -n "$support_root" && -n "$profile" ]] || usage
 [[ "$output" = /* && "$output" == *.app && "$approval_output" = /* ]] || { echo "output and approval-output must be absolute, with output ending in .app" >&2; exit 64; }
 [[ ! -e "$output" && ! -L "$output" && ! -e "$approval_output" && ! -L "$approval_output" ]] || { echo "refusing to replace existing output" >&2; exit 73; }
@@ -76,7 +80,7 @@ cat >"$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>tartci-launcher</string><key>CFBundleIdentifier</key><string>com.danielraffel.tartci.launcher</string><key>CFBundleName</key><string>TartCI Launcher</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSBackgroundOnly</key><true/><key>NSRemovableVolumesUsageDescription</key><string>TartCI uses an external volume for isolated local CI virtual machines.</string></dict></plist>
 PLIST
 xcrun swiftc -O -whole-module-optimization -target arm64-apple-macos13 -framework Security "$support_root/native/macos/tartci-launcher/main.swift" -o "$app/Contents/MacOS/tartci-launcher"
-/usr/bin/codesign --force --timestamp --options runtime --sign "$identity" --identifier com.danielraffel.tartci.launcher "$app"
+/usr/bin/codesign --force --timestamp --options runtime ${keychain_args[@]+"${keychain_args[@]}"} --sign "$identity" --identifier com.danielraffel.tartci.launcher "$app"
 /usr/bin/codesign --verify --strict --deep --verbose=2 "$app"; mv "$app" "$output"
 python3 - "$root" "$output" "$approval_output" <<'PY'
 import os, sys
