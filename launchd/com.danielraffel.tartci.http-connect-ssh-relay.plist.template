@@ -45,11 +45,17 @@
         <string>crates.io</string>
         <string>--allow-host-suffix</string>
         <string>sigstore.dev</string>
+        <string>--log-path</string>
+        <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- A relay that cannot bind (another process holds the port) exits 75;
+         KeepAlive respawns any exit, so this spaces those retries. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
     <key>StandardOutPath</key>
     <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
     <key>StandardErrorPath</key>
