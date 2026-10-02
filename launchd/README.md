@@ -437,6 +437,47 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
 ```
 
+## Schedule backstop for throttled safety-net crons
+
+GitHub delays `schedule` events under load and drops the ones that pile up. On
+Generous-Corp/pulp every hourly-or-faster cron fires about once every five
+hours (7 or 8 runs in 41 h for a `*/15` or `*/30` workflow), while daily crons
+still fire daily, five to seven hours late. Run numbers stay contiguous, so the
+runs are never created; nothing in the repository disables them.
+
+`com.danielraffel.pulp.schedule-backstop.plist.template` runs
+`scripts/schedule_backstop.py` every 300 s. It reads the repository's
+`.github/schedule-backstop.json` (kept consistent with each workflow's cron,
+dispatch inputs, concurrency group, and hosted runner by the repository's
+`schedule_backstop_check.py`) and calls `workflow_dispatch` on a listed
+workflow when the newest run on `main`, from any event, is at least
+`cadence_minutes` old, none is queued or running, and this agent has not
+dispatched it within the cadence. It only dispatches: runs stay on
+GitHub-hosted runners and the crons stay as a backstop, so off, erroring, or
+host-down means exactly today's behaviour.
+
+Run reads deliberately omit the server-side `branch=` filter: a cold
+`branch=main` read intermittently returns a page weeks old, which would read as
+overdue. The ref is selected client-side from an unfiltered page instead.
+
+Install on exactly one always-on host. Dry-run first (`TARTCI_BACKSTOP_APPLY=0`,
+the default, logs `would_dispatch` paced as apply would pace it); go live with
+`TARTCI_BACKSTOP_APPLY=1` and `TARTCI_BACKSTOP_AUTHORITY=1`. Steady state is
+about 50 App API calls per hour. Decision logic is covered hermetically by
+`scripts/test_schedule_backstop.py`. Install:
+
+```
+mkdir -p "$HOME/Library/Logs"
+sed -e "s|\$HOME|$HOME|g" \
+  launchd/com.danielraffel.pulp.schedule-backstop.plist.template \
+  > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
+launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.schedule-backstop"
+```
+
+Judge it by runs per listed workflow per day against `1440 / cadence_minutes`,
+with total Actions runs and minutes as the control.
+
 ## Release CLI macOS launchd rule
 
 `Release CLI` is a different workload from `Build and Test`, so serve it with a
