@@ -755,6 +755,67 @@ class PoolOffRefusalTests(Base):
         self.assertEqual(self.last()["status"], "failed")
 
 
+class OffPeerTests(Base):
+    """A peer that is OFF and not updating is left to the capacity floor.
+
+    m5studio was off for a store move from 19:04Z to 06:14Z on 2026-10-01/02,
+    and every other host refused on it: 11.3 h of fleet-wide starvation.
+    """
+
+    OFF = {"state": "off", "participating": False}
+    LABEL = OnDemandSupplyTests.LABEL
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The on-demand fixture: the label is this host's to serve, and only
+        # peers that publish it and are fully healthy can cover it.
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"repo": "Generous-Corp/pulp", "label": self.LABEL, "verdict": "last_serving_host"}]}
+        self.sys.published["registrations"] = [
+            {"host_id": "m1", "repo": "Generous-Corp/pulp", "labels": ["pulp-build", self.LABEL]},
+            {"host_id": "m5", "repo": "Generous-Corp/pulp", "labels": ["pulp-build", self.LABEL]},
+            {"host_id": "studio", "repo": "Generous-Corp/pulp", "labels": ["pulp-build"]},
+        ]
+        self.sys.peers["m3"] = healthy_peer()
+
+    def test_an_off_peer_with_the_floor_satisfied_proceeds(self) -> None:
+        # studio also publishes the label and is healthy, so draining this
+        # host leaves it served even with m5 counted as absent.
+        self.sys.published["registrations"][2]["labels"].append(self.LABEL)
+        self.sys.peers["m5"] = self.OFF
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        peers = next(step for step in receipt["steps"] if step["step"] == "peers")
+        self.assertIn("off and not updating", peers["detail"])
+        self.assertIn("m5", peers["detail"])
+
+    def test_an_off_peer_with_the_floor_broken_refuses(self) -> None:
+        # Only m5 publishes the label: with m5 off, draining this host would
+        # take it to zero.
+        self.sys.peers["m5"] = self.OFF
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_off_peer_that_is_mid_update_still_refuses(self) -> None:
+        self.sys.published["registrations"][2]["labels"].append(self.LABEL)
+        self.sys.peers["m5"] = self.OFF
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 60}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_draining_peer_still_refuses(self) -> None:
+        self.sys.published["registrations"][2]["labels"].append(self.LABEL)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_off_peer_holds_no_place_in_the_queue(self) -> None:
+        self.sys.published["registrations"][2]["labels"].append(self.LABEL)
+        self.sys.peers["m5"] = self.OFF
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 9 * 3600, "ts": NOW - 60}
+        self.assertUpdated(self.apply())
+
+
 class MidJobWaitTests(Base):
     def test_waits_while_mid_job_then_proceeds(self) -> None:
         self.sys.offplan = [12, 12, 0]
@@ -796,7 +857,7 @@ class InstallFailureTests(Base):
         self.assertUpdated(self.apply())
 
     def test_refusal_does_not_spend_the_attempt(self) -> None:
-        self.sys.peers["m5"] = {"state": "off", "participating": False}
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
         self.sys.peers["m5"] = {"state": "on", "participating": True}
         self.assertUpdated(self.apply())
@@ -1160,7 +1221,7 @@ class RecordTests(Base):
         self.assertUpdated(self.apply())
 
     def test_old_refusal_receipts_are_pruned(self) -> None:
-        self.sys.peers["m5"] = {"state": "off", "participating": False}
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
         self.assertEqual(len(list((self.cfg.state_dir / "attempts").glob("*.json"))), 1)
         self.sys.clock += 8 * 86400

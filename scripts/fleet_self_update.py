@@ -16,8 +16,10 @@ no new mechanics; every step is a command that already exists:
      launcher build (signing identity EXTRACTED from the live bundle's leaf
      certificate) plus its verification. Nothing on the host changes yet.
   3. One host at a time, in queue order: read every other published host's
-     pool state, self-update marker and waiting ticket over SSH. Any peer not
-     `on`, or updating, or waiting longer than this host, DEFERS this host: it
+     pool state, self-update marker and waiting ticket over SSH. A peer that
+     is draining, unreadable, updating, or waiting longer than this host
+     DEFERS this host. A peer that is OFF and not updating does not: the
+     capacity floor (step 4) counts it as serving nothing. A deferred host
      keeps its place (waiting.json), exits 0, and becomes loud (exit 3, a
      self_update_starved event) only past STARVED_AFTER_SECONDS. Then
      announce, settle, and re-read: of two hosts updating at once the earlier
@@ -652,11 +654,19 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     """One peer's pool state, update marker and waiting ticket.
 
     {"busy": bool, "evidence": str, "active_age": seconds | None,
-     "waited": seconds | None}. Ages are computed on the PEER's clock, so host
-    clock skew cannot make a live marker look stale or a long wait look short.
-    Unreachable or unreadable peers are busy: fail closed.
+     "waited": seconds | None, "off": bool}. Ages are computed on the PEER's
+    clock, so host clock skew cannot make a live marker look stale or a long
+    wait look short. Unreachable or unreadable peers are busy: fail closed.
+
+    A peer that is OFF with no live update marker is not busy: it is out of
+    service on purpose (m5studio, off for a store move on 2026-10-01, blocked
+    every other host's update for 11 h). It is marked `off`, and whether this
+    host may still go out is the capacity floor's call, which counts an off
+    host as serving nothing. Draining, unreadable or updating peers still
+    refuse.
     """
-    out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "waited": None}
+    out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "waited": None,
+                           "off": False}
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
@@ -677,7 +687,8 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
         # A peer that stopped refreshing its ticket has stopped trying.
         if isinstance(ticket, dict) and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL:
             out["waited"] = max(0.0, clock - float(ticket.get("since", clock)))
-    if value.get("state") != "on" or value.get("participating") is not True:
+    is_off = value.get("state") == "off"
+    if not is_off and (value.get("state") != "on" or value.get("participating") is not True):
         out["evidence"] = (f"peer {host_id} is {value.get('state')} "
                            f"(participating={value.get('participating')})")
         return out
@@ -694,6 +705,10 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
         out.update(evidence=f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}",
                    active_age=max(0.0, clock - float(active.get("ts", 0))))
         return out
+    if is_off:
+        out.update(busy=False, off=True,
+                   evidence=f"peer {host_id} is off and not updating (left to the capacity floor)")
+        return out
     out.update(busy=False, evidence=f"peer {host_id} on, not updating")
     return out
 
@@ -708,19 +723,29 @@ def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
     return survey_peers(cfg, sys_, me)[0]
 
 
-def survey_peers(cfg: Config, sys_: System, me: str) -> tuple[list[str], dict[str, float]]:
-    """(why each busy peer is busy, {peer: seconds it has waited for its turn})."""
+def survey_peers(cfg: Config, sys_: System,
+                 me: str) -> tuple[list[str], dict[str, float], list[str]]:
+    """(why each busy peer is busy, {peer: seconds it has waited}, off peers).
+
+    An off peer neither blocks nor holds a place in the queue: it cannot take
+    a turn while it is off, and yielding to it would stall the fleet the same
+    way refusing on it did.
+    """
     busy: list[str] = []
     waiting: dict[str, float] = {}
+    off: list[str] = []
     for peer, target in published_peers(cfg, sys_).items():
         if peer == me:
             continue
         info = read_peer(cfg, sys_, peer, target)
         if info["busy"]:
             busy.append(info["evidence"])
+        elif info.get("off"):
+            off.append(peer)
+            continue
         if info["waited"] is not None:
             waiting[peer] = info["waited"]
-    return busy, waiting
+    return busy, waiting, off
 
 
 def queue_ahead(me: str, my_wait: float, waiting: dict[str, float]) -> list[str]:
@@ -1437,7 +1462,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy, waiting = survey_peers(cfg, sys_, me)
+        busy, waiting, off = survey_peers(cfg, sys_, me)
         ticket = waiting_ticket(cfg)
         my_wait = max(0.0, now - float(ticket["since"])) if ticket else 0.0
         ahead = queue_ahead(me, my_wait, waiting)
@@ -1455,7 +1480,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             refusals.append(refusal)
             receipt.step("peers", refusal, ok=False)
         else:
-            receipt.step("peers", "every other published host is on and not updating")
+            receipt.step("peers", "every other published host is on and not updating"
+                         + (f"; off and not updating, so counted as serving nothing by the "
+                            f"capacity floor: {', '.join(off)}" if off else ""))
         allow = False
         try:
             allow, rule = floor_decision(cfg, sys_, me)
