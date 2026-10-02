@@ -399,6 +399,10 @@ cmd_artifact_cache() { exec "$HERE/scripts/artifact-cache.sh" "$@"; }
 # LaunchAgent runs it at login and every 15 minutes).
 cmd_keychain_unlock() { tartci_toml_exec "$HERE/scripts/keychain_unlock.py" "$@"; }
 
+# The GitHub-hosted queue-saturation detector, run from the installed
+# generation so its launchd agent follows self-updates.
+cmd_queue_saturation() { tartci_toml_exec_or_python3 "$HERE/scripts/gh_queue_saturation.py" "$@"; }
+
 # `tartci ccache <scan|quarantine|reset> [--host-cache | --cache DIR] ...`
 # --host-cache (the default when --cache is absent) is the cache the macOS gate
 # VMs mount: ${TARTCI_CI_CACHE:-~/.cache/pulp-ci}/ccache.
@@ -1366,6 +1370,7 @@ case "${1:-help}" in
   reclaim) shift; cmd_reclaim "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
+  queue-saturation) shift; cmd_queue_saturation "$@" ;;
   ccache)  shift; cmd_ccache "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;

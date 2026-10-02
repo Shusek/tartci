@@ -413,7 +413,8 @@ reports busy or returns unknown state, stop; do not replace the registration.
 ## GitHub-hosted queue-saturation detector
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
-`scripts/gh_queue_saturation.py` on a `StartInterval` (default 300s) to catch the
+`scripts/gh_queue_saturation.py` (as `tartci queue-saturation`, from the
+installed generation) on a `StartInterval` (default 300s) to catch the
 inverse of a wedge: the required self-hosted gate sits **online and idle** while
 its GitHub-hosted routing preamble is starved behind a saturated shared pool, so
 the required check reads `pending` for reasons that have nothing to do with the
@@ -436,6 +437,10 @@ sed -e "s|\$HOME|$HOME|g" \
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.queue-saturation.plist"
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
 ```
+
+After install, the launchd watchdog keeps a loaded copy rendered from this
+template (keeping the host's `PULP_SAT_*` values), so a template change reaches
+the host on its next self-update without a hand re-render.
 
 ## Schedule backstop for throttled safety-net crons
 
