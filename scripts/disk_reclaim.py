@@ -71,6 +71,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Iterable
 
@@ -191,7 +192,7 @@ def nested_source_marker(
         if depth >= maxdepth:
             continue
         try:
-            entries = list(os.scandir(current))
+            entries = bounded_scandir(current)
         except OSError as error:
             if error.errno in UNMEASURABLE_ERRNOS:
                 return None, False
@@ -229,7 +230,7 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
             if depth >= maxdepth:
                 continue
             try:
-                entries = list(os.scandir(current))
+                entries = bounded_scandir(current)
             except OSError:
                 continue
             for entry in entries:
@@ -249,7 +250,47 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
 # files under the scan, so an entry vanishing mid-walk is routine AND is
 # positive evidence the tree is busy. Treating that as unmeasured would make
 # the hourly pass report unknown on every busy host.
-UNMEASURABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EIO, errno.ELOOP})
+UNMEASURABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EIO, errno.ELOOP,
+                                 errno.ETIMEDOUT})
+
+# One directory listing that has not returned in this long is abandoned. On
+# 2026-10-02 m1's hourly pass sat in open() of one directory for 14 h, and
+# launchd never starts an interval job's next run while one is alive, so the
+# host went unreclaimed the whole time. A listing that cannot be read in time
+# is "could not look", never "empty", so nothing under it is deleted.
+SCANDIR_TIMEOUT_S = 120.0
+SCAN_TIMEOUTS: list[str] = []
+
+
+def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry]:
+    """`list(os.scandir(path))`, or OSError(ETIMEDOUT) once `timeout` passes.
+
+    The listing runs on a daemon thread. A listing stuck in the kernel cannot
+    be cancelled, so its thread is abandoned; being a daemon thread, it does
+    not keep the pass from exiting. Every abandoned path is recorded in
+    SCAN_TIMEOUTS and printed, so the directory that blocks is named.
+    """
+    limit = SCANDIR_TIMEOUT_S if timeout is None else timeout
+    result: dict[str, Any] = {}
+
+    def listing() -> None:
+        try:
+            result["entries"] = list(os.scandir(path))
+        except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+            result["error"] = error
+
+    worker = threading.Thread(target=listing, name=f"scandir {path}", daemon=True)
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        SCAN_TIMEOUTS.append(str(path))
+        print(f"disk_reclaim: SCAN TIMEOUT: listing {path} did not return in "
+              f"{limit:.0f}s; skipped (nothing under it is deleted)", file=sys.stderr)
+        raise OSError(errno.ETIMEDOUT, f"directory listing timed out after {limit:.0f}s",
+                      str(path))
+    if "error" in result:
+        raise result["error"]
+    return result["entries"]
 
 
 def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float | None:
@@ -272,7 +313,7 @@ def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float | None:
         try:
             newest = max(newest, current.stat().st_mtime)
             measured = True
-            entries = list(os.scandir(current))
+            entries = bounded_scandir(current)
         except OSError as exc:
             if exc.errno in UNMEASURABLE_ERRNOS:
                 return None
@@ -773,6 +814,7 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
     scratch_freed = (int(scratch.get("removed_bytes") or 0)
                      if receipt.get("mode") == "fix" else 0)
     summary["boot_volume"] = report.get("boot_volume")
+    summary["scan_timeouts"] = report.get("scan_timeouts") or []
     summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
                                   + int(summary["pulp_reapers"]["reclaimed_bytes"] or 0)
                                   + tmp_freed + scratch_freed)
@@ -1174,6 +1216,9 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         # status names it rather than calling the pass "failed".
         "fail_below_gb": args.fail_below_gb,
         "tightest_root": tightest_volume_root(volumes_after),
+        # Directories whose listing did not return in time; nothing under them
+        # was judged or removed.
+        "scan_timeouts": list(SCAN_TIMEOUTS),
     }
     receipt["report"] = report
 

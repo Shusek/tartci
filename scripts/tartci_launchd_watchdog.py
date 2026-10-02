@@ -621,6 +621,20 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     effective_stale_s = stale_log_s
     if interval_s is not None:
         effective_stale_s = max(stale_log_s, 2 * interval_s)
+    # An uninterruptible interval agent stuck in one run is never healed (a
+    # bootout mid-run is unsafe), and launchd starts no later run while it is
+    # alive, so "the next interval starts it cleanly" never happens. On
+    # 2026-10-02 m1's reclaim sat 14 h in one run while this pass logged it as
+    # heal-failed and then rate-limited. Say what it is instead.
+    if (label in UNINTERRUPTIBLE_AGENTS and interval_s is not None and state == "running"
+            and log_age is not None and log_age > effective_stale_s):
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "attention",
+            f"one run has gone {int(log_age)}s without a log line (> {effective_stale_s}s, "
+            f"at least twice its {interval_s}s interval); launchd starts no later run while it lives and "
+            "this agent is never interrupted automatically — read its log, then stop "
+            "the run by hand",
+        )
     # classify() reads "non-zero exit, fresh log" as a KeepAlive job mid-restart.
     # An interval agent does not restart: it ran, wrote its log, and exited
     # non-zero, so the fresh log is the failing run itself. That used to print
