@@ -8,17 +8,22 @@ bare `codesign --sign` put dialogs on m5studio's screen at each attempt.
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import fleet_doctor as fd  # noqa: E402
 import fleet_self_update as su  # noqa: E402
+import keychain_unlock  # noqa: E402
 import signing_prompt_guard as guard  # noqa: E402
 
 
@@ -41,6 +46,23 @@ class Host(unittest.TestCase):
         self.unlock_rc = 0
         self.info = f'Keychain "{self.sibling}" no-timeout'
         self.calls: list[list[str]] = []
+        env = mock.patch.dict(os.environ, {"TARTCI_HOME": str(self.home / ".tartci")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.agent(state="ok", age=60)
+
+    def agent(self, state: str | None, age: float = 60) -> None:
+        plist = self.home / "Library" / "LaunchAgents" / f"{keychain_unlock.LABEL}.plist"
+        if state is None:
+            plist.unlink(missing_ok=True)
+            return
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text("<plist/>")
+        path = keychain_unlock.state_path(self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"state": state, "at": time.time() - age,
+                                    "detail": "unlock failed (exit 51)" if state == "failed"
+                                    else "unlocked, no auto-lock"}))
 
     def run_(self, argv: list[str]) -> tuple[int, str]:
         self.calls.append(argv)
@@ -90,6 +112,24 @@ class GuardTests(Host):
         (self.home / ".config" / "pulp" / "secrets" / "keychain.env").unlink()
         self.assertEqual(self.status()["state"], "not_applicable")
         self.assertEqual(self.calls, [])
+
+
+class UnlockAgentGuardTests(Host):
+    """The keychain is locked again at every login; the agent is what unlocks it."""
+
+    def test_a_missing_agent_is_a_risk(self) -> None:
+        self.agent(None)
+        value = self.status()
+        self.assertEqual(value["state"], "risk")
+        self.assertIn("keychain-unlock agent is not installed", value["risks"][0])
+
+    def test_a_failed_last_run_is_a_risk(self) -> None:
+        self.agent("failed")
+        self.assertIn("last run FAILED", self.status()["risks"][0])
+
+    def test_an_agent_that_stopped_running_is_a_risk(self) -> None:
+        self.agent("ok", age=guard.UNLOCK_STALE_SECS + 60)
+        self.assertIn("min ago", self.status()["risks"][0])
 
 
 class PinnedKeychainTests(Host):

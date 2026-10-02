@@ -455,6 +455,32 @@ place (a guest may be reading it), and is additive: re-run it after the lock
 changes. The consuming job still installs with `--require-hashes`, so the
 wheelhouse decides where the bytes come from, never which bytes are accepted.
 
+### Signing keychain: never a password dialog
+
+A process in the GUI login session that touches a locked non-login keychain
+makes securityd show a password dialog for that keychain, and only
+`~/.config/pulp/secrets/keychain.env` holds that password. macOS locks those
+keychains again at every login and logout. Three things keep the dialog away:
+
+- Every tartci signer names its keychain (`codesign --keychain <dedicated>`)
+  and unlocks it in its own session first. The dedicated keychain is
+  keychain.env's `PULP_SIGN_KEYCHAIN`, or its `-unattended` sibling when
+  `pulp ship doctor` has built one.
+- `com.danielraffel.tartci.keychain-unlock` (installed by `tartci setup`, and
+  reinstalled by the launchd watchdog wherever keychain.env exists) runs
+  `tartci keychain-unlock` at login and every 15 minutes. It unlocks only the
+  dedicated keychain, with the password on `security -i`'s standard input, and
+  clears any auto-lock. State: `~/.tartci/state/keychain-unlock/last.json`.
+- `tartci pool status` prints `signing prompts:` and `tartci doctor fleet`
+  reports `signing_prompts_*`. It flags a second signing keychain on the user
+  search list, a password that no longer unlocks the dedicated keychain, a
+  keychain that re-locks on its own, and an unlock agent that is missing,
+  failing or stopped.
+
+Never run `security show-keychain-info` (or anything that reads a keychain)
+against a keychain that may be locked: on a GUI host that read is itself what
+raises the dialog. Unlock with `unlock-keychain -p` first, which never prompts.
+
 ### Optional artifact cache: git mirrors and pinned archives (no rebake)
 
 Every job on a disposable guest otherwise re-downloads the same bytes. Measured
