@@ -85,10 +85,13 @@
   Hourly, not every 5 minutes like the reap agent: a pass walks the scan roots
   and sizes candidates, and disk fills over days rather than seconds.
 
-  Background QoS (ProcessType=Background, LowPriorityIO): a pass walks and
-  sizes terabytes of build trees on the same volumes gate VMs and builds are
-  using. Nothing waits on it, so it must yield CPU and disk bandwidth to them
-  rather than compete for both once an hour.
+  Demoted, not confined (ProcessType=Standard, Nice 10, LowPriorityIO): a pass
+  walks and sizes terabytes of build trees on the same volumes gate VMs and
+  builds are using, so it yields CPU and disk bandwidth to them. It is not
+  ProcessType=Background: on Apple silicon that confines the pass to the
+  efficiency cores and throttles it hardest exactly when the host is busy,
+  which turned a 211 s pass into 2446 s on m3. Reclaim is what frees space
+  when a volume is filling, so it has to finish while that still matters.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -116,7 +119,10 @@
     <integer>3600</integer>
 
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
 
     <key>LowPriorityIO</key>
     <true/>
