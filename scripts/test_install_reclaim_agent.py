@@ -101,6 +101,10 @@ class InstallerIsSafeToRepeat(unittest.TestCase):
             env = spec.get("EnvironmentVariables") or {}
             self.assertIn("TARTCI_RECLAIM_PRESSURE_FREE_GB", env)
             self.assertIn("TARTCI_RECLAIM_FAIL_BELOW_GB", env)
+            # A pass walks terabytes on the volumes gate VMs build on; it must
+            # yield CPU and I/O to them.
+            self.assertEqual(spec.get("ProcessType"), "Background")
+            self.assertIs(spec.get("LowPriorityIO"), True)
 
     def test_rejects_an_unknown_argument(self):
         res = run([str(INSTALLER), "--wat"])

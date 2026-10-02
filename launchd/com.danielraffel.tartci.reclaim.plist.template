@@ -84,6 +84,11 @@
 
   Hourly, not every 5 minutes like the reap agent: a pass walks the scan roots
   and sizes candidates, and disk fills over days rather than seconds.
+
+  Background QoS (ProcessType=Background, LowPriorityIO): a pass walks and
+  sizes terabytes of build trees on the same volumes gate VMs and builds are
+  using. Nothing waits on it, so it must yield CPU and disk bandwidth to them
+  rather than compete for both once an hour.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -109,6 +114,12 @@
 
     <key>StartInterval</key>
     <integer>3600</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
 
     <key>StandardOutPath</key>
     <string>$HOME/Library/Logs/tartci/tartci-reclaim.log</string>

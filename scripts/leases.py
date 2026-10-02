@@ -76,7 +76,12 @@ def parse_ts(value: Any) -> dt.datetime | None:
     return None
 
 
-def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+def run(
+    argv: list[str],
+    *,
+    env_overrides: dict[str, str | None] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run a system binary, PATH-independently. Never raises.
 
     Resolved through host_profile so a launchd agent's minimal PATH (no
@@ -89,6 +94,11 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 127, "", "")
     env = dict(os.environ)
     env["PATH"] = host_profile.system_path()
+    for key, value in (env_overrides or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     try:
         return subprocess.run(
             [resolved, *argv[1:]],
@@ -96,20 +106,32 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
             capture_output=True,
             check=False,
             env=env,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(argv, 124, "", f"timed out after {exc.timeout}s")
     except OSError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
 
+# `ps -o lstart` and `sysctl kern.boottime` format dates through the caller's
+# locale and time zone: `LC_ALL=en_GB` prints "Thu  1 Oct", `TZ=UTC` shifts the
+# hour. A start time recorded by a launchd supervisor (no TZ, C locale) must
+# compare equal when read back from any shell, so every probe pins the same
+# rendering. Records written before this pin came from launchd in the same
+# rendering, so they still compare equal.
+_STABLE_TIME_ENV: dict[str, str | None] = {"LC_ALL": "C", "LANG": "C", "TZ": None}
+
+
 def pid_start(pid: int) -> str:
-    proc = run(["ps", "-p", str(pid), "-o", "lstart="])
+    proc = run(["ps", "-p", str(pid), "-o", "lstart="], env_overrides=_STABLE_TIME_ENV)
     if proc.returncode != 0:
         return ""
     return " ".join(proc.stdout.strip().split())
 
 
 def host_boot_time() -> str:
-    proc = run(["sysctl", "-n", "kern.boottime"])
+    proc = run(["sysctl", "-n", "kern.boottime"], env_overrides=_STABLE_TIME_ENV)
     if proc.returncode == 0 and proc.stdout.strip():
         return " ".join(proc.stdout.strip().split())
     boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id")
@@ -175,23 +197,110 @@ def identity_matches(
 
 
 def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bool:
+    """True only when the lease owner is positively confirmed alive.
+
+    A committed guardian is an ownership transfer, not a fallback. Otherwise
+    a still-live supervisor can mask a crashed Tart/QEMU writer forever (most
+    visibly for Windows KEEP_FAILED jobs). A finite guard-run wrapper also
+    records its exact writer child, which remains authoritative if the wrapper
+    dies while that child is still modifying the clone/overlay. Reaping uses
+    owner_verdict(), which separates "dead" from "could not tell".
+    """
+    return owner_verdict(record, current_boot)[0] == OWNER_ALIVE
+
+
+# --- proving owner death -----------------------------------------------------
+#
+# A lease is released by its owner, or reaped only after its owner is PROVABLY
+# gone. "The identity probe did not confirm the owner" is not proof: `ps` can
+# fail (spawn error under load, a timeout) while the owner keeps running, and
+# reaping on that silently returns a running gate VM's cores to the pool. On a
+# host that lends idle gate capacity, the next admission then oversubscribes
+# the host. So every owner probe answers alive / dead / unknown, and only
+# `dead` reaps. Age never reaps: a stale heartbeat is reported, not acted on.
+
+OWNER_ALIVE = "alive"
+OWNER_DEAD = "dead"
+OWNER_UNKNOWN = "unknown"
+
+
+def _pid_exists(pid: int) -> bool | None:
+    """Kernel answer without spawning anything: True, False, or None (unknown)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def identity_verdict(
+    record: dict[str, Any],
+    *,
+    pid_key: str,
+    start_key: str,
+    boot_key: str,
+    current_boot: str,
+    require_start: bool = False,
+) -> tuple[str, str]:
+    """(verdict, evidence) for one recorded process identity."""
+    try:
+        pid = int(record.get(pid_key))
+    except (TypeError, ValueError):
+        return OWNER_DEAD, f"{pid_key}_invalid"
+    if pid <= 0:
+        return OWNER_DEAD, f"{pid_key}_invalid"
+    expected_start = " ".join(str(record.get(start_key) or "").split())
+    if require_start and not expected_start:
+        # An identity that was never pinned can never be proven to be ours.
+        return OWNER_DEAD, f"{pid_key}_start_unrecorded"
+    exists = _pid_exists(pid)
+    if exists is False:
+        return OWNER_DEAD, f"{pid_key}={pid} no_such_process"
+    current_start = pid_start(pid)
+    if not current_start:
+        # The kernel may still list it while `ps` failed; ask the kernel again
+        # so an owner that exited in between is still provably dead.
+        if _pid_exists(pid) is False:
+            return OWNER_DEAD, f"{pid_key}={pid} no_such_process"
+        return OWNER_UNKNOWN, f"{pid_key}={pid} exists but start-time probe failed"
+    if expected_start:
+        if current_start == expected_start:
+            return OWNER_ALIVE, f"{pid_key}={pid} start matches"
+        return OWNER_DEAD, (
+            f"{pid_key}={pid} reused: start {current_start!r} != recorded {expected_start!r}"
+        )
+    record_boot = str(record.get(boot_key) or "")
+    if (
+        record_boot
+        and record_boot != "unknown"
+        and current_boot != "unknown"
+        and record_boot != current_boot
+    ):
+        return OWNER_DEAD, f"{pid_key}={pid} recorded on another boot"
+    return OWNER_ALIVE, f"{pid_key}={pid} exists"
+
+
+def owner_verdict(record: dict[str, Any], current_boot: str | None = None) -> tuple[str, str]:
+    """Owner liveness for a lease record, under the same ownership rules as
+    owner_matches(): a committed VM guardian (or its managed-child writer) owns
+    the lease outright; otherwise the acquiring process does."""
     boot = current_boot if current_boot is not None else host_boot_time()
-    # A committed guardian is an ownership transfer, not a fallback. Otherwise
-    # a still-live supervisor can mask a crashed Tart/QEMU writer forever (most
-    # visibly for Windows KEEP_FAILED jobs). A finite guard-run wrapper also
-    # records its exact writer child, which remains authoritative if the wrapper
-    # dies while that child is still modifying the clone/overlay.
     if is_vm_kind(record.get("command_kind")) and "guardian_pid" in record:
-        if identity_matches(
+        verdict, evidence = identity_verdict(
             record,
             pid_key="guardian_pid",
             start_key="guardian_process_start_time",
             boot_key="guardian_host_boot_time",
             current_boot=boot,
             require_start=True,
-        ):
-            return True
-        return record.get("guardian_mode") == "managed-child" and identity_matches(
+        )
+        if verdict != OWNER_DEAD or record.get("guardian_mode") != "managed-child":
+            return verdict, evidence
+        writer, writer_evidence = identity_verdict(
             record,
             pid_key="guardian_writer_pid",
             start_key="guardian_writer_process_start_time",
@@ -199,13 +308,83 @@ def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bo
             current_boot=boot,
             require_start=True,
         )
-    return identity_matches(
+        return writer, f"{evidence}; {writer_evidence}"
+    return identity_verdict(
         record,
         pid_key="pid",
         start_key="process_start_time",
         boot_key="host_boot_time",
         current_boot=boot,
     )
+
+
+TART_VM_KINDS = ("tart-macos-vm", "tart-linux-vm")
+
+
+def record_vm_name(record: dict[str, Any]) -> str:
+    name = str(record.get("vm_name") or "")
+    if name:
+        return name
+    prefix = f"vm-{record.get('command_kind')}-"
+    lease_id = str(record.get("id") or "")
+    return lease_id[len(prefix):] if lease_id.startswith(prefix) else ""
+
+
+def running_tart_vms(timeout: float = 10.0) -> set[str] | None:
+    """Names of running Tart VMs; empty when Tart is absent; None when unknown."""
+    tart = os.environ.get("TARTCI_TART_BIN") or host_profile.resolve_system_binary("tart")
+    if tart is None and os.access("/opt/homebrew/bin/tart", os.X_OK):
+        tart = "/opt/homebrew/bin/tart"
+    if tart is None:
+        return set()
+    proc = run([tart, "list", "--format", "json"], timeout=timeout)
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    running: set[str] = set()
+    for vm in payload:
+        if not isinstance(vm, dict):
+            continue
+        state = str(vm.get("State", vm.get("state", ""))).lower()
+        name = vm.get("Name") or vm.get("name")
+        if name and state.startswith("run"):
+            running.add(str(name))
+    return running
+
+
+def lease_events_file(store_dir: pathlib.Path) -> pathlib.Path:
+    return store_dir / "events.jsonl"
+
+
+LEASE_EVENTS_MAX_BYTES = 4 * 1024 * 1024
+
+
+def journal_lease_events(store_dir: pathlib.Path, rows: list[dict[str, Any]]) -> None:
+    """Append reap/keep decisions with the caller that made them. Best effort:
+    an audit write never changes a lease decision. An unproven owner is logged
+    on every reclaim pass, so the journal keeps one previous generation and is
+    bounded at twice LEASE_EVENTS_MAX_BYTES."""
+    if not rows:
+        return
+    caller = {"pid": os.getpid(), "ppid": os.getppid(), "argv": sys.argv[:6]}
+    path = lease_events_file(store_dir)
+    try:
+        if path.stat().st_size >= LEASE_EVENTS_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps({"ts": iso(utcnow()), **row, "caller": caller},
+                                        sort_keys=True) + "\n")
+    except OSError:
+        pass
 
 
 def default_store_dir() -> pathlib.Path:
@@ -326,24 +505,65 @@ def record_has_explicit_mem(record: dict[str, Any]) -> bool:
     return "lease_size_mem_mb" in record
 
 
-def reclaim(records: list[dict[str, Any]], stale_secs: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+def reclaim(
+    records: list[dict[str, Any]],
+    stale_secs: int,
+    *,
+    store_dir: pathlib.Path | None = None,
+    releasing_id: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Split records into (active, reaped, problems).
+
+    A record is reaped only when its owner is provably dead and, for a Tart VM
+    lease, its VM is provably not running. An unknown probe keeps the record.
+    `releasing_id` is the lease its own owner is releasing right now: the
+    caller removes it by id, so it skips the VM inventory probe.
+    """
     now = utcnow()
     boot = host_boot_time()
     active: list[dict[str, Any]] = []
     reaped: list[dict[str, Any]] = []
     problems: list[str] = []
+    journal: list[dict[str, Any]] = []
+    vm_inventory: set[str] | None = None
+    vm_inventory_read = False
     for record in records:
         heartbeat = parse_ts(record.get("heartbeat_at"))
         stale = heartbeat is None or (now - heartbeat).total_seconds() >= stale_secs
-        same_owner = owner_matches(record, boot)
-        if not same_owner:
+        verdict, evidence = owner_verdict(record, boot)
+        lease_id = record.get("id")
+        if (
+            verdict == OWNER_DEAD
+            and record.get("command_kind") in TART_VM_KINDS
+            and lease_id != releasing_id
+        ):
+            vm_name = record_vm_name(record)
+            if vm_name:
+                if not vm_inventory_read:
+                    vm_inventory = running_tart_vms()
+                    vm_inventory_read = True
+                if vm_inventory is None:
+                    verdict, evidence = OWNER_UNKNOWN, f"{evidence}; vm {vm_name} state unknown"
+                elif vm_name in vm_inventory:
+                    verdict, evidence = OWNER_UNKNOWN, f"{evidence}; vm {vm_name} still running"
+                else:
+                    evidence = f"{evidence}; vm {vm_name} not running"
+        if verdict == OWNER_DEAD:
             reaped_record = dict(record)
             reaped_record["_reap_reason"] = "identity_mismatch"
             reaped.append(reaped_record)
+            journal.append({"event": "lease_reaped", "id": lease_id,
+                            "reason": "identity_mismatch", "evidence": evidence})
             continue
+        if verdict == OWNER_UNKNOWN:
+            problems.append(f"owner_unproven_kept:{lease_id}")
+            journal.append({"event": "lease_kept_unproven", "id": lease_id,
+                            "evidence": evidence})
         if stale:
-            problems.append(f"stale_heartbeat_live_owner:{record.get('id')}")
+            problems.append(f"stale_heartbeat_live_owner:{lease_id}")
         active.append(record)
+    if store_dir is not None:
+        journal_lease_events(store_dir, journal)
     return active, reaped, problems
 
 
@@ -1194,7 +1414,7 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
     cfg = capacity_config(args)
     with locked_store(store_dir):
         records = load_records(store_dir)
-        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        active, reaped, problems = reclaim(records, int(args.stale_secs), store_dir=store_dir)
         if len(active) != len(records):
             write_records(store_dir, active)
         # Keep the record set and its disk probes in one transaction. Otherwise
@@ -1289,7 +1509,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
     with locked_store(store_dir):
         records = load_records(store_dir)
-        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        active, reaped, problems = reclaim(records, int(args.stale_secs), store_dir=store_dir)
         # The free-space probe is deliberately inside the same host-state lock
         # as reservation accounting and record commit. Moving it above this
         # boundary recreates the race this axis exists to close.
@@ -1607,7 +1827,7 @@ def attach_guardian(
         raise RuntimeError("cannot prove exact VM guardian process start identity")
     with locked_store(store_dir):
         records = load_records(store_dir)
-        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        active, reaped, problems = reclaim(records, int(args.stale_secs), store_dir=store_dir)
         target = next((record for record in active if record.get("id") == args.id), None)
         if target is None:
             write_records(store_dir, active)
@@ -1675,17 +1895,24 @@ def finish_guard_run(
             raise ValueError(f"guardian lost ownership of lease {args.id} during writer run")
         if writer is not None and not guardian_identity_matches(target, writer, writer=True):
             raise ValueError(f"guarded writer identity changed for lease {args.id}")
-        if identity_matches(
+        supervisor, evidence = identity_verdict(
             target,
             pid_key="pid",
             start_key="process_start_time",
             boot_key="host_boot_time",
             current_boot=host_boot_time(),
-        ):
+        )
+        if supervisor == OWNER_DEAD:
+            records.remove(target)
+            journal_lease_events(store_dir, [{
+                "event": "lease_reaped", "id": args.id,
+                "reason": "guard_run_finished_supervisor_dead", "evidence": evidence,
+            }])
+        else:
+            # Alive, or unproven: hand ownership back to the supervisor. If it
+            # really is gone, the next reclaim proves that and reaps the record.
             for field in GUARDIAN_FIELDS:
                 target.pop(field, None)
-        else:
-            records.remove(target)
         write_records(store_dir, records)
 
 
@@ -1833,7 +2060,7 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         raise ValueError("resize takes positive --cores")
     with locked_store(store_dir):
         records = load_records(store_dir)
-        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        active, reaped, problems = reclaim(records, int(args.stale_secs), store_dir=store_dir)
         record = next((row for row in active if row.get("id") == args.id), None)
         if record is None:
             write_records(store_dir, active)
@@ -1921,7 +2148,9 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     cfg = capacity_config(args)
     with locked_store(store_dir):
         records = load_records(store_dir)
-        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        active, reaped, problems = reclaim(
+            records, int(args.stale_secs), store_dir=store_dir, releasing_id=str(args.id)
+        )
         kept = [record for record in active if record.get("id") != args.id]
         removed = len(kept) != len(active)
         # A VM lease is owned by its guardian (the `tart run` it exec'd into).
@@ -1961,7 +2190,7 @@ def heartbeat(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     now = iso(utcnow())
     with locked_store(store_dir):
         records = load_records(store_dir)
-        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        active, reaped, problems = reclaim(records, int(args.stale_secs), store_dir=store_dir)
         updated = False
         for record in active:
             if record.get("id") == args.id:
