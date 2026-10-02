@@ -70,6 +70,10 @@ DEFAULT_STALE_HOURS = 24
 DEFAULT_WAIT_SECONDS = 90 * 60
 DEFAULT_POLL_SECONDS = 45
 INSTALL_ATTEMPTS = 4
+# `shipyard writer-domain-exec` exits this, naming WRITER_DOMAIN_OVERLAP, when a
+# Shipyard Sandbox E2E audit holds the writer domain past its acquire timeout.
+WRITER_DOMAIN_OVERLAP_EXIT = 75
+WRITER_DOMAIN_OVERLAP = "sandbox_writer_domain_overlap"
 INSTALL_RETRY_SECONDS = 30
 # Readiness problems that only mean a supervisor loaded by `pool on` has not yet
 # written its first heartbeat; verification re-reads them for a bounded window.
@@ -146,6 +150,10 @@ class Refused(Exception):
 
 class Deferred(Refused):
     """Refused only because another host holds, or has waited longer for, a turn."""
+
+
+class WriterDomainBusy(Refused):
+    """A Shipyard Sandbox E2E audit holds the writer domain this install writes."""
 
 
 class Failed(Exception):
@@ -1802,14 +1810,40 @@ class Run:
             self.sys.sleep(self.cfg.poll_seconds)
         self.receipt.step("wait-idle", "no owned lane mid-job")
 
+    def _writer_fence(self) -> list[str]:
+        """The `shipyard writer-domain-exec` prefix for a write to ~/.local/bin.
+
+        The install writes ~/.local/bin/tartci, inside Shipyard's protected
+        writer domain. On 2026-10-02 m3's install landed in the middle of a
+        Shipyard Sandbox E2E audit on the same host, which attributed the
+        write to the sandbox and failed. Shipyard's own command takes the
+        writer domain SHARED around the child (the audit holds it EXCLUSIVE),
+        so the protocol is not copied here to drift. A host without Shipyard,
+        or with one too old to have the command, has no audit to fence.
+        """
+        shipyard = self.cfg.home / ".local" / "bin" / "shipyard"
+        if not shipyard.is_file():
+            return []
+        probe = self.sys.run([str(shipyard), "writer-domain-exec", "--help"], timeout=30)
+        if probe.rc != 0:
+            return []
+        return [str(shipyard), "writer-domain-exec", "--path", str(self.cfg.shim), "--"]
+
     def _install(self, args: list[str]) -> None:
+        fence = self._writer_fence()
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
-            result = self.sys.run_critical(["./tartci", *args, "--apply"],
+            result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
                                            cwd=str(self.cfg.checkout), env=census_env(),
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
                 return
+            if fence and result.rc == WRITER_DOMAIN_OVERLAP_EXIT and WRITER_DOMAIN_OVERLAP in result.text:
+                # Nothing was written: the child never started. Defer to a
+                # later cycle rather than spend the attempt.
+                self.receipt.step("writer-lease", result.text[:300], ok=False)
+                raise WriterDomainBusy(f"{WRITER_DOMAIN_OVERLAP}: a Shipyard sandbox audit owns "
+                                       f"the writer domain; install deferred: {result.text[:200]}")
             self.receipt.step("install", f"attempt {attempt} failed: {result.text[:300]}", ok=False)
             if result.rc == EXIT_TIMED_OUT:
                 # Never install on top of an interrupted install: recovery reads
