@@ -5,6 +5,7 @@
 #   scripts/artifact-cache.sh git-sync --repo <owner/repo> [--branch main] [--dir DIR]
 #   scripts/artifact-cache.sh prune --older-than-days <N> [--dir DIR]
 #   scripts/artifact-cache.sh compact --repo <owner/repo> [--dir DIR]
+#   scripts/artifact-cache.sh refresh [--compact-above <packs>] [--dir DIR]
 #   scripts/artifact-cache.sh status [--dir DIR]
 #
 # add      downloads <url>, checks it against <hex> and stores it as
@@ -19,6 +20,13 @@
 # compact  folds a mirror's packs into one. A guest reads packs through the
 #          share for its whole job and a deleted pack may not be rediscovered
 #          there, so this refuses while any Tart VM is running.
+# refresh  re-syncs every branch of every mirror that already exists under git/
+#          and creates none, so a host that never ran git-sync is untouched; an
+#          absent cache is a no-op. With --compact-above N it also folds a
+#          mirror holding more than N packs, only when Tart reports no running
+#          VM at that moment, and skips (never fails) otherwise. This is what
+#          the scheduled com.danielraffel.tartci.artifact-cache-refresh agent
+#          runs. One failed mirror does not stop the others; the exit is 1.
 #
 # A running guest may have the directory mounted, so nothing is ever rewritten
 # in place: a blob lands in a private staging file on the same filesystem and
@@ -28,7 +36,7 @@
 set -euo pipefail
 
 usage(){
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-2}"
 }
 
@@ -36,14 +44,14 @@ die(){ printf 'artifact-cache: %s\n' "$*" >&2; exit 1; }
 
 cmd="${1:-}"
 case "$cmd" in
-  add|git-sync|prune|compact|status) shift;;
+  add|git-sync|prune|compact|refresh|status) shift;;
   -h|--help) usage 0;;
   *) usage 2;;
 esac
 
 cache_root="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
 dir="${TARTCI_ARTIFACT_CACHE_DIR:-$cache_root/artifact-cache}"
-url="" sha="" repo="" branch="main" days=""
+url="" sha="" repo="" branch="main" days="" compact_above=""
 # Where mirrors fetch from; tests point it at a local repository.
 git_base="${TARTCI_ARTIFACT_CACHE_GIT_BASE:-https://github.com}"
 while [ "$#" -gt 0 ]; do
@@ -53,6 +61,7 @@ while [ "$#" -gt 0 ]; do
     --repo) repo="${2:-}"; shift 2;;
     --branch) branch="${2:-}"; shift 2;;
     --older-than-days) days="${2:-}"; shift 2;;
+    --compact-above) compact_above="${2:-}"; shift 2;;
     --dir) dir="${2:-}"; shift 2;;
     -h|--help) usage 0;;
     *) die "unknown argument: $1";;
@@ -80,6 +89,22 @@ mirror_config(){
 }
 
 sha256_of(){ shasum -a 256 "$1" | awk '{print $1}'; }
+
+pack_count(){ find "$1/objects/pack" -name '*.pack' | wc -l | tr -d ' '; }
+
+# Number of running Tart VMs, or empty when Tart cannot say. Only an explicit 0
+# permits a repack: unknown is treated as "a guest may be reading".
+running_vms(){
+  ${TARTCI_TART_BIN:-tart} list --format json 2>/dev/null \
+    | python3 -c 'import json,sys; print(sum(1 for v in json.load(sys.stdin) if v.get("State") == "running" or v.get("Running")))' \
+    2>/dev/null || true
+}
+
+# Fetch one branch into an existing mirror. Only adds packs (see mirror_config).
+fetch_branch(){
+  mirror_config "$1"
+  git -C "$1" fetch --quiet --no-tags origin "+refs/heads/$2:refs/heads/$2"
+}
 
 # One writer at a time per cache; a second sync waits rather than racing.
 staging=""
@@ -148,12 +173,9 @@ case "$cmd" in
       mv "$staging" "$mirror"
       staging=""
     else
-      mirror_config "$mirror"
-      git -C "$mirror" fetch --quiet --no-tags origin \
-        "+refs/heads/$branch:refs/heads/$branch" \
-        || die "fetch of $repo failed"
+      fetch_branch "$mirror" "$branch" || die "fetch of $repo failed"
     fi
-    packs="$(find "$mirror/objects/pack" -name '*.pack' | wc -l | tr -d ' ')"
+    packs="$(pack_count "$mirror")"
     printf 'artifact-cache: %s at %s (%s, %s packs)\n' "$repo" \
       "$(git -C "$mirror" rev-parse --short "refs/heads/$branch")" \
       "$(du -sh "$mirror" | awk '{print $1}')" "$packs"
@@ -165,15 +187,67 @@ case "$cmd" in
     [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must look like owner/name"
     mirror="$dir/git/$repo.git"
     [ -d "$mirror" ] || die "no mirror at $mirror"
-    running="$(${TARTCI_TART_BIN:-tart} list --format json 2>/dev/null \
-      | python3 -c 'import json,sys; print(sum(1 for v in json.load(sys.stdin) if v.get("State") == "running" or v.get("Running")))' \
-      2>/dev/null)" || running=""
+    running="$(running_vms)"
     [ "$running" = 0 ] \
       || die "refusing to compact while Tart reports running VMs (${running:-unknown}); a guest may be reading these packs"
     lock_cache
     git -C "$mirror" repack -a -d -q
-    printf 'artifact-cache: compacted %s to %s pack(s)\n' "$repo" \
-      "$(find "$mirror/objects/pack" -name '*.pack' | wc -l | tr -d ' ')"
+    printf 'artifact-cache: compacted %s to %s pack(s)\n' "$repo" "$(pack_count "$mirror")"
+    ;;
+
+  refresh)
+    [ -z "$compact_above" ] || [[ "$compact_above" =~ ^[1-9][0-9]*$ ]] \
+      || die "--compact-above must be a positive integer"
+    # Never create the cache or a mirror: absence means this host did not opt in.
+    mirrors=()
+    for mirror in "$dir"/git/*/*.git; do
+      [ -d "$mirror" ] || continue
+      mirrors+=("$mirror")
+    done
+    if [ "${#mirrors[@]}" -eq 0 ]; then
+      printf 'artifact-cache: no mirrors under %s/git; nothing to refresh\n' "$dir"
+      exit 0
+    fi
+    lock_cache
+    failed=0
+    for mirror in "${mirrors[@]}"; do
+      name="${mirror#"$dir"/git/}"
+      name="${name%.git}"
+      if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        printf 'artifact-cache: skipping %s (not an owner/name mirror)\n' "$mirror" >&2
+        failed=1
+        continue
+      fi
+      branches="$(git -C "$mirror" for-each-ref --format='%(refname:lstrip=2)' refs/heads 2>/dev/null)" || branches=""
+      if [ -z "$branches" ]; then
+        printf 'artifact-cache: %s has no branch to refresh\n' "$name" >&2
+        failed=1
+        continue
+      fi
+      while IFS= read -r ref; do
+        if fetch_branch "$mirror" "$ref"; then
+          printf 'artifact-cache: refreshed %s %s at %s\n' "$name" "$ref" \
+            "$(git -C "$mirror" rev-parse --short "refs/heads/$ref")"
+        else
+          printf 'artifact-cache: fetch of %s %s failed\n' "$name" "$ref" >&2
+          failed=1
+        fi
+      done <<<"$branches"
+      packs="$(pack_count "$mirror")"
+      if [ -n "$compact_above" ] && [ "$packs" -gt "$compact_above" ]; then
+        # Asked as late as possible: the window between this answer and the
+        # repack is the only one in which a booting guest could see a pack go.
+        running="$(running_vms)"
+        if [ "$running" = 0 ]; then
+          git -C "$mirror" repack -a -d -q
+          printf 'artifact-cache: compacted %s from %s to %s pack(s)\n' "$name" "$packs" "$(pack_count "$mirror")"
+        else
+          printf 'artifact-cache: %s holds %s packs; compaction deferred (running VMs: %s)\n' \
+            "$name" "$packs" "${running:-unknown}"
+        fi
+      fi
+    done
+    exit "$failed"
     ;;
 
   prune)
