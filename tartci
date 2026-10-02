@@ -1262,6 +1262,8 @@ if fleet["managed"]:
         mark = {"ok": "ok", "warn": "WARN", "problem": "PROBLEM"}[disk["state"]]
         print(f"disk: {disk['role']} {disk['path']}: {mark} {disk['used_percent']}% used, "
               f"{disk['free_gib']} GiB free")
+    for condition in fleet.get("host_conditions") or []:
+        print(f"  host condition: {condition['code']}: {condition.get('detail', '')}")
     for problem in fleet["problems"]:
         line = f"  problem: {problem['code']}"
         if "label" in problem:

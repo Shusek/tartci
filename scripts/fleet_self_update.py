@@ -75,6 +75,12 @@ INSTALL_RETRY_SECONDS = 30
 # written its first heartbeat; verification re-reads them for a bounded window.
 SETTLING_PROBLEM_CODES = frozenset({"heartbeat_missing", "supervisor_not_running",
                                     "supervisor_pid_missing"})
+# Readiness problems about the host itself, not the generation: an install
+# neither causes nor fixes them, so verifying a new generation must not fail
+# on them. m5 (AC sleep 1) rolled back every update once its idle sleep
+# became a readiness problem, twice on 2026-10-02.
+HOST_CONDITION_CODES = frozenset({"host_idle_sleep_enabled", "power_unverified",
+                                  "disk_pressure"})
 VERIFY_SETTLE_SECONDS = 180
 VERIFY_SETTLE_POLL_SECONDS = 10
 ACTIVE_MARKER_TTL = 3 * 3600
@@ -2005,8 +2011,10 @@ def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], boo
         if value.get("state") != "on" or value.get("participating") is not True:
             problems.append(f"pool is {value.get('state')} after pool on")
         if fleet.get("managed") and fleet.get("fleet_ready") is not True:
-            found = fleet.get("problems") or []
-            problems.append(f"fleet not ready: {found}")
+            found = [p for p in fleet.get("problems") or []
+                     if not (isinstance(p, dict) and p.get("code") in HOST_CONDITION_CODES)]
+            if found or not fleet.get("problems"):
+                problems.append(f"fleet not ready: {found}")
             settling = bool(found) and all(
                 isinstance(p, dict) and p.get("code") in SETTLING_PROBLEM_CODES
                 for p in found)
