@@ -1193,6 +1193,30 @@ class RootDiscoveryTests(unittest.TestCase):
                 dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
             self.assertEqual(dr.parse_roots(None), [])
 
+    def test_profile_reclaim_paths_add_the_external_volume_root(self):
+        """A host whose external volume is not named Workshop is still scanned.
+
+        m5studio keeps code on /Volumes/Atelier; the root comes from the
+        installed profile's [reclaim] repo/worktrees_root, not a volume name.
+        """
+        code = self.base / "atelier" / "Code"
+        (code / "pulp").mkdir(parents=True)
+        profile = self.base / "profile.toml"
+        profile.write_text(
+            "[reclaim]\n"
+            f'repo = "{code}/pulp"\n'
+            f'worktrees_root = "{code}/agent-worktrees"\n')
+        with unittest.mock.patch.dict(os.environ, {"TARTCI_FLEET_PROFILE": str(profile)}), \
+                unittest.mock.patch.object(
+                    dr, "DEFAULT_ROOT_CANDIDATES", (str(self.present_a),)):
+            self.assertEqual(dr.parse_roots(None), [self.present_a, code])
+        # Control: without the profile only the built-in candidate remains.
+        with unittest.mock.patch.dict(
+                os.environ, {"TARTCI_FLEET_PROFILE": str(self.absent)}), \
+                unittest.mock.patch.object(
+                    dr, "DEFAULT_ROOT_CANDIDATES", (str(self.present_a),)):
+            self.assertEqual(dr.parse_roots(None), [self.present_a])
+
     def test_an_explicitly_declared_missing_root_is_still_a_fault(self):
         """Discovery must not soften the declared-root contract."""
         buffer = io.StringIO()

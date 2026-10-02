@@ -457,11 +457,37 @@ def classify(
 # code and worktrees on an external Workshop volume and still has a populated
 # `~/Code` on the boot disk, so `~/Code` alone is exactly that failure.
 # Discovery keeps whichever of these the host actually has, so a host is
-# covered without per-host tuning of the rendered plist.
+# covered without per-host tuning of the rendered plist. The external-volume
+# code root is not named here: it comes from the installed fleet profile's
+# `[reclaim]` repo and worktrees_root (profile_root_candidates), so a host whose
+# volume has a different name (m3: Workshop, m5studio: Atelier) is covered.
 DEFAULT_ROOT_CANDIDATES = (
     "~/Code",
-    "/Volumes/Workshop/Code",
 )
+
+
+def profile_root_candidates() -> list[str]:
+    """Code roots the installed fleet profile declares under `[reclaim]`.
+
+    The parent of `repo` and of `worktrees_root` (both are `<volume>/Code/...`
+    on the hosts that set them). Empty when there is no profile or no table.
+    """
+    profile = pulp_reapers.default_profile_path()
+    if tomllib is None or not profile.is_file():
+        return []
+    try:
+        with profile.open("rb") as handle:
+            reclaim = tomllib.load(handle).get("reclaim")
+    except (OSError, ValueError):
+        return []
+    if not isinstance(reclaim, dict):
+        return []
+    out: list[str] = []
+    for key in ("repo", "worktrees_root"):
+        value = reclaim.get(key)
+        if isinstance(value, str) and value.strip().startswith("/"):
+            out.append(str(pathlib.PurePosixPath(value.strip()).parent))
+    return out
 
 
 def discover_roots() -> list[pathlib.Path]:
@@ -474,7 +500,7 @@ def discover_roots() -> list[pathlib.Path]:
     """
     found: list[pathlib.Path] = []
     seen: set[str] = set()
-    for candidate in DEFAULT_ROOT_CANDIDATES:
+    for candidate in (*DEFAULT_ROOT_CANDIDATES, *profile_root_candidates()):
         path = pathlib.Path(os.path.expanduser(candidate))
         try:
             resolved = path.resolve()
@@ -847,7 +873,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--roots",
         default=os.environ.get("TARTCI_RECLAIM_ROOTS"),
-        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS, else whichever of ~/Code and /Volumes/Workshop/Code exist)")
+        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS, else whichever of ~/Code and the fleet profile's [reclaim] repo/worktrees_root parents exist)")
     parser.add_argument("--maxdepth", type=int,
                         default=int(os.environ.get("TARTCI_RECLAIM_MAXDEPTH", "5")),
                         help="directory depth below each root to scan (default 5)")
