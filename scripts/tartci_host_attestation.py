@@ -207,6 +207,25 @@ def slug_matches_repo(slug: str | None, repo: str | None) -> bool:
     return slug.replace("/", "-").lower() == repo.replace("/", "-").lower()
 
 
+def names_same_repository(slug: str | None, repo: str | None) -> bool:
+    """Whether ``slug`` names a repository called what ``repo`` is called,
+    under any owner, in either spelling (``owner/name`` or ``owner-name``).
+
+    A lane only has a say over runners for its own repository. A registration
+    against the same name under another owner is the pre-org-move leftover the
+    stale check exists for; a registration against a different repository is a
+    runner serving that repository, which m3's live Shipyard release runner is,
+    and judging it against Pulp's lane reported it stale on every pass.
+    """
+    if not slug or not repo:
+        return False
+    name = repo.rsplit("/", 1)[-1].lower()
+    slug = slug.lower()
+    if "/" in slug:
+        return slug.rsplit("/", 1)[-1] == name
+    return slug == name or slug.endswith(f"-{name}")
+
+
 def discover_launch_agents(agents_dir: str) -> list[tuple[str, str]]:
     """Every relevant LaunchAgent on disk, as ``(label, plist path)``."""
     found: list[tuple[str, str]] = []
@@ -359,14 +378,16 @@ def assess_persistent_runner(label: str, plist_path: str | None, lane_repo: str 
         record["reason"] = detail
         return record
 
-    if lane_repo and not slug_matches_repo(record["registration_repo"], lane_repo):
+    if (lane_repo and names_same_repository(record["registration_repo"], lane_repo)
+            and not slug_matches_repo(record["registration_repo"], lane_repo)):
         record["verdict"] = "stale_repo"
         record["reason"] = (
             f"registered against {record['registration_repo']} but the lane serves {lane_repo}"
         )
         return record
 
-    if slug_from_label and lane_repo and not slug_matches_repo(slug_from_label, lane_repo):
+    if (slug_from_label and lane_repo and names_same_repository(slug_from_label, lane_repo)
+            and not slug_matches_repo(slug_from_label, lane_repo)):
         record["verdict"] = "stale_repo"
         record["reason"] = (
             f"launchd label names {slug_from_label} but the lane serves {lane_repo}"

@@ -190,6 +190,36 @@ class PersistentRunnerVerdicts(unittest.TestCase):
         self.assertEqual(record["verdict"], "stale_repo")
         self.assertIn("danielraffel/pulp", record["reason"])
 
+    def test_a_runner_for_another_repository_is_not_judged_by_this_lane(self):
+        # m3's live Shipyard release runner read "stale_repo" against the
+        # Pulp lane on every pass.
+        label = "actions.runner.danielraffel-Shipyard.Shipyard-studio-02"
+        self._printed[label] = PRINT_HEALTHY
+        self._register("https://github.com/danielraffel/Shipyard")
+        record = att.assess_persistent_runner(
+            label, self.plist, "Generous-Corp/pulp", ["shipyard-build"], 300
+        )
+        self.assertEqual(record["verdict"], "healthy", record["reason"])
+        self.assertEqual(record["registration_repo"], "danielraffel/Shipyard")
+
+    def test_a_pre_org_move_launchd_label_is_still_stale(self):
+        # Control for the exemption: same repository name, old owner, in the
+        # label rather than the registration.
+        label = "actions.runner.danielraffel-pulp.pulp-preamble-m3"
+        self._printed[label] = PRINT_HEALTHY
+        self._register()
+        record = att.assess_persistent_runner(
+            label, self.plist, "Generous-Corp/pulp", ["pulp-preamble"], 300
+        )
+        self.assertEqual(record["verdict"], "stale_repo")
+        self.assertIn("danielraffel-pulp", record["reason"])
+
+    def test_names_same_repository_reads_both_spellings(self):
+        self.assertTrue(att.names_same_repository("danielraffel/pulp", "Generous-Corp/pulp"))
+        self.assertTrue(att.names_same_repository("danielraffel-pulp", "Generous-Corp/pulp"))
+        self.assertFalse(att.names_same_repository("danielraffel/Shipyard", "Generous-Corp/pulp"))
+        self.assertFalse(att.names_same_repository("danielraffel-Shipyard", "Generous-Corp/pulp"))
+
     def test_a_fully_healthy_runner_is_healthy(self):
         # The control. Without it every assertion above is satisfied by a
         # function that returns "broken" unconditionally.
