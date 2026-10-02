@@ -5,6 +5,11 @@ import argparse, hashlib, json, os, re, stat, subprocess, tomllib
 from pathlib import Path
 
 class IdentityError(ValueError): pass
+def external_store(value: object)->bool:
+    """An absolute /Volumes/<volume>/<dir>... path with no dot components."""
+    if not isinstance(value,str) or not value.startswith("/Volumes/"): return False
+    parts=value.split("/")[1:]
+    return len(parts)>=3 and all(part not in ("",".","..") for part in parts)
 def profile_policy_digest(path_value: str|Path)->str:
     try: value=tomllib.loads(Path(path_value).read_text())
     except (OSError,tomllib.TOMLDecodeError) as error: raise IdentityError(f"cannot read launcher profile policy: {error}") from error
@@ -30,7 +35,7 @@ def bundle_digest(root: Path) -> str:
         digest.update(relative.encode()+b"\0"+str(stat.S_IMODE(info.st_mode)).encode()+b"\0")
         if stat.S_ISREG(info.st_mode): digest.update(path.read_bytes())
     return digest.hexdigest()
-def verify(path_value: str|Path,*,identifier:str,team_id:str,sha256:str|None=None,profile_policy_sha256:str|None=None,source_commit:str|None=None)->dict[str,object]:
+def verify(path_value: str|Path,*,identifier:str,team_id:str,sha256:str|None=None,profile_policy_sha256:str|None=None,source_commit:str|None=None,tart_home:str|None=None)->dict[str,object]:
     path=Path(path_value)
     if path.is_symlink() or not path.is_dir(): raise IdentityError("launcher must be a regular non-symlink app bundle")
     metadata=path.stat()
@@ -58,7 +63,12 @@ def verify(path_value: str|Path,*,identifier:str,team_id:str,sha256:str|None=Non
         raise IdentityError(f"launcher sealed metadata is unreadable: {error}") from error
     if not isinstance(metadata,dict) or set(metadata)!={"schema","source_commit","support_manifest_sha256","profile_policy_sha256","tart_home"} or metadata.get("schema")!=1:
         raise IdentityError("launcher sealed metadata is malformed")
-    if metadata.get("tart_home")!="/Volumes/Workshop/VMs": raise IdentityError("launcher sealed metadata has the wrong Tart store")
+    # The sealed store is any external-volume store (m3: Workshop, m5studio:
+    # Atelier); the profile policy digest already binds it to one profile, and
+    # a caller that knows the profile's tart_home pins it exactly.
+    sealed_store=metadata.get("tart_home")
+    if not external_store(sealed_store): raise IdentityError("launcher sealed metadata has no external-volume Tart store")
+    if tart_home is not None and sealed_store!=tart_home: raise IdentityError("launcher sealed metadata has the wrong Tart store")
     if not re.fullmatch(r"[0-9a-f]{40}",str(metadata.get("source_commit",""))): raise IdentityError("launcher source commit is malformed")
     if not re.fullmatch(r"[0-9a-f]{64}",str(metadata.get("profile_policy_sha256",""))): raise IdentityError("launcher profile policy digest is malformed")
     if hashlib.sha256(manifest).hexdigest()!=metadata.get("support_manifest_sha256"): raise IdentityError("launcher support manifest digest does not match sealed metadata")
@@ -69,8 +79,8 @@ def verify(path_value: str|Path,*,identifier:str,team_id:str,sha256:str|None=Non
     if bundle_digest(path)!=digest: raise IdentityError("launcher bundle changed during verification")
     return {"schema":1,"path":canonical,"sha256":digest,"owner_uid":path.stat().st_uid,"mode":stat.S_IMODE(path.stat().st_mode),"identifier":actual_identifier,"team_id":actual_team,"designated_requirement":designated,"designated_requirement_sha256":hashlib.sha256(designated.encode()).hexdigest(),"hardened_runtime":True,"authority_class":"developer-id-application","architecture":"arm64","source_commit":metadata["source_commit"],"profile_policy_sha256":metadata["profile_policy_sha256"],"support_manifest_sha256":metadata["support_manifest_sha256"],"lane_ids":sorted(lanes["lanes"])}
 def main()->int:
-    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="command",required=True); command=sub.add_parser("verify"); command.add_argument("path"); command.add_argument("--identifier",required=True); command.add_argument("--team-id",required=True); command.add_argument("--sha256"); command.add_argument("--profile-policy-sha256"); command.add_argument("--source-commit"); args=parser.parse_args()
-    try: record=verify(args.path,identifier=args.identifier,team_id=args.team_id,sha256=args.sha256,profile_policy_sha256=args.profile_policy_sha256,source_commit=args.source_commit)
+    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="command",required=True); command=sub.add_parser("verify"); command.add_argument("path"); command.add_argument("--identifier",required=True); command.add_argument("--team-id",required=True); command.add_argument("--sha256"); command.add_argument("--profile-policy-sha256"); command.add_argument("--source-commit"); command.add_argument("--tart-home"); args=parser.parse_args()
+    try: record=verify(args.path,identifier=args.identifier,team_id=args.team_id,sha256=args.sha256,profile_policy_sha256=args.profile_policy_sha256,source_commit=args.source_commit,tart_home=args.tart_home)
     except (IdentityError,OSError,subprocess.TimeoutExpired) as error: parser.exit(1,f"macos launcher identity rejected: {error}\n")
     print(json.dumps(record,sort_keys=True,separators=(",",":"))); return 0
 if __name__=="__main__": raise SystemExit(main())

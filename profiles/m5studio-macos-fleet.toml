@@ -1,17 +1,20 @@
 # m5studio (Daniels-M5-Studio, M5 Ultra 30c/256G). Derived 2026-09-28 from M3's live
-# profile; internal-disk interim paths. See pulp-planning
-# 2026-09-28-m5studio-host-bringup-plan.md §9 for what changes on the Workshop SSD.
+# profile. Since 2026-10-01 the Tart store, the Pulp checkout and agent worktrees
+# live on the external 4 TB APFS volume /Volumes/Atelier (owners disabled, not
+# encrypted), the same shape as M3's /Volumes/Workshop under a different volume
+# name. cache_root and log_root stay on the internal disk, as on M3. See
+# pulp-planning 2026-09-28-m5studio-host-bringup-plan.md §9.
 schema = 1
 name = "m5studio-macos-fleet"
 
-# Shipyard's durable host tag for M3 is `studio`. The profile name remains M3
-# operator vocabulary, but install authority is bound to that exact live tag.
+# Shipyard's durable host tag for this host is `m5studio`; install authority is
+# bound to that exact live tag.
 [host]
 id = "m5studio"
 # The SSH alias other fleet hosts reach this one by (self-update peers).
 ssh = "m5s"
 home = "/Users/danielraffel"
-tart_home = "/Users/danielraffel/VMs"
+tart_home = "/Volumes/Atelier/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 # Measured 2026-09-21: of 209 assignment-scan failures on this host in 24h,
@@ -35,12 +38,15 @@ agent_floor_cores = 10
 agent_floor_qos = "utility"
 
 # Daniel-only external-volume execution. The stable Developer-ID identity is
-# the TCC responsible process; public/home-backed profiles do not inherit it.
-# Canary for the report-only cross-host build disagreement check. One host is
-# enough: the detector reads every gate host's jobs from GitHub, and M3 already
-# runs this fleet's other fleet-wide views. The launchd watchdog runs it at most
-# every 15 minutes and only logs; it never resets a cache or changes
-# scheduling. Remove this table to turn it off.
+# the TCC responsible process (Full Disk Access / Removable Volumes for
+# /Volumes/Atelier); public/home-backed profiles do not inherit it. The
+# approval digest is this host's own, written by scripts/build_macos_launcher.sh.
+[launch_helper]
+path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
+approval_sha256_path = "/Users/danielraffel/.config/tartci/m5studio-launcher-approved.sha256"
+identifier = "com.danielraffel.tartci.launcher"
+team_id = "95CX6P84C4"
+
 [stacked_images]
 enabled = false
 minimum_macos_major = 27
@@ -54,18 +60,15 @@ flat_rollback = "pulp-build-runner:latest"
 # clean_worktree_builds.sh while the worktrees_root volume is below
 # pressure_free_gb. Their merged / idle / not-in-use / lineage gates are the
 # safety; tartci adds none and relaxes none (scripts/pulp_reapers.py).
-# m3 keeps its Pulp worktrees on Workshop (CLAUDE.md host policy), and that is
-# the volume that filled on 2026-09-27: 19 GiB free, every gate VM lease refused
-# disk_capacity_exceeded for ~6 h, while 1,330 GB sat in 40 merged worktrees'
-# build dirs that only Pulp's own reaper can prove dead.
-# Remove this table to turn it off.
+# m5studio keeps its Pulp checkout and worktrees on Atelier, beside the Tart
+# store, as m3 does on Workshop. On m3 that volume filled on 2026-09-27: 19 GiB
+# free, every gate VM lease refused disk_capacity_exceeded for ~6 h, while
+# 1,330 GB sat in 40 merged worktrees' build dirs that only Pulp's own reaper
+# can prove dead. Remove this table to turn it off.
 [reclaim]
 pulp_worktree_builds = true
-repo = "/Users/danielraffel/Code/pulp"
-# m5studio has no Workshop volume yet, so Pulp worktrees are siblings of the
-# primary checkout under ~/Code (the reapers only touch worktrees of `repo`).
-# Move to /Volumes/Workshop/Code/agent-worktrees with the volume migration.
-worktrees_root = "/Users/danielraffel/Code"
+repo = "/Volumes/Atelier/Code/pulp"
+worktrees_root = "/Volumes/Atelier/Code/agent-worktrees"
 pressure_free_gb = 200
 # Remove finished git checkouts agents left in /private/tmp (48 h idle,
 # clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py

@@ -36,13 +36,19 @@ python3 - "$rendered_dir" "$profile" "$support_root/.tartci-support-manifest.jso
 import hashlib, json, plistlib, re, stat, sys, tomllib
 from pathlib import Path
 source, profile, manifest, output, metadata, launch = map(Path, sys.argv[1:]); lanes = {}
+# The sealed store is the profile's own external-volume Tart home (m3:
+# /Volumes/Workshop/VMs, m5studio: /Volumes/Atelier/VMs); every lane must use it.
+tart_home = tomllib.loads(profile.read_text())["host"]["tart_home"]
+store_parts = tart_home.split("/")[1:]
+if not tart_home.startswith("/Volumes/") or len(store_parts) < 3 or any(p in ("", ".", "..") for p in store_parts):
+    raise SystemExit(f"launch helper requires an external-volume Tart store, got {tart_home!r}")
 for path in sorted(source.glob("*.plist")):
     if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode): raise SystemExit(f"invalid lane plist: {path}")
     value = plistlib.loads(path.read_bytes()); env = value.get("EnvironmentVariables")
     if not isinstance(env, dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in env.items()): raise SystemExit(f"invalid lane environment: {path}")
     lane = env.get("TARTCI_QUEUE_LANE_ID", "")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", lane) or lane in lanes: raise SystemExit(f"invalid or duplicate lane enum: {path}")
-    if env.get("TART_HOME") != "/Volumes/Workshop/VMs": raise SystemExit(f"wrong M3 Tart store: {path}")
+    if env.get("TART_HOME") != tart_home: raise SystemExit(f"wrong Tart store (expected {tart_home}): {path}")
     lanes[lane] = {"environment": dict(sorted(env.items()))}
 if not lanes: raise SystemExit("rendered config directory contains no fleet plists")
 output.write_text(json.dumps({"schema":1,"lanes":lanes},sort_keys=True,separators=(",",":"))+"\n")
@@ -55,7 +61,7 @@ metadata.write_text(json.dumps({
     "source_commit":manifest_value["source_commit"],
     "support_manifest_sha256":hashlib.sha256(manifest.read_bytes()).hexdigest(),
     "profile_policy_sha256":profile_policy,
-    "tart_home":"/Volumes/Workshop/VMs",
+    "tart_home":tart_home,
 },sort_keys=True,separators=(",",":"))+"\n")
 launch.write_text(
     '#!/bin/bash\n'
@@ -67,7 +73,7 @@ launch.chmod(0o555)
 PY
 chmod -R a-w "$app/Contents/Resources/support"
 cat >"$app/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>tartci-launcher</string><key>CFBundleIdentifier</key><string>com.danielraffel.tartci.launcher</string><key>CFBundleName</key><string>TartCI Launcher</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSBackgroundOnly</key><true/><key>NSRemovableVolumesUsageDescription</key><string>TartCI uses the Workshop volume for isolated local CI virtual machines.</string></dict></plist>
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>tartci-launcher</string><key>CFBundleIdentifier</key><string>com.danielraffel.tartci.launcher</string><key>CFBundleName</key><string>TartCI Launcher</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSBackgroundOnly</key><true/><key>NSRemovableVolumesUsageDescription</key><string>TartCI uses an external volume for isolated local CI virtual machines.</string></dict></plist>
 PLIST
 xcrun swiftc -O -whole-module-optimization -target arm64-apple-macos13 -framework Security "$support_root/native/macos/tartci-launcher/main.swift" -o "$app/Contents/MacOS/tartci-launcher"
 /usr/bin/codesign --force --timestamp --options runtime --sign "$identity" --identifier com.danielraffel.tartci.launcher "$app"
