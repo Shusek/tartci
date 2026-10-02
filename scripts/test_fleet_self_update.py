@@ -665,18 +665,20 @@ class UpdateQueueTests(Base):
                 self.sys.clock += seconds
         self.sys.hook = hook
 
-    def test_a_slow_checkout_does_not_shrink_this_hosts_wait(self) -> None:
-        # m3 on 2026-10-02: checkout took 10 min, m3 measured its own wait to
-        # the attempt's start and yielded to m5, which had waited 7 min less
-        # and was yielding back to m3. No host updated for hours.
-        self.ticket(since=NOW - 12000)
-        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 12000 + 420,
-                                       "ts": NOW - 60}
-        self.slow_checkout(600)
+    def test_the_earliest_ticket_goes_whatever_its_survey_delay(self) -> None:
+        # 2026-10-02: m3 held the earliest ticket, surveyed after a 10 min
+        # checkout, and yielded to m5 while m5 yielded back. No host updated.
+        mine, theirs = NOW - 12000, NOW - 12000 + 420
+        self.ticket(since=mine)
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": theirs, "ts": NOW - 60}
+        self.slow_checkout(3600)
         self.assertUpdated(self.apply())
+        # The same two tickets seen from m5: it yields, so exactly one goes.
+        self.assertEqual(su.queue_ahead("m1", mine, {"m5": theirs}), [])
+        self.assertEqual(len(su.queue_ahead("m5", theirs, {"m1": mine})), 1)
 
-    def test_a_slow_checkout_still_yields_to_a_longer_waiter(self) -> None:
-        # Control, same instrument: m5 now started waiting 7 min BEFORE this host.
+    def test_a_slow_checkout_still_yields_to_an_earlier_ticket(self) -> None:
+        # Control, same instrument: m5 now joined the queue 7 min BEFORE this host.
         self.ticket(since=NOW - 12000)
         self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 12000 - 420,
                                        "ts": NOW - 60}
@@ -684,24 +686,21 @@ class UpdateQueueTests(Base):
         self.assertDeferred(self.apply())
         self.assertIn("m5", su.waiting_ticket(self.cfg)["reason"])
 
-    def test_a_peer_read_early_in_the_survey_is_carried_forward(self) -> None:
-        # Peers are read one at a time over SSH; a wait read before a slow
-        # peer answered must not look shorter than this host's, measured after.
-        self.ticket(since=NOW - 12000)
-        # m5 is surveyed before studio, which takes 5 min to answer.
-        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 12000 - 60,
-                                       "ts": NOW - 60}
-        surveyed = []
+    def test_equal_tickets_go_to_the_lower_host_name(self) -> None:
+        since = NOW - 3600
+        self.assertEqual(su.queue_ahead("m1", since, {"m5": since}), [])
+        self.assertEqual(len(su.queue_ahead("m5", since, {"m1": since})), 1)
+        self.ticket(since=since)
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": since, "ts": NOW - 60}
+        self.assertUpdated(self.apply())
 
-        def hook(argv):
-            if argv[:1] == ["ssh"] and "pool status" in argv[-1]:
-                surveyed.append(argv[5])
-                if argv[5] == "m3":
-                    self.sys.clock += 300
-        self.sys.hook = hook
-        self.assertDeferred(self.apply())
-        self.assertEqual(surveyed[:2], ["m5", "m3"], "the instrument relies on this order")
-        self.assertIn("m5", su.waiting_ticket(self.cfg)["reason"])
+    def test_an_off_front_host_does_not_hold_the_turn(self) -> None:
+        # m5 joined first but is off: it cannot take a turn, so the next
+        # ticket goes, subject to the capacity floor.
+        self.ticket(since=NOW - 3600)
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 9 * 3600, "ts": NOW - 60}
+        self.sys.peers["m5"] = {"state": "off", "participating": False}
+        self.assertUpdated(self.apply())
 
     def test_a_ticket_its_host_stopped_refreshing_is_ignored(self) -> None:
         self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 9 * 3600,

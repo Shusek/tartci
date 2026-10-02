@@ -663,9 +663,10 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     """One peer's pool state, update marker and waiting ticket.
 
     {"busy": bool, "evidence": str, "active_age": seconds | None,
-     "waited": seconds | None, "off": bool}. Ages are computed on the PEER's
-    clock, so host clock skew cannot make a live marker look stale or a long
-    wait look short. Unreachable or unreadable peers are busy: fail closed.
+     "since": epoch | None, "off": bool}. Marker ages are computed on the
+    PEER's clock, so host clock skew cannot make a live marker look stale.
+    `since` is when the peer's live waiting ticket joined the queue. Unreachable
+    or unreadable peers are busy: fail closed.
 
     A peer that is OFF with no live update marker is not busy: it is out of
     service on purpose (m5studio, off for a store move on 2026-10-01, blocked
@@ -674,7 +675,7 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     host as serving nothing. Draining, unreadable or updating peers still
     refuse.
     """
-    out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "waited": None,
+    out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
                            "off": False}
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
@@ -694,8 +695,9 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
         except json.JSONDecodeError:
             ticket = None
         # A peer that stopped refreshing its ticket has stopped trying.
-        if isinstance(ticket, dict) and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL:
-            out["waited"] = max(0.0, clock - float(ticket.get("since", clock)))
+        if (isinstance(ticket, dict) and isinstance(ticket.get("since"), (int, float))
+                and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL):
+            out["since"] = float(ticket["since"])
     is_off = value.get("state") == "off"
     if not is_off and (value.get("state") != "on" or value.get("participating") is not True):
         out["evidence"] = (f"peer {host_id} is {value.get('state')} "
@@ -733,25 +735,16 @@ def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
 
 
 def survey_peers(cfg: Config, sys_: System,
-                 me: str) -> tuple[list[str], dict[str, float], list[str], float]:
-    """(why each busy peer is busy, {peer: seconds it has waited}, off peers,
-    the local time every wait is measured to).
+                 me: str) -> tuple[list[str], dict[str, float], list[str]]:
+    """(why each busy peer is busy, {peer: when its ticket joined the queue},
+    off peers).
 
     An off peer neither blocks nor holds a place in the queue: it cannot take
     a turn while it is off, and yielding to it would stall the fleet the same
     way refusing on it did.
-
-    Every wait, this host's included, must be measured to the same instant.
-    A peer's wait is read on its own clock as the survey reaches it, so it is
-    carried forward by the local time that has passed since, and the caller
-    measures its own wait to the returned instant. Measuring this host's wait
-    to when the attempt started instead let a slow checkout shrink it: on
-    2026-10-02 m3, the longest waiter, yielded to m5 for hours while m5
-    correctly yielded back to m3, and no host updated.
     """
     busy: list[str] = []
     waiting: dict[str, float] = {}
-    read_at: dict[str, float] = {}
     off: list[str] = []
     for peer, target in published_peers(cfg, sys_).items():
         if peer == me:
@@ -762,28 +755,26 @@ def survey_peers(cfg: Config, sys_: System,
         elif info.get("off"):
             off.append(peer)
             continue
-        if info["waited"] is not None:
-            waiting[peer] = info["waited"]
-            read_at[peer] = sys_.now()
-    measured_at = sys_.now()
-    for peer, at in read_at.items():
-        waiting[peer] += max(0.0, measured_at - at)
-    return busy, waiting, off, measured_at
+        if info["since"] is not None:
+            waiting[peer] = info["since"]
+    return busy, waiting, off
 
 
-def queue_ahead(me: str, my_wait: float, waiting: dict[str, float]) -> list[str]:
-    """Peers that have waited longer than this host and so go first.
+def queue_ahead(me: str, my_since: float, waiting: dict[str, float]) -> list[str]:
+    """Peers whose tickets joined the queue before this host's, and so go first.
 
     Without an order, the host whose stagger comes first in the window won
     every contended turn: m3 was refused at every attempt for hours while a
-    peer updated. The longest waiter goes first; a tie goes to the lower id.
+    peer updated. The order is the tickets' recorded `since`, earliest first,
+    ties to the lower id: a total order every host computes identically from
+    the same tickets. Comparing waits measured during each host's survey made
+    the order depend on when the survey ran: on 2026-10-02 m3 held the
+    earliest ticket but surveyed after a 10 min checkout, measured itself
+    short, and yielded to m5 while m5 yielded back, so no host updated.
     """
-    ahead = []
-    for peer, waited in sorted(waiting.items()):
-        if waited > my_wait + ANNOUNCE_TIE_SECONDS or (
-                abs(waited - my_wait) <= ANNOUNCE_TIE_SECONDS and peer < me):
-            ahead.append(f"{peer} (waiting {waited / 3600:.1f} h)")
-    return ahead
+    return [f"{peer} (waiting since {_iso(since)})"
+            for peer, since in sorted(waiting.items(), key=lambda item: (item[1], item[0]))
+            if (since, peer) < (my_since, me)]
 
 
 def waiting_ticket(cfg: Config) -> dict | None:
@@ -1559,10 +1550,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy, waiting, off, measured_at = survey_peers(cfg, sys_, me)
+        busy, waiting, off = survey_peers(cfg, sys_, me)
         ticket = waiting_ticket(cfg)
-        my_wait = max(0.0, measured_at - float(ticket["since"])) if ticket else 0.0
-        ahead = queue_ahead(me, my_wait, waiting)
+        my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
+                    else sys_.now())
+        ahead = queue_ahead(me, my_since, waiting)
         if busy:
             refusal = "another fleet host is not serving normally: " + "; ".join(busy)
             if apply:
