@@ -93,6 +93,9 @@ class FakeSystem(su.System):
         self.codesign_verify_rc = 0
         self.installed_after = None    # commit the host executes after install
         self.checked_out = None
+        self.writer_domain_exec = True   # the installed shipyard has the subcommand
+        self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
+        self.fenced: list[list[str]] = []
 
     def now(self) -> float:
         return self.clock
@@ -202,6 +205,16 @@ class FakeSystem(su.System):
             return ok(f'  1) {IDENTITY} "Developer ID Application: X (95CX6P84C4)"\n')
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
             return self._build(a)
+        if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
+            if a[1:] == ["writer-domain-exec", "--help"]:
+                return ok() if self.writer_domain_exec else su.Result(2, "", "unrecognized subcommand")
+            if a[1] == "writer-domain-exec":
+                if self.audit_holds_domain:
+                    return su.Result(75, "", "sandbox_writer_domain_overlap: exclusive sandbox "
+                                     "audit owns ~/Library/Application Support/shipyard")
+                child = a[a.index("--") + 1:]
+                self.fenced.append(child)
+                return self.run(child, cwd=cwd, env=env, timeout=timeout)
         if a[0] == "./tartci":
             return self._tartci(a[1:])
         if a[0] == str(self.home / ".local" / "bin" / "tartci"):
@@ -883,6 +896,55 @@ class MidJobWaitTests(Base):
         joined = [" ".join(a) for a, _ in self.sys.calls]
         self.assertFalse(any(c.startswith("./tartci pool off") and "--plan" not in c for c in joined))
         self.assertFalse(any("--apply" in c for c in joined))
+
+
+class ShipyardWriterLeaseTests(Base):
+    """The install writes ~/.local/bin only under `shipyard writer-domain-exec`."""
+
+    def shipyard(self) -> None:
+        path = self.home / ".local" / "bin" / "shipyard"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+
+    def installs(self) -> list[str]:
+        return [" ".join(a) for a, _ in self.sys.calls
+                if "--apply" in a and "install" in a and a[0] == "./tartci"]
+
+    def test_an_audit_holding_the_domain_defers_and_writes_nothing(self) -> None:
+        # m3 on 2026-10-02: the install wrote ~/.local/bin/tartci mid-audit
+        # and the Sandbox E2E audit failed.
+        self.shipyard()
+        self.sys.audit_holds_domain = True
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.installs(), [])
+        self.assertEqual(self.sys.pool_state, "on")
+        receipts = [json.loads(path.read_text())
+                    for path in (self.cfg.state_dir / "attempts").glob("*.json")]
+        self.assertEqual([r["status"] for r in receipts], ["refused"])
+        self.assertIn("sandbox_writer_domain_overlap", receipts[0]["error"])
+        self.assertIsNone(su.halt_reason(self.cfg.state_dir))
+
+    def test_a_free_domain_installs_under_the_lease(self) -> None:
+        # Control, same instrument: shipyard present, no audit.
+        self.shipyard()
+        self.assertUpdated(self.apply())
+        self.assertEqual(len(self.sys.fenced), 1)
+        self.assertEqual(self.sys.fenced[0][0], "./tartci")
+        self.assertIn("--apply", self.sys.fenced[0])
+        wrapped = next(a for a, _ in self.sys.calls if "writer-domain-exec" in a and "--" in a)
+        self.assertEqual(wrapped[wrapped.index("--path") + 1], str(self.home / ".local/bin/tartci"))
+
+    def test_without_shipyard_the_install_is_unfenced(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.sys.fenced, [])
+        self.assertEqual(len(self.installs()), 1)
+
+    def test_a_shipyard_without_the_subcommand_is_treated_as_absent(self) -> None:
+        self.shipyard()
+        self.sys.writer_domain_exec = False
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.sys.fenced, [])
+        self.assertFalse(any("writer-domain-exec" in a and "--" in a for a, _ in self.sys.calls))
 
 
 class InstallFailureTests(Base):

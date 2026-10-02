@@ -1028,6 +1028,69 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
             f"{was} -> {source[:12]}")
 
 
+QUEUE_SATURATION_LABEL = "com.danielraffel.pulp.queue-saturation"
+
+
+def desired_queue_saturation_plist(home: str, installed: dict) -> dict:
+    """The template rendered for `home`, keeping the host's own PULP_SAT_* values."""
+    import re  # noqa: PLC0415
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "launchd", f"{QUEUE_SATURATION_LABEL}.plist.template")
+    with open(path, "rb") as fh:
+        source = re.sub(rb"<!--.*?-->", b"", fh.read(), flags=re.DOTALL)
+    desired = plistlib.loads(source.replace(b"$HOME", home.encode()))
+    env = desired.setdefault("EnvironmentVariables", {})
+    for key, value in (installed.get("EnvironmentVariables") or {}).items():
+        if key.startswith("PULP_SAT_") and value:
+            env[key] = value
+    return desired
+
+
+def queue_saturation_pass(home: str | None = None, run=subprocess.run,
+                          loaded=None) -> str | None:
+    """Re-render a loaded queue-saturation agent that no longer matches its template.
+
+    Nothing re-rendered it after install: m5's copy from 2026-07-19 predated
+    the required PULP_SAT_GH_CLI and failed on every run for two months, and
+    m1's and m5's ran gh_queue_saturation.py from a stale checkout rather than
+    the installed generation. The host's PULP_SAT_* tuning is kept; an absent
+    or unloaded agent is left alone. Returns the line to log, or None.
+    """
+    home = home or os.path.expanduser("~")
+    plist_path = os.path.join(home, "Library", "LaunchAgents", f"{QUEUE_SATURATION_LABEL}.plist")
+    if not os.path.isfile(plist_path):
+        return None
+    is_loaded = loaded if loaded is not None else (
+        lambda label: _run(["launchctl", "print", f"{_domain()}/{label}"])[0] == 0)
+    if not is_loaded(QUEUE_SATURATION_LABEL):
+        return None
+    try:
+        with open(plist_path, "rb") as fh:
+            installed = plistlib.load(fh)
+        desired = desired_queue_saturation_plist(home, installed)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN queue-saturation agent unreadable "
+                f"({exc}); not re-rendered")
+    if installed == desired:
+        return None
+    try:
+        tmp = f"{plist_path}.tmp"
+        with open(tmp, "wb") as fh:
+            plistlib.dump(desired, fh)
+        os.replace(tmp, plist_path)
+        domain = f"gui/{os.getuid()}"
+        run(["launchctl", "bootout", f"{domain}/{QUEUE_SATURATION_LABEL}"],
+            capture_output=True, text=True, timeout=30)
+        boot = run(["launchctl", "bootstrap", domain, plist_path],
+                   capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{_iso(utcnow())} launchd-watchdog: WARN queue-saturation re-render FAILED ({exc})"
+    if boot.returncode != 0:
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN queue-saturation re-rendered but "
+                f"bootstrap failed (exit {boot.returncode}: {(boot.stderr or '').strip()[:200]})")
+    return f"{_iso(utcnow())} launchd-watchdog: queue-saturation agent re-rendered from its template"
+
+
 def queue_tick_pass() -> str | None:
     """Reinstall a loaded Shipyard queue tick whose copy is not this tartci's.
 
@@ -1325,6 +1388,9 @@ def main(argv: list[str] | None = None) -> int:
         unlock_line = keychain_unlock_agent_pass()
         if unlock_line:
             print(unlock_line)
+        saturation_line = queue_saturation_pass()
+        if saturation_line:
+            print(saturation_line)
         attestation_line = host_attestation_pass()
         if attestation_line:
             print(attestation_line)
