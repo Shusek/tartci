@@ -361,6 +361,9 @@ def summary(home: Path | None = None) -> dict:
         failed = (f"last self-update {last['status'].upper().replace('_', ' ')} for "
                   f"{str(last.get('target'))[:12]}: {last.get('error')}")
         problem = f"{problem}; {failed}" if problem else failed
+    signing = signing_blocked(state)
+    if signing:
+        problem = f"{problem}; {signing}" if problem else signing
     waiting = waiting_line(state)
     if waiting and "STARVED" in waiting:
         problem = f"{problem}; {waiting}" if problem else waiting
@@ -1006,6 +1009,51 @@ def extract_signing_identity(sys_: System, bundle: Path, workdir: Path) -> str:
     return match.group(1).replace(":", "").upper()
 
 
+def signing_secrets(home: Path) -> dict[str, str]:
+    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env)."""
+    directory = Path(os.environ.get("PULP_SECRETS_DIR") or home / ".config" / "pulp" / "secrets")
+    values: dict[str, str] = {}
+    try:
+        lines = (directory / "keychain.env").read_text().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if sep and key and not key.startswith("#"):
+            values[key.removeprefix("export ").strip()] = value.strip().strip('"').strip("'")
+    for key in ("PULP_SIGN_KEYCHAIN", "PULP_SIGN_KEYCHAIN_PW"):
+        if os.environ.get(key):
+            values[key] = os.environ[key]
+    return values
+
+
+def unlock_signing_keychain(sys_: System, home: Path) -> str:
+    """Unlock pulp's dedicated signing keychain in THIS process's session.
+
+    A keychain unlock belongs to the security session that made it: running
+    `pulp ship doctor` over SSH unlocks it for that SSH session only, and the
+    launchd agent kept failing the probe with errSecInternalComponent. On
+    m5studio that was 17 refusals and about 9 h without an update on
+    2026-10-02. This is the same non-interactive step pulp's
+    ensure_signing_ready.sh takes: only the dedicated keychain named in the
+    secrets file, its password from that file, and never the login keychain or
+    a prompt. Returns what it did, for the receipt. A failed unlock does not
+    refuse by itself: `pulp ship doctor` may have rebuilt a
+    pulp-signing-unattended sibling ahead of it in the search list (it did on
+    m5studio), and the probe that follows is what decides.
+    """
+    secrets = signing_secrets(home)
+    keychain, password = secrets.get("PULP_SIGN_KEYCHAIN"), secrets.get("PULP_SIGN_KEYCHAIN_PW")
+    if not keychain or not password:
+        return "no dedicated signing keychain configured in keychain.env; probing as-is"
+    keychain = str(Path(keychain.replace("$HOME", str(home))).expanduser())
+    result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
+    if result.rc != 0:
+        return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
+                "the signing probe decides")
+    return f"unlocked {keychain} for this session"
+
+
 def signing_probe(sys_: System, identity: str, workdir: Path) -> None:
     """Prove the identity signs unattended, with a timestamp, in bounded time.
 
@@ -1019,7 +1067,8 @@ def signing_probe(sys_: System, identity: str, workdir: Path) -> None:
                       timeout=SIGNING_PROBE_TIMEOUT)
     probe.unlink(missing_ok=True)
     if result.rc != 0:
-        raise Refused(f"signing identity {identity} cannot sign unattended (exit {result.rc}: "
+        raise Refused(f"SIGNING KEYCHAIN LOCKED or unusable: signing identity {identity} "
+                      f"cannot sign unattended (exit {result.rc}: "
                       f"{result.text[:200]}); run `pulp ship doctor` to prepare the dedicated "
                       "signing keychain, and never answer a keychain password prompt")
 
@@ -1449,6 +1498,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         if helper is not None and not refresh:
             with tempfile.TemporaryDirectory() as scratch:
                 identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
+                receipt.step("signing-keychain", unlock_signing_keychain(sys_, cfg.home))
                 signing_probe(sys_, identity, Path(scratch))
             receipt.step("signing", f"{'would build' if not apply else 'will build'} a sealed "
                          f"launcher signed by {identity} (extracted from the live bundle's leaf "
@@ -2069,10 +2119,36 @@ def status_lines(state_dir: Path) -> list[str]:
     waiting = waiting_line(state_dir)
     if waiting:
         lines.append(waiting)
+    signing = signing_blocked(state_dir)
+    if signing:
+        lines.append(signing)
     halted = halt_reason(state_dir)
     if halted:
         lines.append(halted)
     return lines
+
+
+def signing_blocked(state_dir: Path) -> str | None:
+    """The run of most recent attempts refused at signing, as one line.
+
+    m5studio refused 17 times in a row at the signing probe, about 9 h, and
+    no status surface said so. Any other outcome ends the run.
+    """
+    run = []
+    for _, value in reversed(_attempts(state_dir)):
+        if value.get("mode") != "apply":
+            continue
+        error = str(value.get("error") or "")
+        at_signing = "SIGNING KEYCHAIN LOCKED" in error or "cannot sign unattended" in error
+        if value.get("status") == "refused" and at_signing:
+            run.append(value)
+            continue
+        break
+    if not run:
+        return None
+    return (f"self-update: SIGNING KEYCHAIN LOCKED: {len(run)} refusal(s) in a row since "
+            f"{run[-1].get('started_at')}; run `pulp ship doctor` on this host "
+            f"(last: {str(run[0].get('error'))[:160]})")
 
 
 def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
