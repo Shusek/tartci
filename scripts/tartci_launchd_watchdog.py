@@ -943,6 +943,77 @@ def keychain_unlock_agent_pass(home: str | None = None,
     return f"{_iso(utcnow())} launchd-watchdog: keychain-unlock agent (re)installed"
 
 
+ATTESTATION_LABEL = "com.danielraffel.shipyard.host-attestation"
+
+
+def _sha256(path: str) -> str | None:
+    import hashlib  # noqa: PLC0415 - only this pass hashes
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def host_attestation_pass(home: str | None = None, run=subprocess.run,
+                          loaded=None) -> str | None:
+    """Redeploy a loaded host-attestation writer that is not this tartci's.
+
+    install_host_attestation.sh copies the writer out of the generation into
+    ~/.local/share/pulp-landing, so a self-update never reached it: on
+    2026-10-02 m3 and m5 still ran a 2026-09-12 writer that reported its own
+    previous exit as a finding, a bug main had fixed two days earlier. The
+    installer is re-run with the arguments the installed plist already carries
+    (every --advertise, the generation and the interval), so a host keeps
+    attesting exactly what it attested. A host without the agent, or with it
+    unloaded, is left alone: installing or re-enabling it is an operator's call.
+    Returns the line to log, or None when there is nothing to say. Never raises.
+    """
+    home = home or os.path.expanduser("~")
+    plist_path = os.path.join(home, "Library", "LaunchAgents", f"{ATTESTATION_LABEL}.plist")
+    if not os.path.isfile(plist_path):
+        return None
+    is_loaded = loaded if loaded is not None else (
+        lambda label: _run(["launchctl", "print", f"{_domain()}/{label}"])[0] == 0)
+    if not is_loaded(ATTESTATION_LABEL):
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    source = _sha256(os.path.join(root, "scripts", "tartci_host_attestation.py"))
+    installed = _sha256(os.path.join(home, ".local", "share", "pulp-landing", "current",
+                                     "tartci_host_attestation.py"))
+    if source is None or source == installed:
+        return None
+    try:
+        with open(plist_path, "rb") as fh:
+            plist = plistlib.load(fh)
+        argv = [str(a) for a in plist.get("ProgramArguments") or []]
+        args: list[str] = []
+        generation = (plist.get("EnvironmentVariables") or {}).get("PULP_ATTESTATION_GENERATION")
+        if generation:
+            args += ["--generation", str(generation)]
+        if isinstance(plist.get("StartInterval"), int):
+            args += ["--interval", str(plist["StartInterval"])]
+        for i, value in enumerate(argv[:-1]):
+            if value == "--advertise":
+                args += ["--advertise", argv[i + 1]]
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation writer is stale "
+                f"but its plist is unreadable ({exc}); not redeployed")
+    try:
+        proc = run(["/bin/bash", os.path.join(root, "scripts", "install_host_attestation.sh"),
+                    *args], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy FAILED ({exc})"
+    was = (installed or "absent")[:12]
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy {was} -> "
+                f"{source[:12]} FAILED (exit {proc.returncode}: "
+                f"{detail[-1] if detail else 'no output'})")
+    return (f"{_iso(utcnow())} launchd-watchdog: host-attestation writer redeployed "
+            f"{was} -> {source[:12]}")
+
+
 def queue_tick_pass() -> str | None:
     """Reinstall a loaded Shipyard queue tick whose copy is not this tartci's.
 
@@ -1240,6 +1311,9 @@ def main(argv: list[str] | None = None) -> int:
         unlock_line = keychain_unlock_agent_pass()
         if unlock_line:
             print(unlock_line)
+        attestation_line = host_attestation_pass()
+        if attestation_line:
+            print(attestation_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
