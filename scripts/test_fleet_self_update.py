@@ -988,13 +988,23 @@ class SigningKeychainTests(Base):
         self.assertUpdated(self.apply())
         self.assertIsNone(su.signing_blocked(self.cfg.state_dir))
 
-    def test_an_unlock_that_fails_refuses_before_the_host_is_touched(self) -> None:
+    def test_a_failed_unlock_is_recorded_and_the_probe_decides(self) -> None:
+        self.secrets()
+        self.sys.unlock_rc = 51
+        # Another keychain in the search list signs (the doctor's unattended
+        # sibling): the update proceeds, and the receipt says the unlock failed.
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        step = next(s for s in receipt["steps"] if s["step"] == "signing-keychain")
+        self.assertIn("could not be unlocked", step["detail"])
+
+    def test_a_failed_unlock_with_nothing_that_signs_refuses_before_the_host_is_touched(self) -> None:
         self.secrets()
         self.sys.locked = True
         self.sys.unlock_rc = 51
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.sys.mutations(), [])
-        self.assertIn("could not be unlocked", su.signing_blocked(self.cfg.state_dir))
+        self.assertIn("SIGNING KEYCHAIN LOCKED", su.signing_blocked(self.cfg.state_dir))
 
 
 class SealedTests(Base):

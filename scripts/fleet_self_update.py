@@ -1037,7 +1037,10 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     2026-10-02. This is the same non-interactive step pulp's
     ensure_signing_ready.sh takes: only the dedicated keychain named in the
     secrets file, its password from that file, and never the login keychain or
-    a prompt. Returns what it did, for the receipt.
+    a prompt. Returns what it did, for the receipt. A failed unlock does not
+    refuse by itself: `pulp ship doctor` may have rebuilt a
+    pulp-signing-unattended sibling ahead of it in the search list (it did on
+    m5studio), and the probe that follows is what decides.
     """
     secrets = signing_secrets(home)
     keychain, password = secrets.get("PULP_SIGN_KEYCHAIN"), secrets.get("PULP_SIGN_KEYCHAIN_PW")
@@ -1046,8 +1049,8 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     keychain = str(Path(keychain.replace("$HOME", str(home))).expanduser())
     result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
     if result.rc != 0:
-        raise Refused(f"SIGNING KEYCHAIN LOCKED: {keychain} could not be unlocked from "
-                      f"keychain.env (exit {result.rc}); run `pulp ship doctor`")
+        return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
+                "the signing probe decides")
     return f"unlocked {keychain} for this session"
 
 
