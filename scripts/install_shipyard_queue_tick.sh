@@ -68,15 +68,62 @@ INSTALLED_SUPPORT="$INSTALL_DIR/shipyard_queue_tick_support.py"
 CONFIG="$HOME/.config/shipyard/queue-tick.env"
 PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
 HEALTH="$HOME/Library/Logs/shipyard-queue-tick.health.json"
-HEALTH_WAIT_SECS="${SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS:-300}"
-case "$HEALTH_WAIT_SECS" in
-  ''|*[!0-9]*|0) echo "SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS must be a positive integer" >&2; exit 2 ;;
-esac
-[ "$HEALTH_WAIT_SECS" -le 3600 ] || {
-  echo "SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS must be at most 3600" >&2
-  exit 2
-}
+# The install waits for the first tick to FINISH, however long it runs: a tick
+# reads every open pull request, and one that took longer than a fixed wait
+# was read as a failed install and rolled back. HEALTH_WAIT_SECS is how long a
+# tick that is NOT running may go without publishing a verdict (it has not
+# started yet, or it exited without one). TICK_MAX_SECS bounds a running tick.
+HEALTH_WAIT_SECS="${SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS:-120}"
+TICK_MAX_SECS="${SHIPYARD_QUEUE_INSTALL_TICK_MAX_SECS:-3600}"
+for setting in HEALTH_WAIT_SECS TICK_MAX_SECS; do
+  case "${!setting}" in
+    ''|*[!0-9]*|0) echo "SHIPYARD_QUEUE_INSTALL_${setting} must be a positive integer" >&2; exit 2 ;;
+  esac
+  [ "${!setting}" -le 3600 ] || {
+    echo "SHIPYARD_QUEUE_INSTALL_${setting} must be at most 3600" >&2
+    exit 2
+  }
+done
 LABEL="com.danielraffel.shipyard.queue-tick"
+DOMAIN="gui/$(id -u)"
+# Exit status when the install failed AND the tick is left unloaded: the host
+# has no queue tick at all until someone bootstraps it.
+EXIT_LEFT_UNLOADED=4
+
+job_loaded() {
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+job_state() {
+  launchctl print "$DOMAIN/$LABEL" 2>/dev/null \
+    | awk -F' = ' '$1 ~ /^[[:space:]]*state$/ { print $2; exit }'
+}
+
+# `launchctl bootout` returns before the job is gone, and a bootstrap that
+# races it fails with "Bootstrap failed: 5: Input/output error". That is how
+# a rollback once left the tick silently unloaded. Wait for the old job to go,
+# retry, and report whether it is loaded now.
+bootstrap_reliably() {
+  local plist="$1" tries=0
+  while job_loaded && [ "$tries" -lt 20 ]; do
+    sleep 0.5
+    tries=$((tries + 1))
+  done
+  tries=0
+  while [ "$tries" -lt 6 ]; do
+    launchctl bootstrap "$DOMAIN" "$plist" >/dev/null 2>&1 || true
+    job_loaded && return 0
+    sleep $((tries + 1))
+    tries=$((tries + 1))
+  done
+  return 1
+}
+
+publish_unloaded_health() {
+  mkdir -p "$(dirname "$HEALTH")" 2>/dev/null || return 0
+  printf '{"schema_version": 1, "status": "unhealthy", "reason": "agent_unloaded: %s", "observed_at": "%s"}\n' \
+    "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HEALTH" 2>/dev/null || true
+}
 
 [ -f "$TEMPLATE" ] && [ -f "$SCRIPT" ] && [ -f "$SUPPORT" ] || {
   echo "installer must run from a complete tartci checkout" >&2
@@ -126,8 +173,14 @@ rollback_and_cleanup() {
       fi
     done
     if [ "$PRIOR_LOADED" = "1" ] && [ -f "$PLIST" ]; then
-      launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || \
-        echo "rollback warning: prior LaunchAgent could not be re-bootstrapped" >&2
+      if ! bootstrap_reliably "$PLIST"; then
+        echo "ROLLBACK FAILED: $LABEL is NOT LOADED; this host has no queue tick." >&2
+        echo "  restore it with: launchctl bootstrap $DOMAIN $PLIST" >&2
+        publish_unloaded_health "rollback could not re-bootstrap $PLIST"
+        rc=$EXIT_LEFT_UNLOADED
+      else
+        echo "rolled back: the prior $LABEL is loaded again" >&2
+      fi
     fi
   fi
   rm -f "$SCRIPT_TMP" "$SUPPORT_TMP" "$CONFIG_TMP" "$PLIST_TMP"
@@ -187,15 +240,18 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
 fi
 
 SWITCH_STARTED=1
-launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
 mv "$SCRIPT_TMP" "$INSTALLED_SCRIPT"
 mv "$SUPPORT_TMP" "$INSTALLED_SUPPORT"
 mv "$CONFIG_TMP" "$CONFIG"
 mv "$PLIST_TMP" "$PLIST"
 
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
 rm -f "$HEALTH"
-launchctl kickstart -k "gui/$(id -u)/$LABEL"
+bootstrap_reliably "$PLIST" || {
+  echo "LaunchAgent $LABEL did not load from $PLIST" >&2
+  exit 1
+}
+launchctl kickstart -k "$DOMAIN/$LABEL"
 
 PRINTED="$(launchctl print "gui/$(id -u)/$LABEL")"
 grep -Fq "$HOME/.config/shipyard/queue-tick.env" <<<"$PRINTED" || {
@@ -206,26 +262,47 @@ grep -Fq "$INSTALLED_SCRIPT" <<<"$PRINTED" || {
   echo "LaunchAgent did not receive installed queue tick executable" >&2
   exit 1
 }
-healthy=0
-attempt=0
-while [ "$attempt" -lt "$HEALTH_WAIT_SECS" ]; do
-  if python3 - "$HEALTH" <<'PY' >/dev/null 2>&1
+# A verdict file the new tick wrote: healthy commits, anything else fails now.
+verdict() {
+  python3 - "$HEALTH" <<'PY' 2>/dev/null
 import json, sys
-with open(sys.argv[1]) as source:
-    value = json.load(source)
-if not isinstance(value, dict) or value.get("status") != "healthy":
-    raise SystemExit(1)
+try:
+    with open(sys.argv[1]) as source:
+        value = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if isinstance(value, dict):
+    print(value.get("status") or "unknown", value.get("reason") or "")
 PY
-  then
-    healthy=1
+}
+started="$(date +%s)"
+idle_since="$started"
+last_note="$started"
+while :; do
+  now="$(date +%s)"
+  read -r status reason <<<"$(verdict)" || true
+  if [ "$status" = "healthy" ]; then
     break
+  elif [ -n "$status" ]; then
+    echo "queue tick published an unhealthy verdict: $status ${reason:-}" >&2
+    exit 1
+  fi
+  if [ "$(job_state)" = "running" ]; then
+    idle_since="$now"
+    if [ $((now - started)) -ge "$TICK_MAX_SECS" ]; then
+      echo "queue tick still running after ${TICK_MAX_SECS}s without a verdict: $HEALTH" >&2
+      exit 1
+    fi
+    if [ $((now - last_note)) -ge 60 ]; then
+      echo "  waiting for the first tick to finish ($((now - started))s so far)"
+      last_note="$now"
+    fi
+  elif [ $((now - idle_since)) -ge "$HEALTH_WAIT_SECS" ]; then
+    echo "queue tick did not publish a fresh healthy verdict: $HEALTH" \
+      "(not running for ${HEALTH_WAIT_SECS}s)" >&2
+    exit 1
   fi
   sleep 1
-  attempt=$((attempt + 1))
 done
-[ "$healthy" = "1" ] || {
-  echo "queue tick did not publish a fresh healthy verdict: $HEALTH" >&2
-  exit 1
-}
 COMMITTED=1
 echo "installed and started $LABEL in $MODE mode; fresh health verdict is healthy"

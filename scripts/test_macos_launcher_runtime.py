@@ -43,6 +43,9 @@ class LauncherRuntimeTests(unittest.TestCase):
                 "TARTCI_TEST_MODE": mode,
                 "TARTCI_TEST_PID_FILE": str(cls.pid_file),
             }}
+        (cls.app / "Contents/Resources/bundle.json").write_text(
+            json.dumps({"tart_home": "/Volumes/Workshop/VMs"})
+        )
         (cls.app / "Contents/Resources/lanes.json").write_text(
             json.dumps({"schema": 1, "lanes": lanes})
         )

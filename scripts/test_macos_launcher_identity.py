@@ -25,6 +25,21 @@ class Tests(unittest.TestCase):
     def test_internal_symlink_rejected(self):
         (self.app/"Contents/Resources/link").symlink_to(self.exe)
         with self.inspect(),self.assertRaises(identity.IdentityError): self.verify()
+    def set_store(self,store):
+        meta=self.app/"Contents/Resources/bundle.json"; value=json.loads(meta.read_text()); value["tart_home"]=store; meta.write_text(json.dumps(value))
+    def test_any_external_volume_store_is_accepted_and_pinned_by_caller(self):
+        self.set_store("/Volumes/Atelier/VMs")
+        with self.inspect(): self.verify()
+        with self.inspect(): self.verify(tart_home="/Volumes/Atelier/VMs")
+        # Control: the same bundle against another host's store is refused.
+        with self.inspect(),self.assertRaises(identity.IdentityError): self.verify(tart_home="/Volumes/Workshop/VMs")
+    def test_non_external_sealed_store_is_rejected(self):
+        for store in ("/Users/x/VMs","/Volumes/Atelier","/Volumes/Atelier/../VMs",""):
+            with self.subTest(store=store):
+                self.set_store(store)
+                with self.inspect(),self.assertRaises(identity.IdentityError): self.verify()
+        self.set_store("/Volumes/Atelier/VMs")
+        with self.inspect(): self.verify()
     def test_sealed_metadata_bindings_are_checked(self):
         with self.inspect(): self.verify(profile_policy_sha256="b"*64,source_commit="a"*40)
         with self.inspect(),self.assertRaises(identity.IdentityError): self.verify(profile_policy_sha256="c"*64)
