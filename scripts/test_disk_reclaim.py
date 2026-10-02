@@ -1445,5 +1445,123 @@ class BoundedScandirTests(unittest.TestCase):
         self.assertEqual(found, [self.root / "other" / "build"])
         self.assertEqual(dr.SCAN_TIMEOUTS, [str(self.blocked)])
 
+
+class AppContainerSkipTests(unittest.TestCase):
+    """Other apps' data containers are never listed: listing one prompts."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.listed: list[str] = []
+        real = os.scandir
+
+        def scandir(path):
+            self.listed.append(str(path))
+            return real(path)
+        for owner, name, value in ((dr.os, "scandir", scandir), (dr, "APP_CONTAINERS_SKIPPED", [])):
+            original = getattr(owner, name)
+            setattr(owner, name, value)
+            self.addCleanup(setattr, owner, name, original)
+
+    def test_a_containers_tree_is_skipped_unlisted(self) -> None:
+        # m1 on 2026-10-02: a listing under launchd waited forever on the
+        # "access data from other apps" consent prompt.
+        containers = self.root / "Library" / "Containers" / "com.example.app" / "build"
+        containers.mkdir(parents=True)
+        group = self.root / "Library" / "Group Containers" / "group.example" / "build"
+        group.mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=6)
+        self.assertEqual(found, [])
+        self.assertFalse(any("Containers" in path for path in self.listed), self.listed)
+        self.assertEqual(sorted(dr.APP_CONTAINERS_SKIPPED),
+                         [str(self.root / "Library" / "Containers"),
+                          str(self.root / "Library" / "Group Containers")])
+
+    def test_a_skipped_container_is_unmeasured_never_old(self) -> None:
+        path = self.root / "Library" / "Containers" / "com.example.app"
+        path.mkdir(parents=True)
+        self.assertIsNone(dr.newest_mtime(path))
+
+    def test_ordinary_directories_are_still_scanned(self) -> None:
+        # Control, same instrument: a build tree outside any container is found,
+        # including one under a Library that is not a container directory.
+        (self.root / "Library" / "Caches" / "build").mkdir(parents=True)
+        (self.root / "proj" / "build").mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=6)
+        self.assertEqual(found, [self.root / "Library" / "Caches" / "build",
+                                 self.root / "proj" / "build"])
+        self.assertEqual(dr.APP_CONTAINERS_SKIPPED, [])
+
+
+class HomeRootGuardTests(unittest.TestCase):
+    """No pass may walk the home directory: ~/Library prompts under launchd."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = pathlib.Path(self.tmp.name).resolve() / "home"
+        (self.home / "Code" / "pulp").mkdir(parents=True)
+        (self.home / "Library" / "Mail").mkdir(parents=True)
+        self.profile = pathlib.Path(self.tmp.name) / "profile.toml"
+        for patcher in (unittest.mock.patch.dict(os.environ, {"HOME": str(self.home),
+                                                              "TARTCI_FLEET_PROFILE": str(self.profile)}),
+                        unittest.mock.patch.object(dr, "DEFAULT_ROOT_CANDIDATES", ())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def roots(self, repo: str, worktrees_root: str) -> tuple[list[pathlib.Path], str]:
+        if dr.tomllib is None:
+            self.skipTest("profile roots need tomllib (Python 3.11+), as on the fleet")
+        self.profile.write_text(f'[reclaim]\nrepo = "{repo}"\nworktrees_root = "{worktrees_root}"\n')
+        err = io.StringIO()
+        with redirect_stderr(err):
+            roots = dr.parse_roots(None)
+        return roots, err.getvalue()
+
+    def test_m1s_profile_scans_code_not_home(self) -> None:
+        # m1 and m5 set worktrees_root = ~/Code; its parent is $HOME, and every
+        # pass walked ~/Library and hung on the "data from other apps" prompt.
+        code = self.home / "Code"
+        roots, err = self.roots(f"{code}/pulp", str(code))
+        self.assertEqual(roots, [code])
+        # Not merely filtered by the guard: home is never a candidate at all.
+        self.assertNotIn(str(self.home), dr.profile_root_candidates())
+        self.assertNotIn("REFUSED", err)
+
+    def test_a_profile_root_at_home_is_refused_loudly(self) -> None:
+        roots, err = self.roots(f"{self.home}/pulp", str(self.home))
+        self.assertEqual(roots, [])
+        self.assertIn("REFUSED scan root", err)
+        self.assertIn("home directory", err)
+
+    def test_an_explicit_home_root_fails_the_pass(self) -> None:
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = dr.main(["--roots", str(self.home), "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("refused", err.getvalue())
+
+    def test_a_root_nested_in_another_is_walked_once(self) -> None:
+        # m3 and m5studio: worktrees_root (…/Code/agent-worktrees) sits inside
+        # repo's parent (…/Code).
+        code = self.home / "Code"
+        (code / "agent-worktrees").mkdir()
+        roots, _ = self.roots(f"{code}/pulp", f"{code}/agent-worktrees")
+        self.assertEqual(roots, [code])
+
+    def test_roots_inside_or_above_library_are_refused(self) -> None:
+        self.assertIsNotNone(dr.refused_root(self.home / "Library" / "Mail"))
+        self.assertIsNotNone(dr.refused_root(pathlib.Path("/")))
+        # An ordinary directory above home still contains ~/Library.
+        self.assertIn("contains", dr.refused_root(self.home.parent))
+        # Control: a code directory under home is a valid root.
+        self.assertIsNone(dr.refused_root(self.home / "Code"))
+
+    def test_the_walk_never_lists_home_library(self) -> None:
+        with self.assertRaises(OSError) as raised:
+            dr.bounded_scandir(self.home / "Library" / "Mail")
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
 if __name__ == "__main__":
     unittest.main()
