@@ -31,6 +31,7 @@ import macos_launcher_probe
 import host_profile
 import network_profile
 import pulp_reapers
+import power_status
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -1753,6 +1754,25 @@ def host_off_problem(pool_state: str) -> dict | None:
             "minutes": value["minutes"], "since": value["since"], "loud": value["loud"]}
 
 
+def idle_sleep_problem(custom_text: str | None = None) -> dict | None:
+    """`host_idle_sleep_enabled` when the host is set to sleep on AC.
+
+    A sleeping host mints nothing and answers no peer, so it is not ready to
+    count on: m5studio's sleeps stalled every host's self-update for 7-9 h on
+    2026-10-01, because each peer probe of it timed out.
+    """
+    try:
+        value = power_status.status(custom_text)
+    except Exception as exc:  # noqa: BLE001 - readiness must not crash on this report
+        return {"code": "power_unverified", "detail": f"{type(exc).__name__}: {exc}"}
+    if value.get("state") != "sleeps":
+        return None
+    return {"code": "host_idle_sleep_enabled",
+            "detail": (f"this host sleeps after {value['sleep_minutes']} min idle on AC "
+                       "(`pmset -c sleep 0`, or System Settings > Energy > Prevent automatic "
+                       "sleeping when the display is off)")}
+
+
 DISK_WARN_PERCENT = 85
 DISK_PROBLEM_PERCENT = 92
 # The home volume holds builds, the per-user temp dir and every tool's state:
@@ -1854,6 +1874,9 @@ def fleet_readiness(
     left_off = host_off_problem(pool_state)
     if left_off is not None:
         problems.append(left_off)
+    sleeps = idle_sleep_problem()
+    if sleeps is not None:
+        problems.append(sleeps)
     disks = disk_pressure(config)
     for disk in disks:
         if disk["state"] == "problem":
