@@ -733,15 +733,25 @@ def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
 
 
 def survey_peers(cfg: Config, sys_: System,
-                 me: str) -> tuple[list[str], dict[str, float], list[str]]:
-    """(why each busy peer is busy, {peer: seconds it has waited}, off peers).
+                 me: str) -> tuple[list[str], dict[str, float], list[str], float]:
+    """(why each busy peer is busy, {peer: seconds it has waited}, off peers,
+    the local time every wait is measured to).
 
     An off peer neither blocks nor holds a place in the queue: it cannot take
     a turn while it is off, and yielding to it would stall the fleet the same
     way refusing on it did.
+
+    Every wait, this host's included, must be measured to the same instant.
+    A peer's wait is read on its own clock as the survey reaches it, so it is
+    carried forward by the local time that has passed since, and the caller
+    measures its own wait to the returned instant. Measuring this host's wait
+    to when the attempt started instead let a slow checkout shrink it: on
+    2026-10-02 m3, the longest waiter, yielded to m5 for hours while m5
+    correctly yielded back to m3, and no host updated.
     """
     busy: list[str] = []
     waiting: dict[str, float] = {}
+    read_at: dict[str, float] = {}
     off: list[str] = []
     for peer, target in published_peers(cfg, sys_).items():
         if peer == me:
@@ -754,7 +764,11 @@ def survey_peers(cfg: Config, sys_: System,
             continue
         if info["waited"] is not None:
             waiting[peer] = info["waited"]
-    return busy, waiting, off
+            read_at[peer] = sys_.now()
+    measured_at = sys_.now()
+    for peer, at in read_at.items():
+        waiting[peer] += max(0.0, measured_at - at)
+    return busy, waiting, off, measured_at
 
 
 def queue_ahead(me: str, my_wait: float, waiting: dict[str, float]) -> list[str]:
@@ -1545,9 +1559,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy, waiting, off = survey_peers(cfg, sys_, me)
+        busy, waiting, off, measured_at = survey_peers(cfg, sys_, me)
         ticket = waiting_ticket(cfg)
-        my_wait = max(0.0, now - float(ticket["since"])) if ticket else 0.0
+        my_wait = max(0.0, measured_at - float(ticket["since"])) if ticket else 0.0
         ahead = queue_ahead(me, my_wait, waiting)
         if busy:
             refusal = "another fleet host is not serving normally: " + "; ".join(busy)
