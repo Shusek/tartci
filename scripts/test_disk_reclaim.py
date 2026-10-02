@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral tests for scripts/disk_reclaim.py.
+"""Behavioral tests for scripts/dr.py.
 
 The janitor deletes directories, so every negative assertion here is paired
 with a control in the same tree that MUST be deleted. A test that only proves
@@ -1390,6 +1390,60 @@ class LogRotationWiringTests(unittest.TestCase):
         self.assertEqual((self.root / "tartci-reclaim.log.1").read_text(),
                          "o" * 64)
 
+
+
+class BoundedScandirTests(unittest.TestCase):
+    """A directory listing that never returns is abandoned, named, and not judged."""
+
+    def setUp(self) -> None:
+        import threading
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.blocked = self.root / "stuck"
+        self.blocked.mkdir()
+        real = os.scandir
+
+        def scandir(path):
+            if pathlib.Path(path) == self.blocked:
+                self.release.wait(30)   # m1 on 2026-10-02: open() never returned
+            return real(path)
+        self.patch(dr.os, "scandir", scandir)
+        self.patch(dr, "SCANDIR_TIMEOUT_S", 0.2)
+        self.patch(dr, "SCAN_TIMEOUTS", [])
+
+    def patch(self, owner, name, value) -> None:
+        original = getattr(owner, name)
+        setattr(owner, name, value)
+        self.addCleanup(setattr, owner, name, original)
+
+    def test_a_listing_that_never_returns_times_out_and_is_named(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(OSError) as raised:
+            dr.bounded_scandir(self.blocked)
+        self.assertEqual(raised.exception.errno, errno.ETIMEDOUT)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(dr.SCAN_TIMEOUTS, [str(self.blocked)])
+
+    def test_a_normal_listing_returns_its_entries(self) -> None:
+        # Control, same instrument: an unblocked directory lists normally.
+        (self.root / "build").mkdir()
+        names = sorted(e.name for e in dr.bounded_scandir(self.root))
+        self.assertEqual(names, ["build", "stuck"])
+        self.assertEqual(dr.SCAN_TIMEOUTS, [])
+
+    def test_a_timed_out_tree_is_unmeasured_never_old(self) -> None:
+        # newest_mtime None keeps the tree; reading the timeout as "empty"
+        # would make it look maximally idle and delete it.
+        self.assertIsNone(dr.newest_mtime(self.blocked))
+
+    def test_the_candidate_scan_finishes_past_a_stuck_directory(self) -> None:
+        (self.root / "other" / "build").mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=4)
+        self.assertEqual(found, [self.root / "other" / "build"])
+        self.assertEqual(dr.SCAN_TIMEOUTS, [str(self.blocked)])
 
 if __name__ == "__main__":
     unittest.main()
