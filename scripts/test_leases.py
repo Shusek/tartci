@@ -714,6 +714,18 @@ class LeaseOwnerDeathMustBeProvenTests(unittest.TestCase):
             verdict, evidence = leases.owner_verdict(record)
         self.assertEqual(verdict, leases.OWNER_ALIVE, evidence)
 
+    def test_matching_start_time_outranks_a_changed_boot_time_string(self) -> None:
+        # kern.boottime is a rendered string; XNU moves it when the calendar
+        # clock is stepped. A pid whose recorded start still matches is the
+        # same process, whatever the boot string says now.
+        record = self._live_record("boot-string-moved")
+        record["host_boot_time"] = "{ sec = 1, usec = 2 } Thu Jan  1 00:00:01 1970"
+        verdict, evidence = leases.owner_verdict(record)
+        self.assertEqual(verdict, leases.OWNER_ALIVE, evidence)
+        # Control: a start time that does not match is still pid reuse.
+        record["process_start_time"] = "Mon Jan  1 00:00:00 2001"
+        self.assertEqual(leases.owner_verdict(record)[0], leases.OWNER_DEAD)
+
     def test_vm_lease_is_kept_while_tart_still_runs_its_vm(self) -> None:
         exited = subprocess.Popen([sys.executable, "-c", "pass"])
         exited.wait(timeout=5)
