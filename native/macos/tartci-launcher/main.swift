@@ -3,7 +3,6 @@ import Foundation
 import Security
 
 private let usage = "usage: tartci-launcher --lane <signed-lane>\n       tartci-launcher --probe-store"
-private let m3Store = "/Volumes/Workshop/VMs"
 private var caughtSignal: Int32 = 0
 #if TARTCI_TESTING
 private let gracefulShutdownSeconds = 0.2, forcedShutdownSeconds = 1.0
@@ -59,8 +58,25 @@ private func spawn(_ executable: String, _ arguments: [String], _ environment: [
     guard result == 0 else { fail("cannot launch sealed TartCI cohort: \(String(cString: strerror(result)))", code: 126) }
     return pid
 }
-private func probeStore() -> Never {
-    let root = URL(fileURLWithPath: m3Store, isDirectory: true)
+struct SealedMetadata: Decodable { let tart_home: String }
+/// The Tart store sealed into this bundle at build time (bundle.json): the
+/// profile's own external-volume store, e.g. /Volumes/Workshop/VMs on m3 or
+/// /Volumes/Atelier/VMs on m5studio. It is covered by the bundle signature.
+private func sealedStore(_ root: URL) -> String {
+    let value: SealedMetadata
+    do {
+        let url = root.appendingPathComponent("Contents/Resources/bundle.json")
+        value = try JSONDecoder().decode(SealedMetadata.self, from: Data(contentsOf: url))
+    } catch { fail("cannot read sealed bundle metadata: \(error)", code: 77) }
+    let parts = value.tart_home.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+    guard value.tart_home.hasPrefix("/Volumes/"), parts.count >= 3,
+          parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+        fail("sealed Tart store is not an external-volume path", code: 77)
+    }
+    return value.tart_home
+}
+private func probeStore(_ store: String) -> Never {
+    let root = URL(fileURLWithPath: store, isDirectory: true)
     let target = root.appendingPathComponent(
         ".tartci-launcher-probe-\(getpid())-\(UUID().uuidString)"
     )
@@ -69,12 +85,12 @@ private func probeStore() -> Never {
     do {
         try payload.write(to: target, options: [.atomic])
         guard try Data(contentsOf: target) == payload else {
-            fail("M3 store probe readback mismatch", code: 74)
+            fail("store probe readback mismatch", code: 74)
         }
         try FileManager.default.removeItem(at: target)
         exit(0)
     } catch {
-        fail("M3 store probe failed: \(error)", code: 74)
+        fail("store probe failed (\(store)): \(error)", code: 74)
     }
 }
 private func processGroupExists(_ pid: pid_t) -> Bool { kill(-pid, 0) == 0 || errno == EPERM }
@@ -106,14 +122,15 @@ private func finish(_ child: pid_t, _ initial: Int32?) -> Never {
 let arguments = Array(CommandLine.arguments.dropFirst())
 let root = appRoot()
 verifySealedBundle(root)
+let store = sealedStore(root)
 if arguments == ["--probe-store"] {
-    probeStore()
+    probeStore(store)
 }
 guard arguments.count == 2, arguments[0] == "--lane",
       arguments[1].range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", options: .regularExpression) != nil else { fail(usage) }
 let config = loadConfiguration(root)
 guard let lane = config.lanes[arguments[1]] else { fail("lane is not in the signed fleet enum", code: 77) }
-guard lane.environment["TART_HOME"] == m3Store else { fail("signed lane has the wrong M3 Tart store", code: 77) }
+guard lane.environment["TART_HOME"] == store else { fail("signed lane has the wrong Tart store", code: 77) }
 guard lane.environment.keys.allSatisfy({ !$0.hasPrefix("DYLD_") }) else {
     fail("signed lane contains a forbidden dynamic-loader variable", code: 77)
 }

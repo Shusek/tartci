@@ -159,14 +159,37 @@ class MacosFleetLaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "external-volume"):
                 fleet.load(path)
 
-    def test_private_launcher_rejects_another_external_store(self) -> None:
+    def test_launcher_accepts_a_differently_named_external_volume(self) -> None:
+        """m5studio keeps its store on /Volumes/Atelier, not Workshop."""
+        data = fleet.load(ROOT / "profiles" / "m5studio-macos-fleet.toml")
+        self.assertEqual(data["host"]["tart_home"], "/Volumes/Atelier/VMs")
+        self.assertEqual(
+            data["launch_helper"]["approval_sha256_path"],
+            "/Users/danielraffel/.config/tartci/m5studio-launcher-approved.sha256")
+        self.assertNotIn("worktree_cleanup", data)
+        self.assertNotIn("build_disagreement", data)
+        self.assertEqual(data["reclaim"]["repo"], "/Volumes/Atelier/Code/pulp")
+
+    def test_launcher_rejects_a_store_at_the_volume_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m3.toml"
             path.write_text(HOST_CONFIGS["studio"].read_text().replace(
-                "/Volumes/Workshop/VMs", "/Volumes/Another/VMs"
+                'tart_home = "/Volumes/Workshop/VMs"', 'tart_home = "/Volumes/Workshop"'
             ))
-            with self.assertRaisesRegex(ValueError, "private M3"):
+            with self.assertRaisesRegex(ValueError, "below an external volume root"):
                 fleet.load(path)
+
+    def test_launcher_approval_path_stays_in_the_private_config_dir(self) -> None:
+        body = HOST_CONFIGS["studio"].read_text()
+        for bad in ("/Users/danielraffel/m3-launcher-approved.sha256",
+                    "/Users/danielraffel/.config/tartci/m3-approved.sha256",
+                    "/Users/danielraffel/.config/tartci/../m3-launcher-approved.sha256"):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "m3.toml"
+                path.write_text(body.replace(
+                    "/Users/danielraffel/.config/tartci/m3-launcher-approved.sha256", bad))
+                with self.assertRaisesRegex(ValueError, "approval_sha256_path"):
+                    fleet.load(path)
 
     def test_launchd_context_probe_is_bounded_and_cleans_up(self) -> None:
         with tempfile.TemporaryDirectory() as td:

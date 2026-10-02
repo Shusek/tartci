@@ -107,8 +107,9 @@ for file in "$out"/*.plist; do plutil -lint "$file"; done
 ssh m1-lan 'mkdir -p "$HOME/Library/Logs/tartci"'
 ```
 
-For M3, stage the exact profile-pinned signed launcher alongside the immutable
-support cohort, then install only at a terminal idle boundary:
+For M3 (and m5studio, whose store is on `/Volumes/Atelier`), stage the exact
+profile-pinned signed launcher alongside the immutable support cohort, then
+install only at a terminal idle boundary:
 
 ```sh
 ./tartci fleet-macos install profiles/m3-macos-fleet.toml \

@@ -402,16 +402,26 @@ def load(path: Path) -> dict:
         expected_path = PurePosixPath(host["home"]) / ".local/libexec/TartCILauncher.app"
         if helper.get("path") != str(expected_path):
             fail("launch_helper.path must be the stable host-local TartCI launcher path")
-        expected_approval = PurePosixPath(host["home"]) / ".config/tartci/m3-launcher-approved.sha256"
-        if helper.get("approval_sha256_path") != str(expected_approval):
-            fail("launch_helper.approval_sha256_path must be the stable private M3 approval path")
+        # One approval digest per host, named for it (m3, m5studio), always in
+        # the host's private tartci config directory.
+        approval = helper.get("approval_sha256_path")
+        approval_dir = str(PurePosixPath(host["home"]) / ".config/tartci")
+        if (not isinstance(approval, str)
+                or str(PurePosixPath(approval).parent) != approval_dir
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}-launcher-approved\.sha256",
+                                    PurePosixPath(approval).name)):
+            fail("launch_helper.approval_sha256_path must be "
+                 f"{approval_dir}/<host>-launcher-approved.sha256")
         if helper.get("identifier") != "com.danielraffel.tartci.launcher":
             fail("launch_helper.identifier must be com.danielraffel.tartci.launcher")
         if (not isinstance(helper.get("team_id"), str)
                 or not re.fullmatch(r"[A-Z0-9]{10}", helper["team_id"])):
             fail("launch_helper.team_id must be a ten-character Apple Team ID")
-        if host["tart_home"] != "/Volumes/Workshop/VMs":
-            fail("launch_helper is restricted to the private M3 /Volumes/Workshop/VMs store")
+        # Any external volume name works (m3: Workshop, m5studio: Atelier); the
+        # store must sit below the volume root, never be the mount point itself.
+        if len(PurePosixPath(host["tart_home"]).parts) < 4:
+            fail("launch_helper requires a Tart store below an external volume root "
+                 "(/Volumes/<volume>/<dir>)")
     if external_tart_home and helper is None:
         fail("an external-volume Tart home requires a verified signed launch_helper")
     if helper is not None and not external_tart_home:
@@ -1195,6 +1205,7 @@ def write_receipt(
             team_id=helper["team_id"],
             profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
             source_commit=source_authority_commit,
+            tart_home=data["host"]["tart_home"],
         )
     persistent_records = persistent_plist_records(data, agents_dir)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -1300,6 +1311,7 @@ def verify_receipt(
             team_id=helper["team_id"],
             profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
             source_commit=verified_support["source_commit"],
+            tart_home=data["host"]["tart_home"],
         )
         if helper_record != receipt.get("launch_helper"):
             fail("installed launch helper does not match its receipt")
@@ -1763,6 +1775,9 @@ def idle_sleep_problem(custom_text: str | None = None) -> dict | None:
 
 DISK_WARN_PERCENT = 85
 DISK_PROBLEM_PERCENT = 92
+# The home volume holds builds, the per-user temp dir and every tool's state:
+# at this fill a Shipyard release build on m3 failed with ENOSPC (2026-10-01).
+HOME_DISK_PROBLEM_PERCENT = 97
 
 
 def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
@@ -1772,9 +1787,11 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
     same window its I/O stalled for hours (a directory scan took 70-204 min
     instead of 1-2) under the system's own space-reclaim pressure. A volume
     this full is a readiness fact about the host, not only a lease denial.
-    At DISK_PROBLEM_PERCENT the VM store volume is a readiness problem; the
-    home volume only warns, because what fills it (iCloud, caches, Chrome's
-    code-sign clones) is outside what this fleet can act on or wait out.
+    At DISK_PROBLEM_PERCENT the VM store volume is a readiness problem. The
+    home volume warns from DISK_WARN_PERCENT, because much of what fills it
+    (iCloud, caches) is outside what this fleet can act on, and becomes a
+    problem only at HOME_DISK_PROBLEM_PERCENT, where builds start failing
+    with ENOSPC.
     """
     rows = []
     seen: set[int] = set()
@@ -1798,7 +1815,8 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
                          "detail": str(exc)})
             continue
         percent = 100.0 * (usage.total - usage.free) / usage.total if usage.total else 0.0
-        state = ("problem" if role == "vm_store" and percent >= DISK_PROBLEM_PERCENT
+        limit = DISK_PROBLEM_PERCENT if role == "vm_store" else HOME_DISK_PROBLEM_PERCENT
+        state = ("problem" if percent >= limit
                  else "warn" if percent >= DISK_WARN_PERCENT else "ok")
         rows.append({"role": role, "path": str(path), "state": state,
                      "used_percent": round(percent, 1),
@@ -1865,7 +1883,9 @@ def fleet_readiness(
             problems.append({
                 "code": "disk_pressure", "label": disk["path"],
                 "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB free "
-                           f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"),
+                           + (f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"
+                              if disk["role"] == "vm_store" else
+                              f"(>= {HOME_DISK_PROBLEM_PERCENT}% fails builds with ENOSPC)")),
             })
     if participating != (pool_state == "on"):
         problems.append({

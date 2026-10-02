@@ -262,6 +262,14 @@ class DiskPressure(unittest.TestCase):
         self.assertEqual(rows["home"]["state"], "warn")
         self.assertEqual(rows["vm_store"]["state"], "ok")
 
+    def test_a_home_volume_full_enough_to_break_builds_is_a_problem(self):
+        # m3, 2026-10-01: its internal data volume at 99% failed a Shipyard
+        # release build with ENOSPC while pool status only warned.
+        rows = {row["role"]: row for row in self.run_with(50.0, home_percent=99.0)}
+        self.assertEqual(rows["home"]["state"], "problem")
+        self.assertEqual({r["role"]: r for r in self.run_with(50.0, home_percent=96.0)}
+                         ["home"]["state"], "warn")
+
     def test_readiness_turns_a_full_store_into_a_problem_and_pool_status_prints_it(self):
         import macos_fleet_lanes as fleet
         source = (HERE / "macos_fleet_lanes.py").read_text()
@@ -269,7 +277,8 @@ class DiskPressure(unittest.TestCase):
         self.assertIn('if disk["state"] == "problem":', body[:body.index("\ndef ")])
         self.assertIn('"code": "disk_pressure"', body[:body.index("\ndef ")])
         self.assertIn('for disk in fleet.get("disk") or []:', (HERE.parent / "tartci").read_text())
-        self.assertEqual((fleet.DISK_WARN_PERCENT, fleet.DISK_PROBLEM_PERCENT), (85, 92))
+        self.assertEqual((fleet.DISK_WARN_PERCENT, fleet.DISK_PROBLEM_PERCENT,
+                          fleet.HOME_DISK_PROBLEM_PERCENT), (85, 92, 97))
 
 
 if __name__ == "__main__":
