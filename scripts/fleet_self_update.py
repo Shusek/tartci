@@ -1027,26 +1027,38 @@ def signing_secrets(home: Path) -> dict[str, str]:
     return values
 
 
+def signing_keychain(home: Path) -> str | None:
+    """The dedicated keychain every unattended signature must name.
+
+    keychain.env's PULP_SIGN_KEYCHAIN, or its `-unattended` sibling when that
+    exists: pulp's ensure_signing_ready.sh builds the sibling when the
+    configured keychain cannot be unlocked, and signs from it from then on.
+    """
+    keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
+    if not keychain:
+        return None
+    path = Path(keychain.replace("$HOME", str(home))).expanduser()
+    stem = str(path)[: -len(".keychain-db")] if str(path).endswith(".keychain-db") else str(path)
+    sibling = Path(f"{stem}-unattended.keychain-db")
+    return str(sibling if sibling.exists() else path)
+
+
 def unlock_signing_keychain(sys_: System, home: Path) -> str:
-    """Unlock pulp's dedicated signing keychain in THIS process's session.
+    """Unlock the dedicated signing keychain in THIS process's session.
 
     A keychain unlock belongs to the security session that made it: running
     `pulp ship doctor` over SSH unlocks it for that SSH session only, and the
-    launchd agent kept failing the probe with errSecInternalComponent. On
-    m5studio that was 17 refusals and about 9 h without an update on
-    2026-10-02. This is the same non-interactive step pulp's
-    ensure_signing_ready.sh takes: only the dedicated keychain named in the
-    secrets file, its password from that file, and never the login keychain or
-    a prompt. Returns what it did, for the receipt. A failed unlock does not
-    refuse by itself: `pulp ship doctor` may have rebuilt a
-    pulp-signing-unattended sibling ahead of it in the search list (it did on
-    m5studio), and the probe that follows is what decides.
+    launchd agent kept failing the probe with errSecInternalComponent (17
+    refusals, about 9 h on m5studio, 2026-10-02). This is the same
+    non-interactive step pulp's ensure_signing_ready.sh takes: only the
+    dedicated keychain, its password from keychain.env, never the login
+    keychain or a prompt. Returns what it did, for the receipt. A failed
+    unlock does not refuse by itself; the probe that follows decides.
     """
-    secrets = signing_secrets(home)
-    keychain, password = secrets.get("PULP_SIGN_KEYCHAIN"), secrets.get("PULP_SIGN_KEYCHAIN_PW")
+    keychain = signing_keychain(home)
+    password = signing_secrets(home).get("PULP_SIGN_KEYCHAIN_PW")
     if not keychain or not password:
         return "no dedicated signing keychain configured in keychain.env; probing as-is"
-    keychain = str(Path(keychain.replace("$HOME", str(home))).expanduser())
     result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
     if result.rc != 0:
         return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
@@ -1054,7 +1066,21 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     return f"unlocked {keychain} for this session"
 
 
-def signing_probe(sys_: System, identity: str, workdir: Path) -> None:
+def keychain_args(home: Path) -> list[str]:
+    """`--keychain <dedicated>` for every codesign this module runs.
+
+    Without it codesign walks the user search list, and a LOCKED keychain on
+    that list makes securityd raise a password dialog in the GUI session. That
+    is how the agent's probe put a dialog on m5studio's screen at each attempt
+    on 2026-10-02 (SecurityAgent spawns at 06:06Z, 06:37Z, 13:59Z, 14:28Z,
+    14:58Z, each probe ending in a 60 s TimeoutExpired).
+    """
+    keychain = signing_keychain(home)
+    return ["--keychain", keychain] if keychain else []
+
+
+def signing_probe(sys_: System, identity: str, workdir: Path,
+                  keychain: list[str] | None = None) -> None:
     """Prove the identity signs unattended, with a timestamp, in bounded time.
 
     The equivalent of pulp's ensure_signing_ready.sh probe: an unattended run
@@ -1063,8 +1089,8 @@ def signing_probe(sys_: System, identity: str, workdir: Path) -> None:
     """
     probe = workdir / "signing-probe"
     probe.write_bytes(b"tartci signing probe\n")
-    result = sys_.run(["codesign", "--force", "--timestamp", "--sign", identity, str(probe)],
-                      timeout=SIGNING_PROBE_TIMEOUT)
+    result = sys_.run(["codesign", "--force", "--timestamp", *(keychain or []), "--sign", identity,
+                       str(probe)], timeout=SIGNING_PROBE_TIMEOUT)
     probe.unlink(missing_ok=True)
     if result.rc != 0:
         raise Refused(f"SIGNING KEYCHAIN LOCKED or unusable: signing identity {identity} "
@@ -1145,7 +1171,8 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
                    out_dir: Path) -> tuple[Path, Path]:
     live = Path(helper["path"])
     identity = extract_signing_identity(sys_, live, out_dir)
-    signing_probe(sys_, identity, out_dir)
+    pinned = keychain_args(cfg.home)
+    signing_probe(sys_, identity, out_dir, pinned)
     bundle = out_dir / "TartCILauncher.app"
     approval = out_dir / "approved.sha256"
     manifest = cfg.checkout / ".tartci-support-manifest.json"
@@ -1153,7 +1180,7 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     try:
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
-                           "--support-root", ".", "--profile", str(profile)],
+                           "--support-root", ".", "--profile", str(profile), *pinned],
                           cwd=str(cfg.checkout), timeout=1800)
     finally:
         restore_writable(cfg.checkout)
@@ -1499,7 +1526,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             with tempfile.TemporaryDirectory() as scratch:
                 identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
                 receipt.step("signing-keychain", unlock_signing_keychain(sys_, cfg.home))
-                signing_probe(sys_, identity, Path(scratch))
+                signing_probe(sys_, identity, Path(scratch), keychain_args(cfg.home))
             receipt.step("signing", f"{'would build' if not apply else 'will build'} a sealed "
                          f"launcher signed by {identity} (extracted from the live bundle's leaf "
                          "certificate; a timestamped signing probe with it succeeded)")
