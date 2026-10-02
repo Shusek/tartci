@@ -1698,6 +1698,18 @@ fleet`), and check GitHub's job history against it with
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
+- **Update queue.** A host that defers keeps a ticket in
+  `~/.tartci/state/self-update/waiting.json` whose `since` records when it
+  joined the queue and survives new targets. Hosts take turns in `since`
+  order, earliest first, ties to the lower host id: every host computes the
+  same order from the same tickets, whenever its survey runs. An off peer and
+  a ticket not refreshed within the TTL hold no place.
+- **A change to the queue or peer gates cannot fix a wedge it caused.** Each
+  host decides with its *installed* tartci, so a fix to the deciding code only
+  takes effect after some host updates. If the queue itself is wedged, unwedge
+  it once by hand: move the waiting ticket of a host that is wrongly ahead
+  aside (it rejoins at the back on its next attempt), or update the first host
+  manually. Delete the moved ticket after that host updates.
 - **Capacity floor.** `--allow-last-serving-host` only when every last-serving
   label is either idle by design (the pulp-release classes) or **minted on
   demand by another host**, logged in the receipt. On an ephemeral JIT fleet a
