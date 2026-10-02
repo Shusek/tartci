@@ -36,6 +36,7 @@ import datetime as dt
 import json
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -263,7 +264,21 @@ def _update_checkout() -> str | None:
     return str(checkout) if (checkout / ".git").exists() else None
 
 
+def _scratch_home() -> bool:
+    """True when TARTCI_HOME is under the temp dir, which is how every test runs.
+
+    A starvation test once reached the real API from a developer machine and
+    opened tartci issue #326. Issues are only ever written for a real host's
+    state, whatever a test forgets to stub.
+    """
+    home = os.environ.get("TARTCI_HOME") or str(Path.home() / ".tartci")
+    scratch = os.path.realpath(tempfile.gettempdir())
+    return os.path.realpath(home).startswith(scratch + os.sep)
+
+
 def _open_issue(title: str, body: str) -> tuple[int, str]:
+    if _scratch_home():
+        return 1, "refused: issue writes from a scratch TARTCI_HOME (a test run) never reach GitHub"
     # ghapp derives repository provenance from the working directory, so it
     # runs inside the tartci checkout the self-update agent keeps.
     return _ghapp(["api", "-X", "POST", f"repos/{ISSUE_REPO}/issues", "-f", f"title={title}",
@@ -271,5 +286,7 @@ def _open_issue(title: str, body: str) -> tuple[int, str]:
 
 
 def _close_issue(number: str) -> tuple[int, str]:
+    if _scratch_home():
+        return 1, "refused: issue writes from a scratch TARTCI_HOME (a test run) never reach GitHub"
     return _ghapp(["api", "-X", "PATCH", f"repos/{ISSUE_REPO}/issues/{number}",
                    "-f", "state=closed", "--jq", ".state"], _update_checkout())

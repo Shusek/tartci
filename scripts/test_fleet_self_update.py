@@ -58,6 +58,9 @@ class FakeSystem(su.System):
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
+        self.locked = False          # dedicated keychain locked in this session
+        self.unlocked = False
+        self.unlock_rc = 0
         self.rollback_install_rc = 0
         self.broken_target = False     # the new generation fails verification
         self.broken_previous = False   # ...and so does the restored one
@@ -135,8 +138,14 @@ class FakeSystem(su.System):
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
+        if a[0] == "security" and a[1] == "unlock-keychain":
+            self.unlocked = self.unlock_rc == 0
+            return su.Result(self.unlock_rc, "", "" if self.unlock_rc == 0 else "bad password")
         if a[0] == "codesign" and "--timestamp" in a:
-            return su.Result(self.signing_rc, "", "" if self.signing_rc == 0 else "errSecInternalComponent")
+            # The live failure: the dedicated keychain is locked in this
+            # session until something unlocks it here.
+            rc = self.signing_rc if (self.unlocked or not self.locked) else 1
+            return su.Result(rc, "", "" if rc == 0 else "errSecInternalComponent")
         if a[0] == "git":
             if "clone" in a:
                 if not self.clone_ok:
@@ -927,6 +936,65 @@ class RelayTests(Base):
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertIn("relay", self.last()["error"])
         self.assertEqual(self.sys.pool_state, "on")
+
+
+class SigningKeychainTests(Base):
+    """The agent unlocks pulp's dedicated keychain in its own session.
+
+    `pulp ship doctor` over SSH unlocked it for that SSH session only. The
+    launchd agent kept failing the probe with errSecInternalComponent, and
+    m5studio refused 17 times in a row (about 9 h) with nothing on any status
+    surface.
+    """
+
+    sealed = True
+
+    def secrets(self) -> None:
+        path = self.home / ".config/pulp/secrets/keychain.env"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('PULP_SIGN_KEYCHAIN="$HOME/Library/Keychains/pulp-signing.keychain-db"\n'
+                        "PULP_SIGN_KEYCHAIN_PW=s3cret\n")
+
+    def calls(self, word: str) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[0] == word]
+
+    def test_a_keychain_locked_in_this_session_is_unlocked_before_the_probe(self) -> None:
+        self.secrets()
+        self.sys.locked = True
+        self.assertUpdated(self.apply())
+        unlock = self.calls("security")
+        self.assertEqual(unlock[0][:3], ["security", "unlock-keychain", "-p"])
+        self.assertEqual(unlock[0][-1],
+                         str(self.home / "Library/Keychains/pulp-signing.keychain-db"))
+        order = [("probe" if a[0] == "codesign" and "--timestamp" in a else a[0])
+                 for a, _ in self.sys.calls if a[0] in ("security", "codesign")]
+        self.assertLess(order.index("security"), order.index("probe"))
+
+    def test_a_locked_keychain_without_secrets_is_refused_and_loud(self) -> None:
+        # Control: with nothing to unlock from, the probe fails as before, and
+        # the run of refusals is now on the status surfaces.
+        self.sys.locked = True
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.clock += 1800
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.calls("security"), [])
+        line = su.signing_blocked(self.cfg.state_dir)
+        self.assertIn("SIGNING KEYCHAIN LOCKED: 2 refusal(s) in a row", line)
+        self.assertIn("pulp ship doctor", line)
+        self.assertIn(line, su.status_lines(self.cfg.state_dir))
+        self.assertIn("SIGNING KEYCHAIN LOCKED", su.summary(self.home)["problem"])
+        # Unlockable again: the next success ends the run and the line goes.
+        self.secrets()
+        self.assertUpdated(self.apply())
+        self.assertIsNone(su.signing_blocked(self.cfg.state_dir))
+
+    def test_an_unlock_that_fails_refuses_before_the_host_is_touched(self) -> None:
+        self.secrets()
+        self.sys.locked = True
+        self.sys.unlock_rc = 51
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("could not be unlocked", su.signing_blocked(self.cfg.state_dir))
 
 
 class SealedTests(Base):

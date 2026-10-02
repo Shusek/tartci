@@ -213,6 +213,29 @@ class SurfaceTests(Fixture):
         self.assertIn("WARN host-off", line)
 
 
+class ScratchHomeGuardTests(unittest.TestCase):
+    def test_a_test_run_never_writes_an_issue_whatever_it_forgot_to_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp) / "ghapp-calls"
+            stub = Path(tmp) / "bin" / "ghapp"
+            stub.parent.mkdir()
+            stub.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho 99\n")
+            stub.chmod(0o755)
+            env = {"TARTCI_HOME": str(Path(tmp) / ".tartci"),
+                   "PATH": f"{stub.parent}:{os.environ.get('PATH', '')}"}
+            with mock.patch.dict(os.environ, env):
+                rc, text = host_off._open_issue("t", "b")
+                close_rc, _ = host_off._close_issue("5")
+            self.assertEqual((rc, close_rc), (1, 1))
+            self.assertIn("scratch TARTCI_HOME", text)
+            self.assertFalse(calls.exists())
+
+    def test_a_real_home_is_not_scratch(self) -> None:
+        # Control: the guard keys on the temp dir, not on every override.
+        with mock.patch.dict(os.environ, {"TARTCI_HOME": "/Users/someone/.tartci"}):
+            self.assertFalse(host_off._scratch_home())
+
+
 class WiringTests(unittest.TestCase):
     def test_readiness_and_the_watchdog_pass_consult_it(self) -> None:
         here = Path(__file__).resolve().parent
