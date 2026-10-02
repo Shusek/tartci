@@ -885,6 +885,33 @@ class VerificationTests(Base):
                 self.assertIn(needle, str(caught.exception))
 
 
+class HostConditionVerifyTests(Base):
+    """A host condition the install neither causes nor fixes never fails it.
+
+    m5 is set to sleep on AC. Once that became a readiness problem, every
+    update of m5 failed verification and rolled back (07:29Z and 13:53Z on
+    2026-10-02), each time after a drain.
+    """
+
+    SLEEPS = {"code": "host_idle_sleep_enabled", "detail": "sleeps after 1 min idle on AC"}
+
+    def test_a_host_that_sleeps_on_ac_still_updates(self) -> None:
+        self.sys.status_problems = [self.SLEEPS]
+        self.assertUpdated(self.apply())
+
+    def test_a_full_disk_still_updates(self) -> None:
+        self.sys.status_problems = [{"code": "disk_pressure", "label": "/Users/x"}]
+        self.assertUpdated(self.apply())
+
+    def test_a_real_problem_beside_a_host_condition_still_fails(self) -> None:
+        # Control: only the host conditions are set aside.
+        self.sys.status_problems = [self.SLEEPS, {"code": "loaded_receipt_mismatch",
+                                                  "label": "lane"}]
+        self.assertNotEqual(self.apply(), su.EXIT_OK)
+        self.assertNotEqual(self.last()["status"], "succeeded")
+        self.assertIn("loaded_receipt_mismatch", self.last()["error"])
+
+
 class RelayTests(Base):
     relay = True
 

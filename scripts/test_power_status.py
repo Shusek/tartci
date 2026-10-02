@@ -128,7 +128,11 @@ class ReadinessTests(Isolated):
         self.assertIsNone(fleet.idle_sleep_problem(STUDIO))
         body = (HERE / "macos_fleet_lanes.py").read_text()
         body = body[body.index("def fleet_readiness("):]
-        self.assertIn("sleeps = idle_sleep_problem()", body[:body.index("\ndef ")])
+        self.assertIn("host_conditions = [c for c in (idle_sleep_problem(),)",
+                      body[:body.index("\ndef ")])
+        self.assertIn('"host_conditions": host_conditions,', body[:body.index("\ndef ")])
+        # A host condition is not a problem: it must not gate fleet_ready.
+        self.assertNotIn("problems.append(sleeps)", body)
 
     def test_the_heal_pass_refreshes_the_count(self) -> None:
         source = (HERE / "tartci_launchd_watchdog.py").read_text()

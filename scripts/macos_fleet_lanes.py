@@ -1757,9 +1757,10 @@ def host_off_problem(pool_state: str) -> dict | None:
 def idle_sleep_problem(custom_text: str | None = None) -> dict | None:
     """`host_idle_sleep_enabled` when the host is set to sleep on AC.
 
-    A sleeping host mints nothing and answers no peer, so it is not ready to
-    count on: m5studio's sleeps stalled every host's self-update for 7-9 h on
-    2026-10-01, because each peer probe of it timed out.
+    A sleeping host mints nothing and answers no peer: m5studio's sleeps
+    stalled every host's self-update for 7-9 h on 2026-10-01, because each
+    peer probe of it timed out. Readiness reports it as a host condition,
+    not a problem (see fleet_readiness).
     """
     try:
         value = power_status.status(custom_text)
@@ -1874,9 +1875,10 @@ def fleet_readiness(
     left_off = host_off_problem(pool_state)
     if left_off is not None:
         problems.append(left_off)
-    sleeps = idle_sleep_problem()
-    if sleeps is not None:
-        problems.append(sleeps)
+    # Reported beside `problems`, like config drift: a host condition no
+    # install can cause or fix. Folded into fleet_ready it failed every
+    # self-update's verification on m5 (AC sleep 1) and rolled it back.
+    host_conditions = [c for c in (idle_sleep_problem(),) if c is not None]
     disks = disk_pressure(config)
     for disk in disks:
         if disk["state"] == "problem":
@@ -2209,6 +2211,7 @@ def fleet_readiness(
             "blocked_seconds_threshold": blocked_serving_seconds,
         },
         "problems": problems,
+        "host_conditions": host_conditions,
         "disk": disks,
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.

@@ -3005,6 +3005,16 @@ class ServingBlockedTests(unittest.TestCase):
         self.assertEqual(value["verified_running_supervisors"], 1)
         self.assertTrue(value["fleet_ready"])
 
+    def test_a_host_set_to_sleep_is_a_host_condition_not_a_readiness_problem(self) -> None:
+        # m5 (AC sleep 1) rolled back every self-update once its idle sleep
+        # was a readiness problem: verification requires fleet_ready.
+        sleeps = {"code": "host_idle_sleep_enabled", "detail": "sleeps after 1 min idle on AC"}
+        with mock.patch.object(fleet, "idle_sleep_problem", return_value=sleeps):
+            value = self._readiness({})
+        self.assertTrue(value["fleet_ready"], value["problems"])
+        self.assertEqual(value["host_conditions"], [sleeps])
+        self.assertNotIn("host_idle_sleep_enabled", {p["code"] for p in value["problems"]})
+
     # -- the false positives -------------------------------------------------
 
     def test_an_idle_lane_with_no_demand_is_not_blocked(self) -> None:
