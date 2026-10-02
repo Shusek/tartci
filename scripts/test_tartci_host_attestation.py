@@ -444,5 +444,89 @@ class PriorSamples(unittest.TestCase):
         self.assertEqual(att.load_prior_samples("/nonexistent/attestation.json"), {})
 
 
+
+class WatchdogRedeployTests(unittest.TestCase):
+    """The heal pass redeploys a stale writer with the plist's own arguments."""
+
+    def setUp(self) -> None:
+        import hashlib
+        import tartci_launchd_watchdog as wd
+        self.wd = wd
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = self.tmp.name
+        self.agents = os.path.join(self.home, "Library", "LaunchAgents")
+        os.makedirs(self.agents)
+        self.current = os.path.join(self.home, ".local", "share", "pulp-landing", "current")
+        os.makedirs(self.current)
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "tartci_host_attestation.py"), "rb") as fh:
+            self.source = fh.read()
+        self.source_sha = hashlib.sha256(self.source).hexdigest()
+        self.calls: list[list[str]] = []
+
+    def plist(self, **extra) -> None:
+        value = {"Label": "com.danielraffel.shipyard.host-attestation",
+                 "ProgramArguments": ["/opt/homebrew/bin/python3",
+                                      f"{self.current}/tartci_host_attestation.py",
+                                      "--write", "--self-check",
+                                      "--advertise", "actions.runner.o-r.preamble-m3=self-hosted,pulp-preamble"],
+                 "EnvironmentVariables": {"PULP_ATTESTATION_GENERATION": "landing-2026-09-12"},
+                 "StartInterval": 300}
+        value.update(extra)
+        with open(os.path.join(self.agents, "com.danielraffel.shipyard.host-attestation.plist"), "wb") as fh:
+            plistlib.dump(value, fh)
+
+    def installed(self, content: bytes) -> None:
+        with open(os.path.join(self.current, "tartci_host_attestation.py"), "wb") as fh:
+            fh.write(content)
+
+    def run_pass(self, loaded: bool = True, rc: int = 0):
+        def fake_run(argv, **kw):
+            self.calls.append(list(argv))
+            return __import__("subprocess").CompletedProcess(argv, rc, "", "boom" if rc else "")
+        return self.wd.host_attestation_pass(self.home, fake_run, loaded=lambda label: loaded)
+
+    def test_a_stale_writer_is_redeployed_with_the_plists_own_arguments(self) -> None:
+        # m3 and m5 on 2026-10-02 ran a 2026-09-12 writer nothing redeployed.
+        self.plist()
+        self.installed(b"# an older writer\n")
+        line = self.run_pass()
+        self.assertIn("redeployed", line)
+        self.assertIn(self.source_sha[:12], line)
+        self.assertEqual(len(self.calls), 1)
+        argv = self.calls[0]
+        self.assertTrue(argv[1].endswith("install_host_attestation.sh"))
+        self.assertEqual(argv[2:], ["--generation", "landing-2026-09-12", "--interval", "300",
+                                    "--advertise",
+                                    "actions.runner.o-r.preamble-m3=self-hosted,pulp-preamble"])
+
+    def test_a_current_writer_is_left_alone(self) -> None:
+        # Control, same instrument: only the installed bytes changed.
+        self.plist()
+        self.installed(self.source)
+        self.assertIsNone(self.run_pass())
+        self.assertEqual(self.calls, [])
+
+    def test_an_unloaded_or_absent_agent_is_not_installed(self) -> None:
+        self.installed(b"# an older writer\n")
+        self.assertIsNone(self.run_pass())          # no plist: never opted in
+        self.plist()
+        self.assertIsNone(self.run_pass(loaded=False))  # switched off by someone
+        self.assertEqual(self.calls, [])
+
+    def test_a_failed_redeploy_is_loud(self) -> None:
+        self.plist()
+        self.installed(b"# an older writer\n")
+        line = self.run_pass(rc=1)
+        self.assertIn("WARN host-attestation redeploy", line)
+        self.assertIn("FAILED (exit 1: boom)", line)
+
+    def test_the_heal_pass_runs_it(self) -> None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "tartci_launchd_watchdog.py")) as fh:
+            source = fh.read()
+        self.assertIn("attestation_line = host_attestation_pass()", source[source.index("def main("):])
+
 if __name__ == "__main__":
     unittest.main()
