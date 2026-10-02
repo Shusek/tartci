@@ -479,14 +479,35 @@ class PortInUseTests(unittest.TestCase):
             self.assertEqual((Path(f"{log}.1")).stat().st_size, 2048)
             self.assertEqual(log.stat().st_size, 0)
 
-    def test_the_launchd_plist_throttles_respawns_and_names_its_log(self) -> None:
+    def test_the_launchd_plist_throttles_respawns(self) -> None:
         import plistlib
         import re
         template = (ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template")
         value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", template.read_bytes(), flags=re.DOTALL))
         self.assertGreaterEqual(value.get("ThrottleInterval", 0), 30)
+
+    # The flags the relay script deployed at ~/.local/share/tartci/scripts on
+    # every host accepts (sha256 1553367fdcb96919…, 2026-08-31). Self-update
+    # never refreshes that copy, so a template flag outside this set makes the
+    # relay exit 2 at start: on 2026-10-02 `--log-path` did, and m5's update
+    # rolled back at the relay probe.
+    DEPLOYED_RELAY_FLAGS = frozenset({
+        "--listen-host", "--listen-port", "--allow-route", "--relay-host",
+        "--allow-host-suffix", "--ssh", "--connect-timeout", "--header-timeout",
+        "--tunnel-idle-timeout", "--write-timeout", "--max-handlers",
+    })
+
+    def test_the_plist_passes_only_flags_the_deployed_relay_accepts(self) -> None:
+        import plistlib
+        import re
+        template = (ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template")
+        value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", template.read_bytes(), flags=re.DOTALL))
         args = value["ProgramArguments"]
-        self.assertEqual(args[args.index("--log-path") + 1], value["StandardErrorPath"])
+        if not args[1].startswith("$HOME/.local/share/tartci/scripts/"):
+            self.skipTest("the relay no longer runs the copy self-update never refreshes")
+        flags = {arg for arg in args if arg.startswith("--")}
+        self.assertLessEqual(flags, self.DEPLOYED_RELAY_FLAGS,
+                             f"not accepted by the deployed relay: {flags - self.DEPLOYED_RELAY_FLAGS}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
