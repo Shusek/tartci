@@ -469,7 +469,11 @@ scripts/artifact-cache.sh git-sync --repo Generous-Corp/pulp
 scripts/artifact-cache.sh add --url <archive url> --sha256 <pinned digest>
 scripts/artifact-cache.sh status
 scripts/artifact-cache.sh prune --older-than-days 30
+scripts/artifact-cache.sh refresh [--compact-above 16]
 ```
+
+`tartci artifact-cache <args>` runs the same script through the installed
+wrapper.
 
 This fills `${TARTCI_CI_CACHE:-~/.cache/pulp-ci}/artifact-cache` (override with
 `TARTCI_ARTIFACT_CACHE_DIR` or `--dir`). The next VM boot mounts it read-only
@@ -484,6 +488,20 @@ needed, and an empty or absent directory leaves boots unchanged.
   `compact --repo ...`, which refuses while any Tart VM is running because a
   guest reads the packs through the share for its whole job. Never delete a
   mirror while VMs are running.
+- `refresh` keeps every mirror that already exists current: it re-fetches each
+  branch the mirror holds and never creates a mirror, so a host that never ran
+  `git-sync` is unchanged and an absent cache is a no-op. With
+  `--compact-above N` it also folds a mirror holding more than N packs, but only
+  when Tart reports zero running VMs at that moment; a running or unknown VM
+  count defers compaction to a later pass. A failed mirror does not stop the
+  others and the pass exits 1. The `com.danielraffel.tartci.artifact-cache-refresh`
+  LaunchAgent (`launchd/com.danielraffel.tartci.artifact-cache-refresh.plist.template`)
+  runs `refresh --compact-above 16` every 6 hours (`StartInterval`, so not
+  aligned to the clock; `RunAtLoad` off) at `ProcessType=Background` with
+  `LowPriorityIO`, against the same `TARTCI_CI_CACHE` the runner plists use.
+  `tartci setup` installs it with `scripts/install_artifact_cache_refresh_agent.sh
+  --install` (idempotent; `--plan` shows what it would do). Its log is
+  `~/Library/Logs/tartci/tartci-artifact-cache-refresh.log`.
 - `sha256/<hex>` holds a file whose SHA-256 is `<hex>`. `add` takes the digest
   the consuming job already pins and refuses bytes that do not match it, and a
   consuming job must re-verify the digest and fall back to its own download
