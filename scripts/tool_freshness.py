@@ -96,6 +96,13 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
                           "--host-class", "{host_class}", "--apply", "--json"],
         "verdict_json": True,
         "auto_apply": True,
+        # A tag exists while its release is still a DRAFT: the Release job
+        # queues behind the single Shipyard macOS runner, and fleet-update
+        # --to that tag 404s. Without a readiness check that 404 was a spent
+        # attempt, so every intermediate tag was skipped for apply_retry_hours.
+        # A draft's assets answer 404 to an anonymous HEAD, so it reads "not
+        # ready yet" until it is published. The fleet is macOS arm64.
+        "release_assets": ["shipyard-macos-arm64.dmg", "checksums.sha256"],
     },
     "pulp": {
         "repo": "Generous-Corp/pulp",

@@ -268,6 +268,26 @@ class ToolFreshnessTests(unittest.TestCase):
         row = self.refresh(host)["tools"]["shipyard"]
         self.assertIn("already attempted v0.221.1", row["apply"])
 
+    def test_a_shipyard_tag_whose_release_is_still_a_draft_is_not_ready_not_attempted(self) -> None:
+        # The Release job queues behind the single Shipyard macOS runner, so a
+        # tag exists while its release is a draft and fleet-update --to it
+        # 404s. That 404 used to be a spent attempt: the tag was skipped 6 h.
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+        draft = {"ready": False, "missing": ["shipyard-macos-arm64.dmg", "checksums.sha256"],
+                 "sums": None, "detail": "asset shipyard-macos-arm64.dmg missing"}
+        row = self.refresh(host, release=draft)["tools"]["shipyard"]
+        self.assertIn("not ready yet", row["apply"])
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertNotIn("shipyard", json.loads((self.state / "attempts.json").read_text()))
+        # Published a few minutes later: the next pass applies it.
+        row = self.refresh(host, NOW + 5 * 60)["tools"]["shipyard"]
+        self.assertEqual(row["apply"], "applied v0.221.1: ok")
+
+    def test_shipyard_readiness_checks_the_macos_release_assets(self) -> None:
+        self.assertEqual(tf.DEFAULT_TOOLS["shipyard"]["release_assets"],
+                         ["shipyard-macos-arm64.dmg", "checksums.sha256"])
+
     def test_auto_apply_installs_verifies_and_records_one_deploy_event(self) -> None:
         host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
         host.apply_installs["shipyard"] = "0.221.1"

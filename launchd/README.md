@@ -58,13 +58,18 @@ Shipyard fleet probes should point `host_class.<name>.tartci_bin` at that same
 wrapper and `host_class.<name>.tart_home` at the same `$HOME/VMs` store; otherwise
 capacity and supervisor health will be read from different Tart homes.
 
-### External-volume responsible process (Daniel's M3 profile only)
+### External-volume responsible process (Daniel's M3 and m5studio profiles)
 
 `profiles/m3-macos-fleet.toml` deliberately keeps its 4 TiB Tart store at
-`/Volumes/Workshop/VMs`. Its managed LaunchAgents therefore start the stable
+`/Volumes/Workshop/VMs`, and `profiles/m5studio-macos-fleet.toml` keeps its
+store at `/Volumes/Atelier/VMs`. The volume name is the profile's, not the
+code's: the build seals the profile's own `tart_home` into the bundle
+(`bundle.json`), the launcher probes and enforces that store, and each host has
+its own approval digest (`~/.config/tartci/<host>-launcher-approved.sha256`).
+Their managed LaunchAgents therefore start the stable
 Developer-ID-signed `TartCILauncher.app` at
 `~/.local/libexec/TartCILauncher.app`. Its signature seals the exact TartCI
-support cohort and five rendered M3 lane environments. The resident launcher
+support cohort and that host's rendered lane environments. The resident launcher
 accepts only `--lane <sealed-enum>` or the fixed `--probe-store`, spawns no
 caller-selected executable or arguments, owns the child process group, and
 bounds TERM-to-KILL cleanup inside launchd's 30-second exit window. It contains
@@ -79,13 +84,14 @@ scripts/build_macos_launcher.sh \
   --approval-output /absolute/staging/TartCILauncher.sha256 \
   --identity '<Developer ID Application identity>' \
   --support-root /absolute/immutable/tartci-generation \
-  --profile profiles/m3-macos-fleet.toml
+  --profile profiles/m3-macos-fleet.toml   # or profiles/m5studio-macos-fleet.toml
 scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
   --identifier com.danielraffel.tartci.launcher \
-  --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256>
+  --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256> \
+  --tart-home <the profile's tart_home>
 ```
 
-The M3 profile pins path, identifier, Team ID, exact profile policy, and the
+Each such profile pins path, identifier, Team ID, exact profile policy, and the
 path to an owned mode-0600 approval digest produced by the signing build.
 The bundle binds the same exact TartCI source commit as the installed support
 cohort. The installer accepts it with `--launch-helper-source`, atomically
@@ -98,7 +104,7 @@ retain the ordinary launch path.
 `tartci pool on` runs a one-shot LaunchAgent probe through this same identity
 before loading any fleet supervisor or opening participation. The probe must
 write, read back, and delete a temporary file in the declared Tart store. Its
-first M3 run may require one explicit Removable Volumes consent; TartCI never
+first run on each host may require one explicit Removable Volumes consent; TartCI never
 edits TCC databases or invokes `tccutil`. Denial, timeout, signature drift, or
 digest drift leaves the pool off. `$HOME/VMs` is the safe rollback while the
 external-volume identity is unavailable.
@@ -658,7 +664,9 @@ step tells you what the rollout is actually worth on that host. Under `--fix`
 the same figure is what was freed.
 
 Scan roots are discovered rather than declared: the janitor keeps whichever of
-`~/Code` and `/Volumes/Workshop/Code` the host actually has, and measures free
+`~/Code` and the installed fleet profile's `[reclaim]` code root (the parent
+of `repo` / `worktrees_root`, e.g. `/Volumes/Workshop/Code` on m3,
+`/Volumes/Atelier/Code` on m5studio) the host actually has, and measures free
 space on every volume those roots span. The `TARTCI_RECLAIM_FAIL_BELOW_GB`
 floor is judged against the tightest of those volumes, so a healthy disk cannot
 certify a full one. Pressure is scoped per volume instead: only candidates on a
@@ -787,7 +795,18 @@ scripts/install_shipyard_queue_tick.sh \
 ```
 
 The installer removes any previous health verdict before kickstart and succeeds
-only after the newly started tick publishes a fresh healthy verdict. Every mode
+only after the newly started tick publishes a fresh healthy verdict. It waits
+for that tick to finish however long it runs (a tick reads every open pull
+request), up to `SHIPYARD_QUEUE_INSTALL_TICK_MAX_SECS` (default 3600). It
+fails after `SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS` (default 120) only when
+the tick is not running and has published nothing. A failed install restores
+the prior files and re-bootstraps the prior agent, retrying the bootstrap
+that races launchd's asynchronous bootout. If the agent still is not loaded,
+the installer says `ROLLBACK FAILED … NOT LOADED`, writes an `unhealthy`
+`agent_unloaded` health verdict, and exits 4, so the host is never left
+without a tick in silence. The launchd watchdog reinstalls a loaded tick
+whose copy differs from the running tartci (`scripts/queue_tick_refresh.py`),
+and never switches an unloaded one back on. Every mode
 requires `--gh-cli` pointing to an executable GitHub App wrapper; unattended
 operation never falls back to ambient `gh`. `--repo-root` is optional and only
 sets the directory the merge-queue hold check runs from. `--mode live` and
