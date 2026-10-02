@@ -916,6 +916,33 @@ def refresh_tools(interval_s: int = 1800, timeout_s: int = 600) -> str | None:
     return None
 
 
+def keychain_unlock_agent_pass(home: str | None = None,
+                               run=subprocess.run) -> str | None:
+    """Reinstall the keychain-unlock agent where keychain.env exists.
+
+    The installer is idempotent (a current, loaded agent is left alone), so a
+    host whose agent was removed, never installed, or rendered from an older
+    template gets it back on the next heal pass. Returns the line to log.
+    """
+    home = home or os.path.expanduser("~")
+    if not os.path.isfile(os.path.join(home, ".config", "pulp", "secrets", "keychain.env")):
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        proc = run(["/bin/bash", os.path.join(root, "scripts", "install_keychain_unlock_agent.sh"),
+                    "--install"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{_iso(utcnow())} launchd-watchdog: WARN keychain-unlock agent install FAILED ({exc})"
+    text = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        detail = (proc.stderr or text).strip().splitlines()
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN keychain-unlock agent install FAILED "
+                f"(exit {proc.returncode}: {detail[-1] if detail else 'no output'})")
+    if "already installed and loaded" in text:
+        return None
+    return f"{_iso(utcnow())} launchd-watchdog: keychain-unlock agent (re)installed"
+
+
 def queue_tick_pass() -> str | None:
     """Reinstall a loaded Shipyard queue tick whose copy is not this tartci's.
 
@@ -1210,6 +1237,9 @@ def main(argv: list[str] | None = None) -> int:
         tick_line = queue_tick_pass()
         if tick_line:
             print(tick_line)
+        unlock_line = keychain_unlock_agent_pass()
+        if unlock_line:
+            print(unlock_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

@@ -17,7 +17,13 @@ status() reports, without ever prompting:
     (`unlock-keychain -p` never prompts; a refusal means the recorded
     password has drifted);
   - after that unlock, so reading settings cannot prompt, whether the keychain
-    re-locks on its own (an inactivity timeout or lock-on-sleep).
+    re-locks on its own (an inactivity timeout or lock-on-sleep);
+  - whether the keychain-unlock LaunchAgent is installed and its last run
+    succeeded recently. macOS locks the keychain again at every login, and
+    that agent is what unlocks it in the GUI session, the only session the
+    dialogs come from. Nothing here can read the GUI session's lock state
+    without risking a dialog: even `show-keychain-info` on a locked keychain
+    raises one, so it is only ever run right after a successful unlock.
 
 States: ok | risk | not_applicable (no keychain.env) | unknown.
 """
@@ -34,6 +40,10 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_self_update as su  # noqa: E402
+import keychain_unlock  # noqa: E402
+
+# The agent runs every 15 minutes; two missed runs is a stopped agent.
+UNLOCK_STALE_SECS = 2 * keychain_unlock.INTERVAL_SECS + 300
 
 Runner = Callable[[list[str]], tuple[int, str]]
 
@@ -50,7 +60,29 @@ def search_list(text: str) -> list[str]:
     return [line.strip().strip('"') for line in text.splitlines() if line.strip()]
 
 
-def status(home: Path | None = None, run: Runner = _run) -> dict[str, Any]:
+def unlock_agent_risk(home: Path, now: float | None = None) -> str | None:
+    """Why the keychain-unlock agent cannot be relied on, or None."""
+    import time
+    now = time.time() if now is None else now
+    plist = home / "Library" / "LaunchAgents" / f"{keychain_unlock.LABEL}.plist"
+    if not plist.is_file():
+        return (f"the keychain-unlock agent is not installed ({plist}); after the next login "
+                "the keychain is locked in the GUI session again. "
+                "Run scripts/install_keychain_unlock_agent.sh --install")
+    last = keychain_unlock.last(home)
+    if not last:
+        return "the keychain-unlock agent has not recorded a run yet"
+    if last.get("state") == "failed":
+        return f"the keychain-unlock agent's last run FAILED: {last.get('detail')}"
+    age = now - float(last.get("at") or 0)
+    if age > UNLOCK_STALE_SECS:
+        return (f"the keychain-unlock agent's last run was {int(age // 60)} min ago "
+                f"(it runs every {keychain_unlock.INTERVAL_SECS // 60} min)")
+    return None
+
+
+def status(home: Path | None = None, run: Runner = _run,
+           now: float | None = None) -> dict[str, Any]:
     home = home or Path.home()
     secrets = su.signing_secrets(home)
     dedicated = su.signing_keychain(home)
@@ -77,6 +109,9 @@ def status(home: Path | None = None, run: Runner = _run) -> dict[str, Any]:
         if rc == 0 and (re.search(r"timeout=\d+", out) or "lock-on-sleep" in out):
             risks.append(f"{dedicated} re-locks on its own ({out.strip()[:120]}); "
                          "`pulp ship doctor` sets it to no-timeout")
+    agent = unlock_agent_risk(home, now)
+    if agent:
+        risks.append(agent)
     return {"state": "risk" if risks else "ok", "risks": risks, "dedicated": dedicated}
 
 
