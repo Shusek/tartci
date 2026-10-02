@@ -625,6 +625,193 @@ class LeaseReclaimTests(unittest.TestCase):
         self.assertFalse(any(key.startswith("_") for key in digest["leases"][0]))
 
 
+def _reclaim_args(store: Path, stale_secs: int = 300) -> argparse.Namespace:
+    return argparse.Namespace(
+        store_dir=str(store),
+        capacity=4,
+        reserved_gate_cores=0,
+        gate_priority=100,
+        stale_secs=stale_secs,
+        role=None,
+        role_file=None,
+        host_cores=None,
+        model=None,
+    )
+
+
+def _fake_tart(directory: Path, body: str) -> Path:
+    tart = directory / "tart"
+    tart.write_text("#!/bin/sh\n" + body)
+    tart.chmod(0o755)
+    return tart
+
+
+class LeaseOwnerDeathMustBeProvenTests(unittest.TestCase):
+    """A lease leaves the store only when its owner is provably gone.
+
+    An owner probe that could not answer (ps failed or timed out, tart list
+    failed) used to read as "owner dead", which silently returned a running
+    gate VM's cores to the pool and let the next admission oversubscribe the
+    host.
+    """
+
+    def _live_record(self, lease_id: str, **extra: object) -> dict:
+        now = leases.iso(leases.utcnow())
+        return {
+            "id": lease_id,
+            "lease_size_cores": 1,
+            "priority": 40,
+            "priority_class": "build",
+            **leases.process_identity(os.getpid()),
+            "command_kind": "test",
+            "owner": "unittest",
+            "created_at": now,
+            "heartbeat_at": now,
+            **extra,
+        }
+
+    def test_failed_start_time_probe_on_a_live_owner_keeps_the_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "leases"
+            store.mkdir()
+            leases.write_records(store, [self._live_record("probe-failed")])
+            # Control: the record is live while the probe works.
+            self.assertEqual(
+                [row["id"] for row in leases.status_digest(_reclaim_args(store))["leases"]],
+                ["probe-failed"],
+            )
+            with mock.patch.object(leases, "pid_start", return_value=""):
+                digest = leases.status_digest(_reclaim_args(store))
+            self.assertEqual([row["id"] for row in digest["leases"]], ["probe-failed"])
+            self.assertEqual(digest["reaped"], [])
+            self.assertIn("owner_unproven_kept:probe-failed", digest["problems"])
+            events = [json.loads(line) for line in
+                      (store / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(events[-1]["event"], "lease_kept_unproven")
+        self.assertEqual(events[-1]["id"], "probe-failed")
+        self.assertEqual(events[-1]["caller"]["pid"], os.getpid())
+
+    def test_owner_start_time_matches_under_any_caller_locale_and_zone(self) -> None:
+        # The owner's start time is recorded by a launchd supervisor (C locale,
+        # no TZ) and read back by whatever shell runs `tartci lease ...` next.
+        recorded = subprocess.run(
+            ["/bin/ps", "-p", str(os.getpid()), "-o", "lstart="],
+            text=True, capture_output=True, check=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        ).stdout
+        recorded = " ".join(recorded.split())
+        foreign = {"LC_ALL": "en_GB.UTF-8", "LANG": "en_GB.UTF-8", "TZ": "Asia/Kolkata"}
+        shifted = subprocess.run(
+            ["/bin/ps", "-p", str(os.getpid()), "-o", "lstart="],
+            text=True, capture_output=True, check=True,
+            env={"PATH": "/usr/bin:/bin", **foreign},
+        ).stdout
+        # Control: the foreign caller environment really does render differently.
+        self.assertNotEqual(" ".join(shifted.split()), recorded)
+        with mock.patch.dict(os.environ, foreign):
+            self.assertEqual(leases.pid_start(os.getpid()), recorded)
+            record = self._live_record("foreign-caller", process_start_time=recorded)
+            verdict, evidence = leases.owner_verdict(record)
+        self.assertEqual(verdict, leases.OWNER_ALIVE, evidence)
+
+    def test_vm_lease_is_kept_while_tart_still_runs_its_vm(self) -> None:
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        cases = {
+            # tart list output -> expected outcome for a dead guardian
+            '[{"Name":"vm-a","State":"running"}]': "kept",
+            '[{"Name":"vm-a","State":"stopped"}]': "reaped",
+            "[]": "reaped",
+        }
+        for listing, outcome in cases.items():
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory() as td:
+                store = Path(td) / "leases"
+                store.mkdir()
+                tart = _fake_tart(Path(td), f"echo '{listing}'\n")
+                record = self._live_record(
+                    "vm-tart-macos-vm-vm-a",
+                    command_kind="tart-macos-vm",
+                    vm_name="vm-a",
+                    guardian_pid=exited.pid,
+                    guardian_process_start_time="Mon Jan  1 00:00:00 2001",
+                    guardian_host_boot_time=leases.host_boot_time(),
+                    guardian_mode="exec",
+                )
+                leases.write_records(store, [record])
+                with mock.patch.dict(os.environ, {"TARTCI_TART_BIN": str(tart)}):
+                    digest = leases.status_digest(_reclaim_args(store))
+                kept = [row["id"] for row in digest["leases"]]
+                reaped = [row["id"] for row in digest["reaped"]]
+                if outcome == "kept":
+                    self.assertEqual(kept, ["vm-tart-macos-vm-vm-a"])
+                    self.assertEqual(reaped, [])
+                else:
+                    self.assertEqual(kept, [])
+                    self.assertEqual(reaped, ["vm-tart-macos-vm-vm-a"])
+                    event = json.loads(
+                        (store / "events.jsonl").read_text().splitlines()[-1])
+                    self.assertEqual(event["event"], "lease_reaped")
+                    self.assertIn("vm vm-a not running", event["evidence"])
+
+    def test_vm_lease_is_kept_when_tart_cannot_list(self) -> None:
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "leases"
+            store.mkdir()
+            tart = _fake_tart(Path(td), "exit 1\n")
+            record = self._live_record(
+                "vm-tart-macos-vm-vm-b",
+                command_kind="tart-macos-vm",
+                vm_name="vm-b",
+                guardian_pid=exited.pid,
+                guardian_process_start_time="Mon Jan  1 00:00:00 2001",
+                guardian_host_boot_time=leases.host_boot_time(),
+                guardian_mode="exec",
+            )
+            leases.write_records(store, [record])
+            with mock.patch.dict(os.environ, {"TARTCI_TART_BIN": str(tart)}):
+                digest = leases.status_digest(_reclaim_args(store))
+        self.assertEqual([row["id"] for row in digest["leases"]], ["vm-tart-macos-vm-vm-b"])
+        self.assertIn("owner_unproven_kept:vm-tart-macos-vm-vm-b", digest["problems"])
+
+    def test_event_journal_keeps_one_bounded_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td)
+            journal = store / "events.jsonl"
+            with mock.patch.object(leases, "LEASE_EVENTS_MAX_BYTES", 64):
+                for n in range(6):
+                    leases.journal_lease_events(store, [{"event": "probe", "n": n}])
+            self.assertTrue((store / "events.jsonl.1").exists())
+            self.assertLess(journal.stat().st_size, 64 + 512)
+            last = json.loads(journal.read_text().splitlines()[-1])
+        self.assertEqual(last["n"], 5)
+
+    def test_owner_releasing_its_own_vm_lease_skips_the_inventory(self) -> None:
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "leases"
+            store.mkdir()
+            calls = Path(td) / "calls"
+            tart = _fake_tart(Path(td), f"echo x >> '{calls}'; echo '[]'\n")
+            record = self._live_record(
+                "vm-tart-macos-vm-vm-c",
+                command_kind="tart-macos-vm",
+                vm_name="vm-c",
+                guardian_pid=exited.pid,
+                guardian_process_start_time="Mon Jan  1 00:00:00 2001",
+                guardian_host_boot_time=leases.host_boot_time(),
+                guardian_mode="exec",
+            )
+            with mock.patch.dict(os.environ, {"TARTCI_TART_BIN": str(tart)}):
+                active, reaped, _ = leases.reclaim(
+                    [record], 300, releasing_id="vm-tart-macos-vm-vm-c")
+            self.assertFalse(calls.exists(), "release by the owner must not list VMs")
+        self.assertEqual(active, [])
+        self.assertEqual([row["id"] for row in reaped], ["vm-tart-macos-vm-vm-c"])
+
+
 class LeaseMemoryAxisTests(LeaseCliTestCase):
     def test_build_lease_without_mem_charges_a_core_derived_estimate(self) -> None:
         body = json.loads(
