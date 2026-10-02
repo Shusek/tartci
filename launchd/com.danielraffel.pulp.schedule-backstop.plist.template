@@ -41,8 +41,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>$HOME/.local/share/tartci/scripts/schedule_backstop.py</string>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>schedule-backstop</string>
     </array>
 
     <key>WorkingDirectory</key>

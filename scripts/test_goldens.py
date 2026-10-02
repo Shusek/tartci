@@ -127,7 +127,7 @@ class ApplySnippetReload(unittest.TestCase):
         with open(os.path.join(logs, "tart-runner-linux.log"), "w") as fh:
             fh.write("idle: waiting for work\n")
         if tartci_rc is not None:
-            tdir = os.path.join(home, ".local", "share", "tartci")
+            tdir = os.path.join(home, ".local", "bin")
             os.makedirs(tdir)
             with open(os.path.join(tdir, "tartci"), "w") as fh:
                 fh.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{home}/tartci.log"\nexit {tartci_rc}\n')
