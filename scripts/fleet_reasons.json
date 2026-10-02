@@ -201,6 +201,20 @@
       "remedy": "Read the installed generation's verdict as authoritative, since that is the tree the running supervisors execute. Run the installed CLI, not a checkout, when asking whether the fleet is up.",
       "do_not": "Do not report a checkout's readiness verdict as the host's."
     },
+    "power_ok": {
+      "summary": "The host never sleeps on AC power (pmset AC `sleep` is 0)."
+    },
+    "power_sleeps": {
+      "summary": "The host is configured to sleep after N idle minutes on AC power.",
+      "why": "A sleeping Mac takes its runners, SSH, lease store and VMs with it while launchd still reports every lane loaded. m5studio ran for days with the setting off and spent 4-6 hours a day asleep. `pmset -g` can print `sleep N (sleep prevented by ...)` while an app holds an assertion, which hides it until that app lets go.",
+      "remedy": "System Settings > Energy > turn on 'Prevent automatic sleeping when the display is off' (or `sudo pmset -c sleep 0`), then confirm `pmset -g custom` shows `sleep 0` under AC Power.",
+      "do_not": "Do not read an awake host, or `sleep prevented by ...`, as the setting being on."
+    },
+    "power_unknown": {
+      "summary": "The AC Power profile could not be read from `pmset -g custom`.",
+      "why": "An unreadable power profile is not evidence that the host stays awake.",
+      "remedy": "Run `pmset -g custom` on the host and read the AC Power section."
+    },
     "reclaim_boot_low": {
       "summary": "The reclaimer's last pass ran; the Tart store's volume is fine, but the boot data volume, which no lease floor covers, is still below its own floor (exit 5).",
       "why": "On a host whose Tart store is on another volume (m3: Workshop), the lease floor never looks at the boot disk, so it could fill to zero unseen; m3 went from 57 GiB to 2 GiB free on 2026-10-01. Leases keep working, but a full boot disk stops commands from starting.",
