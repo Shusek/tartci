@@ -274,10 +274,14 @@ APP_CONTAINERS_SKIPPED: list[str] = []
 
 
 def is_app_container(path: Any) -> bool:
-    """Whether `path` is, or lies inside, a Library/*Containers directory."""
+    """Whether `path` is, or lies inside, ~/Library or a Library/*Containers directory."""
     parts = pathlib.PurePath(os.fspath(path)).parts
-    return any(parts[i] == "Library" and parts[i + 1] in APP_CONTAINER_DIRS
-               for i in range(len(parts) - 1))
+    if any(parts[i] == "Library" and parts[i + 1] in APP_CONTAINER_DIRS
+           for i in range(len(parts) - 1)):
+        return True
+    library = pathlib.PurePath(os.path.expanduser("~")) / "Library"
+    candidate = pathlib.PurePath(os.fspath(path))
+    return candidate == library or library in candidate.parents
 
 
 def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry]:
@@ -531,8 +535,11 @@ DEFAULT_ROOT_CANDIDATES = (
 def profile_root_candidates() -> list[str]:
     """Code roots the installed fleet profile declares under `[reclaim]`.
 
-    The parent of `repo` and of `worktrees_root` (both are `<volume>/Code/...`
-    on the hosts that set them). Empty when there is no profile or no table.
+    The parent of `repo` (the code directory a checkout sits in) and
+    `worktrees_root` itself. Taking the parent of `worktrees_root` too assumed
+    it was always `<volume>/Code/agent-worktrees`; m1 and m5 set it to
+    `~/Code`, whose parent is the home directory, and every pass walked all of
+    $HOME, ~/Library included. Empty when there is no profile or no table.
     """
     profile = pulp_reapers.default_profile_path()
     if tomllib is None or not profile.is_file():
@@ -548,8 +555,29 @@ def profile_root_candidates() -> list[str]:
     for key in ("repo", "worktrees_root"):
         value = reclaim.get(key)
         if isinstance(value, str) and value.strip().startswith("/"):
-            out.append(str(pathlib.PurePosixPath(value.strip()).parent))
+            path = pathlib.PurePosixPath(value.strip())
+            out.append(str(path.parent if key == "repo" else path))
     return out
+
+
+def refused_root(path: pathlib.Path) -> str | None:
+    """Why `path` may never be a scan root, or None.
+
+    A root at or above the home directory reaches ~/Library, where listing
+    another app's data asks the logged-in user and, under launchd, waits
+    forever. `/`, `/Users`, `/Volumes` and $HOME are refused outright, as is
+    any root that contains or lies inside ~/Library.
+    """
+    resolved = pathlib.Path(os.path.realpath(path))
+    home = pathlib.Path(os.path.realpath(os.path.expanduser("~")))
+    library = home / "Library"
+    if resolved in (pathlib.Path("/"), pathlib.Path("/Users"), pathlib.Path("/Volumes"), home):
+        return f"{resolved} is a whole-system or home directory"
+    if resolved == library or library in resolved.parents:
+        return f"{resolved} is inside {library}"
+    if resolved in library.parents:
+        return f"{resolved} contains {library}"
+    return None
 
 
 def discover_roots() -> list[pathlib.Path]:
@@ -570,9 +598,16 @@ def discover_roots() -> list[pathlib.Path]:
             continue
         if not resolved.is_dir() or str(resolved) in seen:
             continue
+        reason = refused_root(resolved)
+        if reason:
+            print(f"disk_reclaim: REFUSED scan root {candidate}: {reason}", file=sys.stderr)
+            continue
         seen.add(str(resolved))
         found.append(resolved)
-    return found
+    # A root inside another root (m3: Code and Code/agent-worktrees) would be
+    # walked twice and report its build trees twice; keep the outer one.
+    return [root for root in found
+            if not any(other != root and other in root.parents for other in found)]
 
 
 def parse_roots(raw: str | None) -> list[pathlib.Path]:
@@ -1031,7 +1066,9 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # the disk it was installed to protect fills up.
     unusable = []
     for root in roots:
-        if not root.is_dir():
+        if refused_root(root):
+            unusable.append(f"{root} (refused: {refused_root(root)})")
+        elif not root.is_dir():
             unusable.append(f"{root} (not a directory)")
         elif not os.access(root, os.R_OK | os.X_OK):
             unusable.append(f"{root} (not readable)")
