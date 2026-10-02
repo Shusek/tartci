@@ -1445,5 +1445,53 @@ class BoundedScandirTests(unittest.TestCase):
         self.assertEqual(found, [self.root / "other" / "build"])
         self.assertEqual(dr.SCAN_TIMEOUTS, [str(self.blocked)])
 
+
+class AppContainerSkipTests(unittest.TestCase):
+    """Other apps' data containers are never listed: listing one prompts."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.listed: list[str] = []
+        real = os.scandir
+
+        def scandir(path):
+            self.listed.append(str(path))
+            return real(path)
+        for owner, name, value in ((dr.os, "scandir", scandir), (dr, "APP_CONTAINERS_SKIPPED", [])):
+            original = getattr(owner, name)
+            setattr(owner, name, value)
+            self.addCleanup(setattr, owner, name, original)
+
+    def test_a_containers_tree_is_skipped_unlisted(self) -> None:
+        # m1 on 2026-10-02: a listing under launchd waited forever on the
+        # "access data from other apps" consent prompt.
+        containers = self.root / "Library" / "Containers" / "com.example.app" / "build"
+        containers.mkdir(parents=True)
+        group = self.root / "Library" / "Group Containers" / "group.example" / "build"
+        group.mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=6)
+        self.assertEqual(found, [])
+        self.assertFalse(any("Containers" in path for path in self.listed), self.listed)
+        self.assertEqual(sorted(dr.APP_CONTAINERS_SKIPPED),
+                         [str(self.root / "Library" / "Containers"),
+                          str(self.root / "Library" / "Group Containers")])
+
+    def test_a_skipped_container_is_unmeasured_never_old(self) -> None:
+        path = self.root / "Library" / "Containers" / "com.example.app"
+        path.mkdir(parents=True)
+        self.assertIsNone(dr.newest_mtime(path))
+
+    def test_ordinary_directories_are_still_scanned(self) -> None:
+        # Control, same instrument: a build tree outside any container is found,
+        # including one under a Library that is not a container directory.
+        (self.root / "Library" / "Caches" / "build").mkdir(parents=True)
+        (self.root / "proj" / "build").mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=6)
+        self.assertEqual(found, [self.root / "Library" / "Caches" / "build",
+                                 self.root / "proj" / "build"])
+        self.assertEqual(dr.APP_CONTAINERS_SKIPPED, [])
+
 if __name__ == "__main__":
     unittest.main()

@@ -262,6 +262,24 @@ SCANDIR_TIMEOUT_S = 120.0
 SCAN_TIMEOUTS: list[str] = []
 
 
+# Other apps' data containers. Opening one from a process without Full Disk
+# Access asks the logged-in user ("would like to access data from other
+# apps") and the open() waits for the answer; under launchd nobody is there,
+# so it waits forever. On 2026-10-02 m1's hourly pass hung at its first
+# listing while sandboxd sent kTCCServiceSystemPolicyAppDataDetailed requests.
+# Never list them: a skipped container is "could not look", so nothing in it
+# is judged or removed.
+APP_CONTAINER_DIRS = ("Containers", "Group Containers", "Daemon Containers")
+APP_CONTAINERS_SKIPPED: list[str] = []
+
+
+def is_app_container(path: Any) -> bool:
+    """Whether `path` is, or lies inside, a Library/*Containers directory."""
+    parts = pathlib.PurePath(os.fspath(path)).parts
+    return any(parts[i] == "Library" and parts[i + 1] in APP_CONTAINER_DIRS
+               for i in range(len(parts) - 1))
+
+
 def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry]:
     """`list(os.scandir(path))`, or OSError(ETIMEDOUT) once `timeout` passes.
 
@@ -270,6 +288,9 @@ def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry
     not keep the pass from exiting. Every abandoned path is recorded in
     SCAN_TIMEOUTS and printed, so the directory that blocks is named.
     """
+    if is_app_container(path):
+        APP_CONTAINERS_SKIPPED.append(str(path))
+        raise OSError(errno.EPERM, "another app's data container is never listed", str(path))
     limit = SCANDIR_TIMEOUT_S if timeout is None else timeout
     result: dict[str, Any] = {}
 
@@ -1219,6 +1240,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         # Directories whose listing did not return in time; nothing under them
         # was judged or removed.
         "scan_timeouts": list(SCAN_TIMEOUTS),
+        "app_containers_skipped": list(APP_CONTAINERS_SKIPPED),
     }
     receipt["report"] = report
 
