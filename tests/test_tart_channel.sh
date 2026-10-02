@@ -84,6 +84,10 @@ if [ -f "$tmp/home/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist" ]
   echo "setup wrote a reclaim agent into the temp HOME" >&2
   exit 1
 fi
+if [ -f "$tmp/home/Library/LaunchAgents/com.danielraffel.tartci.artifact-cache-refresh.plist" ]; then
+  echo "setup wrote an artifact-cache refresh agent into the temp HOME" >&2
+  exit 1
+fi
 if [ -s "$tmp/launchctl.calls" ]; then
   echo "setup reached launchctl from a temp HOME:" >&2
   cat "$tmp/launchctl.calls" >&2

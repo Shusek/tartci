@@ -12,6 +12,7 @@
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
+#   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
 #   tartci ccache reset [--reset] [--plan] [--force]  # operator reset; refuses
@@ -357,6 +358,9 @@ cmd_setup() {
   # a usable host and `doctor` reports the gap.
   "$HERE/scripts/install_reclaim_agent.sh" --install ||
     echo "setup: could not install the disk reclaimer; 'tartci doctor' will keep reporting it" >&2
+  # Keeps any artifact-cache git mirror current; a no-op on a host that has none.
+  "$HERE/scripts/install_artifact_cache_refresh_agent.sh" --install ||
+    echo "setup: could not install the artifact-cache refresher" >&2
   cmd_doctor
 }
 
@@ -383,6 +387,9 @@ cmd_runtime() {
 cmd_reclaim() {
   tartci_toml_exec_or_python3 "$HERE/scripts/disk_reclaim.py" "$@"
 }
+
+# The host artifact cache macOS guests mount read-only; see scripts/artifact-cache.sh.
+cmd_artifact_cache() { exec "$HERE/scripts/artifact-cache.sh" "$@"; }
 
 # `tartci ccache <scan|quarantine|reset> [--host-cache | --cache DIR] ...`
 # --host-cache (the default when --cache is absent) is the cache the macOS gate
@@ -1347,6 +1354,7 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  artifact-cache) shift; cmd_artifact_cache "$@" ;;
   ccache)  shift; cmd_ccache "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;

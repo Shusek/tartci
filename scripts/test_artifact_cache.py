@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import plistlib
 import subprocess
 import tempfile
 import textwrap
@@ -17,6 +18,10 @@ LIB = ROOT / "providers/tart-macos/artifact-cache.lib.sh"
 SYNC = ROOT / "scripts/artifact-cache.sh"
 MAC_JIT = ROOT / "providers/tart-macos/runner.sh"
 WARM = ROOT / "providers/tart-macos/warm-vm.lib.sh"
+REFRESH_LABEL = "com.danielraffel.tartci.artifact-cache-refresh"
+REFRESH_TEMPLATE = ROOT / f"launchd/{REFRESH_LABEL}.plist.template"
+REFRESH_INSTALLER = ROOT / "scripts/install_artifact_cache_refresh_agent.sh"
+RUNNER_TEMPLATE = ROOT / "launchd/com.danielraffel.pulp.tart-runner-macos.plist.template"
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -284,6 +289,213 @@ class RunnerWiringTests(unittest.TestCase):
         warm = WARM.read_text(encoding="utf-8")
         self.assertIn('WARM_ARTIFACT="$CURRENT_ARTIFACT_CACHE"', warm)
         self.assertIn('CURRENT_ARTIFACT_CACHE="$WARM_ARTIFACT"', warm)
+
+
+class RefreshTests(unittest.TestCase):
+    """`refresh` keeps existing mirrors current and never creates one."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.base = self.tmp / "remote"
+        self.cache = self.tmp / "cache"
+        self.work: dict[str, Path] = {}
+        for repo in ("owner/repo", "owner/other"):
+            origin = self.base / f"{repo}.git"
+            origin.mkdir(parents=True)
+            _git("init", "--quiet", "--bare", "-b", "main", str(origin))
+            work = self.tmp / "work" / repo
+            _git("clone", "--quiet", str(origin), str(work))
+            self.work[repo] = work
+            self._commit(repo, "one")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _commit(self, repo: str, name: str, branch: str = "main") -> str:
+        work = self.work[repo]
+        (work / name).write_text(name)
+        _git("add", name, cwd=work)
+        _git("commit", "--quiet", "-m", name, cwd=work)
+        _git("push", "--quiet", "origin", f"HEAD:{branch}", cwd=work)
+        return _git("rev-parse", "HEAD", cwd=work)
+
+    def _run(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(SYNC), *args, "--dir", str(self.cache)],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.base), **(env or {})},
+        )
+
+    def _tart(self, running: int | None) -> dict:
+        tart = self.tmp / "tart"
+        if running is None:
+            tart.write_text("#!/bin/bash\nexit 1\n")
+        else:
+            vms = ", ".join('{"Name": "v%d", "State": "running"}' % i for i in range(running))
+            tart.write_text(f"#!/bin/bash\necho '[{vms}]'\n")
+        tart.chmod(0o755)
+        return {"TARTCI_TART_BIN": str(tart)}
+
+    def _mirror(self, repo: str = "owner/repo") -> Path:
+        return self.cache / f"git/{repo}.git"
+
+    def _packs(self, repo: str = "owner/repo") -> list[Path]:
+        return list((self._mirror(repo) / "objects/pack").glob("*.pack"))
+
+    def test_an_absent_cache_is_left_absent(self) -> None:
+        proc = self._run("refresh")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("nothing to refresh", proc.stdout)
+        self.assertFalse(self.cache.exists(), "refresh created a cache this host never opted into")
+
+    def test_a_cache_without_mirrors_gains_none(self) -> None:
+        (self.cache / "sha256").mkdir(parents=True)
+        proc = self._run("refresh")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.cache / "git").exists())
+        self.assertFalse((self.cache / ".lock").exists())
+
+    def test_existing_mirrors_advance_and_no_new_mirror_appears(self) -> None:
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        self._commit("owner/repo", "dev-base", branch="dev")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo", "--branch", "dev").returncode, 0)
+        head = self._commit("owner/repo", "two")
+        dev = self._commit("owner/repo", "three", branch="dev")
+        proc = self._run("refresh")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        mirror = self._mirror()
+        self.assertEqual(_git("rev-parse", "refs/heads/main", cwd=mirror), head)
+        self.assertEqual(_git("rev-parse", "refs/heads/dev", cwd=mirror), dev)
+        self.assertFalse(self._mirror("owner/other").exists(),
+                         "refresh created a mirror nobody asked for")
+        self.assertFalse((self.cache / ".lock").exists())
+
+    def test_refresh_without_compaction_never_deletes_a_pack(self) -> None:
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        seen = set(self._packs())
+        for n in range(4):
+            self._commit("owner/repo", f"c{n}")
+            self.assertEqual(self._run("refresh", env=self._tart(0)).returncode, 0)
+            now = set(self._packs())
+            self.assertTrue(seen <= now, "refresh removed a pack a guest may be reading")
+            seen = now
+        self.assertEqual(len(seen), 5)
+
+    def _grow(self, packs: int) -> None:
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        for n in range(packs - 1):
+            self._commit("owner/repo", f"g{n}")
+            self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        self.assertEqual(len(self._packs()), packs)
+
+    def test_compaction_is_deferred_while_a_vm_runs_or_tart_cannot_say(self) -> None:
+        self._grow(4)
+        for running in (1, None):
+            proc = self._run("refresh", "--compact-above", "2", env=self._tart(running))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("compaction deferred", proc.stdout)
+            self.assertEqual(len(self._packs()), 4, f"repacked with running={running}")
+
+    def test_compaction_folds_only_above_the_threshold_when_idle(self) -> None:
+        self._grow(4)
+        proc = self._run("refresh", "--compact-above", "4", env=self._tart(0))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self._packs()), 4)
+        proc = self._run("refresh", "--compact-above", "3", env=self._tart(0))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self._packs()), 1)
+        self.assertEqual(_git("fsck", "--connectivity-only", "--no-dangling", cwd=self._mirror()), "")
+
+    def test_one_failed_mirror_does_not_stop_the_others(self) -> None:
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        self.assertEqual(self._run("git-sync", "--repo", "owner/other").returncode, 0)
+        # Sorted first, so a fail-fast loop would never reach owner/repo.
+        _git("-C", str(self._mirror("owner/other")), "remote", "set-url", "origin",
+             str(self.tmp / "gone.git"))
+        head = self._commit("owner/repo", "two")
+        proc = self._run("refresh")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("fetch of owner/other main failed", proc.stderr)
+        self.assertEqual(_git("rev-parse", "refs/heads/main", cwd=self._mirror()), head)
+
+    def test_rejects_a_bad_threshold(self) -> None:
+        proc = self._run("refresh", "--compact-above", "0")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--compact-above", proc.stderr)
+
+
+class RefreshAgentTests(unittest.TestCase):
+    """The scheduled agent runs refresh at background QoS on the guests' cache."""
+
+    def _spec(self, home: str = "/Users/someone") -> dict:
+        res = subprocess.run(
+            ["python3", "scripts/render_launchd_template.py", str(REFRESH_TEMPLATE),
+             "--set", f"HOME={home}"],
+            cwd=ROOT, capture_output=True, text=True, check=True)
+        return plistlib.loads(res.stdout.encode())
+
+    def test_template_runs_refresh_at_background_qos(self) -> None:
+        spec = self._spec()
+        self.assertEqual(spec["Label"], REFRESH_LABEL)
+        self.assertEqual(spec["ProgramArguments"][1:4],
+                         ["/Users/someone/.local/bin/tartci", "artifact-cache", "refresh"])
+        self.assertIn("--compact-above", spec["ProgramArguments"])
+        self.assertEqual(spec["ProcessType"], "Background")
+        self.assertIs(spec["LowPriorityIO"], True)
+        # Interval, not calendar: the watchdog's staleness bound is derived
+        # from StartInterval, and an interval is not aligned to :00/:30.
+        self.assertGreaterEqual(int(spec["StartInterval"]), 3600)
+        self.assertNotIn("StartCalendarInterval", spec)
+        self.assertIs(spec["RunAtLoad"], False)
+
+    def test_template_refreshes_the_cache_the_guests_mount(self) -> None:
+        runner = plistlib.loads(subprocess.run(
+            ["python3", "scripts/render_launchd_template.py", str(RUNNER_TEMPLATE),
+             "--set", "HOME=/Users/someone", "--set", "TART_HOME=/Users/someone/VMs"],
+            cwd=ROOT, capture_output=True, text=True, check=True).stdout.encode())
+        self.assertEqual(self._spec()["EnvironmentVariables"]["TARTCI_CI_CACHE"],
+                         runner["EnvironmentVariables"]["TARTCI_CI_CACHE"])
+
+    def test_tartci_dispatches_the_subcommand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["bash", str(ROOT / "tartci"), "artifact-cache", "refresh",
+                 "--dir", str(Path(tmp) / "absent")],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("nothing to refresh", proc.stdout)
+
+    def test_setup_installs_the_agent(self) -> None:
+        body = (ROOT / "tartci").read_text()
+        start = body.index("cmd_setup()")
+        end = body.index("cmd_bench()", start)
+        self.assertIn('install_artifact_cache_refresh_agent.sh" --install', body[start:end])
+
+    def test_installer_plan_writes_nothing_and_temp_home_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = Path(tmp) / "agents"
+            calls = Path(tmp) / "launchctl.calls"
+            double = Path(tmp) / "launchctl"
+            double.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\nexit 1\n")
+            double.chmod(0o755)
+            plan = subprocess.run(
+                [str(REFRESH_INSTALLER), "--plan"], capture_output=True, text=True, check=False,
+                env={**os.environ, "TARTCI_AGENTS_DIR": str(agents),
+                     "TARTCI_LAUNCHCTL_BIN": str(double)})
+            self.assertEqual(plan.returncode, 0, plan.stderr)
+            self.assertIn("plan: write", plan.stdout)
+            self.assertFalse((agents / f"{REFRESH_LABEL}.plist").exists())
+            calls.unlink(missing_ok=True)
+            home = Path(tmp) / "home"
+            home.mkdir()
+            res = subprocess.run(
+                [str(REFRESH_INSTALLER), "--install"], capture_output=True, text=True, check=False,
+                env={**os.environ, "HOME": str(home), "TARTCI_LAUNCHCTL_BIN": str(double),
+                     "TARTCI_LAUNCHD_GUARD_TREAT_AS_REAL": "1"})
+            self.assertEqual(res.returncode, 4, res.stdout + res.stderr)
+            self.assertFalse((home / "Library/LaunchAgents" / f"{REFRESH_LABEL}.plist").exists())
+            self.assertFalse(calls.exists(), "launchctl was called from a temp HOME")
 
 
 if __name__ == "__main__":
