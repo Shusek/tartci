@@ -412,5 +412,81 @@ class FakeSshEndToEndTests(unittest.TestCase):
         self.assertEqual(events[-1][0], "bridge_exhausted")
 
 
+
+class PortInUseTests(unittest.TestCase):
+    """A port held by another process refuses loudly instead of crash-looping."""
+
+    def held_port(self) -> int:
+        holder = socket.socket()
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        return holder.getsockname()[1]
+
+    def run_main(self, argv: list[str]) -> tuple[int, str]:
+        import contextlib
+        import io
+        err = io.StringIO()
+        original = relay.port_holder
+        relay.port_holder = lambda port, run=None: "pid 2518 (Python)"
+        try:
+            with contextlib.redirect_stderr(err):
+                rc = relay.main(argv)
+        finally:
+            relay.port_holder = original
+        return rc, err.getvalue()
+
+    def test_a_held_port_exits_75_and_names_the_holder(self) -> None:
+        # m3 on 2026-10-02: a legacy bridge held 49125 and the relay crash-looped.
+        port = self.held_port()
+        rc, err = self.run_main(["--listen-host", "127.0.0.1", "--listen-port", str(port),
+                                 "--relay-host", "a", "--relay-host", "b", "--allow-route", "127.0.0.0/8=127.0.0.1", "--allow-host-suffix", "github.com"])
+        self.assertEqual(rc, relay.EXIT_PORT_IN_USE)
+        self.assertIn("REFUSING TO START", err)
+        self.assertIn("pid 2518 (Python)", err)
+        self.assertIn('"event": "listen_port_in_use"', err)
+
+    def test_another_bind_error_still_raises(self) -> None:
+        # Only a held port is a known, retryable condition.
+        def fake_server(*args, **kwargs):
+            raise OSError(13, "Permission denied")
+        original = relay.ThreadingServer
+        relay.ThreadingServer = fake_server
+        try:
+            with self.assertRaises(OSError):
+                relay.serve(relay.parse_args(["--relay-host", "a", "--relay-host", "b", "--allow-route", "127.0.0.0/8=127.0.0.1", "--allow-host-suffix", "github.com"]),
+                            holder=lambda port: "nobody")
+        finally:
+            relay.ThreadingServer = original
+
+    def test_holder_is_parsed_from_lsof_field_output(self) -> None:
+        import subprocess
+        fake = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "p2518\ncPython\n", "")
+        self.assertEqual(relay.port_holder(49125, run=fake), "pid 2518 (Python)")
+        empty = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")
+        self.assertIn("no listener", relay.port_holder(49125, run=empty))
+
+    def test_an_oversized_log_is_rotated_at_startup(self) -> None:
+        port = self.held_port()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "relay.log"
+            log.write_bytes(b"x" * 2048)
+            rc, _ = self.run_main(["--listen-host", "127.0.0.1", "--listen-port", str(port),
+                                   "--relay-host", "a", "--relay-host", "b", "--allow-route", "127.0.0.0/8=127.0.0.1", "--allow-host-suffix", "github.com",
+                                   "--log-path", str(log), "--log-max-bytes", "1024"])
+            self.assertEqual(rc, relay.EXIT_PORT_IN_USE)
+            self.assertEqual((Path(f"{log}.1")).stat().st_size, 2048)
+            self.assertEqual(log.stat().st_size, 0)
+
+    def test_the_launchd_plist_throttles_respawns_and_names_its_log(self) -> None:
+        import plistlib
+        import re
+        template = (ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template")
+        value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", template.read_bytes(), flags=re.DOTALL))
+        self.assertGreaterEqual(value.get("ThrottleInterval", 0), 30)
+        args = value["ProgramArguments"]
+        self.assertEqual(args[args.index("--log-path") + 1], value["StandardErrorPath"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

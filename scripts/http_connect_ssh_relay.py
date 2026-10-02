@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import ipaddress
 import json
 import select
@@ -436,6 +437,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--listen-host", default="0.0.0.0")
     parser.add_argument("--listen-port", type=int, default=49125)
     parser.add_argument(
+        "--log-path",
+        default="",
+        help="launchd log to rotate aside at startup once it reaches --log-max-bytes",
+    )
+    parser.add_argument("--log-max-bytes", type=int, default=8 * 1024 * 1024)
+    parser.add_argument("--log-generations", type=int, default=3)
+    parser.add_argument(
         "--allow-route",
         action="append",
         required=True,
@@ -456,8 +464,70 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# EX_TEMPFAIL: another process holds the listen port. launchd's KeepAlive
+# respawns on any exit, so the plist's ThrottleInterval is what spaces retries.
+EXIT_PORT_IN_USE = 75
+
+
+def port_holder(port: int, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """Who listens on `port`, as "pid N (command)", or why that is unknown."""
+    try:
+        result = run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unknown (lsof failed: {error})"
+    holders, pid = [], None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c") and pid is not None:
+            holders.append(f"pid {pid} ({line[1:]})")
+            pid = None
+    return ", ".join(holders) or "unknown (lsof found no listener)"
+
+
+def serve(args: argparse.Namespace,
+          holder: Callable[[int], str] | None = None) -> int:
+    """Bind and serve, or refuse loudly when another process holds the port.
+
+    A port held by another process does not free itself on a respawn: on
+    2026-10-02 m3's relay lost 49125 to a hand-installed legacy bridge and
+    launchd respawned it every ~10 s for days, 64,728 runs and a 220 MB log
+    of identical tracebacks, while the attestation only said "last exit 1".
+    """
+    try:
+        server = ThreadingServer(
+            (args.listen_host, args.listen_port),
+            ConnectHandler,
+            max_handlers=args.max_handlers,
+        )
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        who = (holder or port_holder)(args.listen_port)
+        emit_event("listen_port_in_use", port=args.listen_port, holder=who)
+        print(
+            f"http-connect-ssh-relay: REFUSING TO START: {args.listen_host}:{args.listen_port} "
+            f"is already held by {who}; stop that listener or move this relay's port",
+            file=sys.stderr,
+        )
+        return EXIT_PORT_IN_USE
+    with server:
+        server.serve_forever()
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.log_path:
+        import pathlib  # noqa: PLC0415 - only the launchd entry point rotates
+
+        from disk_reclaim import rotate_log  # noqa: PLC0415 - sibling module
+
+        rotate_log(pathlib.Path(args.log_path).expanduser(),
+                   args.log_max_bytes, args.log_generations)
     if (
         not 1 <= args.listen_port <= 65535
         or args.connect_timeout < 1
@@ -485,13 +555,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         connect_deadline=args.connect_deadline,
         retry_backoff=args.retry_backoff,
     )
-    with ThreadingServer(
-        (args.listen_host, args.listen_port),
-        ConnectHandler,
-        max_handlers=args.max_handlers,
-    ) as server:
-        server.serve_forever()
-    return 0
+    return serve(args)
 
 
 if __name__ == "__main__":
