@@ -80,10 +80,23 @@ class RunnerAssignmentTests(unittest.TestCase):
         self.assertIn("runner_job=timeout", proc.stderr)
         self.assertLess(proc.elapsed, 4.5)  # type: ignore[attr-defined]
 
-    def test_invalid_job_deadline_fails_closed(self) -> None:
-        proc, _root = self._run_harness("sleep 1", {"TARTCI_JOB_TIMEOUT_SECS": "soon"})
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("TARTCI_JOB_TIMEOUT_SECS must be a positive integer", proc.stderr)
+    def test_invalid_job_deadline_stops_and_cleans_the_live_runner(self) -> None:
+        for value, message in (("soon", "must be a positive integer"),
+                               ("0", "must be a positive integer"),
+                               ("500000", "must be at most 432000")):
+            with self.subTest(value=value):
+                proc, root = self._run_harness(
+                    "sleep 3; printf finished > \"$TEST_ROOT/runner.finished\"",
+                    {"TARTCI_JOB_TIMEOUT_SECS": value},
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn(f"TARTCI_JOB_TIMEOUT_SECS {message}", proc.stderr)
+                self.assertTrue((root / "vm.deleted").is_file())
+                self.assertFalse((root / "runner.finished").exists())
+                self.assertLess(proc.elapsed, 2.5)  # type: ignore[attr-defined]
+        body = RUNNER.read_text(encoding="utf-8")
+        self.assertLess(body.index("tartci_validate_runner_job_timeout"),
+                        body.index('if [ "$LOOP" = 1 ]; then'))
 
     def test_never_assigned_runner_times_out_and_cleans_vm_and_lease(self) -> None:
         proc, root = self._run_harness(

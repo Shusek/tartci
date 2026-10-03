@@ -248,6 +248,16 @@ queued_work(){
     --match-labels "$QUEUE_MATCH_LABELS" 2>/dev/null || echo ERR
 }
 
+# Prove the repository boundary and the public-repository fork gate
+# (scripts/runner_group_repository_access.py). GitHub assigns any job whose
+# labels match, so this runs before a VM boots (a refusal must not boot VMs in
+# a loop) and again right before the JIT mint. $1 receives the receipt.
+verify_runner_repository_access(){
+  SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE=repo \
+    python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+    --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$1"
+}
+
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_mem lease_priority
   local build_parallel_effective
@@ -266,6 +276,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-linux \
     "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
   state_dir="$(tartci_provider_state_dir tart-linux)"
+  if ! verify_runner_repository_access "$logdir/repository-access.json"; then
+    note "[$i] runner repository access not proven — not booting a VM"
+    return 1
+  fi
   write_state(){
     TARTCI_STATE_LABELS="$LABELS" \
     TARTCI_STATE_REPO="$REPO" \
@@ -380,12 +394,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     fi
   fi
 
-  # GitHub assigns any job whose labels match, so prove the repository boundary
-  # and the public-repository fork gate before a registration exists.
-  if ! SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE=repo \
-      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
-      --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" \
-      >"$logdir/repository-access.json"; then
+  if ! verify_runner_repository_access "$logdir/repository-access.json"; then
     note "[$i] runner repository access not proven — refusing JIT registration and discarding VM"
     discard_current_linux_vm
     return 1
@@ -503,6 +512,8 @@ i=0
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 tartci_validate_runner_idle_timeout "$IDLE_TIMEOUT" \
   || die "invalid Linux runner assignment timeout configuration"
+tartci_validate_runner_job_timeout "${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}" \
+  || die "invalid Linux job timeout configuration"
 tartci_validate_bounded_positive_integer \
   TARTCI_LINUX_BUILD_PARALLEL_LEVEL "$BUILD_PARALLEL_LEVEL" 64 \
   || die "invalid Linux build parallelism configuration"

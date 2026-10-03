@@ -56,6 +56,15 @@ class WindowsRunnerArchiveTests(unittest.TestCase):
         refuse = body.index("refusing an unverified download")
         self.assertLess(refuse, body.index("Invoke-WebRequest -Uri $url"))
 
+    def test_runner_is_installed_and_verified_before_any_registration(self) -> None:
+        # An unpinned golden must fail before minting, not mint and delete a
+        # registration on every iteration.
+        body = WINDOWS.read_text(encoding="utf-8")
+        install = body.index('wsh "powershell -NoProfile -EncodedCommand $enc_install"')
+        legacy_mint = body.index('\n  jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig"')
+        self.assertLess(install, legacy_mint)
+        self.assertLess(body.index('$expectedSha="'), install)
+
     def test_malformed_pins_are_rejected_before_any_guest_contact(self) -> None:
         env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/tmp")}
         for value in ("not-hex", "ab" * 31, "ab" * 33):

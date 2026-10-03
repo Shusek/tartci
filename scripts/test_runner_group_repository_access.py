@@ -108,11 +108,22 @@ class RunnerGroupRepositoryAccessTests(unittest.TestCase):
         self.assertEqual(self.calls_made(), ["repos/Generous-Corp/pulp"])
 
     def test_repository_scope_fails_closed_when_visibility_is_unreadable(self) -> None:
-        for state in ({"api_error": True}, {"repository": {"visibility": "selected"}}):
-            with self.subTest(state=state):
-                result = self.run_check(1, state)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("access error", result.stderr)
+        result = self.run_check(1, {"api_error": True})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("access error", result.stderr)
+        # An answer that proves neither visibility is a denial, not a retry.
+        for repository in ({"visibility": "selected"}, {"id": 1}):
+            with self.subTest(repository=repository):
+                result = self.run_check(1, {"repository": repository})
+                self.assertEqual(result.returncode, 3)
+                self.assertIn("unreadable visibility", json.loads(result.stdout)["reason"])
+
+    def test_visibility_falls_back_to_the_private_flag(self) -> None:
+        result = self.run_check(1, {"repository": {"private": True}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_check(1, {"repository": {"private": False}})
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("fork pull requests run without approval", json.loads(result.stdout)["reason"])
 
     def test_public_repository_requires_approval_for_all_external_contributors(self) -> None:
         for approval in ("first_time_contributors", "first_time_contributors_new_to_github"):
@@ -154,13 +165,16 @@ class RunnerGroupRepositoryAccessTests(unittest.TestCase):
         self.assertEqual(receipt["public_repositories"], [])
 
     def test_group_that_allows_public_repositories_checks_fork_approval(self) -> None:
-        result = self.run_check(
-            3,
-            {"pages": [["Generous-Corp/pulp"]], "public": ["Generous-Corp/pulp"],
-             "group": {"allows_public_repositories": True}},
-        )
-        self.assertEqual(result.returncode, 3)
-        self.assertEqual(json.loads(result.stdout)["verdict"], "deny")
+        # An absent flag is treated as allowing public repositories.
+        for group in ({"allows_public_repositories": True}, {}):
+            with self.subTest(group=group):
+                result = self.run_check(
+                    3,
+                    {"pages": [["Generous-Corp/pulp"]], "public": ["Generous-Corp/pulp"],
+                     "group": group},
+                )
+                self.assertEqual(result.returncode, 3)
+                self.assertEqual(json.loads(result.stdout)["verdict"], "deny")
 
     def test_required_workflow_restriction_refuses_repository_scope(self) -> None:
         result = self.run_check(1, {}, {"TARTCI_REQUIRE_WORKFLOW_RESTRICTION": "1"})
@@ -180,6 +194,16 @@ class RunnerGroupRepositoryAccessTests(unittest.TestCase):
                 "Generous-Corp/pulp/.github/workflows/release.yml@refs/heads/main"]}, 3),
             "foreign repository": ({"restricted_to_workflows": True, "selected_workflows": [
                 "Generous-Corp/forge/.github/workflows/ci.yml@refs/heads/main"]}, 3),
+            "unpinned": ({"restricted_to_workflows": True, "selected_workflows": [
+                "Generous-Corp/pulp/.github/workflows/ci.yml"]}, 3),
+            "wildcard ref": ({"restricted_to_workflows": True, "selected_workflows": [
+                "Generous-Corp/pulp/.github/workflows/ci.yml@*"]}, 3),
+            "wildcard file": ({"restricted_to_workflows": True, "selected_workflows": [
+                "Generous-Corp/pulp/.github/workflows/*.yml@refs/heads/main"]}, 3),
+            "pull request ref": ({"restricted_to_workflows": True, "selected_workflows": [
+                "Generous-Corp/pulp/.github/workflows/ci.yml@refs/pull/1/merge"]}, 3),
+            "commit": ({"restricted_to_workflows": True, "selected_workflows": [
+                "Generous-Corp/pulp/.github/workflows/ci.yml@" + "a" * 40]}, 0),
             "exact": ({"restricted_to_workflows": True, "selected_workflows": [
                 "Generous-Corp/pulp/.github/workflows/ci.yml@refs/heads/main"]}, 0),
         }

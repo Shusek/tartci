@@ -302,9 +302,9 @@ class ProviderIntegrationTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 run_one = body.index("run_one")
                 proof = (
-                    'verify_runner_repository_access "$logdir"'
-                    if "qemu-windows" in str(provider)
-                    else "runner_group_repository_access.py"
+                    "runner_group_repository_access.py"
+                    if "tart-macos" in str(provider)
+                    else 'verify_runner_repository_access "$logdir/repository-access.json"'
                 )
                 gate = body.index('admission_json="$(tartci_admission_clean', run_one)
                 mint = body.find("generate-jitconfig", run_one)
@@ -315,6 +315,12 @@ class ProviderIntegrationTests(unittest.TestCase):
                         f"mint at offset {mint} has no repository-access proof",
                     )
                     mint = body.find("generate-jitconfig", mint + 1)
+                if "tart-macos" not in str(provider):
+                    # A refused repository must not boot a VM every poll.
+                    early = body.index("verify_runner_repository_access", run_one)
+                    boot = body.index("tart clone" if "tart-linux" in str(provider)
+                                      else "allocate_ssh_port)", run_one)
+                    self.assertLess(early, boot)
 
     def test_gate_is_after_boot_and_before_jit_mint(self) -> None:
         for provider in PROVIDERS:

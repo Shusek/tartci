@@ -45,6 +45,11 @@ tartci_validate_runner_idle_timeout() {
 # keep its VM (and its share of the host) alive indefinitely.
 TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT=21600
 
+tartci_validate_runner_job_timeout() {
+  tartci_validate_bounded_positive_integer \
+    TARTCI_JOB_TIMEOUT_SECS "${1:-}" 432000
+}
+
 _tartci_observe_runner_assignment() {
   local runner_log="$1" assigned_fn="${2:-}" assignment_line=""
   [ "$TARTCI_RUNNER_WAS_ASSIGNED" = 0 ] || return 0
@@ -71,14 +76,20 @@ tartci_monitor_runner_assignment() {
   local uncertainty_count=0 uncertainty_max="${TARTCI_RUNNER_ASSIGNMENT_VERIFY_ATTEMPTS:-3}"
   local job_timeout="${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}"
   TARTCI_RUNNER_WAS_ASSIGNED=0
-  tartci_validate_runner_idle_timeout "$timeout" || return $?
-  tartci_validate_bounded_positive_integer \
-    TARTCI_RUNNER_ASSIGNMENT_VERIFY_ATTEMPTS "$uncertainty_max" 20 || return $?
-  tartci_validate_bounded_positive_integer \
-    TARTCI_JOB_TIMEOUT_SECS "$job_timeout" 432000 || return $?
   if ! declare -F "$cleanup_fn" >/dev/null 2>&1; then
     printf 'runner assignment cleanup callback is unavailable: %s\n' \
       "$cleanup_fn" >&2
+    return 2
+  fi
+  # The runner is already registered and listening: an unusable deadline must
+  # stop and clean it up, never leave it serving a job nobody watches.
+  if ! tartci_validate_runner_idle_timeout "$timeout" \
+     || ! tartci_validate_bounded_positive_integer \
+       TARTCI_RUNNER_ASSIGNMENT_VERIFY_ATTEMPTS "$uncertainty_max" 20 \
+     || ! tartci_validate_runner_job_timeout "$job_timeout"; then
+    kill -9 "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+    "$cleanup_fn"
     return 2
   fi
 

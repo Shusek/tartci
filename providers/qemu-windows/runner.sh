@@ -281,14 +281,13 @@ CURRENT_PREPARED_LISTENER_PID=""
 WINDOWS_DRAIN_REQUESTED=0
 
 # Prove the runner group's repository boundary, and that no public repository
-# lets fork pull requests reach this runner unapproved, right before a JIT mint.
-# GitHub assigns any job whose labels match, so every mint path needs this.
+# lets fork pull requests reach this runner unapproved. GitHub assigns any job
+# whose labels match, so it runs before a VM boots (a refusal must not boot VMs
+# in a loop) and again right before every JIT mint. $1 receives the receipt.
 verify_runner_repository_access(){
-  local logdir="$1"
   SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE="${TARTCI_RUNNER_SCOPE:-repo}" \
     python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
-    --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" \
-    >"$logdir/repository-access.json"
+    --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$1"
 }
 
 cleanup_active_windows_job(){
@@ -375,6 +374,11 @@ run_one(){ # $1=iteration index
     "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
   tartci_prepare_and_check_disk_root_observed "$WORKROOT/port-locks" "" "" qemu-windows \
     "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
+  if [ -z "${LOCAL_JOB:-}" ] \
+     && ! verify_runner_repository_access "$LOGROOT/$job.repository-access.json"; then
+    note "[$i] runner repository access not proven — not booting a VM"
+    return 1
+  fi
 
   local port port_lock port_lock_device port_lock_inode jobdir logdir overlay efivars qpid
   read -r port port_lock port_lock_device port_lock_inode < <(allocate_ssh_port)
@@ -541,7 +545,7 @@ run_one(){ # $1=iteration index
       if [ -n "${LOCAL_JOB:-}" ]; then
         python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --operation local-job -- "$GUEST_DRIVER" run-local "$job" "$port" "$LOCAL_JOB" >"$prepared_log" 2>&1 || prepared_rc=$?
       else
-        verify_runner_repository_access "$logdir" || prepared_rc=$?
+        verify_runner_repository_access "$logdir/repository-access.json" || prepared_rc=$?
         if [ "$prepared_rc" = 0 ] && tartci_pool_lock_acquire && tartci_pool_admission_open; then
           local prepared_labels=() label
           IFS=',' read -r -a prepared_labels <<< "$LABELS"
@@ -573,7 +577,41 @@ run_one(){ # $1=iteration index
     return "$prepared_rc"
   fi
 
-  if ! verify_runner_repository_access "$logdir"; then
+  # (1) Install or verify the pinned runner agent BEFORE minting: a golden that
+  # lacks it without TARTCI_WIN_RUNNER_SHA256 must not register (and delete) a
+  # runner on every iteration. No credential is involved yet.
+  local enc_install
+  enc_install="$(printf '%s' '$ProgressPreference="SilentlyContinue"
+$dir="C:\actions-runner"
+$runnerVersion="'"$RUNNER_VERSION"'"
+$expectedSha="'"$RUNNER_SHA256"'".ToLowerInvariant()
+$listener="$dir\bin\Runner.Listener.exe"
+$currentVersion=""
+if (Test-Path $listener) {
+  try { $currentVersion = ((& $listener --version 2>$null | Select-Object -First 1).Trim()) } catch { $currentVersion = "" }
+}
+if ($currentVersion -ne $runnerVersion) {
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $dir
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  if (-not $expectedSha) { Write-Error "Actions Runner $runnerVersion is not in the golden and TARTCI_WIN_RUNNER_SHA256 is unset; refusing an unverified download"; exit 1 }
+  $url="https://github.com/actions/runner/releases/download/v$runnerVersion/actions-runner-win-arm64-$runnerVersion.zip"
+  Invoke-WebRequest -Uri $url -OutFile "$dir\r.zip"
+  $actualSha=(Get-FileHash -Algorithm SHA256 -Path "$dir\r.zip").Hash.ToLowerInvariant()
+  if ($actualSha -ne $expectedSha) { Remove-Item -Force "$dir\r.zip"; Write-Error "Actions Runner archive SHA-256 mismatch: got $actualSha"; exit 1 }
+  Expand-Archive -Path "$dir\r.zip" -DestinationPath $dir -Force
+  Remove-Item "$dir\r.zip"
+}
+# Goldens may carry stale runner registration files from an older proof. JIT
+# configs are single-use; leave only the runner binaries before each fresh boot.
+Remove-Item -Force -ErrorAction SilentlyContinue "$dir\.runner","$dir\.credentials","$dir\.credentials_rsaparams","$dir\.env","$dir\.path","$dir\jit.cfg"
+# Integrity gate: the agent binary must exist after install. The download is
+# pinned by SHA-256 and Expand-Archive rejects a corrupt/truncated zip, but this
+# catches a partial extract loudly rather than failing opaquely at run.
+if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Listener.exe missing after install (corrupt/truncated download?)"; exit 1 }' | iconv -t UTF-16LE | base64)"
+  wsh "powershell -NoProfile -EncodedCommand $enc_install" \
+    || { note "[$i] runner install failed"; runtime_emit_complete fail jit_failed 1 "$job" "" "$logdir"; cleanup_job failure; return 1; }
+
+  if ! verify_runner_repository_access "$logdir/repository-access.json"; then
     note "[$i] runner repository access not proven — refusing JIT registration and discarding VM"
     cleanup_job success
     return 1
@@ -634,38 +672,10 @@ try {
   # multi-KB; it must NEVER ride a command line — embedding it in a PowerShell
   # -EncodedCommand or passing it as a cmd arg blows cmd.exe's 8191-char limit
   # through the ssh→cmd→powershell chain ("The command line is too long").
-  # So: (1) ensure the agent binary version [no blob], (2) STREAM the blob into a
-  # file via ssh STDIN [unbounded], (3) run the agent reading that file [no blob].
-  local enc_install ps_preflight ps_run enc_after
-  enc_install="$(printf '%s' '$ProgressPreference="SilentlyContinue"
-$dir="C:\actions-runner"
-$runnerVersion="'"$RUNNER_VERSION"'"
-$expectedSha="'"$RUNNER_SHA256"'".ToLowerInvariant()
-$listener="$dir\bin\Runner.Listener.exe"
-$currentVersion=""
-if (Test-Path $listener) {
-  try { $currentVersion = ((& $listener --version 2>$null | Select-Object -First 1).Trim()) } catch { $currentVersion = "" }
-}
-if ($currentVersion -ne $runnerVersion) {
-  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $dir
-  New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  if (-not $expectedSha) { Write-Error "Actions Runner $runnerVersion is not in the golden and TARTCI_WIN_RUNNER_SHA256 is unset; refusing an unverified download"; exit 1 }
-  $url="https://github.com/actions/runner/releases/download/v$runnerVersion/actions-runner-win-arm64-$runnerVersion.zip"
-  Invoke-WebRequest -Uri $url -OutFile "$dir\r.zip"
-  $actualSha=(Get-FileHash -Algorithm SHA256 -Path "$dir\r.zip").Hash.ToLowerInvariant()
-  if ($actualSha -ne $expectedSha) { Remove-Item -Force "$dir\r.zip"; Write-Error "Actions Runner archive SHA-256 mismatch: got $actualSha"; exit 1 }
-  Expand-Archive -Path "$dir\r.zip" -DestinationPath $dir -Force
-  Remove-Item "$dir\r.zip"
-}
-# Goldens may carry stale runner registration files from an older proof. JIT
-# configs are single-use; leave only the runner binaries before each fresh boot.
-Remove-Item -Force -ErrorAction SilentlyContinue "$dir\.runner","$dir\.credentials","$dir\.credentials_rsaparams","$dir\.env","$dir\.path","$dir\jit.cfg"
-# Integrity gate: the agent binary must exist after install. The download is
-# pinned by SHA-256 and Expand-Archive rejects a corrupt/truncated zip, but this
-# catches a partial extract loudly rather than failing opaquely at run.
-if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Listener.exe missing after install (corrupt/truncated download?)"; exit 1 }' | iconv -t UTF-16LE | base64)"
-  wsh "powershell -NoProfile -EncodedCommand $enc_install" \
-    || { note "[$i] runner install failed"; runtime_emit_complete fail jit_failed 1 "$job" "" "$logdir"; cleanup_job failure; return 1; }
+  # So: (1) ensure the agent binary version [no blob; done before the mint],
+  # (2) STREAM the blob into a file via ssh STDIN [unbounded], (3) run the agent
+  # reading that file [no blob].
+  local ps_preflight ps_run enc_after
 
   # (2) stream the JIT config in via stdin → file (no command-line length limit).
   # Guard the pipeline: under `set -euo pipefail` a dropped SSH / PowerShell error
@@ -809,7 +819,8 @@ exit $LASTEXITCODE'
   local runner_output="$logdir/runner-output.log"
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed
   local runner_assigned_at=0 job_timeout="${TARTCI_JOB_TIMEOUT_SECS:-21600}"
-  case "$job_timeout" in ''|0|*[!0-9]*) job_timeout=21600 ;; esac
+  # Zero, a leading zero or a non-number would kill every job at assignment.
+  case "$job_timeout" in ''|0*|*[!0-9]*) job_timeout=21600 ;; esac
   run_guest_ps_file "C:\actions-runner\tartci-runner.ps1" "$ps_run" >"$runner_output" 2>&1 &
   runner_pid=$!
   if ! tartci_pool_lock_handoff_to_listener "$runner_pid"; then
@@ -881,7 +892,9 @@ if (Test-Path $diagDir) {
   note "[$i] timing: boot=$(elapsed "$t_start" "$t_booted")s preflight=$(elapsed "$t_booted" "$t_preflight")s runner=$(elapsed "$t_preflight" "$t_runner_done")s total=$(elapsed "$t_start" "$t_done")s"
 
   if [ "$run_status" -ne 0 ]; then
-    if [ "$run_status" -eq 124 ]; then
+    if [ "$run_status" -eq 124 ] && [ "$runner_assigned" = 1 ]; then
+      runtime_emit_complete fail runner_timeout "$run_status" "$job" "$logdir/timing.tsv" "$logdir"
+    elif [ "$run_status" -eq 124 ]; then
       runtime_emit_complete fail idle_timeout "$run_status" "$job" "$logdir/timing.tsv" "$logdir"
     else
       runtime_emit_complete fail source_failure "$run_status" "$job" "$logdir/timing.tsv" "$logdir"

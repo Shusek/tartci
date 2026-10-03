@@ -1651,7 +1651,7 @@ rsync -a '/Volumes/My Shared Files/configure-checks/' \"\$HOME/Library/Caches/Pu
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE|CCACHE_READONLY|CCACHE_TEMPDIR)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|CCACHE_READONLY|CCACHE_TEMPDIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      ${ccache_ro_dotenv}\
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
@@ -1724,7 +1724,9 @@ rsync -a '/Volumes/My Shared Files/configure-checks/' \"\$HOME/Library/Caches/Pu
       if [ "$CURRENT_JOB_POLICY_VIOLATION" = 1 ]; then
         # The queue policy is not GitHub's assignment rule: a refused run (a
         # fork pull request, another workflow) can still land here. Stop it
-        # now; the caller discards the VM and nothing is promoted to caches.
+        # now; the caller discards the VM and settles any write-isolation layer
+        # as non-green. Writes it already made to an `rw` host cache remain, so
+        # untrusted lanes also need TARTCI_HOST_CACHE_ACCESS=ro.
         note "[$vm] GitHub assigned a run outside the queue policy — stopping it and discarding the VM"
         kill "$ssh_pid" 2>/dev/null || true
         stop_current_aqua_runner

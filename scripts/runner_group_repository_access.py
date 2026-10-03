@@ -22,9 +22,12 @@ from queue_policy import QueuePolicy
 
 
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+# A selected workflow must name one file at one immutable or protected ref: an
+# unpinned or wildcard entry admits a pull request's own copy of the workflow.
 WORKFLOW = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/"
-    r"(?P<path>\.github/workflows/[^/@]+\.ya?ml)(?:@\S+)?$"
+    r"(?P<path>\.github/workflows/[^/@*?\[\]]+\.ya?ml)"
+    r"@(?P<ref>refs/(?:heads|tags)/[^*?\[\]\s]+|[0-9a-f]{40})$"
 )
 PER_PAGE = 100
 MAX_PAGES = 20
@@ -86,10 +89,14 @@ def _require_untrusted_forks_gated(
         payload = api(gh_cli, f"repos/{candidate}", repo, timeout)
         visibility = payload.get("visibility")
         private = payload.get("private")
+        if visibility is None and isinstance(private, bool):
+            # Older GitHub Enterprise Server releases only report `private`.
+            visibility = "private" if private else "public"
         if visibility in ("private", "internal") and private is True:
             continue
         if visibility != "public" or private is not False:
-            raise AccessError(f"repository {candidate} has unreadable visibility")
+            # A readable answer that proves neither is a denial, not a retry.
+            raise RepositoryInaccessible(f"repository {candidate} has unreadable visibility")
         if not group_allows_public:
             # GitHub does not route a public repository's jobs to a group that
             # disallows public repositories, so its forks cannot reach us.
@@ -136,7 +143,12 @@ def _require_workflow_allow_list(group: dict[str, Any], repositories: list[str])
     allowed = {candidate.lower() for candidate in repositories}
     for workflow in selected:
         match = WORKFLOW.fullmatch(workflow) if isinstance(workflow, str) else None
-        if not match or match.group("repo").lower() not in allowed:
+        if not match:
+            raise RepositoryInaccessible(
+                f"runner group allows workflow {workflow!r} at an unpinned or wildcard ref; "
+                "pin each to refs/heads/<branch>, refs/tags/<tag> or a commit SHA"
+            )
+        if match.group("repo").lower() not in allowed:
             raise RepositoryInaccessible(f"runner group allows an unobserved workflow {workflow!r}")
         if (policy_paths is not None and match.group("repo").lower() == repositories[0].lower()
                 and match.group("path") not in policy_paths):
@@ -227,8 +239,8 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
         _require_workflow_allow_list(group, reachable)
         if _enabled("TARTCI_REQUIRE_WORKFLOW_RESTRICTION") else None
     )
-    # Absent means GitHub's default for a new group: public repositories denied.
-    allows_public = group.get("allows_public_repositories") is True
+    # Only an explicit false exempts public repositories from the fork gate.
+    allows_public = group.get("allows_public_repositories") is not False
     public = _require_untrusted_forks_gated(gh_cli, repo, reachable, timeout, allows_public)
     receipt: dict[str, Any] = {
         "schema": 1,

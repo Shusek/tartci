@@ -39,18 +39,21 @@ action. Such a job must not be able to:
   secrets in protected environments that PR workflows cannot use.
 - **Organization runner groups.** Use them when your plan supports them. Use a
   dedicated group with *Selected repositories*, keep *Allow public
-  repositories* off, and restrict it to *Selected workflows*. Pin trusted lanes
-  to `@refs/heads/main`. Set `TARTCI_REQUIRE_WORKFLOW_RESTRICTION=1` so tartci
-  refuses to mint unless GitHub enforces that allow-list. With a queue policy,
-  every allowed workflow of the primary repository must also be one of the
-  policy's `workflow_paths`.
+  repositories* off, and restrict it to *Selected workflows*, each pinned to a
+  protected ref such as `@refs/heads/main`. Set
+  `TARTCI_REQUIRE_WORKFLOW_RESTRICTION=1` so tartci refuses to mint unless
+  GitHub enforces that allow-list. Unpinned, wildcard and `refs/pull/...`
+  entries are refused, because they would admit a pull request's own copy of
+  the workflow. With a queue policy, every allowed workflow of the primary
+  repository must also be one of the policy's `workflow_paths`.
 
 The queue policy (`TARTCI_QUEUE_POLICY_FILE`, see `queue-policy.txt`) decides
 when to *boot* a VM. It cannot stop GitHub from handing the runner another
 label-matching job. On macOS, if GitHub assigns a run in the primary repository
 that the policy refuses, the supervisor now stops the job and discards the VM.
-That is containment after the fact, not prevention: the job may already have
-run for a few seconds. The policy is refused outright with
+That is containment after the fact, not prevention. Until the next observation
+the job runs, and anything it writes to an `rw` host cache stays there. That is
+another reason for `TARTCI_HOST_CACHE_ACCESS=ro` on untrusted lanes. The policy is refused outright with
 `TARTCI_RUNNER_ASSIGNMENT_MODE=event-class-v2`, whose scanner does not read it.
 
 ## 2. Separate trust classes
@@ -87,12 +90,15 @@ off hosts that serve trusted work.
 - **GitHub:** use a GitHub App wrapper (`TARTCI_GH_CLI=ghapp`) or a
   fine-grained token for exactly the served repositories, instead of an
   operator's `gh auth login`. A fine-grained token needs Administration
-  read/write, Actions read/write and Metadata read. Read the token from a 0600
-  file in a small wrapper (see `scripts/tartci-m1-stackbench-jit-gh`). Never
-  put a token in a plist.
+  read/write, Actions read/write and Metadata read. Have a small wrapper read
+  the token from a 0600 file and pass it to `gh` as `GH_TOKEN`, never on the
+  command line. Never put a token in a plist.
 - **Public repositories:** the access check also reads the fork-approval
-  policy. That needs Administration read on the repository, which the JIT mint
-  already requires for repository-scoped runners.
+  policy of every public repository that can reach the runner. That needs
+  Administration read on each one. Repository-scoped minting already requires
+  that. An organization group that allows public repositories needs it
+  granted explicitly; without it the check fails with 403, which the macOS
+  provider records as a denial.
 - **Guest SSH key:** use a dedicated key that opens nothing but CI guests
   (`TARTCI_VM_SSH_KEY`, `TARTCI_WIN_SSH_KEY`), not your everyday
   `~/.ssh/id_ed25519`. Providers now pass `IdentitiesOnly=yes`,
@@ -124,14 +130,16 @@ off hosts that serve trusted work.
   Change the base image's default `admin` password if the golden auto-logs in
   through a password you can rotate.
 - **Pin runner binaries.** macOS verifies `TARTCI_RUNNER_SHA256`. Windows now
-  refuses an unpinned download: set `TARTCI_WIN_RUNNER_SHA256` to the SHA-256
-  from the actions/runner release notes, or bake the runner into the golden.
+  refuses an unpinned download, before any runner is registered: set
+  `TARTCI_WIN_RUNNER_SHA256` to the SHA-256 from the actions/runner release
+  notes, or bake the runner into the golden.
 
 ## 5. Host operations
 
-- **Job deadlines:** macOS stops an assigned job after `TARTCI_JOB_TIMEOUT_SECS`
-  (default 7200). Linux and the shared Windows path now do the same, defaulting
-  to 21600 (GitHub's own default job timeout). Lower it to your longest real
+- **Job deadlines:** macOS and prepared Windows guests stop an assigned job
+  after `TARTCI_JOB_TIMEOUT_SECS` (default 7200). Linux and the shared Windows
+  path now do the same, defaulting to 21600 (GitHub's own default job timeout).
+  Linux refuses to start with an invalid value. Lower it to your longest real
   job.
 - **Draining:** `tartci pool drain` lets an assigned job finish. A SIGTERM
   (`pool off`, `launchctl bootout`) defers an assigned prepared Windows job
@@ -152,6 +160,6 @@ off hosts that serve trusted work.
 | `TARTCI_HOST_CACHE_ACCESS` | `rw` | `ro` mounts ccache/configure-check shares read-only, guest ccache read-only |
 | `TARTCI_TART_NETWORK` | `shared` | `softnet` isolates macOS/Linux guests with Tart Softnet |
 | `TARTCI_TART_SOFTNET_ALLOW` | empty | comma-separated CIDRs a Softnet guest may reach |
-| `TARTCI_JOB_TIMEOUT_SECS` | `7200` macOS, `21600` Linux/Windows | host-side limit for an assigned job |
+| `TARTCI_JOB_TIMEOUT_SECS` | `7200` macOS and prepared Windows, `21600` Linux and shared Windows | host-side limit for an assigned job |
 | `TARTCI_WIN_RUNNER_SHA256` | empty | required pin for a Windows runner download |
 | `TARTCI_WIN_ADMIN_PASSWORD` | random | Windows golden admin password (`[A-Za-z0-9._-]`, at least 12 characters) |

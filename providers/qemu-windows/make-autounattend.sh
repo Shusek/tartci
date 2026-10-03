@@ -24,6 +24,7 @@ case "$ADMIN_PASSWORD" in
   ''|*[!A-Za-z0-9._-]*) echo "TARTCI_WIN_ADMIN_PASSWORD must be non-empty [A-Za-z0-9._-]" >&2; exit 2 ;;
 esac
 [ "${#ADMIN_PASSWORD}" -ge 12 ] || { echo "TARTCI_WIN_ADMIN_PASSWORD must have at least 12 characters" >&2; exit 2; }
+rm -f "$OUT_DIR/admin-password"
 ( umask 077 && printf '%s\n' "$ADMIN_PASSWORD" >"$OUT_DIR/admin-password" )
 
 # Build the authorized_keys block (one key per line), then XML-escape for embedding.
@@ -130,7 +131,7 @@ cat > "$OUT_DIR/media/autounattend.xml" <<XML
         <SynchronousCommand wcm:action="add"><Order>3</Order><CommandLine>cmd /c if not exist C:\ProgramData\ssh mkdir C:\ProgramData\ssh</CommandLine></SynchronousCommand>${KEY_CMDS}
         <SynchronousCommand wcm:action="add"><Order>90</Order><CommandLine>powershell -Command "icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>95</Order><CommandLine>powershell -Command "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</CommandLine></SynchronousCommand>
-        <SynchronousCommand wcm:action="add"><Order>96</Order><CommandLine>powershell -Command "\$c = Get-Content C:\ProgramData\ssh\sshd_config; Set-Content C:\ProgramData\ssh\sshd_config -Value (@('PasswordAuthentication no') + \$c); Restart-Service sshd"</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>96</Order><CommandLine>powershell -Command "\$p = 'C:\ProgramData\ssh\sshd_config'; if (-not (Test-Path \$p)) { Copy-Item C:\Windows\System32\OpenSSH\sshd_config_default \$p }; if (Test-Path \$p) { \$c = Get-Content \$p; Set-Content \$p -Value (@('PasswordAuthentication no') + \$c); Restart-Service sshd }"</CommandLine></SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>
@@ -142,6 +143,9 @@ echo "admin console password: $OUT_DIR/admin-password (SSH is key-only)"
 
 # Build a small bootable-data ISO with autounattend.xml at the root. Windows
 # Setup auto-detects autounattend.xml on any attached removable media root.
+rm -f "$OUT_DIR/autounattend.iso"
 hdiutil makehybrid -iso -joliet -default-volume-name "UNATTEND" \
   -o "$OUT_DIR/autounattend.iso" "$OUT_DIR/media" >/dev/null
+# The ISO carries the admin password in plain text, like the XML.
+chmod 600 "$OUT_DIR/autounattend.iso" 2>/dev/null || true
 echo "built $OUT_DIR/autounattend.iso"

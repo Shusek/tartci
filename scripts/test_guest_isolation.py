@@ -69,7 +69,7 @@ class ProviderWiringTests(unittest.TestCase):
         # ccache, recorded in the runner .env the Aqua runner actually reads.
         self.assertIn("rsync -a '/Volumes/My Shared Files/configure-checks/'", body)
         self.assertIn("'CCACHE_READONLY=true'", body)
-        self.assertRegex(body, r"awk -F= .*CCACHE_READONLY\|CCACHE_TEMPDIR\)\$/' \.env > \.env\.tartci")
+        self.assertRegex(body, r"awk -F= .*\|CCACHE_READONLY\|CCACHE_TEMPDIR\|.*\.env > \.env\.tartci")
 
     def test_macos_refuses_read_only_caches_with_write_isolation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -121,6 +121,8 @@ class ProviderWiringTests(unittest.TestCase):
         deadline = body.index('-ge "$job_timeout" ]; then', assigned)
         self.assertLess(assigned, deadline)
         self.assertIn('job_timeout="${TARTCI_JOB_TIMEOUT_SECS:-21600}"', body)
+        self.assertIn("''|0*|*[!0-9]*) job_timeout=21600", body)
+        self.assertIn("runtime_emit_complete fail runner_timeout", body)
 
 
 class GoldenCredentialTests(unittest.TestCase):
