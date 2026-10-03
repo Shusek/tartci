@@ -123,5 +123,49 @@ class ProviderWiringTests(unittest.TestCase):
         self.assertIn('job_timeout="${TARTCI_JOB_TIMEOUT_SECS:-21600}"', body)
 
 
+class GoldenCredentialTests(unittest.TestCase):
+    """Clones share their golden's credentials, so none may be well known."""
+
+    def autounattend(self, root: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        stub = root / "bin"
+        stub.mkdir(exist_ok=True)
+        (stub / "hdiutil").write_text("#!/bin/sh\nexit 0\n")
+        (stub / "hdiutil").chmod(0o755)
+        key = root / "id.pub"
+        key.write_text("ssh-ed25519 AAAAfixture operator\n")
+        script = ROOT / "providers" / "qemu-windows" / "make-autounattend.sh"
+        return subprocess.run(
+            ["bash", str(script), str(root / "out")],
+            env={"PATH": f"{stub}:{os.environ['PATH']}", "HOME": str(root),
+                 "TARTCI_PUBKEYS": str(key), **env},
+            text=True, capture_output=True, timeout=30, check=False)
+
+    def test_windows_golden_gets_a_private_password_and_key_only_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.autounattend(root, {})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            xml = (root / "out" / "media" / "autounattend.xml").read_text()
+            password_file = root / "out" / "admin-password"
+            password = password_file.read_text().strip()
+            self.assertGreaterEqual(len(password), 12)
+            self.assertEqual(password_file.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("<Value>admin</Value>", xml)
+            self.assertEqual(xml.count(f"<Value>{password}</Value>"), 2)
+            self.assertIn("'PasswordAuthentication no'", xml)
+
+    def test_windows_golden_rejects_a_weak_or_unsafe_password(self) -> None:
+        for value in ("admin", "has space in it", "<xml>injection</xml>"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                result = self.autounattend(Path(directory), {"TARTCI_WIN_ADMIN_PASSWORD": value})
+                self.assertEqual(result.returncode, 2)
+
+    def test_linux_golden_bake_disables_password_ssh(self) -> None:
+        body = (ROOT / "providers" / "tart-linux" / "provision.sh").read_text(encoding="utf-8")
+        self.assertIn("/etc/ssh/sshd_config.d/00-tartci-key-only.conf", body)
+        self.assertIn("'PasswordAuthentication no'", body)
+        self.assertIn("sudo sshd -t", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

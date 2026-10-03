@@ -12,6 +12,20 @@ OUT_DIR="${1:-${TARTCI_WIN:-$HOME/.tartci/windows}}"
 IFS=: read -ra PUBKEYS <<< "${TARTCI_PUBKEYS:-$HOME/.ssh/id_ed25519.pub}"
 mkdir -p "$OUT_DIR/media"
 
+# Every CI clone shares this account, and sibling guests can reach each other's
+# SSH forwards, so it must not be a well-known password. Generated unless
+# TARTCI_WIN_ADMIN_PASSWORD is set; kept beside the media (0600) for console
+# and bench logins. SSH below accepts keys only.
+ADMIN_PASSWORD="${TARTCI_WIN_ADMIN_PASSWORD:-}"
+if [ -z "$ADMIN_PASSWORD" ]; then
+  ADMIN_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24 || true)"
+fi
+case "$ADMIN_PASSWORD" in
+  ''|*[!A-Za-z0-9._-]*) echo "TARTCI_WIN_ADMIN_PASSWORD must be non-empty [A-Za-z0-9._-]" >&2; exit 2 ;;
+esac
+[ "${#ADMIN_PASSWORD}" -ge 12 ] || { echo "TARTCI_WIN_ADMIN_PASSWORD must have at least 12 characters" >&2; exit 2; }
+( umask 077 && printf '%s\n' "$ADMIN_PASSWORD" >"$OUT_DIR/admin-password" )
+
 # Build the authorized_keys block (one key per line), then XML-escape for embedding.
 AK=""
 for f in "${PUBKEYS[@]}"; do [ -f "$f" ] && AK+="$(cat "$f")"$'\n'; done
@@ -105,23 +119,26 @@ cat > "$OUT_DIR/media/autounattend.xml" <<XML
         <LocalAccounts>
           <LocalAccount wcm:action="add">
             <Name>admin</Name><Group>Administrators</Group><DisplayName>admin</DisplayName>
-            <Password><Value>admin</Value><PlainText>true</PlainText></Password>
+            <Password><Value>${ADMIN_PASSWORD}</Value><PlainText>true</PlainText></Password>
           </LocalAccount>
         </LocalAccounts>
       </UserAccounts>
-      <AutoLogon><Enabled>true</Enabled><Username>admin</Username><Password><Value>admin</Value><PlainText>true</PlainText></Password><LogonCount>3</LogonCount></AutoLogon>
+      <AutoLogon><Enabled>true</Enabled><Username>admin</Username><Password><Value>${ADMIN_PASSWORD}</Value><PlainText>true</PlainText></Password><LogonCount>3</LogonCount></AutoLogon>
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>powershell -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>2</Order><CommandLine>powershell -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>3</Order><CommandLine>cmd /c if not exist C:\ProgramData\ssh mkdir C:\ProgramData\ssh</CommandLine></SynchronousCommand>${KEY_CMDS}
         <SynchronousCommand wcm:action="add"><Order>90</Order><CommandLine>powershell -Command "icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>95</Order><CommandLine>powershell -Command "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>96</Order><CommandLine>powershell -Command "\$c = Get-Content C:\ProgramData\ssh\sshd_config; Set-Content C:\ProgramData\ssh\sshd_config -Value (@('PasswordAuthentication no') + \$c); Restart-Service sshd"</CommandLine></SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>
 </unattend>
 XML
+chmod 600 "$OUT_DIR/media/autounattend.xml"
 echo "wrote $OUT_DIR/media/autounattend.xml ($(wc -l < "$OUT_DIR/media/autounattend.xml") lines)"
+echo "admin console password: $OUT_DIR/admin-password (SSH is key-only)"
 
 # Build a small bootable-data ISO with autounattend.xml at the root. Windows
 # Setup auto-detects autounattend.xml on any attached removable media root.
