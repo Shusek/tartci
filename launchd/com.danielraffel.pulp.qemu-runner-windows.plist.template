@@ -21,13 +21,21 @@
        keeps current. Never hand-copy a tartci checkout under ~/.local/share:
        nothing refreshes it, and agents running from it go stale.
 
-    3. Copy this file to ~/Library/LaunchAgents/, replacing $HOME and
+    3. Copy this file to ~/Library/LaunchAgents/, replacing $HOME, this host's label and
        $TARTCI_GOLDENS with absolute paths (launchd does NOT expand shell vars):
 
          sed -e "s|\$HOME|$HOME|g" \
+             -e "s|\$TARTCI_HOST_LABEL|pulp-host-<this host>|g" \
              -e "s|\$TARTCI_GOLDENS|$HOME/.tartci/goldens|g" \
            launchd/com.danielraffel.pulp.qemu-runner-windows.plist.template \
            > ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
+
+       Never re-run this render over an installed plist: it resets every
+       host value to this template's default. That includes the host label,
+       the golden store, TARTCI_VM_POLL and the ghapp-shim PATH entry. A
+       render of the stock template on m1 would have produced a lane labelled
+       pulp-host-macstudio with the wrong golden store (2026-10-03). To move an installed
+       plist forward, change only the keys that changed and keep the rest.
 
     4. Load:   launchctl load ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
        Verify: launchctl list | grep qemu-runner-windows ; tail -F ~/Library/Logs/tartci/qemu-runner-windows.log
@@ -80,7 +88,7 @@
         <string>windows</string>
         <string>--loop</string>
         <string>--labels</string>
-        <string>self-hosted,Windows,ARM64,pulp-build-windows,pulp-host-macstudio</string>
+        <string>self-hosted,Windows,ARM64,pulp-build-windows,$TARTCI_HOST_LABEL</string>
     </array>
 
     <key>WorkingDirectory</key>
