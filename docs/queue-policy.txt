@@ -1,0 +1,44 @@
+Optional queue admission policy and explicit runner scope
+
+Set TARTCI_QUEUE_POLICY_FILE to an absolute JSON filename, or pass
+--policy-file directly to scripts/queue_scan.py. With a policy, workflow_paths
+replaces --workflow display-name selection in all providers using that scanner.
+Without a policy, the previous display-name behavior and cache namespaces remain.
+
+Example:
+{
+  "repository": "owner/repo",
+  "events": ["workflow_dispatch", "pull_request", "push"],
+  "workflow_paths": [".github/workflows/ci.yml"],
+  "same_repository_pull_requests": true,
+  "push_branches": ["main"]
+}
+
+repository must match --repo. events and workflow_paths are required, nonempty
+lists with exact values. A malformed/unreadable policy fails before an API call.
+Unknown settings fail validation. A workflow rename does not affect path matching.
+A GitHub run path's optional @ref suffix is ignored; the filename remains exact.
+When same_repository_pull_requests is enabled, an allowed pull_request run must
+identify this repository as head_repository and provide nonempty pull_requests
+with matching head/base repository IDs. Missing evidence declines admission.
+push must identify this repository as its head repository; push_branches, when
+nonempty, limits the branches. Policies do not add API requests.
+
+Filtering happens before the bounded job-fetch quota and again before counting
+cached jobs. Both discovery and negative-cache namespaces include policy content,
+so changing admission cannot reuse an incompatible observation. Label matching
+continues to require that the runner supplies every label requested by the job.
+
+This is VM-demand admission. GitHub independently assigns the eventual job to a
+registered runner. Use runner-group workflow restrictions and appropriate labels
+to enforce the same execution boundary; a queue filter alone cannot guarantee it.
+workflow_call handling inherits GitHub's run metadata: a reusable workflow may
+belong to its caller's run. Verify actual caller payloads before enabling a lane.
+
+Set TARTCI_RUNNER_SCOPE=org or repo for an explicit registration API scope on
+macOS or Windows. Scope is independent of runner_group_id: an organization can
+use its default group (ID 1). macOS defaults to auto (historical group-based
+selection); Windows defaults to repo. auto is also accepted by Windows.
+Create, list, and delete operations use the selected scope. Group IDs remain
+positive decimal integers without leading zeros. --print-runner-api-root prints
+the configured root without credentials, a golden, or a running VM.

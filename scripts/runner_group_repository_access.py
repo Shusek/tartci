@@ -50,7 +50,10 @@ def api(gh_cli: str, path: str, repo: str, timeout: int) -> dict[str, Any]:
 
 
 def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[str, Any]:
-    if runner_group_id == 1:
+    declared = [r for r in os.environ.get("TARTCI_ASSIGNMENT_REPOSITORIES", "").splitlines() if r]
+    if any(not REPO.fullmatch(r) or r.split("/")[0].lower() != repo.split("/")[0].lower() for r in declared):
+        raise AccessError("invalid declared assignment repositories")
+    if runner_group_id == 1 and os.environ.get("TARTCI_RUNNER_SCOPE", "auto") != "org":
         return {
             "schema": 1,
             "verdict": "admit",
@@ -101,6 +104,18 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
         raise AccessError(
             f"runner-group repository pagination count mismatch ({seen} != {total})"
         )
+    if declared:
+        expected = {r.lower() for r in declared}
+        observed = {r.lower() for r in selected}
+        if repo.lower() not in observed or observed != expected or len(observed) != len(selected):
+            raise RepositoryInaccessible("runner group repositories differ from the complete declared observation scope")
+        return {
+            "schema": 1, "verdict": "admit", "repo": repo,
+            "runner_group_id": runner_group_id,
+            "registration_scope": "organization-observed-repositories",
+            "visibility": visibility, "assignment_repositories": sorted(selected),
+            "reason": "all visible repositories are explicitly observed; foreign assignments are quarantined",
+        }
     if len(selected) != 1 or selected[0].lower() != repo.lower():
         raise RepositoryInaccessible(
             f"runner group {runner_group_id} must select only {repo}; "

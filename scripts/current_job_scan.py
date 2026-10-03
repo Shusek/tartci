@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
+from queue_policy import QueuePolicy
 
 PER_PAGE = 100
 
@@ -36,7 +37,15 @@ def _objects(payload: Any, key: str, path: str) -> list[dict[str, Any]]:
 class CurrentJobScanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.configured_names = tuple(dict.fromkeys(args.workflow))
+        self.configured_names = tuple(dict.fromkeys(args.workflow or []))
+        self.policy = None
+        policy_file = getattr(args, "policy_file", None)
+        if policy_file:
+            try:
+                self.policy = QueuePolicy.load(policy_file, args.repo)
+            except (OSError, ValueError) as error:
+                raise ScanError(f"invalid queue policy: {error}") from error
+        self.repositories = tuple(dict.fromkeys([args.repo, *getattr(args, "assignment_repo", [])]))
         self.deadline = time.monotonic() + args.scan_timeout
         self.api_calls = 0
         self.api_lock = threading.Lock()
@@ -150,6 +159,19 @@ class CurrentJobScanner:
 
     def _workflow_contract(self) -> dict[int, str]:
         workflows = self._pages(f"repos/{self.args.repo}/actions/workflows", "workflows")
+        if self.policy:
+            contract = {}
+            matched = set()
+            for workflow in workflows:
+                path = workflow.get("path")
+                if path in self.policy.paths:
+                    if path in matched or type(workflow.get("id")) is not int or not workflow.get("name"):
+                        raise ScanError("policy workflow path did not resolve uniquely")
+                    matched.add(path)
+                    contract[workflow["id"]] = workflow["name"]
+            if matched != self.policy.paths:
+                raise ScanError("policy workflow path is missing")
+            return contract
         by_name: dict[str, list[int]] = {name: [] for name in self.configured_names}
         for workflow in workflows:
             name, workflow_id = workflow.get("name"), workflow.get("id")
@@ -168,9 +190,10 @@ class CurrentJobScanner:
     def _receipt(kind: str, **values: Any) -> dict[str, Any]:
         return {"kind": kind, **values}
 
-    def _confirm(self, run_id: int, job_id: int, contract: dict[int, str]) -> dict[str, Any]:
-        job = self._gh(f"repos/{self.args.repo}/actions/jobs/{job_id}")
-        run = self._gh(f"repos/{self.args.repo}/actions/runs/{run_id}")
+    def _confirm(self, run_id: int, job_id: int, contract: dict[int, str], repository: str | None = None) -> dict[str, Any]:
+        repository = repository or self.args.repo
+        job = self._gh(f"repos/{repository}/actions/jobs/{job_id}")
+        run = self._gh(f"repos/{repository}/actions/runs/{run_id}")
         if job.get("id") != job_id or run.get("id") != run_id:
             raise ScanError("exact assignment revalidation returned different ids")
         status = str(job.get("status") or "").lower()
@@ -182,6 +205,8 @@ class CurrentJobScanner:
                 "workflow_name": workflow_name, "runner_name": runner,
                 "job_status": status, "run_status": run_status,
                 "run_conclusion": run.get("conclusion")}
+        if repository != self.args.repo:
+            base["repository"] = repository
         if runner != self.args.runner:
             return self._receipt("assignment_changed", **base)
         if status == "completed":
@@ -190,6 +215,8 @@ class CurrentJobScanner:
             return self._receipt("terminal", conclusion=job.get("conclusion"), **base)
         if status != "in_progress":
             return self._receipt("assignment_changed", **base)
+        if repository != self.args.repo or (self.policy and not self.policy.allows(run)):
+            return self._receipt("unexpected_assignment", **base)
         if not isinstance(workflow_id, int) or contract.get(workflow_id) != workflow_name:
             return self._receipt("unexpected_assignment", **base)
         return self._receipt("active", **base)
@@ -198,28 +225,28 @@ class CurrentJobScanner:
         contract = self._workflow_contract()
         # Repository-wide discovery is load-bearing: filtering expected workflows
         # first makes an unexpected assignment indistinguishable from idle.
-        runs = self._pages(
-            f"repos/{self.args.repo}/actions/runs?status=in_progress", "workflow_runs"
-        )
-        matches = self._matches(runs)
+        def observe():
+            result = []
+            for repository in self.repositories:
+                runs = self._pages(
+                    f"repos/{repository}/actions/runs?status=in_progress", "workflow_runs"
+                )
+                result.extend(self._matches(runs, repository))
+            return result
+        matches = observe()
         if not matches:
-            # A same-count insertion/removal can preserve page 1 while moving an
-            # assignment across a deeper boundary. A negative verdict therefore
-            # requires a second complete, identical scheduler snapshot.
             first = dict(self.page_fingerprints)
-            runs = self._pages(
-                f"repos/{self.args.repo}/actions/runs?status=in_progress", "workflow_runs"
-            )
-            matches = self._matches(runs)
+            matches = observe()
             if not matches and self.page_fingerprints != first:
                 raise ScanError("scheduler pages changed while confirming no assignment")
         if len(matches) > 1:
             return self._receipt("ambiguous_assignment", matches=len(matches))
         if not matches:
             return self._receipt("no_assignment")
-        return self._confirm(*matches[0], contract)
+        repository, run_id, job_id = matches[0]
+        return self._confirm(run_id, job_id, contract, repository)
 
-    def _matches(self, runs: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    def _matches(self, runs: list[dict[str, Any]], repository: str) -> list[tuple[str, int, int]]:
         run_ids: list[int] = []
         for run in runs:
             run_id = run.get("id")
@@ -229,10 +256,10 @@ class CurrentJobScanner:
 
         def fetch(run_id: int) -> tuple[int, list[dict[str, Any]]]:
             return run_id, self._pages(
-                f"repos/{self.args.repo}/actions/runs/{run_id}/jobs?filter=latest", "jobs"
+                f"repos/{repository}/actions/runs/{run_id}/jobs?filter=latest", "jobs"
             )
 
-        matches: list[tuple[int, int]] = []
+        matches: list[tuple[str, int, int]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.args.parallelism) as pool:
             futures = [pool.submit(fetch, run_id) for run_id in run_ids]
             for future in concurrent.futures.as_completed(futures):
@@ -242,7 +269,7 @@ class CurrentJobScanner:
                         job_id = job.get("id")
                         if not isinstance(job_id, int):
                             raise ScanError(f"matching job in run {run_id} lacks integer id")
-                        matches.append((run_id, job_id))
+                        matches.append((repository, run_id, job_id))
         return matches
 
     def revalidate(self) -> dict[str, Any]:
@@ -253,7 +280,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
     parser.add_argument("--runner", required=True)
-    parser.add_argument("--workflow", required=True, action="append")
+    parser.add_argument("--assignment-repo", action="append", default=[r for r in os.environ.get("TARTCI_ASSIGNMENT_REPOSITORIES", "").splitlines() if r])
+    parser.add_argument("--workflow", action="append", default=[])
+    parser.add_argument("--policy-file", default=os.environ.get("TARTCI_QUEUE_POLICY_FILE"))
     parser.add_argument("--mode", choices=("discover", "revalidate"), default="discover")
     parser.add_argument("--run-id", type=int)
     parser.add_argument("--job-id", type=int)
@@ -275,6 +304,11 @@ def parse_args() -> argparse.Namespace:
         default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")),
     )
     args = parser.parse_args()
+    import re
+    if any(not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r) or r.split("/")[0].lower() != args.repo.split("/")[0].lower() for r in args.assignment_repo):
+        parser.error("assignment repositories must belong to the configured organization")
+    if not args.workflow and not args.policy_file:
+        parser.error("--workflow or --policy-file is required")
     for field in ("gh_timeout", "max_pages", "scan_timeout", "result_cap", "max_api_calls", "parallelism"):
         if not math.isfinite(getattr(args, field)) or getattr(args, field) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")

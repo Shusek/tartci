@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
+from queue_policy import QueuePolicy
 from gh_identity import (
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
@@ -78,9 +79,11 @@ def _old_enough(timestamp: str, min_age_seconds: int, now: int) -> bool:
 class QueueScanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        policy_file = getattr(args, "policy_file", None)
+        self.policy = QueuePolicy.load(policy_file, args.repo) if policy_file else None
         configured_workflows = (
             [args.workflow] if isinstance(args.workflow, str) else args.workflow
-        )
+        ) or []
         self.workflows = tuple(
             dict.fromkeys(
                 workflow
@@ -88,7 +91,10 @@ class QueueScanner:
                 if isinstance(workflow, str) and workflow
             )
         )
-        if not self.workflows:
+        # Path policies replace display-name selection, including after rename.
+        if self.policy:
+            self.workflows = ()
+        if not self.workflows and not self.policy:
             raise ValueError("at least one workflow name is required")
         self.workflow_set = set(self.workflows)
         self.labels = {label.strip().lower() for label in args.labels.split(",") if label.strip()}
@@ -109,6 +115,8 @@ class QueueScanner:
                 ",".join(sorted(self.job_statuses)),
             )
         )
+        if self.policy:
+            namespace += "\0policy:" + self.policy.fingerprint
         digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:16]
         base_state_path = Path(args.state_file)
         suffix = base_state_path.suffix or ".json"
@@ -119,6 +127,8 @@ class QueueScanner:
         discovery_namespace = "\0".join(
             (args.repo.lower(), *sorted(self.workflows))
         )
+        if self.policy:
+            discovery_namespace += "\0policy:" + self.policy.fingerprint
         discovery_digest = hashlib.sha256(
             discovery_namespace.encode("utf-8")
         ).hexdigest()[:16]
@@ -383,7 +393,8 @@ class QueueScanner:
                         for run in page_runs:
                             if (
                                 not isinstance(run, dict)
-                                or run.get("name") not in self.workflow_set
+                                or (self.policy is None and run.get("name") not in self.workflow_set)
+                                or (self.policy is not None and not self.policy.allows(run))
                             ):
                                 continue
                             run_id = run.get("id")
@@ -546,6 +557,9 @@ class QueueScanner:
         matched_job_ids: set[int] = set()
         backlog_id_set = set(backlog_ids)
         for run in candidates:
+            # Cached observations are not an admission authority.
+            if self.policy is not None and not self.policy.allows(run):
+                continue
             run_id = int(run["id"])
             cached = negative.get(str(run_id))
             if (
@@ -626,12 +640,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", required=True)
     parser.add_argument(
         "--workflow",
-        required=True,
         action="append",
         help=(
             "exact workflow name to scan; repeat for one shared-label lane "
             "serving multiple workflows"
         ),
+    )
+    parser.add_argument(
+        "--policy-file",
+        default=os.environ.get("TARTCI_QUEUE_POLICY_FILE"),
+        help="repository-bound JSON policy; selects exact paths instead of display names",
     )
     parser.add_argument("--labels", required=True)
     parser.add_argument("--job-statuses", default="queued")
@@ -691,6 +709,8 @@ def parse_args() -> argparse.Namespace:
     # so a caller opts in per lane rather than inheriting it by upgrade.
     parser.add_argument("--exclude-assigned", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
+    if not args.workflow and not args.policy_file:
+        parser.error("--workflow or --policy-file is required")
     for field in (
         "gh_timeout",
         "max_run_pages",
@@ -756,7 +776,7 @@ def main() -> int:
             identity = "\0".join(
                 (
                     args.repo,
-                    "\0".join(sorted(dict.fromkeys(args.workflow))),
+                    "\0".join(sorted(dict.fromkeys(args.workflow or []))),
                     args.labels,
                     args.provider,
                     args.lane_id,
