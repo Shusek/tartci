@@ -5,6 +5,9 @@
 This fork adds opt-in support for prepared macOS and Windows CI guests,
 explicit resource budgets, workflow admission policies, and shared runner
 groups. See [the fork guide](docs/suvio-fork.md) for the changes and update policy.
+Before serving a repository's main CI from these runners, work through
+[security hardening](docs/security-hardening.md): GitHub assigns any
+label-matching job, including fork pull requests, to a registered runner.
 
 Stand up **fast, cached, disposable Linux / Windows / macOS build VMs on an Apple
 Silicon Mac**, optionally wired to GitHub runners +

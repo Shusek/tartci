@@ -32,6 +32,16 @@ continues to require that the runner supplies every label requested by the job.
 This is VM-demand admission. GitHub independently assigns the eventual job to a
 registered runner. Use runner-group workflow restrictions and appropriate labels
 to enforce the same execution boundary; a queue filter alone cannot guarantee it.
+TARTCI_REQUIRE_WORKFLOW_RESTRICTION=1 makes the JIT boundary refuse a group that
+is not restricted to selected workflows of observed repositories, or that allows
+a primary-repository workflow outside workflow_paths.
+
+When GitHub nevertheless assigns the macOS runner a primary-repository run the
+policy refuses, current_job_scan reports policy_violation and the supervisor
+stops the job and discards the VM (nothing is promoted to caches). Runs of other
+declared repositories remain observed unexpected_assignment receipts.
+A policy is refused with TARTCI_RUNNER_ASSIGNMENT_MODE=event-class-v2, whose
+scanner does not read it.
 workflow_call handling inherits GitHub's run metadata: a reusable workflow may
 belong to its caller's run. Verify actual caller payloads before enabling a lane.
 
