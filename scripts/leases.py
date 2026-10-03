@@ -578,11 +578,11 @@ def profile_for_args(args: argparse.Namespace) -> dict[str, Any]:
 
 def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     profile = profile_for_args(args)
-    total = int(args.capacity) if getattr(args, "capacity", None) else int(profile["lease_capacity_cores"])
+    total = int(args.capacity) if getattr(args, "capacity", None) else int(os.environ.get("TARTCI_LEASE_CAPACITY_CORES", profile["lease_capacity_cores"]))
     reserved = (
         int(args.reserved_gate_cores)
         if getattr(args, "reserved_gate_cores", None) is not None
-        else int(profile["reserved_gate_cores"])
+        else int(os.environ.get("TARTCI_GATE_RESERVED_CORES", profile["reserved_gate_cores"]))
     )
     reserved = min(max(0, reserved), max(0, total - 1)) if total > 1 else 0
     gate_priority = int(getattr(args, "gate_priority", PRIORITY_CLASSES["gate"]))
@@ -591,7 +591,7 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     total_mem = (
         int(args.capacity_mem_mb)
         if getattr(args, "capacity_mem_mb", None) is not None
-        else int(profile.get("lease_capacity_mem_mb", 0))
+        else int(os.environ.get("TARTCI_LEASE_CAPACITY_MEM_MB", profile.get("lease_capacity_mem_mb", 0)))
     )
     per_job_mem = int(
         profile.get("per_compile_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB)
@@ -606,7 +606,7 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     reserved_mem = (
         int(args.reserved_gate_mem_mb)
         if getattr(args, "reserved_gate_mem_mb", None) is not None
-        else int(profile.get("reserved_gate_mem_mb", 0))
+        else int(os.environ.get("TARTCI_GATE_RESERVED_MEM_MB", profile.get("reserved_gate_mem_mb", 0)))
     )
     reserved_mem = (
         min(max(0, reserved_mem), total_mem - per_job_mem)

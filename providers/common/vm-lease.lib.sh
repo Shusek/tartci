@@ -500,7 +500,10 @@ print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_b
 tartci_vm_lease_granted_cores(){
   local cores="$1" priority="$2" ngc
   tartci_positive_int_or_empty "$cores" || cores=1
-  ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || ngc=""
+  ngc="${TARTCI_NON_GATE_CAPACITY_CORES:-}"
+  if ! tartci_positive_int_or_empty "$ngc"; then
+    ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || ngc=""
+  fi
   if tartci_vm_lease_is_non_gate_priority "$priority" \
      && tartci_positive_int_or_empty "$ngc" && [ "$cores" -gt "$ngc" ]; then
     cores="$ngc"
