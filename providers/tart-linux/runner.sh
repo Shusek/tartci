@@ -416,11 +416,23 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] vm $vm up at $ip — launching JIT runner (assignment_timeout=${IDLE_TIMEOUT}s, build_parallel=${build_parallel_effective}, one job)"
   write_state idle-wait
 
-  # Write the JIT config and run the agent once. A JIT runner processes exactly
-  # one job and deregisters. The host cache binding above is mandatory so a
-  # mount regression cannot silently turn every ephemeral job cold.
+  # Stream the JIT config over stdin into an owner-only guest file. Embedding
+  # it in the ssh command line exposed this runner credential to every local
+  # user on the host (ps) for the whole job.
+  if ! printf '%s' "$jit" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    'umask 077 && cat > ~/jit.cfg'; then
+    tartci_pool_lock_release
+    note "[$i] failed to stream JIT config into the guest — discarding VM"
+    discard_current_linux_vm
+    return 1
+  fi
+  jit=""
+
+  # Run the agent once. A JIT runner processes exactly one job and
+  # deregisters. The host cache binding above is mandatory so a mount
+  # regression cannot silently turn every ephemeral job cold.
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
+    "cd ~/actions-runner && \
      touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \
      export CCACHE_DIR=\"\$HOME/.ccache\" && \
@@ -429,7 +441,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
      printf 'TARTCI_DIAG ccache_dir=%s\n' \"\$CCACHE_DIR\" && \
      printf 'TARTCI_DIAG cmake_build_parallel_level=%s\n' \"\$CMAKE_BUILD_PARALLEL_LEVEL\" && \
      umask 0022 && runner_umask=\"\$(umask)\" && printf 'TARTCI_DIAG runner_umask=%s\n' \"\$runner_umask\" && \
-     [ \"\$runner_umask\" = 0022 ] && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
+     [ \"\$runner_umask\" = 0022 ] && jit_config=\"\$(cat ~/jit.cfg)\" && rm -f ~/jit.cfg && \
+     ./run.sh --jitconfig \"\$jit_config\"" \
     >"$logdir/runner-output.log" 2>&1 &
   CURRENT_RUNNER_PID=$!
   if ! tartci_pool_lock_handoff_to_listener "$CURRENT_RUNNER_PID"; then

@@ -40,6 +40,10 @@ REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Windows,ARM64,pulp-build-windows}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
+# SHA-256 of actions-runner-win-arm64-$RUNNER_VERSION.zip (from the actions/runner
+# release notes). Required whenever the golden lacks that runner version: an
+# unverified download would put an unauthenticated binary next to the JIT token.
+RUNNER_SHA256="${TARTCI_WIN_RUNNER_SHA256:-}"
 VCVARS_ARCH="${TARTCI_WIN_VCVARS_ARCH:-${PULP_WIN_VCVARS_ARCH:-arm64}}"
 PREFLIGHT_MODE="${TARTCI_WIN_PREFLIGHT_MODE:-${PULP_WIN_PREFLIGHT_MODE:-fast}}"
 WIN_CPUS="${TARTCI_WIN_CPUS:-${PULP_WIN_CPUS:-8}}"
@@ -243,6 +247,12 @@ VARS_TPL="${TARTCI_WIN_VARS_TEMPLATE:-}"; for v in /opt/homebrew/share/qemu/edk2
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
 case "$WIN_CPUS" in ''|*[!0-9]*) die "invalid TARTCI_WIN_CPUS='$WIN_CPUS'";; esac
+case "$RUNNER_VERSION" in ''|*[!0-9.]*) die "invalid Actions Runner version: $RUNNER_VERSION";; esac
+case "$RUNNER_SHA256" in
+  '') ;;
+  *[!0-9a-fA-F]*) die "TARTCI_WIN_RUNNER_SHA256 must contain 64 hexadecimal characters";;
+  *) [ "${#RUNNER_SHA256}" -eq 64 ] || die "TARTCI_WIN_RUNNER_SHA256 must contain 64 hexadecimal characters";;
+esac
 case "$WIN_MEMORY_MB" in ''|*[!0-9]*) die "invalid TARTCI_WIN_MEMORY_MB='$WIN_MEMORY_MB'";; esac
 
 delete_runner_registration(){
@@ -626,6 +636,7 @@ try {
   enc_install="$(printf '%s' '$ProgressPreference="SilentlyContinue"
 $dir="C:\actions-runner"
 $runnerVersion="'"$RUNNER_VERSION"'"
+$expectedSha="'"$RUNNER_SHA256"'".ToLowerInvariant()
 $listener="$dir\bin\Runner.Listener.exe"
 $currentVersion=""
 if (Test-Path $listener) {
@@ -634,8 +645,11 @@ if (Test-Path $listener) {
 if ($currentVersion -ne $runnerVersion) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $dir
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  if (-not $expectedSha) { Write-Error "Actions Runner $runnerVersion is not in the golden and TARTCI_WIN_RUNNER_SHA256 is unset; refusing an unverified download"; exit 1 }
   $url="https://github.com/actions/runner/releases/download/v$runnerVersion/actions-runner-win-arm64-$runnerVersion.zip"
   Invoke-WebRequest -Uri $url -OutFile "$dir\r.zip"
+  $actualSha=(Get-FileHash -Algorithm SHA256 -Path "$dir\r.zip").Hash.ToLowerInvariant()
+  if ($actualSha -ne $expectedSha) { Remove-Item -Force "$dir\r.zip"; Write-Error "Actions Runner archive SHA-256 mismatch: got $actualSha"; exit 1 }
   Expand-Archive -Path "$dir\r.zip" -DestinationPath $dir -Force
   Remove-Item "$dir\r.zip"
 }
@@ -643,8 +657,8 @@ if ($currentVersion -ne $runnerVersion) {
 # configs are single-use; leave only the runner binaries before each fresh boot.
 Remove-Item -Force -ErrorAction SilentlyContinue "$dir\.runner","$dir\.credentials","$dir\.credentials_rsaparams","$dir\.env","$dir\.path","$dir\jit.cfg"
 # Integrity gate: the agent binary must exist after install. The download is
-# over authenticated HTTPS and Expand-Archive rejects a corrupt/truncated zip,
-# but this catches a partial extract loudly rather than failing opaquely at run.
+# pinned by SHA-256 and Expand-Archive rejects a corrupt/truncated zip, but this
+# catches a partial extract loudly rather than failing opaquely at run.
 if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Listener.exe missing after install (corrupt/truncated download?)"; exit 1 }' | iconv -t UTF-16LE | base64)"
   wsh "powershell -NoProfile -EncodedCommand $enc_install" \
     || { note "[$i] runner install failed"; runtime_emit_complete fail jit_failed 1 "$job" "" "$logdir"; cleanup_job failure; return 1; }
