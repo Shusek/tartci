@@ -6,6 +6,7 @@ name: lint
 # same script contributors run locally — catches that class before merge.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:

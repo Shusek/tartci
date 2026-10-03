@@ -59,6 +59,10 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 for test_script in tests/test_*.sh; do bash "$test_script" || exit; done
 ```
 
+The same workflow can be started manually with
+`gh workflow run ci.yml --repo Shusek/tartci --ref main`. Its jobs use
+GitHub-hosted Ubuntu runners and do not register or change a VM runner.
+
 The prepared-driver tests exercise local success/failure, JIT transport,
 assigned-job drain and cleanup with fake providers. Actual platform builds
 should also run against the host's private prepared goldens before deployment.
