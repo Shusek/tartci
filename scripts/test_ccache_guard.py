@@ -385,7 +385,9 @@ class RunnerWiringTests(unittest.TestCase):
     def test_macos_runner_guards_the_cache_before_the_vm_boots(self) -> None:
         body = (ROOT / "providers/tart-macos/runner.sh").read_text()
         guard_call = body.index('tartci_ccache_guard "$CACHE_ROOT/ccache"')
-        boot = body.index('tartci_vm_lease_guard_exec tart run')
+        # Prepared guests have no host shares. This guard protects the legacy
+        # boot that mounts the host cache, rather than the prepared branch.
+        boot = body.index('tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}"')
         self.assertLess(guard_call, boot)
         self.assertIn('scripts/ccache_guard.py" quarantine', body)
 

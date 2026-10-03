@@ -510,11 +510,11 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 
-if [ -n "$GUEST_DRIVER" ]; then
+if [ -n "${GUEST_DRIVER:-}" ]; then
   [ "${GUEST_DRIVER#/}" != "$GUEST_DRIVER" ] && [ -x "$GUEST_DRIVER" ] || die "TARTCI_GUEST_DRIVER must be an absolute executable path"
   [ "${TARTCI_WARM_VM:-0}" = 0 ] || die "prepared driver does not support warm parking"
 fi
-[ -z "$LOCAL_JOB" ] || { [ -n "$GUEST_DRIVER" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires a guest driver and --once"
+[ -z "${LOCAL_JOB:-}" ] || { [ -n "${GUEST_DRIVER:-}" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires a guest driver and --once"
 configure_runner_api_root
 CURRENT_RUNNER_API_ROOT="$RUNNER_API_ROOT"
 [ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
@@ -530,7 +530,7 @@ case "$RUNNER_VERSION" in
 esac
 [ "$PRINT_RUNNER_VERSION" = 1 ] && { printf '%s\n' "$RUNNER_VERSION"; exit 0; }
 # Prepared drivers verify their baked runner and never download this archive.
-if [ -z "$GUEST_DRIVER" ]; then
+if [ -z "${GUEST_DRIVER:-}" ]; then
   case "$RUNNER_SHA256" in
     ''|*[!0-9a-fA-F]*) die "set a 64-character TARTCI_RUNNER_SHA256 when overriding Actions Runner version $RUNNER_VERSION";;
   esac
@@ -575,8 +575,8 @@ if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then
     || die "another loaded LaunchAgent resolves to this runner/state identity"
 fi
 command -v tart >/dev/null 2>&1 || die "tart not installed"
-[ -n "$LOCAL_JOB" ] || command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
-[ -n "$LOCAL_JOB" ] || command -v "$JIT_GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$JIT_GH_CLI' (TARTCI_JIT_GH_CLI) not installed / authed"
+[ -n "${LOCAL_JOB:-}" ] || command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
+[ -n "${LOCAL_JOB:-}" ] || command -v "$JIT_GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$JIT_GH_CLI' (TARTCI_JIT_GH_CLI) not installed / authed"
 mkdir -p "$STATE_DIR"
 
 jit_denial_file_for(){
@@ -1509,7 +1509,7 @@ cancel_current_run(){
 }
 
 ensure_runner_version(){
-  if [ -n "$GUEST_DRIVER" ]; then
+  if [ -n "${GUEST_DRIVER:-}" ]; then
     python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation guest-preflight -- "$GUEST_DRIVER" preflight "$CURRENT_VM" "$1"
     return $?
   fi
@@ -1582,7 +1582,7 @@ GUEST
 # hooks are no-ops unless TARTCI_CCACHE_WRITE_ISOLATION=1.
 run_runner_until_done(){
   local layer_rc=0
-  if [ -n "$GUEST_DRIVER" ]; then run_runner_until_done_unlayered "$@"; return $?; fi
+  if [ -n "${GUEST_DRIVER:-}" ]; then run_runner_until_done_unlayered "$@"; return $?; fi
   tartci_ccache_layer_attach "$1" || return 1
   run_runner_until_done_unlayered "$@" || layer_rc=$?
   tartci_ccache_layer_settle "$1" "$layer_rc" "$STATE_DIR/$1.actions-runner.log"
@@ -1599,7 +1599,7 @@ run_runner_until_done_unlayered(){
   # Claim the guest secret/service cleanup target before the first byte crosses
   # SSH, so a failed stream or pending signal cannot leave an unowned JIT file.
   CURRENT_AQUA_LABEL="$aqua_label"
-  if [ -n "$GUEST_DRIVER" ]; then
+  if [ -n "${GUEST_DRIVER:-}" ]; then
     printf '%s' "$jit" | "$GUEST_DRIVER" run-jit "$vm" "$ip" >"$runner_log" 2>&1 & ssh_pid=$!
     jit=""
   else
@@ -1715,7 +1715,7 @@ run_runner_until_done_unlayered(){
 }
 
 install_and_preflight_aqua_runner(){
-  if [ -n "$GUEST_DRIVER" ]; then return 0; fi
+  if [ -n "${GUEST_DRIVER:-}" ]; then return 0; fi
   local ip="$1" vm="$2" aqua_label
   aqua_label="com.tartci.aqua.$vm"
   if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
@@ -1760,7 +1760,7 @@ boot_vm_to_ssh(){
   # A warm-VM park has no job and no class yet, so it starts none.
   [ -z "$proof_group" ] || tartci_boundary_proof_start "$vm" "$labels" "$proof_group"
 
-  if [ -n "$GUEST_DRIVER" ]; then
+  if [ -n "${GUEST_DRIVER:-}" ]; then
     note "[$i] clone $GOLDEN → $vm (CoW) + boot prepared guest without host shares"
   else
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
@@ -1782,7 +1782,7 @@ boot_vm_to_ssh(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  if [ -n "$GUEST_DRIVER" ]; then
+  if [ -n "${GUEST_DRIVER:-}" ]; then
     CURRENT_GUEST_CORES="$lease_cores"; CURRENT_GUEST_MEM_MB="$lease_mem"
     boot_log="$(mktemp -t "tart-run-$vm")"
     tartci_vm_lease_guard_exec tart run --no-graphics --no-audio --no-clipboard --net-softnet \
@@ -2018,7 +2018,7 @@ run_one(){
       note "[$i] selected class demand is gone or a preferred class is waiting (${ASSIGNMENT_V2_PRE_MINT_BLOCKER}) — not cloning"
       return 75
     fi
-    if [ -z "$LOCAL_JOB" ]; then
+    if [ -z "${LOCAL_JOB:-}" ]; then
       reclaim_runner_name "$vm" "$selected_runner_api_root"
       sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
     fi
@@ -2040,7 +2040,7 @@ run_one(){
   fi
   ip="$CURRENT_IP"
   t_booted="$(now_epoch)"
-  if [ -n "$LOCAL_JOB" ]; then
+  if [ -n "${LOCAL_JOB:-}" ]; then
     local local_log="$STATE_DIR/$vm.actions-runner.log"
     python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation local-preflight -- "$GUEST_DRIVER" preflight "$vm" "$ip" || rc=$?
     if [ "$rc" = 0 ]; then
@@ -2072,7 +2072,7 @@ run_one(){
   fi
   # Opt-in ([guest_network] dns_servers); fail-open. Before the runner exists,
   # so every download the job makes resolves through the configured resolvers.
-[ -n "$GUEST_DRIVER" ] || tartci_apply_guest_dns "$ip"
+[ -n "${GUEST_DRIVER:-}" ] || tartci_apply_guest_dns "$ip"
   heartbeat ensuring-runner
   event runner_version "required=$RUNNER_VERSION"
   if ! ensure_runner_version "$ip"; then

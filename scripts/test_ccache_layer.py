@@ -377,9 +377,11 @@ class ShellLibTests(unittest.TestCase):
         self.assertIn("     ${CCACHE_LAYER_GUEST_ENV}mv .env.tartci .env && \\", source)
         wrapper = source[source.index("run_runner_until_done(){"):
                          source.index("run_runner_until_done_unlayered(){")]
-        self.assertLess(wrapper.index("tartci_ccache_layer_attach"),
-                        wrapper.index("run_runner_until_done_unlayered"))
-        self.assertLess(wrapper.index("run_runner_until_done_unlayered"),
+        # The prepared driver bypasses host-cache layers. Check the call that
+        # runs within the legacy attach/settle path, independent of that bypass.
+        legacy_run = wrapper.index('run_runner_until_done_unlayered "$@" || layer_rc=$?')
+        self.assertLess(wrapper.index("tartci_ccache_layer_attach"), legacy_run)
+        self.assertLess(legacy_run,
                         wrapper.index("tartci_ccache_layer_settle"))
 
 

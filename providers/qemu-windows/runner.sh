@@ -220,14 +220,14 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 
-if [ -n "$GUEST_DRIVER" ]; then
+if [ -n "${GUEST_DRIVER:-}" ]; then
   [ "${GUEST_DRIVER#/}" != "$GUEST_DRIVER" ] && [ -x "$GUEST_DRIVER" ] || die "TARTCI_GUEST_DRIVER must be an absolute executable path"
 fi
-[ -z "$LOCAL_JOB" ] || { [ -n "$GUEST_DRIVER" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires guest driver and --once"
+[ -z "${LOCAL_JOB:-}" ] || { [ -n "${GUEST_DRIVER:-}" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires guest driver and --once"
 RUNNER_API_ROOT="$(tartci_runner_api_root "$REPO" "$RUNNER_GROUP_ID" "${TARTCI_RUNNER_SCOPE:-repo}")"
 [ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
-[ -n "$LOCAL_JOB" ] || command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT)"
+[ -n "${LOCAL_JOB:-}" ] || command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT)"
 
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
@@ -430,9 +430,9 @@ run_one(){ # $1=iteration index
     return 1
   fi
   local network="user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22"
-  if [ -n "$GUEST_DRIVER" ]; then
+  if [ -n "${GUEST_DRIVER:-}" ]; then
     network="$network,restrict=on"
-    if [ -z "$LOCAL_JOB" ]; then
+    if [ -z "${LOCAL_JOB:-}" ]; then
       [ -n "${TARTCI_WIN_PROXY_COMMAND:-}" ] || { cleanup_active_windows_job; return 1; }
       network="$network,guestfwd=tcp:10.0.2.100:3128-cmd:$TARTCI_WIN_PROXY_COMMAND"
     fi
@@ -488,11 +488,11 @@ run_one(){ # $1=iteration index
     cleanup_job failure; return 1
   fi
   t_booted="$(now_epoch)"
-  if [ -n "$GUEST_DRIVER" ]; then
+  if [ -n "${GUEST_DRIVER:-}" ]; then
     local prepared_rc=0 prepared_jit="" prepared_log="$logdir/actions-runner.log"
     python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation guest-preflight -- "$GUEST_DRIVER" preflight "$job" "$port" || prepared_rc=$?
     if [ "$prepared_rc" = 0 ]; then
-      if [ -n "$LOCAL_JOB" ]; then
+      if [ -n "${LOCAL_JOB:-}" ]; then
         python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --operation local-job -- "$GUEST_DRIVER" run-local "$job" "$port" "$LOCAL_JOB" >"$prepared_log" 2>&1 || prepared_rc=$?
       else
         python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$logdir/repository-access.json" || prepared_rc=$?
