@@ -1779,6 +1779,13 @@ class Run:
             plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
             if plan.rc == 0:
                 break
+            if plan.rc in POOL_OFF_REFUSALS and plan.rc != 12:
+                # A capacity refusal stops nothing: the drain is undone by the
+                # recovery, so it must not spend the attempt or count toward
+                # the halt. m1 on 2026-10-03 drained, waited 28 min, got exit
+                # 11 here, and recorded a failed attempt.
+                raise Refused(f"pool off --plan refused (exit {plan.rc}), nothing stopped: "
+                              f"{plan.text[:300]}")
             if plan.rc != 12:
                 raise Failed(f"pool off --plan refused (exit {plan.rc}): {plan.text[:300]}")
             if self.sys.now() >= deadline:

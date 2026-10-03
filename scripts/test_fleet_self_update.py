@@ -805,6 +805,23 @@ class PoolOffRefusalTests(Base):
         self.sys.off_rc = 0
         self.assertUpdated(self.apply())
 
+    def test_a_capacity_refusal_while_waiting_idle_is_a_refusal(self) -> None:
+        # m1 on 2026-10-03: drained, waited, then `pool off --plan` exited 11
+        # and the attempt was recorded as failed.
+        self.sys.offplan = [12, 11]
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        receipts = [json.loads(path.read_text())
+                    for path in (self.cfg.state_dir / "attempts").glob("*.json")]
+        self.assertEqual([r["status"] for r in receipts], ["refused"])
+        self.assertIn("nothing stopped", receipts[0]["error"])
+        self.assertIsNone(su.halt_reason(self.cfg.state_dir))
+
+    def test_an_unknown_plan_exit_while_waiting_idle_still_fails(self) -> None:
+        # Control: only the documented refusal codes are refusals.
+        self.sys.offplan = [12, 9]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+
     def test_lanes_launchd_still_holds_are_a_refusal_too(self) -> None:
         # m5studio, 2026-10-01 10:51Z: "launchd still holds ... forge-gate
         # after 40s" (exit 13) was recorded as a failed update and spent 6 h.
