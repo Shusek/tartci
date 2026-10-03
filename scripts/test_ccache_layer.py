@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -233,6 +235,163 @@ class PromotionTests(Base):
 
 class HostileLayerTests(Base):
     """A sibling guest can rewrite a green layer while the host promotes it."""
+
+    def test_a_parent_swapped_after_header_validation_cannot_publish_host_data(self) -> None:
+        for kind in (0, 1):
+            with self.subTest(kind=kind):
+                layer = self.attach(f"vm-parent-{kind}")
+                key = "ab" + str(kind) * 38
+                src = write_entry(layer / "remote", key, entry(kind))
+                outside = self.tmp / f"outside-{kind}"
+                outside.mkdir()
+                (outside / src.name).write_bytes(b"fixture private host data")
+                classify = cl.entry_type
+
+                def swap_parent(path: Path) -> int | None:
+                    result = classify(path)
+                    path.parent.rename(path.parent.with_name("retired"))
+                    path.parent.symlink_to(outside, target_is_directory=True)
+                    return result
+
+                with mock.patch.object(cl, "entry_type", side_effect=swap_parent):
+                    counts = cl.promote_layer(self.layout, layer)
+                self.assertEqual(counts["rejected"], 1)
+                self.assertEqual(counts["promoted"], 0)
+                self.assertFalse((self.layout.shared / key[:2] / key[2:]).exists())
+
+    def test_copy_and_header_reads_reject_symlinked_ancestors(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        secret = outside / "entry"
+        secret.write_bytes(entry(0, b"fixture private host data"))
+        parent = self.tmp / "swapped-parent"
+        parent.symlink_to(outside, target_is_directory=True)
+        self.assertIsNone(cl.entry_type(parent / "entry"))
+        with self.assertRaises(OSError):
+            cl.copy_synced(parent / "entry", self.tmp / "copied")
+        self.assertFalse((self.tmp / "copied").exists())
+
+    def test_symlinked_destination_cannot_write_outside_the_share(self) -> None:
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        self.layout.ensure()
+        (self.layout.shared / "ab").symlink_to(outside, target_is_directory=True)
+        for kind in (0, 1):
+            with self.subTest(kind=kind):
+                layer = self.attach(f"vm-dest-{kind}")
+                write_entry(layer / "remote", "ab" + str(kind) * 38, entry(kind))
+                counts = cl.promote_layer(self.layout, layer)
+                self.assertEqual(counts["rejected"], 1)
+                self.assertEqual(list(outside.iterdir()), [])
+        src = self.tmp / "regular"
+        src.write_bytes(entry(0))
+        with self.assertRaises(OSError):
+            cl.copy_synced(src, self.layout.shared / "ab" / "copied")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_publication_keeps_open_directories_when_both_parents_are_swapped(self) -> None:
+        for manifest in (False, True):
+            for copy_fallback in (False, True):
+                with self.subTest(manifest=manifest, copy_fallback=copy_fallback):
+                    case = self.tmp / f"race-{manifest}-{copy_fallback}"
+                    source, target = case / "source", case / "target"
+                    outside_source, outside_target = case / "outside-source", case / "outside-target"
+                    for directory in (source, target, outside_source, outside_target):
+                        directory.mkdir(parents=True)
+                    payload = entry(int(manifest), b"guest cache")
+                    src, dest = source / "entry", target / "entry"
+                    src.write_bytes(payload)
+                    os.utime(src, (3000, 3000))
+                    if manifest:
+                        dest.write_bytes(entry(1, b"old cache"))
+                        os.utime(dest, (1000, 1000))
+                    secret = outside_source / "entry"
+                    secret.write_bytes(b"fixture private host data")
+                    unrelated = outside_target / "entry"
+                    unrelated.write_bytes(b"fixture unrelated host data")
+                    real_link = cl.os.link
+                    first = True
+
+                    def swap_parents(*args, **kwargs):
+                        nonlocal first
+                        if first:
+                            first = False
+                            source.rename(case / "retired-source")
+                            source.symlink_to(outside_source, target_is_directory=True)
+                            target.rename(case / "retired-target")
+                            target.symlink_to(outside_target, target_is_directory=True)
+                            if copy_fallback:
+                                raise OSError(errno.EXDEV, "fixture cross-device link")
+                        return real_link(*args, **kwargs)
+
+                    with mock.patch.object(cl.os, "link", side_effect=swap_parents):
+                        if manifest:
+                            outcome = cl.publish_manifest(src, dest, self.layout.locks / "race.lock")
+                        else:
+                            outcome = cl.publish_result(src, dest)
+                    self.assertEqual(outcome, "replaced" if manifest else "promoted")
+                    published = case / "retired-target" / "entry"
+                    self.assertEqual(published.read_bytes(), payload)
+                    if manifest:
+                        self.assertEqual(published.stat().st_mtime_ns, 3000_000_000_000)
+                    self.assertEqual(secret.read_bytes(), b"fixture private host data")
+                    self.assertEqual(unrelated.read_bytes(), b"fixture unrelated host data")
+                    self.assertEqual(list(outside_target.iterdir()), [unrelated])
+                    self.assertFalse(list((case / "retired-target").glob(f"{cl.TMP_PREFIX}*")))
+
+    def test_a_leaf_swapped_after_open_is_rejected_before_publication(self) -> None:
+        src = self.tmp / "entry"
+        src.write_bytes(entry(0))
+        outside = self.tmp / "secret"
+        outside.write_bytes(b"fixture private host data")
+        dest = self.tmp / "published"
+        real_link = cl.os.link
+
+        def swap_leaf(*args, **kwargs):
+            src.unlink()
+            src.symlink_to(outside)
+            return real_link(*args, **kwargs)
+
+        with mock.patch.object(cl.os, "link", side_effect=swap_leaf), self.assertRaises(OSError):
+            cl.publish_result(src, dest)
+        self.assertFalse(dest.exists() or dest.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"fixture private host data")
+
+    def test_trim_cannot_unlink_host_files_when_a_cache_parent_is_swapped(self) -> None:
+        key = "ab" + "1" * 38
+        cached = write_entry(self.layout.shared, key, entry(0, b"x" * 100), mtime=1)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        secret = outside / cached.name
+        secret.write_bytes(b"fixture private host data")
+        scan = cl.os.scandir
+        scans = 0
+
+        def swap_before_scan(path):
+            nonlocal scans
+            # Swap after the shared directory listing, before its child is read.
+            scans += 1
+            if scans == 2:
+                cached.parent.rename(cached.parent.with_name("retired"))
+                cached.parent.symlink_to(outside, target_is_directory=True)
+            return scan(path)
+
+        with mock.patch.object(cl.os, "scandir", side_effect=swap_before_scan):
+            cl.trim(self.layout, max_size=1, interval=0, now=10_000)
+        self.assertGreaterEqual(scans, 2)
+        self.assertEqual(secret.read_bytes(), b"fixture private host data")
+
+    def test_trim_never_touches_a_symlinked_stamp_target(self) -> None:
+        self.layout.ensure()
+        secret = self.tmp / "secret"
+        secret.write_bytes(b"fixture private host data")
+        os.utime(secret, (1000, 1000))
+        (self.layout.shared / cl.TRIM_STAMP).symlink_to(secret)
+        try:
+            cl.trim(self.layout, max_size=1, interval=0)
+        except OSError:
+            pass  # Refusing an unsafe stamp is also a safe outcome.
+        self.assertEqual(secret.stat().st_mtime_ns, 1000_000_000_000)
 
     def test_an_entry_swapped_for_a_symlink_never_publishes_its_target(self) -> None:
         secret = self.tmp / "host-secret"

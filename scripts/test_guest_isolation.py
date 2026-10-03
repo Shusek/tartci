@@ -7,8 +7,10 @@ reaching the host or sibling VMs, and from receiving the operator's SSH agent.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,11 +130,40 @@ class ProviderWiringTests(unittest.TestCase):
 class GoldenCredentialTests(unittest.TestCase):
     """Clones share their golden's credentials, so none may be well known."""
 
-    def autounattend(self, root: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    def autounattend(self, root: Path, env: dict[str, str],
+                    observe: bool = False) -> subprocess.CompletedProcess[str]:
         stub = root / "bin"
         stub.mkdir(exist_ok=True)
-        (stub / "hdiutil").write_text("#!/bin/sh\nexit 0\n")
+        (stub / "hdiutil").write_text(f"#!{sys.executable}\n" + '''
+import json, os, pathlib, sys
+dest = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])
+dest.write_bytes((pathlib.Path(sys.argv[-1]) / "autounattend.xml").read_bytes())
+if os.environ.get("PUBLIC_ISO"):
+    dest.chmod(0o644)
+if os.environ.get("OBSERVATIONS"):
+    with open(os.environ["OBSERVATIONS"], "a") as report:
+        report.write(json.dumps({"kind": "iso", "mode": dest.stat().st_mode & 0o777,
+                                 "parent_mode": dest.parent.stat().st_mode & 0o777}) + "\\n")
+if os.environ.get("FAIL_ISO"):
+    sys.exit(42)
+''')
         (stub / "hdiutil").chmod(0o755)
+        if observe:
+            (stub / "cat").write_text(f"#!{sys.executable}\n" + '''
+import json, os, pathlib, sys
+if len(sys.argv) > 1:
+    for name in sys.argv[1:]:
+        sys.stdout.buffer.write(pathlib.Path(name).read_bytes())
+else:
+    content = sys.stdin.buffer.read()
+    sys.stdout.buffer.write(content)
+    sys.stdout.buffer.flush()
+    with open(os.environ["OBSERVATIONS"], "a") as report:
+        report.write(json.dumps({"kind": "xml", "mode": os.fstat(1).st_mode & 0o777,
+                                 "contains_password": b"fixture-only-admin-123" in content}) + "\\n")
+''')
+            (stub / "cat").chmod(0o755)
+            env = {**env, "OBSERVATIONS": str(root / "observations.jsonl")}
         key = root / "id.pub"
         key.write_text("ssh-ed25519 AAAAfixture operator\n")
         script = ROOT / "providers" / "qemu-windows" / "make-autounattend.sh"
@@ -155,6 +186,69 @@ class GoldenCredentialTests(unittest.TestCase):
             self.assertNotIn("<Value>admin</Value>", xml)
             self.assertEqual(xml.count(f"<Value>{password}</Value>"), 2)
             self.assertIn("'PasswordAuthentication no'", xml)
+            self.assertEqual((root / "out" / "media" / "autounattend.xml").stat().st_mode & 0o777,
+                             0o600)
+            self.assertEqual((root / "out" / "autounattend.iso").stat().st_mode & 0o777, 0o600)
+
+    def test_windows_password_media_are_private_during_creation_and_regeneration(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if existing:
+                    media = root / "out" / "media"
+                    media.mkdir(parents=True)
+                    for path in (media / "autounattend.xml", root / "out" / "autounattend.iso",
+                                 root / "out" / "admin-password"):
+                        path.write_text("old public fixture")
+                        path.chmod(0o644)
+                previous = os.umask(0o022)
+                try:
+                    result = self.autounattend(
+                        root, {"TARTCI_WIN_ADMIN_PASSWORD": "fixture-only-admin-123",
+                               "PUBLIC_ISO": "1"}, observe=True)
+                finally:
+                    os.umask(previous)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                observations = [json.loads(line) for line in
+                                (root / "observations.jsonl").read_text().splitlines()]
+                xml = next(item for item in observations if item["kind"] == "xml")
+                self.assertTrue(xml["contains_password"])
+                self.assertEqual(xml["mode"], 0o600)
+                iso = next(item for item in observations if item["kind"] == "iso")
+                self.assertTrue(iso["mode"] == 0o600 or iso["parent_mode"] == 0o700, iso)
+                for path in (root / "out" / "media" / "autounattend.xml",
+                             root / "out" / "autounattend.iso", root / "out" / "admin-password"):
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertFalse(list((root / "out").glob(".unattend.*")))
+
+    def test_windows_failed_iso_build_preserves_previous_media_and_cleans_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "out" / "media"
+            media.mkdir(parents=True)
+            paths = (media / "autounattend.xml", root / "out" / "autounattend.iso",
+                     root / "out" / "admin-password")
+            for path in paths:
+                path.write_bytes(b"previous fixture")
+            result = self.autounattend(root, {"FAIL_ISO": "1"})
+            self.assertNotEqual(result.returncode, 0)
+            for path in paths:
+                self.assertEqual(path.read_bytes(), b"previous fixture")
+            self.assertFalse(list((root / "out").glob(".unattend.*")))
+
+    def test_windows_iso_permission_failure_is_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stub = root / "bin"
+            stub.mkdir()
+            (stub / "chmod").write_text(
+                '#!/bin/sh\ncase "$*" in *autounattend.iso*) exit 42;; esac\n'
+                'exec /bin/chmod "$@"\n')
+            (stub / "chmod").chmod(0o755)
+            result = self.autounattend(root, {})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "out" / "autounattend.iso").exists())
+            self.assertFalse(list((root / "out").glob(".unattend.*")))
 
     def test_windows_golden_rejects_a_weak_or_unsafe_password(self) -> None:
         for value in ("admin", "has space in it", "<xml>injection</xml>"):

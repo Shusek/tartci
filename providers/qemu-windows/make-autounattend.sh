@@ -7,6 +7,8 @@
 # OpenSSH Server, creates a local `admin` account, and bypasses TPM/SecureBoot/
 # RAM/CPU checks (required for Win11 under AVF). Never bakes private keys.
 set -euo pipefail
+# Apply before creating any password-bearing file; chmod after writing is too late.
+umask 077
 OUT_DIR="${1:-${TARTCI_WIN:-$HOME/.tartci/windows}}"
 # Configurable key set (colon-separated paths via TARTCI_PUBKEYS); never bakes private keys.
 IFS=: read -ra PUBKEYS <<< "${TARTCI_PUBKEYS:-$HOME/.ssh/id_ed25519.pub}"
@@ -24,8 +26,12 @@ case "$ADMIN_PASSWORD" in
   ''|*[!A-Za-z0-9._-]*) echo "TARTCI_WIN_ADMIN_PASSWORD must be non-empty [A-Za-z0-9._-]" >&2; exit 2 ;;
 esac
 [ "${#ADMIN_PASSWORD}" -ge 12 ] || { echo "TARTCI_WIN_ADMIN_PASSWORD must have at least 12 characters" >&2; exit 2; }
-rm -f "$OUT_DIR/admin-password"
-( umask 077 && printf '%s\n' "$ADMIN_PASSWORD" >"$OUT_DIR/admin-password" )
+# A fresh private directory also protects against regeneration over old 0644
+# files and against tools that choose their own output permissions.
+STAGING_DIR="$(mktemp -d "$OUT_DIR/.unattend.XXXXXXXX")"
+trap 'rm -rf "$STAGING_DIR"' EXIT
+mkdir "$STAGING_DIR/media"
+printf '%s\n' "$ADMIN_PASSWORD" >"$STAGING_DIR/admin-password"
 
 # Build the authorized_keys block (one key per line), then XML-escape for embedding.
 AK=""
@@ -43,7 +49,7 @@ while IFS= read -r k; do
   order=$((order+1))
 done <<< "$AK"
 
-cat > "$OUT_DIR/media/autounattend.xml" <<XML
+cat > "$STAGING_DIR/media/autounattend.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
@@ -137,15 +143,18 @@ cat > "$OUT_DIR/media/autounattend.xml" <<XML
   </settings>
 </unattend>
 XML
-chmod 600 "$OUT_DIR/media/autounattend.xml"
-echo "wrote $OUT_DIR/media/autounattend.xml ($(wc -l < "$OUT_DIR/media/autounattend.xml") lines)"
-echo "admin console password: $OUT_DIR/admin-password (SSH is key-only)"
+chmod 600 "$STAGING_DIR/media/autounattend.xml"
 
 # Build a small bootable-data ISO with autounattend.xml at the root. Windows
 # Setup auto-detects autounattend.xml on any attached removable media root.
-rm -f "$OUT_DIR/autounattend.iso"
 hdiutil makehybrid -iso -joliet -default-volume-name "UNATTEND" \
-  -o "$OUT_DIR/autounattend.iso" "$OUT_DIR/media" >/dev/null
+  -o "$STAGING_DIR/autounattend.iso" "$STAGING_DIR/media" >/dev/null
 # The ISO carries the admin password in plain text, like the XML.
-chmod 600 "$OUT_DIR/autounattend.iso" 2>/dev/null || true
+chmod 600 "$STAGING_DIR/autounattend.iso" "$STAGING_DIR/admin-password"
+# Publish complete, private files by rename; never truncate a public old inode.
+mv -f "$STAGING_DIR/admin-password" "$OUT_DIR/admin-password"
+mv -f "$STAGING_DIR/media/autounattend.xml" "$OUT_DIR/media/autounattend.xml"
+mv -f "$STAGING_DIR/autounattend.iso" "$OUT_DIR/autounattend.iso"
+echo "wrote $OUT_DIR/media/autounattend.xml ($(wc -l < "$OUT_DIR/media/autounattend.xml") lines)"
+echo "admin console password: $OUT_DIR/admin-password (SSH is key-only)"
 echo "built $OUT_DIR/autounattend.iso"

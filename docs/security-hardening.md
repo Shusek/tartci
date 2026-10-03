@@ -76,6 +76,12 @@ objects a trusted build would link. It cannot be combined with
 `TARTCI_CCACHE_WRITE_ISOLATION=1`. Write isolation only decides *when* a layer
 is promoted (a green job), not *whose*, so it is not a trust boundary.
 
+Host-side ccache promotion and trimming walk directories without following
+guest-controlled symlinks and use directory/file descriptors for reads, links,
+copies, renames and cleanup. This also covers a parent directory swapped while
+an operation is in progress. Use real cache paths rather than symlinked cache
+directories (the fixed macOS `/var`, `/tmp` and `/etc` aliases are supported).
+
 `TARTCI_TART_NETWORK=softnet` boots macOS and Linux guests with Tart Softnet,
 which isolates each guest from the host, the LAN and its siblings. List any
 destination a guest still needs in `TARTCI_TART_SOFTNET_ALLOW` as
@@ -116,7 +122,11 @@ off hosts that serve trusted work.
   `tailscale up` belongs on hosts and persistent benches, never in a CI golden.
 - SSH into a golden must be key-only. The Windows autounattend now generates a
   random admin password (stored 0600 as `admin-password` beside the media) and
-  disables password SSH. The Linux bake installs
+  disables password SSH. The XML, ISO and password file are built in a private
+  staging directory, then published with mode 0600; regeneration never writes
+  the new password into an old public file. A failed ISO build or permission
+  change fails the generator and removes the staging directory.
+  The Linux bake installs
   `/etc/ssh/sshd_config.d/00-tartci-key-only.conf`. For hand-baked macOS
   goldens, add this before tagging:
 
