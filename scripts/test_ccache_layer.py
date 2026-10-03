@@ -231,6 +231,44 @@ class PromotionTests(Base):
         self.assertFalse(cl.wait_vm_gone("vm", broken, timeout=0.05, poll=0.01))
 
 
+class HostileLayerTests(Base):
+    """A sibling guest can rewrite a green layer while the host promotes it."""
+
+    def test_an_entry_swapped_for_a_symlink_never_publishes_its_target(self) -> None:
+        secret = self.tmp / "host-secret"
+        secret.write_bytes(entry(0, b"host private key"))
+        src = self.tmp / "swapped"
+        src.symlink_to(secret)
+        dest = self.tmp / "published"
+        with self.assertRaises(OSError):
+            cl.publish_result(src, dest)
+        self.assertFalse(dest.exists() or dest.is_symlink())
+        self.assertIsNone(cl.entry_type(src))
+        with self.assertRaises(OSError):
+            cl.copy_synced(src, self.tmp / "copied")
+
+    def test_a_fifo_is_rejected_without_blocking_the_promoter(self) -> None:
+        fifo = self.tmp / "fifo"
+        os.mkfifo(fifo)
+        self.assertIsNone(cl.entry_type(fifo))
+
+    def test_layer_stats_never_reads_a_guest_written_config(self) -> None:
+        seen: dict[str, str] = {}
+
+        def fake_run(argv, env, **_kwargs):
+            seen.update(env)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        original = cl.subprocess.run
+        cl.subprocess.run = fake_run
+        try:
+            cl.layer_stats(self.tmp, "ccache")
+        finally:
+            cl.subprocess.run = original
+        self.assertEqual(seen["CCACHE_CONFIGPATH"], os.devnull)
+        self.assertEqual(seen["CCACHE_DIR"], str(self.tmp / "local"))
+
+
 class KilledJobRegressionTests(Base):
     """A zero-include manifest from a job torn down mid-build never reaches shared.
 

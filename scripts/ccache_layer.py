@@ -50,6 +50,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -247,10 +248,24 @@ def settle(layout: Layout, vm: str, runner_rc: int, capture_status: str,
 # ── Promotion ──────────────────────────────────────────────────────────────
 
 
+def open_regular(path: Path) -> int:
+    """Open a guest-written file for reading without following a symlink.
+
+    Layers live inside the share every live guest mounts read-write, so a
+    sibling VM can swap an entry for a symlink (to a host secret) or a FIFO
+    (to hang the promoter) between our check and our open.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(errno.EINVAL, "not a regular file", str(path))
+    return fd
+
+
 def entry_type(path: Path) -> int | None:
     """The ccache entry type byte, or None when the file is not an entry."""
     try:
-        with path.open("rb") as handle:
+        with os.fdopen(open_regular(path), "rb") as handle:
             header = handle.read(ENTRY_HEADER_MIN)
     except OSError:
         return None
@@ -275,10 +290,18 @@ def iter_layer_entries(remote: Path) -> Iterator[tuple[str, str, Path]]:
             yield sub.name, item.name, Path(item.path)
 
 
+def link_regular(src: Path, dest: Path) -> None:
+    """Hard-link ``src`` itself (never a symlink's target) and prove it regular."""
+    os.link(src, dest, follow_symlinks=False)
+    if not stat.S_ISREG(dest.lstat().st_mode):
+        dest.unlink()
+        raise OSError(errno.EINVAL, "not a regular file", str(src))
+
+
 def publish_result(src: Path, dest: Path) -> str:
     """Hard-link a result entry into place; an existing key always wins."""
     try:
-        os.link(src, dest)
+        link_regular(src, dest)
         return "promoted"
     except FileExistsError:
         return "existing"
@@ -299,7 +322,7 @@ def publish_result(src: Path, dest: Path) -> str:
 
 
 def copy_synced(src: Path, dest: Path) -> None:
-    with src.open("rb") as reader, dest.open("xb") as writer:
+    with os.fdopen(open_regular(src), "rb") as reader, dest.open("xb") as writer:
         shutil.copyfileobj(reader, writer)
         writer.flush()
         os.fsync(writer.fileno())
@@ -318,7 +341,7 @@ def publish_manifest(src: Path, dest: Path, lock_path: Path) -> str:
         tmp = dest.parent / f"{TMP_PREFIX}{dest.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         try:
             try:
-                os.link(src, tmp)
+                link_regular(src, tmp)
             except OSError:
                 copy_synced(src, tmp)
                 stat = src.lstat()
@@ -355,10 +378,16 @@ def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
         dest_dir = layout.shared / key_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / name
-        if kind == ENTRY_TYPE_MANIFEST:
-            outcome = publish_manifest(path, dest, lock_path)
-        else:
-            outcome = publish_result(path, dest)
+        try:
+            if kind == ENTRY_TYPE_MANIFEST:
+                outcome = publish_manifest(path, dest, lock_path)
+            else:
+                outcome = publish_result(path, dest)
+        except OSError as exc:
+            # Swapped for a symlink, FIFO or directory after the checks above.
+            if exc.errno not in (errno.EINVAL, errno.ELOOP, errno.ENOENT, errno.EISDIR):
+                raise
+            outcome = "rejected"
         counts[outcome] += 1
         if outcome in ("promoted", "replaced"):
             counts["bytes"] += info.st_size
@@ -370,7 +399,8 @@ def layer_stats(layer: Path, ccache: str | None) -> dict[str, int] | None:
     """Hit/miss counters from the job's own stats, when a host ccache exists."""
     if not ccache:
         return None
-    env = dict(os.environ, CCACHE_DIR=str(layer / "local"))
+    # The layer is guest-written: read its stats, never its ccache.conf.
+    env = dict(os.environ, CCACHE_DIR=str(layer / "local"), CCACHE_CONFIGPATH=os.devnull)
     try:
         output = subprocess.run([ccache, "--print-stats"], env=env, text=True,
                                 capture_output=True, timeout=30, check=False)
