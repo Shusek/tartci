@@ -201,5 +201,23 @@ else:
                         self.assertEqual(result.stdout.strip(), "1")
 
 
+class AssignmentModeCompatibilityTests(unittest.TestCase):
+    def test_event_class_v2_refuses_a_policy_it_would_ignore(self) -> None:
+        # assignment_scan.py has no policy support, so the combination must
+        # fail loudly instead of silently dropping the admission rules.
+        runner = Path(__file__).resolve().parents[1] / "providers/tart-macos/runner.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policy.json"
+            policy.write_text(json.dumps({**POLICY, "repository": "Generous-Corp/pulp"}))
+            env = {"PATH": os.environ["PATH"], "HOME": directory,
+                   "TARTCI_STATE_DIR": str(Path(directory) / "state"),
+                   "TARTCI_QUEUE_POLICY_FILE": str(policy),
+                   "TARTCI_RUNNER_ASSIGNMENT_MODE": "event-class-v2"}
+            result = subprocess.run(["/bin/bash", str(runner), "--once"], env=env,
+                                    text=True, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not supported with TARTCI_RUNNER_ASSIGNMENT_MODE=event-class-v2", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

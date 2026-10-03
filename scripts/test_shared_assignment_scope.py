@@ -38,7 +38,7 @@ class SharedAssignmentScopeTests(unittest.TestCase):
         args=SimpleNamespace(repo=PRIMARY,runner='fixture-runner',workflow=['Build and Test'],assignment_repo=[FOREIGN],policy_file=None,scan_timeout=5,observation_lock_file='/fixture/unused',observation_lock_timeout=5,parallelism=1)
         scanner=CurrentJobScanner(args)
         def pages(path,key):
-            if path.endswith('/workflows'):return [{'id':99,'name':'Build and Test'}]
+            if path.endswith('/workflows'):return [{'id':99,'name':'Build and Test','path':'.github/workflows/ci.yml'}]
             if '/runs?status=' in path:return [{'id':100 if path.startswith('repos/'+PRIMARY+'/') else 200}]
             if '/100/jobs?' in path:return [{'id':101,'status':'in_progress','runner_name':'fixture-runner'}] if primary else []
             if '/200/jobs?' in path:return [{'id':201,'status':'in_progress','runner_name':'fixture-runner'}] if foreign else []
@@ -54,6 +54,18 @@ class SharedAssignmentScopeTests(unittest.TestCase):
         self.assertEqual(receipt['kind'],'unexpected_assignment')
         self.assertEqual(receipt['repository'],FOREIGN)
         self.assertEqual(receipt['job_id'],201)
+
+    def test_primary_run_outside_the_policy_is_a_policy_violation(self):
+        scanner=self.scanner(foreign=False,primary=True)
+        scanner.policy=SimpleNamespace(paths={'.github/workflows/ci.yml'},allows=lambda run:False)
+        receipt=scanner.discover()
+        self.assertEqual(receipt['kind'],'policy_violation')
+        self.assertEqual(receipt['job_id'],101)
+
+    def test_foreign_run_stays_an_observed_assignment_under_a_policy(self):
+        scanner=self.scanner()
+        scanner.policy=SimpleNamespace(paths={'.github/workflows/ci.yml'},allows=lambda run:False)
+        self.assertEqual(scanner.discover()['kind'],'unexpected_assignment')
 
     def test_two_assignments_across_repositories_are_ambiguous(self):
         self.assertEqual(self.scanner(primary=True).discover(),{'kind':'ambiguous_assignment','matches':2})

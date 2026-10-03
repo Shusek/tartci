@@ -257,6 +257,8 @@ CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=0
 CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
 CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0
 CURRENT_ASSIGNMENT_QUARANTINE="none"
+# Set when GitHub assigned this runner a run the queue policy refuses.
+CURRENT_JOB_POLICY_VIOLATION=0
 CURRENT_SCAN_PID=""
 CURRENT_SCAN_TMP=""
 CURRENT_LABELS="$LABELS"
@@ -539,6 +541,10 @@ fi
 
 configure_workflows
 configure_workflow_tier_groups
+# The event-class-v2 scanner (assignment_scan.py) does not read the queue
+# policy, so combining them would silently drop the policy's admission rules.
+[ -z "${TARTCI_QUEUE_POLICY_FILE:-}" ] || [ "$ASSIGNMENT_MODE" != event-class-v2 ] \
+  || die "TARTCI_QUEUE_POLICY_FILE is not supported with TARTCI_RUNNER_ASSIGNMENT_MODE=event-class-v2"
 tartci_assignment_v2_configure
 # The retarget is a V2 decision: a legacy or observe lane registers with the
 # tier labels but never consults it, so those lanes stay byte-for-byte unchanged.
@@ -1428,6 +1434,11 @@ capture_current_job(){
       CURRENT_JOB_SCAN_FAILURES=0
       return 0 ;;
     no_assignment|terminal|terminal_pending_run|assignment_changed) return 1 ;;
+    policy_violation)
+      CURRENT_JOB_POLICY_VIOLATION=1
+      CURRENT_ASSIGNMENT_QUARANTINE="policy_violation"
+      [ "$previous_status" = "$kind" ] || event job_policy_violation "receipt=$result"
+      return 2 ;;
     unexpected_assignment|ambiguous_assignment)
       [ "$previous_status" = "$kind" ] || event job_assignment_violation "receipt=$result"
       return 2 ;;
@@ -1651,6 +1662,7 @@ run_runner_until_done_unlayered(){
       assigned_at="$now"
       for _ in $(seq 1 6); do
         capture_current_job && break
+        [ "$CURRENT_JOB_POLICY_VIOLATION" = 0 ] || break
         sleep 2
       done
       CURRENT_SERVED=1
@@ -1688,6 +1700,17 @@ run_runner_until_done_unlayered(){
     if [ "$assigned" = 1 ]; then
       job_elapsed=$((now - assigned_at))
       [ -n "$CURRENT_RUN_ID" ] || capture_current_job || true
+      if [ "$CURRENT_JOB_POLICY_VIOLATION" = 1 ]; then
+        # The queue policy is not GitHub's assignment rule: a refused run (a
+        # fork pull request, another workflow) can still land here. Stop it
+        # now; the caller discards the VM and nothing is promoted to caches.
+        note "[$vm] GitHub assigned a run outside the queue policy — stopping it and discarding the VM"
+        kill "$ssh_pid" 2>/dev/null || true
+        stop_current_aqua_runner
+        wait "$ssh_pid" 2>/dev/null || true
+        sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+        return 1
+      fi
       if [ "$warned" = 0 ] && [ "$job_elapsed" -ge "$JOB_WARN" ]; then
         warned=1
         event job_warn "elapsed=${job_elapsed}s"
@@ -1982,6 +2005,7 @@ run_one(){
   CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
   CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0
   CURRENT_ASSIGNMENT_QUARANTINE="none"
+  CURRENT_JOB_POLICY_VIOLATION=0
   CURRENT_LABELS="$selected_labels"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
   # A parked warm VM (opt-in, warm-vm.lib.sh) replaces the lease, clone and

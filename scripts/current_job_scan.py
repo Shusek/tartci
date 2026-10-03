@@ -215,8 +215,13 @@ class CurrentJobScanner:
             return self._receipt("terminal", conclusion=job.get("conclusion"), **base)
         if status != "in_progress":
             return self._receipt("assignment_changed", **base)
-        if repository != self.args.repo or (self.policy and not self.policy.allows(run)):
+        if repository != self.args.repo:
             return self._receipt("unexpected_assignment", **base)
+        if self.policy and not self.policy.allows(run):
+            # The policy only decided to boot a VM; GitHub then assigned this
+            # runner a run the policy refuses (e.g. a fork pull request). The
+            # supervisor stops the job rather than merely recording it.
+            return self._receipt("policy_violation", **base)
         if not isinstance(workflow_id, int) or contract.get(workflow_id) != workflow_name:
             return self._receipt("unexpected_assignment", **base)
         return self._receipt("active", **base)
