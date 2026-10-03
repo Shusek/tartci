@@ -371,6 +371,16 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     fi
   fi
 
+  # GitHub assigns any job whose labels match, so prove the repository boundary
+  # and the public-repository fork gate before a registration exists.
+  if ! SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE=repo \
+      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+      --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" \
+      >"$logdir/repository-access.json"; then
+    note "[$i] runner repository access not proven — refusing JIT registration and discarding VM"
+    discard_current_linux_vm
+    return 1
+  fi
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
     discard_current_linux_vm

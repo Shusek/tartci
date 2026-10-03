@@ -294,6 +294,28 @@ class ProviderIntegrationTests(unittest.TestCase):
                 )
                 self.assertIn("<string>disabled</string>", body)
 
+    def test_every_jit_mint_follows_a_repository_access_proof(self) -> None:
+        # GitHub assigns any job whose labels match, so no provider may mint a
+        # runner without proving the repository boundary and fork gate first.
+        for provider in PROVIDERS:
+            body = provider.read_text(encoding="utf-8")
+            with self.subTest(provider=provider):
+                run_one = body.index("run_one")
+                proof = (
+                    'verify_runner_repository_access "$logdir"'
+                    if "qemu-windows" in str(provider)
+                    else "runner_group_repository_access.py"
+                )
+                gate = body.index('admission_json="$(tartci_admission_clean', run_one)
+                mint = body.find("generate-jitconfig", run_one)
+                self.assertNotEqual(mint, -1)
+                while mint != -1:
+                    self.assertNotEqual(
+                        body.rfind(proof, gate, mint), -1,
+                        f"mint at offset {mint} has no repository-access proof",
+                    )
+                    mint = body.find("generate-jitconfig", mint + 1)
+
     def test_gate_is_after_boot_and_before_jit_mint(self) -> None:
         for provider in PROVIDERS:
             body = provider.read_text(encoding="utf-8")

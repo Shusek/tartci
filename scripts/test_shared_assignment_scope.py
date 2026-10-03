@@ -13,6 +13,7 @@ class SharedAssignmentScopeTests(unittest.TestCase):
     def group(self,declared,selected,group=7,visibility='selected'):
         def api(cli,path,repo,timeout):
             if '/repositories?' in path:return {'total_count':len(selected),'repositories':[{'full_name':r} for r in selected]}
+            if path.startswith('repos/'):return {'private':True,'visibility':'private'}
             return {'visibility':visibility}
         with patch.dict(os.environ,{'TARTCI_ASSIGNMENT_REPOSITORIES':'\n'.join(declared),'TARTCI_RUNNER_SCOPE':'org'}),patch('runner_group_repository_access.api',side_effect=api) as calls:
             receipt=verify(PRIMARY,group,'fixture',5)
@@ -21,7 +22,8 @@ class SharedAssignmentScopeTests(unittest.TestCase):
     def test_group_admits_exact_complete_declared_scope(self):
         receipt,calls=self.group([PRIMARY,FOREIGN],[PRIMARY,FOREIGN])
         self.assertEqual(receipt['registration_scope'],'organization-observed-repositories')
-        self.assertEqual(calls,2)
+        # Group, its repository page, then each reachable repository's visibility.
+        self.assertEqual(calls,4)
 
     def test_group_rejects_unobserved_repository(self):
         with self.assertRaises(RepositoryInaccessible):self.group([PRIMARY],[PRIMARY,FOREIGN])

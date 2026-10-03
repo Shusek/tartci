@@ -57,7 +57,7 @@ elif a[0]=='list':
             for name in ['qemu-img','qemu-system-aarch64','ssh','fake-gh']:
                 script=bin/name
                 if name=='qemu-system-aarch64':text='#!/bin/bash\nexec sleep 300\n'
-                elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json,os\nfrom pathlib import Path\nwith (Path(os.environ['FIXTURE'])/'gh-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
+                elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json,os\nfrom pathlib import Path\nwith (Path(os.environ['FIXTURE'])/'gh-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif sys.argv[1:2]==['api'] and sys.argv[-1].startswith('repos/') and sys.argv[-1].count('/')==2:print(json.dumps({'private':True,'visibility':'private'}))\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
                 elif name=='fake-gh':text='#!/bin/bash\necho unexpected-gh >&2; exit 99\n'
                 else:text='#!/bin/bash\nexit 0\n'
                 script.write_text(text);script.chmod(0o700)

@@ -268,6 +268,17 @@ delete_runner_registration(){
 CURRENT_PREPARED_LISTENER_PID=""
 WINDOWS_DRAIN_REQUESTED=0
 
+# Prove the runner group's repository boundary, and that no public repository
+# lets fork pull requests reach this runner unapproved, right before a JIT mint.
+# GitHub assigns any job whose labels match, so every mint path needs this.
+verify_runner_repository_access(){
+  local logdir="$1"
+  SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE="${TARTCI_RUNNER_SCOPE:-repo}" \
+    python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+    --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" \
+    >"$logdir/repository-access.json"
+}
+
 cleanup_active_windows_job(){
   if [ -n "${CURRENT_PREPARED_LISTENER_PID:-}" ] && kill -0 "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null; then
     kill -TERM "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
@@ -516,7 +527,7 @@ run_one(){ # $1=iteration index
       if [ -n "${LOCAL_JOB:-}" ]; then
         python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --operation local-job -- "$GUEST_DRIVER" run-local "$job" "$port" "$LOCAL_JOB" >"$prepared_log" 2>&1 || prepared_rc=$?
       else
-        python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$logdir/repository-access.json" || prepared_rc=$?
+        verify_runner_repository_access "$logdir" || prepared_rc=$?
         if [ "$prepared_rc" = 0 ] && tartci_pool_lock_acquire && tartci_pool_admission_open; then
           local prepared_labels=() label
           IFS=',' read -r -a prepared_labels <<< "$LABELS"
@@ -548,6 +559,11 @@ run_one(){ # $1=iteration index
     return "$prepared_rc"
   fi
 
+  if ! verify_runner_repository_access "$logdir"; then
+    note "[$i] runner repository access not proven — refusing JIT registration and discarding VM"
+    cleanup_job success
+    return 1
+  fi
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
