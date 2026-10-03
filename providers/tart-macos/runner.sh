@@ -300,7 +300,10 @@ LAST_HEARTBEAT_PHASE=""
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
+# Guests run untrusted job code: offer only the guest key and never forward
+# the operator's agent or X11 into them, whatever ~/.ssh/config says.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes
+  -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -448,6 +451,12 @@ source "$TARTCI_ROOT/providers/tart-macos/artifact-cache.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 # shellcheck source=providers/tart-macos/guest-dns.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/guest-dns.lib.sh"
+# shellcheck source=providers/common/guest-isolation.lib.sh
+source "$TARTCI_ROOT/providers/common/guest-isolation.lib.sh"
+tartci_guest_isolation_configure || die "invalid guest isolation configuration"
+# A read-only share has nowhere to put a job's write layer.
+[ "$TARTCI_HOST_CACHE_ACCESS_MODE" = rw ] || [ "$CCACHE_LAYER_ENABLED" = 0 ] \
+  || die "TARTCI_HOST_CACHE_ACCESS=ro cannot be combined with TARTCI_CCACHE_WRITE_ISOLATION=1"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -1621,18 +1630,30 @@ run_runner_until_done_unlayered(){
     return 1
   fi
   jit=""
+  # Read-only host caches (TARTCI_HOST_CACHE_ACCESS=ro): ccache only reads the
+  # share, and configure checks run against a private copy that dies with the VM.
+  local configure_checks_prep ccache_ro_env="" ccache_ro_dotenv=""
+  configure_checks_prep="ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\""
+  if [ "$TARTCI_HOST_CACHE_ACCESS_MODE" = ro ]; then
+    configure_checks_prep="{ [ ! -L \"\$HOME/Library/Caches/Pulp/configure-checks\" ] || rm -f \"\$HOME/Library/Caches/Pulp/configure-checks\"; } && \
+mkdir -p \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
+rsync -a '/Volumes/My Shared Files/configure-checks/' \"\$HOME/Library/Caches/Pulp/configure-checks/\""
+    ccache_ro_env="export CCACHE_READONLY=true CCACHE_TEMPDIR=\"\$HOME/.ccache-tmp\" && "
+    ccache_ro_dotenv="printf '%s\n' 'CCACHE_READONLY=true' \"CCACHE_TEMPDIR=\$HOME/.ccache-tmp\" >> .env.tartci && "
+  fi
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
-     mkdir -p \"\$HOME/Library/Caches/Pulp\" && ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
-     ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
+     mkdir -p \"\$HOME/Library/Caches/Pulp\" && $configure_checks_prep && \
+     ${ccache_ro_env}ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
      ${CCACHE_LAYER_GUEST_PREP}export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      fetchcontent_hydrated=false && \
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE|CCACHE_READONLY|CCACHE_TEMPDIR)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
+     ${ccache_ro_dotenv}\
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      printf 'PULP_CONFIGURE_CHECK_CACHE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/configure-checks\" >> .env.tartci && \
      if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
@@ -1849,10 +1870,11 @@ boot_vm_to_ssh(){
   CURRENT_GUEST_CORES="$lease_cores"
   CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp "${TMPDIR:-/tmp}/tart-run-$vm.XXXXXX")"
+  local cache_ro; cache_ro="$(tartci_host_cache_mount_suffix)"
   local tart_dirs=(
-    --dir="ccache:$CACHE_ROOT/ccache"
+    --dir="ccache:$CACHE_ROOT/ccache$cache_ro"
     --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
-    --dir="configure-checks:$CACHE_ROOT/configure-checks"
+    --dir="configure-checks:$CACHE_ROOT/configure-checks$cache_ro"
   )
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
   CURRENT_PIP_WHEELHOUSE=0
@@ -1866,6 +1888,7 @@ boot_vm_to_ssh(){
     CURRENT_ARTIFACT_CACHE=1
   fi
   tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
+    ${TARTCI_TART_NETWORK_ARGS[@]+"${TARTCI_TART_NETWORK_ARGS[@]}"} \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat "$boot_phase"

@@ -4,6 +4,10 @@ set -euo pipefail
 
 host_cache="${1:-/mnt/host/ccache}"
 cache_link="${2:-$HOME/.ccache}"
+# rw: the share must be writable. ro: the host mounted it read-only for an
+# untrusted lane (TARTCI_HOST_CACHE_ACCESS=ro); it must be readable and the
+# guest's ccache runs with CCACHE_READONLY.
+access="${3:-rw}"
 mount_root="$(dirname "$host_cache")"
 mount_info="${TARTCI_CCACHE_MOUNT_INFO:-}"
 
@@ -20,8 +24,14 @@ case "$mount_info" in
     ;;
 esac
 
-if [ ! -d "$host_cache" ] || [ ! -w "$host_cache" ]; then
-  printf 'TARTCI_DIAG ccache_binding=unusable host_cache=%s\n' "$host_cache" >&2
+usable=0
+case "$access" in
+  rw) [ -d "$host_cache" ] && [ -w "$host_cache" ] && usable=1 ;;
+  ro) [ -d "$host_cache" ] && [ -r "$host_cache" ] && usable=1 ;;
+  *) printf 'TARTCI_DIAG ccache_binding=invalid_access access=%s\n' "$access" >&2; exit 70 ;;
+esac
+if [ "$usable" != 1 ]; then
+  printf 'TARTCI_DIAG ccache_binding=unusable host_cache=%s access=%s\n' "$host_cache" "$access" >&2
   exit 70
 fi
 
@@ -42,5 +52,5 @@ if [ ! -L "$cache_link" ] || [ "$resolved" != "$expected" ]; then
   exit 70
 fi
 
-printf 'TARTCI_DIAG ccache_binding=host link=%s resolved=%s\n' \
-  "$cache_link" "$resolved"
+printf 'TARTCI_DIAG ccache_binding=host link=%s resolved=%s access=%s\n' \
+  "$cache_link" "$resolved" "$access"

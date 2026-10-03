@@ -71,7 +71,9 @@ IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-${PULP_RUNNER_IDLE_TIMEOUT_SECS
 HOST_SLUG="$(hostname -s 2>/dev/null || hostname)"
 HOST_SLUG="$(printf '%s' "$HOST_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
 RUNNER_NAME_PREFIX="${TARTCI_RUNNER_NAME_PREFIX:-${PULP_RUNNER_NAME_PREFIX:-win-ephr-${HOST_SLUG:-host}}}"
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
+# Guests run untrusted job code: never forward the operator's agent or X11.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes
+  -o ForwardAgent=no -o ForwardX11=no)
 CURRENT_WIN_JOB=""
 CURRENT_WIN_JOBDIR=""
 CURRENT_WIN_PORT_LOCK=""
@@ -455,7 +457,9 @@ run_one(){ # $1=iteration index
     network="$network,restrict=on"
     if [ -z "${LOCAL_JOB:-}" ]; then
       [ -n "${TARTCI_WIN_PROXY_COMMAND:-}" ] || { cleanup_active_windows_job; return 1; }
-      network="$network,guestfwd=tcp:10.0.2.100:3128-cmd:$TARTCI_WIN_PROXY_COMMAND"
+      # QEMU splits -netdev options on commas; a literal comma is doubled, so a
+      # comma in the command cannot smuggle in options such as restrict=off.
+      network="$network,guestfwd=tcp:10.0.2.100:3128-cmd:${TARTCI_WIN_PROXY_COMMAND//,/,,}"
     fi
   fi
   tartci_vm_lease_guard_exec qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$effective_win_cpus" -m "$WIN_MEMORY_MB" \
@@ -804,6 +808,8 @@ exit $LASTEXITCODE'
   local run_status=0
   local runner_output="$logdir/runner-output.log"
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed
+  local runner_assigned_at=0 job_timeout="${TARTCI_JOB_TIMEOUT_SECS:-21600}"
+  case "$job_timeout" in ''|0|*[!0-9]*) job_timeout=21600 ;; esac
   run_guest_ps_file "C:\actions-runner\tartci-runner.ps1" "$ps_run" >"$runner_output" 2>&1 &
   runner_pid=$!
   if ! tartci_pool_lock_handoff_to_listener "$runner_pid"; then
@@ -815,6 +821,15 @@ exit $LASTEXITCODE'
   while kill -0 "$runner_pid" 2>/dev/null; do
     if [ "$runner_assigned" = 0 ] && grep -q 'Running job:' "$runner_output" 2>/dev/null; then
       runner_assigned=1
+      runner_assigned_at="$(now_epoch)"
+    fi
+    # Host-side backstop (GitHub's six-hour default unless TARTCI_JOB_TIMEOUT_SECS):
+    # a wedged or hostile job must not keep the VM alive indefinitely.
+    if [ "$runner_assigned" = 1 ] && [ $(( $(now_epoch) - runner_assigned_at )) -ge "$job_timeout" ]; then
+      runner_timed_out=1
+      note "[$i] job exceeded TARTCI_JOB_TIMEOUT_SECS=${job_timeout}s — stopping the runner"
+      kill "$runner_pid" 2>/dev/null || true
+      break
     fi
     if [ "$runner_assigned" = 0 ]; then
       now="$(now_epoch)"

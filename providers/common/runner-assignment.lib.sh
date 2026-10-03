@@ -40,6 +40,11 @@ tartci_validate_runner_idle_timeout() {
     TARTCI_RUNNER_IDLE_TIMEOUT_SECS "${1:-}" 86400
 }
 
+# Host-side backstop for an assigned job, in seconds. GitHub's own default job
+# timeout is six hours; without a host deadline a wedged or hostile job could
+# keep its VM (and its share of the host) alive indefinitely.
+TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT=21600
+
 _tartci_observe_runner_assignment() {
   local runner_log="$1" assigned_fn="${2:-}" assignment_line=""
   [ "$TARTCI_RUNNER_WAS_ASSIGNED" = 0 ] || return 0
@@ -56,16 +61,21 @@ _tartci_observe_runner_assignment() {
 #
 # Returns the runner's status, or 124 when it remained unassigned for TIMEOUT
 # seconds. Once "Running job:" is observed, the assignment deadline is
-# permanently disabled and the valid job is allowed to finish.
+# permanently disabled and the valid job may run for up to
+# TARTCI_JOB_TIMEOUT_SECS (default six hours) before it is killed (also 124,
+# with TARTCI_RUNNER_WAS_ASSIGNED=1).
 tartci_monitor_runner_assignment() {
   local runner_pid="$1" runner_log="$2" timeout="$3" cleanup_fn="$4"
   local poll="${5:-5}" assigned_fn="${6:-}" authoritative_fn="${7:-}"
-  local started now idle_elapsed rc=0 authoritative_rc=1
+  local started now idle_elapsed rc=0 authoritative_rc=1 assigned_at=""
   local uncertainty_count=0 uncertainty_max="${TARTCI_RUNNER_ASSIGNMENT_VERIFY_ATTEMPTS:-3}"
+  local job_timeout="${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}"
   TARTCI_RUNNER_WAS_ASSIGNED=0
   tartci_validate_runner_idle_timeout "$timeout" || return $?
   tartci_validate_bounded_positive_integer \
     TARTCI_RUNNER_ASSIGNMENT_VERIFY_ATTEMPTS "$uncertainty_max" 20 || return $?
+  tartci_validate_bounded_positive_integer \
+    TARTCI_JOB_TIMEOUT_SECS "$job_timeout" 432000 || return $?
   if ! declare -F "$cleanup_fn" >/dev/null 2>&1; then
     printf 'runner assignment cleanup callback is unavailable: %s\n' \
       "$cleanup_fn" >&2
@@ -75,6 +85,18 @@ tartci_monitor_runner_assignment() {
   started="$(date +%s)"
   while kill -0 "$runner_pid" 2>/dev/null; do
     _tartci_observe_runner_assignment "$runner_log" "$assigned_fn"
+    if [ "$TARTCI_RUNNER_WAS_ASSIGNED" = 1 ]; then
+      now="$(date +%s)"
+      [ -n "$assigned_at" ] || assigned_at="$now"
+      if [ $((now - assigned_at)) -ge "$job_timeout" ]; then
+        printf 'TARTCI_DIAG runner_job=timeout elapsed=%ss limit=%ss\n' \
+          "$((now - assigned_at))" "$job_timeout" >&2
+        kill -9 "$runner_pid" 2>/dev/null || true
+        wait "$runner_pid" 2>/dev/null || true
+        "$cleanup_fn"
+        return 124
+      fi
+    fi
     if [ "$TARTCI_RUNNER_WAS_ASSIGNED" = 0 ]; then
       now="$(date +%s)"
       idle_elapsed=$((now - started))
