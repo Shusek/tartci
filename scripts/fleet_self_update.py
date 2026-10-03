@@ -56,6 +56,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - the launchd python is 3.9
@@ -888,37 +892,9 @@ def census_env() -> dict[str, str]:
     }
 
 
-def peer_mints_on_demand(value: Any) -> str | None:
-    """None when a peer's `pool status --json` proves it can mint on demand.
-
-    Otherwise the reason it cannot be counted. Every field is required, so a
-    peer whose tartci predates one of them, or whose status is unreadable,
-    is not counted: capability that cannot be read is not capability.
-    """
-    if not isinstance(value, dict):
-        return "pool status unreadable"
-    if value.get("state") != "on" or value.get("participating") is not True:
-        return f"pool is {value.get('state')} (participating={value.get('participating')})"
-    fleet = value.get("fleet")
-    if not isinstance(fleet, dict):
-        return "pool status reports no fleet section"
-    if fleet.get("managed") is not True or fleet.get("fleet_ready") is not True:
-        return (f"fleet not ready (managed={fleet.get('managed')}, "
-                f"fleet_ready={fleet.get('fleet_ready')})")
-    if fleet.get("problems"):
-        return f"fleet problems: {fleet.get('problems')}"
-    expected, running = fleet.get("expected_supervisors"), fleet.get("verified_running_supervisors")
-    if not (isinstance(expected, int) and isinstance(running, int)
-            and expected >= 1 and running >= expected):
-        return f"supervisors {running}/{expected} verified running"
-    serving = fleet.get("serving")
-    if not isinstance(serving, dict) or serving.get("blocked") is not False:
-        return f"serving blocked or unmeasured: {serving}"
-    supply = (fleet.get("config") or {}).get("supply") if isinstance(fleet.get("config"), dict) else None
-    if not isinstance(supply, dict) or supply.get("state") != "match":
-        return ("installed supply does not match the published supply "
-                f"({supply.get('state') if isinstance(supply, dict) else 'unreported'})")
-    return None
+# The capacity floor owns the judgement of whether a peer can mint on demand;
+# this module reuses it so the two never disagree about the same peer.
+peer_mints_on_demand = capacity_floor.peer_mints_on_demand
 
 
 def on_demand_supply(cfg: Config, sys_: System, me: str,
