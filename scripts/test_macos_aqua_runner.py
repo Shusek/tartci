@@ -137,10 +137,10 @@ def processes_tagged(tag: str, pgids: frozenset = frozenset()) -> list[tuple[int
     A process belongs when its argv or environment holds tag, or it shares a
     process group with one that does, or its group is listed in pgids.  The
     group rules catch children such as `/bin/bash ./run.sh` whose argv never
-    names the tag and whose environment `ps -E` cannot show.
+    names the tag and whose environment `ps e` cannot show (platform binaries on macOS).
     """
     output = subprocess.run(
-        ["/bin/ps", "-axwwE", "-o", "pid=,pgid=,stat=,command="],
+        ["/bin/ps", "axwwe", "-o", "pid=,pgid=,stat=,command="],
         text=True,
         capture_output=True,
         check=True,
