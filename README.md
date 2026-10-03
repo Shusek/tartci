@@ -54,8 +54,12 @@ needs no tartci update to be read.
 Both `drain` and `off` run a **capacity floor** first
 (`scripts/capacity_floor.py`): they refuse when no host other than this one
 serves a required gate label, because that mutation takes the label to zero
-runners and stalls every pull request waiting on it. The refusal names the
-label and the host; `--allow-last-serving-host` proceeds anyway. An
+runners and stalls every pull request waiting on it. Another host serves a
+label when it has an online runner carrying it, or when it declares a lane tier
+for it in `fleet/advertised-labels.json` and its own `pool status --json`, read
+over SSH, proves it is live and minting on demand (fleet runners are ephemeral,
+so an idle fleet registers none). The refusal names the label, the host, and
+every declaring peer with why it did or did not count; `--allow-last-serving-host` proceeds anyway. An
 indeterminate answer — an unreadable runner scope, an unresolvable host
 identity — refuses too, since it cannot tell "another host is serving" apart
 from "nobody is". A later `pool on` restores only the exact

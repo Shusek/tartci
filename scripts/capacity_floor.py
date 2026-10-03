@@ -14,6 +14,22 @@ each required label this host declares? A label another host still serves is
 free to drain. A label only this host serves refuses, naming the label and the
 host, and proceeds only under an explicit `--allow-last-serving-host`.
 
+A label is also served elsewhere when another fleet host mints its runners on
+demand. Fleet runners are ephemeral JIT registrations that exist only while they
+hold a job, so "no other host has a runner registered right now" is the normal
+idle state of a healthy fleet, not a missing server; counting only registered
+runners made every quiet moment read as "last serving host" and left a host
+unable to drain except while a peer happened to be mid-job. So when the census
+finds no other runner, the guard also asks every other host that DECLARES a lane
+tier for the label in the published supply (fleet/advertised-labels.json)
+whether it is provably live and serving now, by reading that host's own `pool
+status --json` over SSH. A peer counts only when every field proves it: pool on
+and participating, managed and fleet-ready, no fleet problems (a stale heartbeat
+is one), every expected supervisor verified running, serving not blocked, and
+installed supply matching the published supply. Off, draining, unreadable,
+unreachable or older peers do not count, and the refusal names each peer it
+considered and why.
+
 Every indeterminate answer refuses. An unreachable runner scope, a host with no
 resolvable identity, and a persistent runner whose registered name cannot be
 derived are all cases where "another host is serving" and "nobody is" look
@@ -39,6 +55,7 @@ import os
 import re
 import socket
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -49,6 +66,12 @@ import runner_census
 from runner_census import RunnerCensus, RunnerRecord
 
 DEFAULT_PROFILE = "~/.config/tartci/macos-fleet-profile.toml"
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PUBLISHED_SUPPLY = ROOT / "fleet" / "advertised-labels.json"
+# A peer with no `ssh` in the published supply is reached through this alias.
+SSH_ALIAS_CONVENTION = "tartci-{host_id}"
+PEER_STATUS_COMMAND = "cd ~ && ~/.local/bin/tartci pool status --json"
+DEFAULT_PEER_TIMEOUT = 60.0
 
 # Verdicts a single (repo, label) pair can reach.
 SERVED_ELSEWHERE = "served_elsewhere"
@@ -254,6 +277,92 @@ def owner_matcher(
     return owned
 
 
+# ── on-demand peer supply (pure) ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PeerEvidence:
+    """One other host that declares a protected label, and the verdict on it."""
+
+    host: str
+    counted: bool
+    why: str
+
+    def as_dict(self) -> dict:
+        return {"host": self.host, "counted": self.counted, "why": self.why}
+
+    def describe(self) -> str:
+        return f"{self.host} {'counted' if self.counted else 'not counted'} ({self.why})"
+
+
+def peer_mints_on_demand(value: Any) -> str | None:
+    """None when a peer's `pool status --json` proves it can mint on demand.
+
+    Otherwise the reason it cannot be counted. Every field is required, so a
+    peer whose tartci predates one of them, or whose status is unreadable,
+    is not counted: capability that cannot be read is not capability.
+    """
+    if not isinstance(value, dict):
+        return "pool status unreadable"
+    if value.get("state") != "on" or value.get("participating") is not True:
+        return f"pool is {value.get('state')} (participating={value.get('participating')})"
+    fleet = value.get("fleet")
+    if not isinstance(fleet, dict):
+        return "pool status reports no fleet section"
+    if fleet.get("managed") is not True or fleet.get("fleet_ready") is not True:
+        return (f"fleet not ready (managed={fleet.get('managed')}, "
+                f"fleet_ready={fleet.get('fleet_ready')})")
+    if fleet.get("problems"):
+        return f"fleet problems: {fleet.get('problems')}"
+    expected, running = fleet.get("expected_supervisors"), fleet.get("verified_running_supervisors")
+    if not (isinstance(expected, int) and isinstance(running, int)
+            and expected >= 1 and running >= expected):
+        return f"supervisors {running}/{expected} verified running"
+    serving = fleet.get("serving")
+    if not isinstance(serving, dict) or serving.get("blocked") is not False:
+        return f"serving blocked or unmeasured: {serving}"
+    supply = (fleet.get("config") or {}).get("supply") if isinstance(fleet.get("config"), dict) else None
+    if not isinstance(supply, dict) or supply.get("state") != "match":
+        return ("installed supply does not match the published supply "
+                f"({supply.get('state') if isinstance(supply, dict) else 'unreported'})")
+    return None
+
+
+def live_summary(value: dict) -> str:
+    """Why a peer that passed every check counts, in one line."""
+    fleet = value.get("fleet") or {}
+    return (f"pool on, fleet ready, {fleet.get('verified_running_supervisors')}/"
+            f"{fleet.get('expected_supervisors')} supervisors verified running, "
+            "serving unblocked, supply matches")
+
+
+def declaring_hosts(supply: dict, *, repo: str, label: str, exclude: str) -> tuple[str, ...]:
+    """Hosts other than `exclude` whose published lanes carry `label` for `repo`."""
+    hosts = set()
+    for row in supply.get("registrations") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("host_id"), str):
+            continue
+        if row["host_id"] == exclude or row.get("repo") != repo:
+            continue
+        if row.get("class_label") == label or label in (row.get("labels") or []):
+            hosts.add(row["host_id"])
+    return tuple(sorted(hosts))
+
+
+def ssh_targets(supply: dict) -> dict[str, str]:
+    """host_id -> SSH target: the published `ssh`, else the alias convention."""
+    targets: dict[str, str] = {}
+    for row in supply.get("hosts") or []:
+        if isinstance(row, dict) and isinstance(row.get("host_id"), str):
+            ssh = row.get("ssh")
+            targets[row["host_id"]] = (ssh if isinstance(ssh, str) and ssh
+                                       else SSH_ALIAS_CONVENTION.format(host_id=row["host_id"]))
+    return targets
+
+
+PeerResolver = Callable[[str, str], Sequence[PeerEvidence]]
+
+
 # ── decision core (pure; no I/O) ────────────────────────────────────────────
 
 
@@ -265,6 +374,8 @@ class Finding:
     remaining: tuple[str, ...] = ()
     owned_here: tuple[str, ...] = ()
     detail: str = ""
+    # Every other host that declares this label, and whether it was counted.
+    peers: tuple["PeerEvidence", ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -274,6 +385,7 @@ class Finding:
             "remaining": list(self.remaining),
             "owned_here": list(self.owned_here),
             "detail": self.detail,
+            "peers": [peer.as_dict() for peer in self.peers],
         }
 
 
@@ -317,12 +429,16 @@ def classify(
     censuses: dict[str, RunnerCensus],
     owned: Callable[[RunnerRecord], bool],
     allow_last_serving_host: bool = False,
+    peers: PeerResolver | None = None,
 ) -> Decision:
     """Decide whether `action` may proceed on `host`.
 
     Capacity that survives the mutation is an online runner carrying the label
-    that this host does not own. Offline registrations do not count: a drained
-    or disconnected peer serves nothing.
+    that this host does not own, or another host that declares the label and
+    `peers` proves can mint it on demand now. Offline registrations do not
+    count: a drained or disconnected peer serves nothing. `peers` is consulted
+    only for a label the census found no other runner for, and a peer whose
+    liveness it cannot prove is not counted.
     """
     findings: list[Finding] = []
     unknown: Finding | None = None
@@ -362,6 +478,23 @@ def classify(
             findings.append(finding)
             unknown = unknown or finding
             continue
+        evidence = tuple(peers(entry.repo, entry.label)) if peers is not None else ()
+        live = tuple(f"{peer.host} (mints on demand)" for peer in evidence if peer.counted)
+        if live:
+            findings.append(
+                Finding(entry.repo, entry.label, SERVED_ELSEWHERE, live, owned_here,
+                        detail="no other runner is registered right now; "
+                        + "; ".join(peer.describe() for peer in evidence),
+                        peers=evidence)
+            )
+            continue
+        if peers is None:
+            considered = ""
+        elif evidence:
+            considered = ("; peers declaring it, none provably live: "
+                          + "; ".join(peer.describe() for peer in evidence))
+        else:
+            considered = "; no other host declares a lane tier for it in the published supply"
         offline = tuple(record.name for record in status.offline)
         if offline:
             detail = (
@@ -378,7 +511,8 @@ def classify(
                 "no host currently registers a runner carrying this label, and "
                 "this host is the one declaring it"
             )
-        finding = Finding(entry.repo, entry.label, LAST_SERVING_HOST, remaining, owned_here, detail)
+        finding = Finding(entry.repo, entry.label, LAST_SERVING_HOST, remaining, owned_here,
+                          detail + considered, peers=evidence)
         findings.append(finding)
         last = last or finding
 
@@ -475,6 +609,76 @@ def collect_censuses(
     return {repo: runner_census.collect(repo, fetch) for repo in dict.fromkeys(repos)}
 
 
+def load_published_supply(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def peer_resolver(
+    supply_path: Path,
+    *,
+    host: str,
+    ssh: str = "ssh",
+    timeout: float = DEFAULT_PEER_TIMEOUT,
+) -> PeerResolver:
+    """Judge declaring peers by reading their own `pool status --json` over SSH.
+
+    Each peer is read at most once per run, and all of a label's declaring
+    peers are read concurrently, so a slow or unreachable peer costs one
+    `timeout`, not one per peer. Any failure to read, parse or prove a peer
+    leaves it uncounted.
+    """
+    supply = load_published_supply(supply_path)
+    cache: dict[str, PeerEvidence] = {}
+
+    def read(peer: str, target: str) -> PeerEvidence:
+        from bounded_subprocess import ObservationError, run_bounded
+
+        argv = [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                target, PEER_STATUS_COMMAND]
+        try:
+            proc = run_bounded(argv, timeout=timeout, operation="peer_status")
+        except (ObservationError, OSError) as exc:
+            return PeerEvidence(peer, False, f"pool status unreadable via {target}: {exc}")
+        try:
+            value = json.loads(proc.stdout)
+        except ValueError:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            return PeerEvidence(
+                peer, False,
+                f"pool status unreadable via {target} (exit {proc.returncode})"
+                + (f": {tail[-1][:160]}" if tail else ""),
+            )
+        why = peer_mints_on_demand(value)
+        if why is not None:
+            return PeerEvidence(peer, False, why)
+        return PeerEvidence(peer, True, live_summary(value))
+
+    def resolve(repo: str, label: str) -> Sequence[PeerEvidence]:
+        if supply is None:
+            return (PeerEvidence("(published supply)", False,
+                                 f"{supply_path} is unreadable, so no peer can be judged"),)
+        declaring = declaring_hosts(supply, repo=repo, label=label, exclude=host)
+        targets = ssh_targets(supply)
+        pending = [peer for peer in declaring if peer not in cache]
+        if pending:
+            with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+                results = pool.map(
+                    lambda peer: read(peer, targets.get(peer)
+                                      or SSH_ALIAS_CONVENTION.format(host_id=peer)),
+                    pending,
+                )
+                for peer, evidence in zip(pending, results):
+                    cache[peer] = evidence
+        return tuple(cache[peer] for peer in declaring)
+
+    return resolve
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Refuse a pool mutation that takes the last required-label capacity offline."
@@ -492,6 +696,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gh-cli", default="", help="GitHub CLI wrapper (default: $TARTCI_GH_CLI)")
     parser.add_argument("--timeout", type=float, default=15.0, help="per-scope API timeout")
+    parser.add_argument(
+        "--published-supply",
+        default=str(DEFAULT_PUBLISHED_SUPPLY),
+        help="published supply naming which hosts declare each label",
+    )
+    parser.add_argument("--ssh", default="ssh", help="SSH client used to read peers' pool status")
+    parser.add_argument(
+        "--peer-timeout", type=float, default=DEFAULT_PEER_TIMEOUT,
+        help="bound on reading one peer's pool status",
+    )
     parser.add_argument(
         "--allow-last-serving-host",
         action="store_true",
@@ -527,6 +741,10 @@ def run(args: argparse.Namespace) -> Decision:
         censuses=censuses,
         owned=owned,
         allow_last_serving_host=args.allow_last_serving_host,
+        peers=peer_resolver(
+            Path(os.path.expanduser(args.published_supply)),
+            host=host, ssh=args.ssh, timeout=args.peer_timeout,
+        ),
     )
 
 
