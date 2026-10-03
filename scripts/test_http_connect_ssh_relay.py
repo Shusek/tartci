@@ -486,28 +486,20 @@ class PortInUseTests(unittest.TestCase):
         value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", template.read_bytes(), flags=re.DOTALL))
         self.assertGreaterEqual(value.get("ThrottleInterval", 0), 30)
 
-    # The flags the relay script deployed at ~/.local/share/tartci/scripts on
-    # every host accepts (sha256 1553367fdcb96919…, 2026-08-31). Self-update
-    # never refreshes that copy, so a template flag outside this set makes the
-    # relay exit 2 at start: on 2026-10-02 `--log-path` did, and m5's update
-    # rolled back at the relay probe.
-    DEPLOYED_RELAY_FLAGS = frozenset({
-        "--listen-host", "--listen-port", "--allow-route", "--relay-host",
-        "--allow-host-suffix", "--ssh", "--connect-timeout", "--header-timeout",
-        "--tunnel-idle-timeout", "--write-timeout", "--max-handlers",
-    })
-
-    def test_the_plist_passes_only_flags_the_deployed_relay_accepts(self) -> None:
+    def test_the_plist_runs_the_installed_relay_with_arguments_it_accepts(self) -> None:
+        # The relay used to run a copy self-update never refreshed; a template
+        # flag that copy rejected rolled back m5's update on 2026-10-02. It now
+        # runs this generation's script, so this parser is the one that reads
+        # the arguments.
         import plistlib
         import re
         template = (ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template")
         value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", template.read_bytes(), flags=re.DOTALL))
-        args = value["ProgramArguments"]
-        if not args[1].startswith("$HOME/.local/share/tartci/scripts/"):
-            self.skipTest("the relay no longer runs the copy self-update never refreshes")
-        flags = {arg for arg in args if arg.startswith("--")}
-        self.assertLessEqual(flags, self.DEPLOYED_RELAY_FLAGS,
-                             f"not accepted by the deployed relay: {flags - self.DEPLOYED_RELAY_FLAGS}")
+        args = [a.replace("$HOME", "/Users/x").replace("$TARTCI_HTTP_RELAY_PRIMARY", "a")
+                .replace("$TARTCI_HTTP_RELAY_SECONDARY", "b") for a in value["ProgramArguments"]]
+        self.assertEqual(args[:3], ["/bin/bash", "/Users/x/.local/bin/tartci", "network-relay"])
+        parsed = relay.parse_args(args[3:])
+        self.assertEqual(parsed.log_path, value["StandardErrorPath"].replace("$HOME", "/Users/x"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

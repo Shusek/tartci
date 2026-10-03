@@ -7,8 +7,9 @@
     <string>com.danielraffel.network.http-connect-ssh-relay</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>$HOME/.local/share/tartci/scripts/http_connect_ssh_relay.py</string>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>network-relay</string>
         <string>--allow-route</string>
         <string>127.0.0.0/8=127.0.0.1</string>
         <string>--allow-route</string>
@@ -45,6 +46,8 @@
         <string>crates.io</string>
         <string>--allow-host-suffix</string>
         <string>sigstore.dev</string>
+        <string>--log-path</string>
+        <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
