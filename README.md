@@ -1,6 +1,10 @@
 # tartci — local CI VMs on macOS (Tart + QEMU + Shipyard)
 
-[![lint](https://github.com/danielraffel/tartci/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/tartci/actions/workflows/ci.yml)
+[![lint](https://github.com/Shusek/tartci/actions/workflows/ci.yml/badge.svg)](https://github.com/Shusek/tartci/actions/workflows/ci.yml)
+
+This fork adds opt-in support for prepared macOS and Windows CI guests,
+explicit resource budgets, workflow admission policies, and shared runner
+groups. See [the fork guide](docs/suvio-fork.md) for the changes and update policy.
 
 Stand up **fast, cached, disposable Linux / Windows / macOS build VMs on an Apple
 Silicon Mac**, optionally wired to GitHub runners +
