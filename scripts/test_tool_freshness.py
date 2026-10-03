@@ -639,7 +639,7 @@ class PulpInstallScriptTests(unittest.TestCase):
     BASE = "https://github.com/Generous-Corp/pulp/releases/download/v0.880.0"
     INSTALLER_URL = "https://raw.githubusercontent.com/Generous-Corp/pulp/v0.880.0/tools/install/install.sh"
     ARCHIVE = "archive\n"
-    INSTALLER = ('echo "ran PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
+    INSTALLER = ('echo "INSTALLER-RAN PULP_VERSION=$PULP_VERSION DIR=$PULP_INSTALL_DIR '
                  'NOPATH=$PULP_NO_MODIFY_PATH NOSDK=$PULP_SKIP_SDK_INSTALL '
                  'ARCHIVE=$(cat "$PULP_INSTALL_ARCHIVE")" >> "$RECORD"\n')
 
@@ -688,7 +688,7 @@ class PulpInstallScriptTests(unittest.TestCase):
         self.assertEqual(lines[:3], [f"url={self.INSTALLER_URL}", f"url={self.BASE}/SHA256SUMS",
                                      f"url={self.BASE}/pulp-darwin-arm64.tar.gz"])
         home_bin = str(Path(record).parent / "home" / ".pulp" / "bin")
-        self.assertEqual(lines[3], f"ran PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1 "
+        self.assertEqual(lines[3], f"INSTALLER-RAN PULP_VERSION=0.880.0 DIR={home_bin} NOPATH=1 NOSDK=1 "
                                    "ARCHIVE=archive")
 
     def test_any_download_404_is_not_ready_and_installs_nothing(self) -> None:
@@ -697,18 +697,18 @@ class PulpInstallScriptTests(unittest.TestCase):
                 proc, record = self.run_script(missing=missing)
                 self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
                 self.assertIn("not ready", proc.stderr)
-                self.assertNotIn("ran", record.read_text())
+                self.assertNotIn("INSTALLER-RAN", record.read_text())
 
     def test_a_checksum_file_without_this_platform_is_not_ready(self) -> None:
         proc, record = self.run_script(sums=f"{'1' * 64}  pulp-linux-x64.tar.gz\n")
         self.assertEqual(proc.returncode, tf.NOT_READY_EXIT, proc.stderr)
-        self.assertNotIn("ran", record.read_text())
+        self.assertNotIn("INSTALLER-RAN", record.read_text())
 
     def test_a_downloaded_archive_with_the_wrong_checksum_is_refused(self) -> None:
         proc, record = self.run_script(sums=f"{'0' * 64}  pulp-darwin-arm64.tar.gz\n")
         self.assertEqual(proc.returncode, 4)
         self.assertIn("refused", proc.stderr)
-        self.assertNotIn("ran", record.read_text())
+        self.assertNotIn("INSTALLER-RAN", record.read_text())
 
     def test_a_local_archive_is_installed_only_when_its_checksum_matches(self) -> None:
         tmp = Path(tempfile.mkdtemp())
@@ -723,14 +723,14 @@ class PulpInstallScriptTests(unittest.TestCase):
         proc, record = self.run_script(local=str(bad))
         self.assertEqual(proc.returncode, 4)
         self.assertIn("refused: local archive", proc.stderr)
-        self.assertNotIn("ran", record.read_text())
+        self.assertNotIn("INSTALLER-RAN", record.read_text())
 
     def test_refuses_an_installer_that_strands_the_runtime(self) -> None:
         proc, record = self.run_script("tar --exclude='libwgpu_native.dylib' -xzf x\n"
-                                       "echo ran >> \"$RECORD\"\n")
+                                       "echo INSTALLER-RAN >> \"$RECORD\"\n")
         self.assertEqual(proc.returncode, 3)
         self.assertIn("strands pulp-cpp without its runtime", proc.stderr)
-        self.assertNotIn("ran", record.read_text())
+        self.assertNotIn("INSTALLER-RAN", record.read_text())
 
 
 class ReleaseProbeTests(unittest.TestCase):

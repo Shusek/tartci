@@ -2244,7 +2244,7 @@ else:
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("assignment scan failed closed", result.stderr)
         self.assertIn("after 3 attempt(s)", result.stderr)
-        self.assertNotIn("0", result.stdout.strip() or "x")
+        self.assertNotEqual(result.stdout.strip(), "0")
         # Bounded: three attempts, not an unbounded hammer.
         self.assertEqual(len([r for r in requests if "actions/workflows?" in r]), 3, requests)
 
