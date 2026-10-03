@@ -488,43 +488,7 @@ run_one(){ # $1=iteration index
     cleanup_job failure; return 1
   fi
   t_booted="$(now_epoch)"
-  if [ -n "${GUEST_DRIVER:-}" ]; then
-    local prepared_rc=0 prepared_jit="" prepared_log="$logdir/actions-runner.log"
-    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation guest-preflight -- "$GUEST_DRIVER" preflight "$job" "$port" || prepared_rc=$?
-    if [ "$prepared_rc" = 0 ]; then
-      if [ -n "${LOCAL_JOB:-}" ]; then
-        python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --operation local-job -- "$GUEST_DRIVER" run-local "$job" "$port" "$LOCAL_JOB" >"$prepared_log" 2>&1 || prepared_rc=$?
-      else
-        python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$logdir/repository-access.json" || prepared_rc=$?
-        if [ "$prepared_rc" = 0 ] && tartci_pool_lock_acquire; then
-          local prepared_labels=() label
-          IFS=',' read -r -a prepared_labels <<< "$LABELS"
-          label_args=(); for label in "${prepared_labels[@]}"; do label_args+=(-f "labels[]=$label"); done
-          prepared_jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" --jq '.encoded_jit_config')" || prepared_rc=$?
-          if [ "$prepared_rc" = 0 ] && [ -n "$prepared_jit" ]; then
-            printf '%s' "$prepared_jit" | python3 "$TARTCI_ROOT/scripts/guest_driver_listener.py" --idle-timeout "$IDLE_TIMEOUT" --job-timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --receipt "$logdir/listener.json" -- "$GUEST_DRIVER" run-jit "$job" "$port" >"$prepared_log" 2>&1 &
-            CURRENT_PREPARED_LISTENER_PID=$!
-            if ! tartci_pool_lock_handoff_to_listener "$CURRENT_PREPARED_LISTENER_PID"; then
-              kill -TERM "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
-            fi
-            while kill -0 "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null; do
-              sleep 1
-            done
-            wait "$CURRENT_PREPARED_LISTENER_PID" || prepared_rc=$?
-            CURRENT_PREPARED_LISTENER_PID=""
-          else prepared_rc=1; fi
-          prepared_jit=""
-          tartci_pool_lock_release
-        else prepared_rc=75; fi
-      fi
-    fi
-    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 120 --operation guest-collect -- "$GUEST_DRIVER" collect "$job" "$port" || prepared_rc=1
-    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 30 --operation guest-stop -- "$GUEST_DRIVER" stop "$job" "$port" || prepared_rc=1
-    cleanup_job "$([ "$prepared_rc" = 0 ] && printf success || printf failure)"
-    return "$prepared_rc"
-  fi
-
-  if tartci_admission_clean_enabled; then
+  if [ -z "${LOCAL_JOB:-}" ] && tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
     write_state admission-check
     if admission_json="$(tartci_admission_clean "$REPO" "$LABELS")"; then
@@ -543,6 +507,45 @@ run_one(){ # $1=iteration index
       cleanup_job success
       return "$admission_rc"
     fi
+  fi
+
+  if [ -n "${GUEST_DRIVER:-}" ]; then
+    local prepared_rc=0 prepared_jit="" prepared_log="$logdir/actions-runner.log"
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation guest-preflight -- "$GUEST_DRIVER" preflight "$job" "$port" || prepared_rc=$?
+    if [ "$prepared_rc" = 0 ]; then
+      if [ -n "${LOCAL_JOB:-}" ]; then
+        python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --operation local-job -- "$GUEST_DRIVER" run-local "$job" "$port" "$LOCAL_JOB" >"$prepared_log" 2>&1 || prepared_rc=$?
+      else
+        python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$logdir/repository-access.json" || prepared_rc=$?
+        if [ "$prepared_rc" = 0 ] && tartci_pool_lock_acquire && tartci_pool_admission_open; then
+          local prepared_labels=() label
+          IFS=',' read -r -a prepared_labels <<< "$LABELS"
+          label_args=(); for label in "${prepared_labels[@]}"; do label_args+=(-f "labels[]=$label"); done
+          prepared_jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" --jq '.encoded_jit_config')" || prepared_rc=$?
+          if [ "$prepared_rc" = 0 ] && [ -n "$prepared_jit" ]; then
+            printf '%s' "$prepared_jit" | python3 "$TARTCI_ROOT/scripts/guest_driver_listener.py" --idle-timeout "$IDLE_TIMEOUT" --job-timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --receipt "$logdir/listener.json" -- "$GUEST_DRIVER" run-jit "$job" "$port" >"$prepared_log" 2>&1 &
+            CURRENT_PREPARED_LISTENER_PID=$!
+            if ! tartci_pool_lock_handoff_to_listener "$CURRENT_PREPARED_LISTENER_PID"; then
+              kill -TERM "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
+            fi
+            while kill -0 "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null; do
+              sleep 1
+            done
+            wait "$CURRENT_PREPARED_LISTENER_PID" || prepared_rc=$?
+            CURRENT_PREPARED_LISTENER_PID=""
+          else prepared_rc=1; fi
+          prepared_jit=""
+          tartci_pool_lock_release
+        else
+          tartci_pool_lock_release
+          prepared_rc=75
+        fi
+      fi
+    fi
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 120 --operation guest-collect -- "$GUEST_DRIVER" collect "$job" "$port" || prepared_rc=1
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 30 --operation guest-stop -- "$GUEST_DRIVER" stop "$job" "$port" || prepared_rc=1
+    cleanup_job "$([ "$prepared_rc" = 0 ] && printf success || printf failure)"
+    return "$prepared_rc"
   fi
 
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"

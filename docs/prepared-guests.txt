@@ -28,6 +28,10 @@ storage can select a larger bounded preflight; local execution remains
 bounded by TARTCI_JOB_TIMEOUT_SECS. Windows prepared listener monitoring
 recognizes "Running job:" and defers termination of an assigned job until
 completion or the job deadline. It records assignment, drain and exit state.
+Before minting prepared Windows JIT, the configured Shipyard admission gate
+must admit the job and the pool must still be open under the transition lock.
+A refusal or a drain during preflight disposes the VM without minting JIT.
+Credential-free local jobs skip these GitHub admission checks.
 
 Explicit admission budgets:
 TARTCI_LEASE_CAPACITY_CORES / TARTCI_LEASE_CAPACITY_MEM_MB

@@ -12,7 +12,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 
 class PreparedGuestDriverTests(unittest.TestCase):
-    def execute(self,provider,fail=False,github=False,drain=False,lease_budget=False,delayed_delete=False):
+    def execute(self,provider,fail=False,github=False,drain=False,lease_budget=False,delayed_delete=False,admission=None,pool_drain=False):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);bin=root/'bin';bin.mkdir();(root/'vms').mkdir()
             driver=bin/'driver'
@@ -21,6 +21,8 @@ import json,os,sys
 from pathlib import Path
 p=Path(os.environ['FIXTURE'])
 with (p/'driver-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')
+if sys.argv[1]=='preflight' and os.environ.get('DRAIN_DURING_PREFLIGHT')=='1':
+ Path(os.environ['TARTCI_POOL_STATE_FILE']).write_text('draining\\n')
 if sys.argv[1]=='run-jit':
  assert sys.stdin.buffer.read()==b'ZmFrZS1qaXQ='
  print('Running job: fixture',flush=True)
@@ -55,7 +57,7 @@ elif a[0]=='list':
             for name in ['qemu-img','qemu-system-aarch64','ssh','fake-gh']:
                 script=bin/name
                 if name=='qemu-system-aarch64':text='#!/bin/bash\nexec sleep 300\n'
-                elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
+                elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json,os\nfrom pathlib import Path\nwith (Path(os.environ['FIXTURE'])/'gh-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
                 elif name=='fake-gh':text='#!/bin/bash\necho unexpected-gh >&2; exit 99\n'
                 else:text='#!/bin/bash\nexit 0\n'
                 script.write_text(text);script.chmod(0o700)
@@ -70,6 +72,23 @@ elif a[0]=='list':
                  'TARTCI_MACOS_VM_CORES':'4','TARTCI_MACOS_VM_MEM_MB':'8192','TARTCI_WIN_CPUS':'2',
                  'TARTCI_WIN_PROXY_COMMAND':'/usr/bin/true','TARTCI_RUNNER_IDLE_TIMEOUT_SECS':'4','TARTCI_TEARDOWN_STEP_TIMEOUT_SECS':'1','TARTCI_JOB_TIMEOUT_SECS':'10'}
             if provider=='tart-macos':env['TARTCI_RUNNER_VERSION']='2.337.0'
+            if pool_drain:env.update(DRAIN_DURING_PREFLIGHT='1',TARTCI_POOL_STATE_FILE=str(root/'pool-state'))
+            if admission:
+                shipyard=bin/'fake-shipyard'
+                shipyard.write_text('''#!/usr/bin/env python3
+import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+def arg(name):return args[args.index(name)+1]
+verdict=os.environ['ADMISSION_VERDICT']
+(Path(os.environ['FIXTURE'])/'admission-seen').touch()
+print(json.dumps({'schema_version':1,'command':'runner:admission-clean',
+ 'verdict':verdict,'reason':{'admit':'clean','defer':'stale_compatible_runs','error':'mutation_failed'}[verdict],
+ 'repo':arg('--repo'),'base':arg('--base'),'labels':sorted(set(arg('--labels').lower().split(','))),
+ 'observed_at':'2026-10-03T08:00:00Z','blocker_run_ids':[] if verdict=='admit' else [42]}))
+raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
+''');shipyard.chmod(0o700)
+                env.update(TARTCI_ADMISSION_CLEAN_MODE='required',TARTCI_SHIPYARD_CLI=str(shipyard),ADMISSION_VERDICT=admission)
             if lease_budget:
                 env.update(TARTCI_VM_LEASES='1',TARTCI_LEASE_DIR=str(root/'leases'),TARTCI_LEASE_CAPACITY_CORES='10',TARTCI_LEASE_CAPACITY_MEM_MB='24576',TARTCI_GATE_RESERVED_CORES='6',TARTCI_GATE_RESERVED_MEM_MB='12288',TARTCI_NON_GATE_CAPACITY_CORES='4',TARTCI_MACOS_VM_MEM_MB='12288')
             if delayed_delete:env.update(DELAY_DELETE='1',TARTCI_PENDING_DELETE_RETRY_SECS='1',TARTCI_PENDING_DELETE_MAX_ATTEMPTS='3')
@@ -88,9 +107,21 @@ elif a[0]=='list':
             else:
                 result=subprocess.run(command,env=env,capture_output=True,text=True,timeout=45 if lease_budget else 25)
             calls=[json.loads(s) for s in (root/'driver-calls').read_text().splitlines()] if (root/'driver-calls').exists() else []
-            self.assertEqual(result.returncode,9 if fail else 0,(result.stdout+result.stderr)[-6000:])
-            self.assertIn('preflight',[c[0] for c in calls])
-            self.assertIn('run-jit' if github else 'run-local',[c[0] for c in calls])
+            admission_refused=github and admission in ('defer','error')
+            jit_refused=admission_refused or (github and pool_drain)
+            expected=({'defer':3,'error':1}[admission] if admission_refused else (75 if pool_drain else (9 if fail else 0)))
+            self.assertEqual(result.returncode,expected,(result.stdout+result.stderr)[-6000:])
+            if jit_refused:
+                if admission_refused:self.assertTrue((root/'admission-seen').exists())
+                if pool_drain:self.assertIn('preflight',[c[0] for c in calls])
+                self.assertNotIn('run-jit',[c[0] for c in calls])
+                gh_calls=(root/'gh-calls').read_text() if (root/'gh-calls').exists() else ''
+                self.assertNotIn('generate-jitconfig',gh_calls)
+            else:
+                self.assertIn('preflight',[c[0] for c in calls])
+                self.assertIn('run-jit' if github else 'run-local',[c[0] for c in calls])
+                if admission and github:self.assertTrue((root/'admission-seen').exists())
+                if admission and not github:self.assertFalse((root/'admission-seen').exists())
             self.assertNotIn('unexpected-gh',result.stderr)
             if delayed_delete:self.assertIn('pending-delete VM',result.stdout+result.stderr)
             if lease_budget:
@@ -123,6 +154,19 @@ elif a[0]=='list':
 
     def test_windows_github_jit_fixture_and_cleanup(self):
         self.execute('qemu-windows',github=True)
+
+    def test_windows_required_admission_precedes_prepared_jit(self):
+        self.execute('qemu-windows',github=True,admission='admit')
+
+    def test_windows_admission_refusal_never_mints_jit_and_disposes_vm(self):
+        for verdict in ('defer','error'):
+            with self.subTest(verdict=verdict):self.execute('qemu-windows',github=True,admission=verdict)
+
+    def test_windows_credential_free_local_job_skips_github_admission(self):
+        self.execute('qemu-windows',admission='defer')
+
+    def test_windows_drain_during_preflight_prevents_jit_and_disposes_vm(self):
+        self.execute('qemu-windows',github=True,pool_drain=True)
 
     def test_windows_provider_drains_assigned_job_before_cleanup(self):
         self.execute('qemu-windows',github=True,drain=True)
