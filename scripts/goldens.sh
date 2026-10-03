@@ -146,7 +146,7 @@ if [ "$reload" = 1 ]; then
     # owns no VM/job right before bootout, which a log-tail heuristic cannot.
     # Never fall back to a raw bootout: a refusal (exit 3: mid-job or busy
     # state unknown) must leave the lane running.
-    tartci_bin="$HOME/.local/share/tartci/tartci"
+    tartci_bin="$HOME/.local/bin/tartci"
     pending="an unpinned lane picks up the new golden next cycle; a repointed pin takes effect after 'tartci launchd reload $label' once the lane is idle"
     if [ ! -x "$tartci_bin" ]; then
       note "not reloading: tartci is not installed at $tartci_bin — $pending"
