@@ -102,8 +102,10 @@ class InstallerIsSafeToRepeat(unittest.TestCase):
             self.assertIn("TARTCI_RECLAIM_PRESSURE_FREE_GB", env)
             self.assertIn("TARTCI_RECLAIM_FAIL_BELOW_GB", env)
             # A pass walks terabytes on the volumes gate VMs build on; it must
-            # yield CPU and I/O to them.
-            self.assertEqual(spec.get("ProcessType"), "Background")
+            # yield CPU and I/O to them, without being confined to the
+            # efficiency cores (Background), which stalls it under load.
+            self.assertEqual(spec.get("ProcessType"), "Standard")
+            self.assertGreaterEqual(spec.get("Nice", 0), 5)
             self.assertIs(spec.get("LowPriorityIO"), True)
 
     def test_rejects_an_unknown_argument(self):

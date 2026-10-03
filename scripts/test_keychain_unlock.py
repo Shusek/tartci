@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE))
 import keychain_unlock  # noqa: E402
 import tartci_launchd_watchdog as wd  # noqa: E402
 
-SECRET = 'pa ss"w\\\\rd'
+SECRET = 'Pw-Q7 ss"w\\\\rd'
 
 
 class Fixture(unittest.TestCase):
