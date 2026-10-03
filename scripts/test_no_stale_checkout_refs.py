@@ -23,10 +23,6 @@ STALE = re.compile(r"\.local/share/tartci(?!/update-checkout)(?![\w-])")
 # change that moves it; nothing may be added.
 TRANSITIONAL = frozenset({
     "launchd/README.md",
-    "launchd/com.danielraffel.pulp.qemu-runner-windows.plist.template",
-    "launchd/com.danielraffel.pulp.tart-runner-linux.plist.template",
-    "launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template",
-    "launchd/com.danielraffel.pulp.tart-runner-macos.plist.template",
     "launchd/com.danielraffel.shipyard.queue-tick.plist.template",
     "launchd/com.danielraffel.shipyard.steward-scheduler.plist.template",
     "scripts/install_shipyard_queue_tick.sh",
@@ -72,6 +68,16 @@ class NoStaleCheckoutRefsTests(unittest.TestCase):
             self.assertIn(f"<string>{sub}</string>", text, name)
             self.assertIn(f"  {sub}) shift;", (ROOT / "tartci").read_text(), sub)
 
+
+    def test_runner_lane_templates_serve_through_the_installed_generation(self) -> None:
+        import plistlib
+        for name, os_name in (("tart-runner-macos", "macos"), ("tart-runner-macos-release", "macos"),
+                              ("tart-runner-linux", "linux"), ("qemu-runner-windows", "windows")):
+            raw = (ROOT / "launchd" / f"com.danielraffel.pulp.{name}.plist.template").read_bytes()
+            value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", raw, flags=re.DOTALL))
+            self.assertEqual(value["ProgramArguments"][:4],
+                             ["/bin/bash", "$HOME/.local/bin/tartci", "serve", os_name], name)
+            self.assertNotIn("$TARTCI_REPO", raw.decode(), name)
 
 if __name__ == "__main__":
     unittest.main()
