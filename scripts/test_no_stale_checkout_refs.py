@@ -21,14 +21,7 @@ STALE = re.compile(r"\.local/share/tartci(?!/update-checkout)(?![\w-])")
 
 # Still to move onto the installed generation. Each entry is removed by the
 # change that moves it; nothing may be added.
-TRANSITIONAL = frozenset({
-    "launchd/README.md",
-    "launchd/com.danielraffel.shipyard.queue-tick.plist.template",
-    "launchd/com.danielraffel.shipyard.steward-scheduler.plist.template",
-    "scripts/install_shipyard_queue_tick.sh",
-    "scripts/install_shipyard_steward_scheduler.sh",
-    "scripts/queue_tick_refresh.py",
-})
+TRANSITIONAL: frozenset[str] = frozenset()
 
 
 def referencing_files() -> set[str]:
@@ -78,6 +71,16 @@ class NoStaleCheckoutRefsTests(unittest.TestCase):
             self.assertEqual(value["ProgramArguments"][:4],
                              ["/bin/bash", "$HOME/.local/bin/tartci", "serve", os_name], name)
             self.assertNotIn("$TARTCI_REPO", raw.decode(), name)
+
+    def test_queue_tick_and_steward_run_the_installed_generation(self) -> None:
+        import plistlib
+        for name, sub in (("com.danielraffel.shipyard.queue-tick", "queue-tick"),
+                          ("com.danielraffel.shipyard.steward-scheduler", "steward-scheduler")):
+            raw = (ROOT / "launchd" / f"{name}.plist.template").read_bytes()
+            value = plistlib.loads(re.sub(rb"<!--.*?-->", b"", raw, flags=re.DOTALL))
+            self.assertEqual(value["ProgramArguments"][:3],
+                             ["/bin/bash", "$HOME/.local/bin/tartci", sub], name)
+            self.assertIn(f"  {sub}) shift;", (ROOT / "tartci").read_text(), sub)
 
 if __name__ == "__main__":
     unittest.main()

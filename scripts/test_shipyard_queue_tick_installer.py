@@ -65,7 +65,7 @@ class QueueTickInstallerTests(unittest.TestCase):
                 """#!/bin/sh
 if [ "$1" = "print" ]; then
   printf '%s\\n' "$HOME/.config/shipyard/queue-tick.env"
-  printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh"
+  printf '%s\\n' "$HOME/.local/bin/tartci"
 elif [ "$1" = "kickstart" ]; then
   mkdir -p "$HOME/Library/Logs"
   printf '{"status":"healthy"}\\n' > "$HOME/Library/Logs/shipyard-queue-tick.health.json"
@@ -106,18 +106,8 @@ exit 0
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            installed = (
-                home / ".local/share/tartci/scripts/shipyard_queue_tick.sh"
-            )
-            installed_support = (
-                home
-                / ".local/share/tartci/scripts/shipyard_queue_tick_support.py"
-            )
-            self.assertTrue(os.access(installed, os.X_OK))
-            self.assertEqual(installed.read_bytes(), SCRIPT.read_bytes())
-            self.assertEqual(
-                installed_support.read_bytes(), SUPPORT.read_bytes()
-            )
+            # Nothing is copied: the agent runs the installed generation.
+            self.assertFalse((home / ".local/share/tartci/scripts").exists())
             config = home / ".config/shipyard/queue-tick.env"
             self.assertIn(
                 f"SHIPYARD_QUEUE_REPO_ROOT={repo.resolve()}",
@@ -134,6 +124,8 @@ exit 0
                 "com.danielraffel.shipyard.queue-tick.plist"
             ).open("rb") as source:
                 plist = plistlib.load(source)
+            self.assertEqual(plist["ProgramArguments"],
+                             ["/bin/bash", f"{home}/.local/bin/tartci", "queue-tick"])
             environment = plist["EnvironmentVariables"]
             self.assertEqual(environment["SHIPYARD_TICK_APPLY"], "1")
             for retired in (
@@ -204,7 +196,7 @@ printf '%s\\n' "$*" >> "$CALLS"
 case "$1" in
   print)
     printf '%s\\n' "$HOME/.config/shipyard/queue-tick.env"
-    printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh"
+    printf '%s\\n' "$HOME/.local/bin/tartci"
     exit 0
     ;;
   kickstart)
@@ -282,7 +274,7 @@ if command == "print":
     running = time.time() < state["running_until"]
     print("\tstate = " + ("running" if running else "not running"))
     print(home + "/.config/shipyard/queue-tick.env")
-    print(home + "/.local/share/tartci/scripts/shipyard_queue_tick.sh")
+    print(home + "/.local/bin/tartci")
 elif command == "bootout":
     state["loaded"] = False
 elif command == "bootstrap":

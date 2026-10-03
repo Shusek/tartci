@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Keep an installed Shipyard queue tick on the code of the running tartci.
 
-install_shipyard_queue_tick.sh COPIES shipyard_queue_tick.sh and its support
-module into ~/.local/share/tartci/scripts, so a tartci self-update never
-reaches the tick. After the merge path was removed, m3 kept running the copy
-installed on 2026-08-15, in `mode=live`, until someone re-ran the installer by
-hand. The tick on m1 and m5 was a July copy.
+The tick used to be COPIED out of the generation, so a tartci self-update
+never reached it: after the merge path was removed, m3 kept running a
+2026-08-15 copy in `mode=live` until someone re-ran the installer by hand.
+The agent now runs `~/.local/bin/tartci queue-tick`, which follows the
+installed generation, so the only drift left is an agent still installed the
+old way.
 
-drift() compares the installed copies with the running tartci's own by SHA-256.
-refresh() re-runs the running tartci's installer with the settings the host
+drift() reads the installed agent's ProgramArguments. refresh() re-runs the running tartci's installer with the settings the host
 already has: the GitHub App wrapper from the canonical config, the repo root
 when one is set, and the mode from the LaunchAgent (SHIPYARD_TICK_APPLY=1 is
 reap, 0 is dry-run). It acts only on a LOADED tick. An installed but unloaded
@@ -20,7 +20,6 @@ status_line().
 
 from __future__ import annotations
 
-import hashlib
 import os
 import plistlib
 import subprocess
@@ -28,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 LABEL = "com.danielraffel.shipyard.queue-tick"
-FILES = ("shipyard_queue_tick.sh", "shipyard_queue_tick_support.py")
+SUBCOMMAND = "queue-tick"
 INSTALLER = "install_shipyard_queue_tick.sh"
 # The installer waits for its first tick to finish (up to TICK_MAX_S while
 # the tick runs, HEALTH_WAIT_S while it does not) and rolls back on its own.
@@ -45,8 +44,18 @@ def default_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def default_install_dir(home: Path | None = None) -> Path:
-    return (home or Path.home()) / ".local" / "share" / "tartci" / "scripts"
+def desired_program(plist: Path) -> list[str]:
+    """The ProgramArguments of a tick that follows the installed generation."""
+    home = plist.parent.parent.parent
+    return ["/bin/bash", str(home / ".local" / "bin" / "tartci"), SUBCOMMAND]
+
+
+def _program(plist: Path) -> list[str] | None:
+    try:
+        value = plistlib.loads(plist.read_bytes()).get("ProgramArguments")
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    return [str(arg) for arg in value] if isinstance(value, list) else None
 
 
 def default_plist(home: Path | None = None) -> Path:
@@ -55,13 +64,6 @@ def default_plist(home: Path | None = None) -> Path:
 
 def default_config(home: Path | None = None) -> Path:
     return (home or Path.home()) / ".config" / "shipyard" / "queue-tick.env"
-
-
-def _sha(path: Path) -> str | None:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
 
 
 def _loaded(runner: Runner) -> bool | None:
@@ -77,22 +79,20 @@ def _loaded(runner: Runner) -> bool | None:
     return None
 
 
-def drift(root: Path | None = None, install_dir: Path | None = None,
-          plist: Path | None = None, runner: Runner = subprocess.run) -> dict[str, Any]:
-    """Installed tick vs the running tartci. Read-only.
+def drift(plist: Path | None = None, runner: Runner = subprocess.run) -> dict[str, Any]:
+    """Installed tick vs one that follows the installed generation. Read-only.
 
     state: not_installed | current | drift | drift_unloaded | unknown
     """
-    root = root or default_root()
-    install_dir = install_dir or default_install_dir()
     plist = plist or default_plist()
     if not plist.exists():
         return {"state": "not_installed"}
-    differing = [name for name in FILES
-                 if _sha(install_dir / name) != _sha(root / "scripts" / name)]
-    if not differing:
+    program = _program(plist)
+    if program == desired_program(plist):
         return {"state": "current"}
-    detail = f"{', '.join(differing)} in {install_dir} differ from tartci {root.name}"
+    differing = ["ProgramArguments"]
+    detail = (f"{plist.name} runs {' '.join(program or ['<unreadable>'])}, a copied tick "
+              f"no self-update reaches, not `tartci {SUBCOMMAND}`")
     loaded = _loaded(runner)
     if loaded is None:
         return {"state": "unknown", "files": differing,
@@ -132,15 +132,13 @@ def install_args(plist: Path, config: Path) -> tuple[list[str] | None, str]:
     return args, ""
 
 
-def refresh(fix: bool, root: Path | None = None, install_dir: Path | None = None,
-            plist: Path | None = None, config: Path | None = None,
-            runner: Runner = subprocess.run) -> dict[str, Any]:
+def refresh(fix: bool, root: Path | None = None, plist: Path | None = None,
+            config: Path | None = None, runner: Runner = subprocess.run) -> dict[str, Any]:
     """Reinstall a loaded, drifted tick from the running tartci. Never raises."""
     root = root or default_root()
-    install_dir = install_dir or default_install_dir()
     plist = plist or default_plist()
     config = config or default_config()
-    before = drift(root, install_dir, plist, runner)
+    before = drift(plist, runner)
     if before["state"] != "drift":
         return before
     args, why = install_args(plist, config)
@@ -159,7 +157,7 @@ def refresh(fix: bool, root: Path | None = None, install_dir: Path | None = None
         rc, text = proc.returncode, (proc.stderr or proc.stdout or "").strip()
     except (OSError, subprocess.SubprocessError) as exc:
         rc, text = 1, str(exc)
-    after = drift(root, install_dir, plist, runner)
+    after = drift(plist, runner)
     if rc == 0 and after["state"] == "current":
         return {"state": "refreshed", "files": before["files"], "args": args}
     return {"state": "refresh_failed", "files": before["files"],

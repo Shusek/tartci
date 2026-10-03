@@ -47,7 +47,7 @@ state="$HOME/.launchctl-loaded"
 case "$1" in
   print)
     [ -f "$state" ] || exit 3
-    printf '%s\\n%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_steward_scheduler.py" "$HOME/.config/shipyard/steward-scheduler.json"
+    printf '%s\\n%s\\n' "$HOME/.local/bin/tartci" "$HOME/.config/shipyard/steward-scheduler.json"
     ;;
   bootout)
     [ "${FAIL_BOOTOUT-0}" != 1 ] || exit 19
@@ -58,8 +58,8 @@ case "$1" in
       exit 17
     fi
     : > "$state"
-    if [ -x "$HOME/.local/share/tartci/scripts/shipyard_steward_scheduler.py" ]; then
-      "$HOME/.local/share/tartci/scripts/shipyard_steward_scheduler.py"
+    if [ -x "$HOME/.local/bin/tartci" ]; then
+      "$HOME/.local/bin/tartci" steward-scheduler --config "$HOME/.config/shipyard/steward-scheduler.json"
     fi
     ;;
   kickstart) exit 99 ;;
@@ -69,6 +69,12 @@ esac
             encoding="utf-8",
         )
         launchctl.chmod(0o755)
+        # The installed generation's entry point: this checkout's dispatcher.
+        entry = self.home / ".local/bin/tartci"
+        entry.parent.mkdir(parents=True)
+        entry.write_text(f'#!/bin/sh\nexec /bin/bash "{INSTALLER.parent.parent / "tartci"}" "$@"\n',
+                         encoding="utf-8")
+        entry.chmod(0o755)
         plutil = self.bin / "plutil"
         plutil.write_text(
             """#!/bin/sh
@@ -131,8 +137,8 @@ esac
         self.assertFalse(config["authority"])
         self.assertEqual(config["repositories"], [{"repo": "owner/repo", "checkout": str(self.repo.resolve())}])
         self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
-        install_dir = self.home / ".local/share/tartci/scripts"
-        self.assertEqual(install_dir.stat().st_mode & 0o022, 0)
+        # Nothing is copied: the agent runs the installed generation.
+        self.assertFalse((self.home / ".local/share/tartci/scripts").exists())
         health = json.loads(
             (self.home / "Library/Logs/shipyard-steward-scheduler.health.json").read_text(encoding="utf-8")
         )
@@ -148,7 +154,7 @@ esac
         (self.home / ".launchctl-loaded").touch()
         result = self.run_installer("--install", fail_bootstrap=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(installed.read_text(), "old-script")
+        self.assertEqual(installed.read_text(), "old-script")  # never touched
         self.assertEqual(config.read_text(), "old-config")
         self.assertEqual(plist.read_text(), "old-plist")
         self.assertTrue((self.home / ".launchctl-loaded").exists())
@@ -164,7 +170,7 @@ esac
         result = self.run_installer("--install", fail_bootout=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("could not be booted out", result.stderr)
-        self.assertEqual(installed.read_text(), "old-script")
+        self.assertEqual(installed.read_text(), "old-script")  # never touched
         self.assertEqual(config.read_text(), "old-config")
         self.assertEqual(plist.read_text(), "old-plist")
 
