@@ -82,7 +82,9 @@ def unlock_agent_risk(home: Path, now: float | None = None) -> str | None:
 
 
 def status(home: Path | None = None, run: Runner = _run,
-           now: float | None = None) -> dict[str, Any]:
+           now: float | None = None,
+           interactive: keychain_unlock.Interactive = keychain_unlock._security_interactive,
+           ) -> dict[str, Any]:
     home = home or Path.home()
     secrets = su.signing_secrets(home)
     dedicated = su.signing_keychain(home)
@@ -100,10 +102,13 @@ def status(home: Path | None = None, run: Runner = _run,
         risks.append(f"{path} is on the user search list beside the dedicated "
                      f"{Path(dedicated).name}; an unpinned codesign that walks into it while "
                      "it is locked raises a password dialog")
-    rc, out = run(["security", "unlock-keychain", "-p", password, dedicated])
+    # Over stdin: an argv password is readable by every local user via ps.
+    rc, out = interactive(f"unlock-keychain -p {su.security_quote(password)} "
+                          f"{su.security_quote(dedicated)}\n")
     if rc != 0:
         risks.append(f"{dedicated} does not unlock with keychain.env's password "
-                     f"({out.strip()[:120]}); run `pulp ship doctor`")
+                     f"({keychain_unlock._scrub(out, password).strip()[:120]}); "
+                     "run `pulp ship doctor`")
     else:
         rc, out = run(["security", "show-keychain-info", dedicated])
         if rc == 0 and (re.search(r"timeout=\d+", out) or "lock-on-sleep" in out):

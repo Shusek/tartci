@@ -191,7 +191,8 @@ class System:
     """Every side effect. Tests replace it."""
 
     def run(self, argv: list[str], *, cwd: str | None = None,
-            env: dict[str, str] | None = None, timeout: float = 900) -> Result:
+            env: dict[str, str] | None = None, timeout: float = 900,
+            input: str | None = None) -> Result:
         merged = {**os.environ, **(env or {})}
         if argv and argv[0] == "python3":
             # Helpers need tomllib (3.11+). This process was started by
@@ -200,7 +201,7 @@ class System:
             argv = [sys.executable, *argv[1:]]
         try:
             proc = subprocess.run(argv, cwd=cwd, env=merged, capture_output=True,
-                                  text=True, timeout=timeout, check=False)
+                                  text=True, timeout=timeout, check=False, input=input)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return Result(127, "", f"{type(exc).__name__}: {exc}")
         return Result(proc.returncode, proc.stdout, proc.stderr)
@@ -1032,6 +1033,11 @@ def signing_keychain(home: Path) -> str | None:
     return str(sibling if sibling.exists() else path)
 
 
+def security_quote(text: str) -> str:
+    """Quote one token for `security -i`, which reads one command per line."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def unlock_signing_keychain(sys_: System, home: Path) -> str:
     """Unlock the dedicated signing keychain in THIS process's session.
 
@@ -1048,7 +1054,10 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     password = signing_secrets(home).get("PULP_SIGN_KEYCHAIN_PW")
     if not keychain or not password:
         return "no dedicated signing keychain configured in keychain.env; probing as-is"
-    result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
+    # Over stdin: an argv password is readable by every local user via ps.
+    result = sys_.run(["security", "-i"], timeout=30,
+                      input=f"unlock-keychain -p {security_quote(password)} "
+                            f"{security_quote(keychain)}\n")
     if result.rc != 0:
         return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
                 "the signing probe decides")
