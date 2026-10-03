@@ -1784,7 +1784,7 @@ boot_vm_to_ssh(){
   fi
   if [ -n "${GUEST_DRIVER:-}" ]; then
     CURRENT_GUEST_CORES="$lease_cores"; CURRENT_GUEST_MEM_MB="$lease_mem"
-    boot_log="$(mktemp -t "tart-run-$vm")"
+    boot_log="$(mktemp "${TMPDIR:-/tmp}/tart-run-$vm.XXXXXX")"
     tartci_vm_lease_guard_exec tart run --no-graphics --no-audio --no-clipboard --net-softnet \
       --root-disk-opts=caching=cached,sync=fsync "$vm" >"$boot_log" 2>&1 & rpid=$!
     CURRENT_RPID="$rpid"; CURRENT_IP="$vm"
@@ -1825,7 +1825,7 @@ boot_vm_to_ssh(){
   fi
   CURRENT_GUEST_CORES="$lease_cores"
   CURRENT_GUEST_MEM_MB="$lease_mem"
-  boot_log="$(mktemp -t "tart-run-$vm")"
+  boot_log="$(mktemp "${TMPDIR:-/tmp}/tart-run-$vm.XXXXXX")"
   local tart_dirs=(
     --dir="ccache:$CACHE_ROOT/ccache"
     --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
