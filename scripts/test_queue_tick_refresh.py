@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """An installed queue tick follows the running tartci, and drift is shown.
 
-install_shipyard_queue_tick.sh copies the tick out of the generation, so m3
-ran a 2026-08-15 copy in `mode=live` after the merge path was removed.
+The tick used to be copied out of the generation, so m3 ran a 2026-08-15 copy
+in `mode=live` after the merge path was removed. It now runs
+`~/.local/bin/tartci queue-tick`; an agent still installed the old way is the
+drift the watchdog repairs.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -31,28 +34,31 @@ class Fixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.root = self.tmp / "generation"
         (self.root / "scripts").mkdir(parents=True)
-        for name in qtr.FILES:
-            (self.root / "scripts" / name).write_text(f"# {name}: reap only\n")
-        self.install_dir = self.tmp / "share" / "scripts"
-        self.plist = self.tmp / "LaunchAgents" / f"{qtr.LABEL}.plist"
+        self.home = self.tmp / "home"
+        self.plist = self.home / "Library" / "LaunchAgents" / f"{qtr.LABEL}.plist"
         self.config = self.tmp / "queue-tick.env"
         self.calls: list[list[str]] = []
         self.loaded = True
-        # Stand-in installer: copies both files where the real one does and
+        # Stand-in installer: renders the agent the way the real one does and
         # records its arguments, so the test can see what it was asked to keep.
+        desired = qtr.desired_program(self.plist)
+        render = self.tmp / "render.py"
+        render.write_text("import json, plistlib, sys\n"
+                          "value = plistlib.loads(open(sys.argv[1], 'rb').read())\n"
+                          f"value['ProgramArguments'] = json.loads({json.dumps(json.dumps(desired))})\n"
+                          "open(sys.argv[1], 'wb').write(plistlib.dumps(value))\n")
         (self.root / "scripts" / qtr.INSTALLER).write_text(
-            "#!/bin/bash\nset -e\nsrc=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+            "#!/bin/bash\nset -e\n"
             f"echo \"$*\" > {self.tmp}/installer-args\n"
-            f"mkdir -p {self.install_dir}\n"
-            + "".join(f"cp \"$src/{n}\" {self.install_dir}/{n}\n" for n in qtr.FILES))
+            f"/usr/bin/python3 {render} {self.plist}\n")
 
     def install_old(self, apply: str | None = "1", gh_cli: str = "/x/ghapp") -> None:
-        self.install_dir.mkdir(parents=True, exist_ok=True)
-        for name in qtr.FILES:
-            (self.install_dir / name).write_text(f"# {name}: 2026-08-15, merges\n")
         self.plist.parent.mkdir(parents=True, exist_ok=True)
         env = {} if apply is None else {"SHIPYARD_TICK_APPLY": apply}
-        self.plist.write_bytes(plistlib.dumps({"Label": qtr.LABEL, "EnvironmentVariables": env}))
+        self.plist.write_bytes(plistlib.dumps({
+            "Label": qtr.LABEL, "EnvironmentVariables": env,
+            "ProgramArguments": ["/bin/bash",
+                                 f"{self.home}/.local/share/tartci/scripts/shipyard_queue_tick.sh"]}))
         self.config.write_text(f"SHIPYARD_QUEUE_REPO_ROOT=\nSHIPYARD_QUEUE_GH_CLI={gh_cli}\n"
                                "SHIPYARD_QUEUE_AUTHORITY=1\n")
 
@@ -64,10 +70,10 @@ class Fixture(unittest.TestCase):
         return subprocess.run(argv, **kw)
 
     def drift(self):
-        return qtr.drift(self.root, self.install_dir, self.plist, self.runner)
+        return qtr.drift(self.plist, self.runner)
 
     def refresh(self, fix=True):
-        return qtr.refresh(fix, self.root, self.install_dir, self.plist, self.config, self.runner)
+        return qtr.refresh(fix, self.root, self.plist, self.config, self.runner)
 
     def installer_calls(self):
         return [c for c in self.calls if c[0] == "/bin/bash"]
@@ -78,10 +84,12 @@ class DriftTests(Fixture):
         self.assertEqual(self.drift()["state"], "not_installed")
         self.install_old()
         self.assertEqual(self.drift()["state"], "drift")
+        self.assertIn("a copied tick", self.drift()["detail"])
         self.loaded = False
         self.assertEqual(self.drift()["state"], "drift_unloaded")
-        for name in qtr.FILES:
-            shutil.copy(self.root / "scripts" / name, self.install_dir / name)
+        value = plistlib.loads(self.plist.read_bytes())
+        value["ProgramArguments"] = qtr.desired_program(self.plist)
+        self.plist.write_bytes(plistlib.dumps(value))
         self.assertEqual(self.drift()["state"], "current")
 
     def test_pool_status_names_a_stale_copy(self) -> None:
@@ -91,6 +99,11 @@ class DriftTests(Fixture):
         self.assertIsNone(qtr.status_line({"state": "not_installed"}))
         with mock.patch.object(qtr, "status_line", return_value="queue tick: DRIFT (x)"):
             self.assertIn("queue tick: DRIFT (x)", lanes.tool_freshness_summary()["lines"])
+
+    def test_the_template_is_what_drift_calls_current(self) -> None:
+        raw = (HERE.parent / "launchd" / f"{qtr.LABEL}.plist.template").read_text()
+        value = plistlib.loads(raw.replace("$HOME", str(self.home)).encode())
+        self.assertEqual(value["ProgramArguments"], qtr.desired_program(self.plist))
 
 
 class RefreshTests(Fixture):

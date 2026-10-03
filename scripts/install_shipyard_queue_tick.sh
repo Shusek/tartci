@@ -62,9 +62,9 @@ fi
 
 TEMPLATE="$HERE/launchd/com.danielraffel.shipyard.queue-tick.plist.template"
 SCRIPT="$HERE/scripts/shipyard_queue_tick.sh"
-INSTALL_DIR="$HOME/.local/share/tartci/scripts"
-INSTALLED_SCRIPT="$INSTALL_DIR/shipyard_queue_tick.sh"
-INSTALLED_SUPPORT="$INSTALL_DIR/shipyard_queue_tick_support.py"
+# The agent runs the tick through ~/.local/bin/tartci, so it follows the
+# installed generation; nothing is copied, and a self-update reaches it.
+ENTRYPOINT="$HOME/.local/bin/tartci"
 CONFIG="$HOME/.config/shipyard/queue-tick.env"
 PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
 HEALTH="$HOME/Library/Logs/shipyard-queue-tick.health.json"
@@ -134,8 +134,7 @@ echo "queue tick install plan:"
 echo "  repo_root=${REPO_ROOT:-unset (hold check runs from \$HOME)}"
 echo "  mode=$MODE"
 echo "  gh_cli=${GH_CLI:-unset}"
-echo "  executable=$INSTALLED_SCRIPT (mode 755)"
-echo "  support=$INSTALLED_SUPPORT (mode 644)"
+echo "  executable=$ENTRYPOINT queue-tick (the installed generation)"
 echo "  canonical_config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
 if [ "$APPLY" != "1" ]; then
@@ -143,9 +142,7 @@ if [ "$APPLY" != "1" ]; then
   exit 0
 fi
 
-mkdir -p "$INSTALL_DIR" "$HOME/.config/shipyard" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-SCRIPT_TMP=""
-SUPPORT_TMP=""
+mkdir -p "$HOME/.config/shipyard" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 CONFIG_TMP=""
 PLIST_TMP=""
 BACKUP=""
@@ -159,10 +156,8 @@ rollback_and_cleanup() {
     set +e
     echo "install failed; rolling back prior queue-tick installation" >&2
     launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    for entry in script support config plist; do
+    for entry in config plist; do
       case "$entry" in
-        script) target="$INSTALLED_SCRIPT" ;;
-        support) target="$INSTALLED_SUPPORT" ;;
         config) target="$CONFIG" ;;
         plist) target="$PLIST" ;;
       esac
@@ -183,27 +178,15 @@ rollback_and_cleanup() {
       fi
     fi
   fi
-  rm -f "$SCRIPT_TMP" "$SUPPORT_TMP" "$CONFIG_TMP" "$PLIST_TMP"
+  rm -f "$CONFIG_TMP" "$PLIST_TMP"
   [ -z "$BACKUP" ] || rm -rf "$BACKUP"
   exit "$rc"
 }
 trap rollback_and_cleanup EXIT
-SCRIPT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick.sh.XXXXXX")"
-SUPPORT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick_support.py.XXXXXX")"
 CONFIG_TMP="$(mktemp "$HOME/.config/shipyard/.queue-tick.env.XXXXXX")"
 PLIST_TMP="$(mktemp "$HOME/Library/LaunchAgents/.queue-tick.plist.XXXXXX")"
 BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/queue-tick-install-backup.XXXXXX")"
 umask 077
-install -m 755 "$SCRIPT" "$SCRIPT_TMP"
-[ -x "$SCRIPT_TMP" ] && cmp -s "$SCRIPT" "$SCRIPT_TMP" || {
-  echo "staged queue tick executable failed verification" >&2
-  exit 1
-}
-install -m 644 "$SUPPORT" "$SUPPORT_TMP"
-[ -r "$SUPPORT_TMP" ] && cmp -s "$SUPPORT" "$SUPPORT_TMP" || {
-  echo "staged queue tick support module failed verification" >&2
-  exit 1
-}
 {
   printf 'SHIPYARD_QUEUE_REPO_ROOT=%s\n' "$REPO_ROOT"
   printf 'SHIPYARD_QUEUE_GH_CLI=%s\n' "$GH_CLI"
@@ -223,10 +206,8 @@ with open(path, "wb") as destination:
 PY
 plutil -lint "$PLIST_TMP" >/dev/null
 
-for entry in script support config plist; do
+for entry in config plist; do
   case "$entry" in
-    script) target="$INSTALLED_SCRIPT" ;;
-    support) target="$INSTALLED_SUPPORT" ;;
     config) target="$CONFIG" ;;
     plist) target="$PLIST" ;;
   esac
@@ -241,8 +222,6 @@ fi
 
 SWITCH_STARTED=1
 launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
-mv "$SCRIPT_TMP" "$INSTALLED_SCRIPT"
-mv "$SUPPORT_TMP" "$INSTALLED_SUPPORT"
 mv "$CONFIG_TMP" "$CONFIG"
 mv "$PLIST_TMP" "$PLIST"
 
@@ -258,8 +237,8 @@ grep -Fq "$HOME/.config/shipyard/queue-tick.env" <<<"$PRINTED" || {
   echo "LaunchAgent did not receive canonical config path" >&2
   exit 1
 }
-grep -Fq "$INSTALLED_SCRIPT" <<<"$PRINTED" || {
-  echo "LaunchAgent did not receive installed queue tick executable" >&2
+grep -Fq "$ENTRYPOINT" <<<"$PRINTED" || {
+  echo "LaunchAgent does not run the tick through $ENTRYPOINT" >&2
   exit 1
 }
 # A verdict file the new tick wrote: healthy commits, anything else fails now.

@@ -48,8 +48,10 @@ used `WorkingDirectory=$HOME`, a wrapper under `$HOME/.local/bin`, and
 `TART_HOME=$HOME/VMs`; launchd booted a macOS clone and exited 0.
 
 Use `com.danielraffel.pulp.tart-runner-macos.plist.template` as the replacement
-shape: install tartci into `$HOME/.local/share/tartci`, expose a small
-`$HOME/.local/bin/tartci` wrapper, and keep macOS goldens under `$HOME/VMs`.
+shape: install tartci with `./tartci setup`, which puts the
+`$HOME/.local/bin/tartci` entry point on the installed generation that
+self-update keeps current, and keep macOS goldens under `$HOME/VMs`. Never run
+an agent from a hand-copied checkout: nothing refreshes it.
 Only use `/Volumes` for macOS launchd through the opt-in, receipt-bound native
 launcher described below. Do not grant broad access to Bash, Node, Python, or
 `env`: those interpreter identities are shared by unrelated tools and produce
@@ -540,9 +542,9 @@ release agent per workflow.
 
 The Windows lane uses QEMU directly, so every participating Apple Silicon host
 needs Homebrew QEMU on the service PATH, the same Windows qcow2 golden in a
-local golden store, and the tartci scripts installed under a home-backed path.
-Use the qemu template's install recipe, which points launchd at
-`$HOME/.local/share/tartci` rather than a mounted workspace.
+local golden store, and tartci installed with `./tartci setup`. The qemu
+template runs `$HOME/.local/bin/tartci serve windows`, the installed
+generation, rather than a mounted workspace.
 
 Leave `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` unless you are debugging the queue
 poller. With that default, the supervisor only boots QEMU when a fresh queued

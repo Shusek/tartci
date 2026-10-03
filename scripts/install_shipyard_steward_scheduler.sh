@@ -62,8 +62,9 @@ fi
   exit 2
 }
 
-INSTALL_DIR="$HOME/.local/share/tartci/scripts"
-INSTALLED="$INSTALL_DIR/shipyard_steward_scheduler.py"
+# The agent runs the scheduler through ~/.local/bin/tartci, so it follows the
+# installed generation; nothing is copied, and a self-update reaches it.
+ENTRYPOINT="$HOME/.local/bin/tartci"
 CONFIG_DIR="$HOME/.config/shipyard"
 CONFIG="$CONFIG_DIR/steward-scheduler.json"
 PLIST_DIR="$HOME/Library/LaunchAgents"
@@ -99,7 +100,7 @@ echo "Shipyard stewardship scheduler install plan:"
 echo "  mode=$MODE authority=$AUTHORITY"
 echo "  shipyard=$SHIPYARD"
 for repo in "${REPOS[@]}"; do echo "  repo=$repo"; done
-echo "  executable=$INSTALLED"
+echo "  executable=$ENTRYPOINT steward-scheduler (the installed generation)"
 echo "  config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
 echo "  legacy_queue_tick=preserved"
@@ -108,8 +109,8 @@ echo "  legacy_queue_tick=preserved"
 umask 077
 LOG_DIR="$HOME/Library/Logs"
 STATE_DIR="$HOME/.local/state/tartci"
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR"
-python3 - "$HOME" "$INSTALL_DIR" "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR" <<'PY'
+mkdir -p "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR"
+python3 - "$HOME" "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR" <<'PY'
 import os, pathlib, stat, sys
 home = pathlib.Path(sys.argv[1]).resolve()
 for raw in sys.argv[2:]:
@@ -126,7 +127,6 @@ for raw in sys.argv[2:]:
             raise SystemExit(f"install parent escapes HOME: {current}")
         current = current.parent
 PY
-STAGED_SCRIPT="$(mktemp "$INSTALL_DIR/.shipyard_steward_scheduler.py.XXXXXX")"
 STAGED_CONFIG="$(mktemp "$CONFIG_DIR/.steward-scheduler.json.XXXXXX")"
 STAGED_PLIST="$(mktemp "$PLIST_DIR/.steward-scheduler.plist.XXXXXX")"
 BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/steward-scheduler-install.XXXXXX")"
@@ -148,8 +148,8 @@ rollback() {
   if [ "$SWITCHED" = 1 ] && [ "$COMMITTED" != 1 ]; then
     set +e
     launchctl_command bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    for name in script config plist; do
-      case "$name" in script) target="$INSTALLED" ;; config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
+    for name in config plist; do
+      case "$name" in config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
       if [ -f "$BACKUP/$name.present" ]; then cp -p "$BACKUP/$name" "$target"; else rm -f "$target"; fi
     done
     if [ "$PRIOR_LOADED" = 1 ] && [ -f "$PLIST" ]; then
@@ -161,13 +161,11 @@ rollback() {
       fi
     fi
   fi
-  rm -f "$STAGED_SCRIPT" "$STAGED_CONFIG" "$STAGED_PLIST"
+  rm -f "$STAGED_CONFIG" "$STAGED_PLIST"
   rm -rf "$BACKUP"
   exit "$rc"
 }
 trap rollback EXIT
-install -m 755 "$SOURCE" "$STAGED_SCRIPT"
-cmp -s "$SOURCE" "$STAGED_SCRIPT" || { echo "staged scheduler differs from source" >&2; exit 1; }
 
 python3 - "$STAGED_CONFIG" "$ENABLED" "$AUTHORITY" "$SHIPYARD" "${REPOS[@]}" <<'PY'
 import json, os, pathlib, re, stat, subprocess, sys
@@ -227,8 +225,8 @@ chmod 600 "$STAGED_CONFIG"
 sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$STAGED_PLIST"
 plutil -lint "$STAGED_PLIST" >/dev/null
 
-for name in script config plist; do
-  case "$name" in script) target="$INSTALLED" ;; config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
+for name in config plist; do
+  case "$name" in config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
   if [ -e "$target" ]; then cp -p "$target" "$BACKUP/$name"; : > "$BACKUP/$name.present"; fi
 done
 if launchctl_command print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then PRIOR_LOADED=1; fi
@@ -242,13 +240,12 @@ else
   launchctl_command bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 fi
 SWITCHED=1
-mv "$STAGED_SCRIPT" "$INSTALLED"
 mv "$STAGED_CONFIG" "$CONFIG"
 mv "$STAGED_PLIST" "$PLIST"
 rm -f "$HEALTH" "$STARTUP"
 launchctl_command bootstrap "gui/$(id -u)" "$PLIST"
 PRINTED="$(launchctl_command print "gui/$(id -u)/$LABEL")"
-grep -Fq "$INSTALLED" <<<"$PRINTED" && grep -Fq "$CONFIG" <<<"$PRINTED" || {
+grep -Fq "$ENTRYPOINT" <<<"$PRINTED" && grep -Fq "$CONFIG" <<<"$PRINTED" || {
   echo "live launchd registration does not match installed paths" >&2
   exit 1
 }
