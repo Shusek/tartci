@@ -196,11 +196,12 @@ Configure the set the provisioner injects via either:
 - the manifest `[access].authorized_keys` list (pubkey files),
 - default `~/.ssh/id_ed25519.pub`.
 
-**Tailscale (optional but recommended).** Bake it into the Tier 0 golden and run
-`tailscale up` once per golden (or headless `--authkey`). You then get a stable
-MagicDNS name and can `ssh`/log-pull from anywhere without port juggling. Prefer
-the MagicDNS name over the per-boot vmnet IP. Disable Tailscale SSH on persistent
-operator boxes to avoid re-auth prompts.
+**Tailscale: hosts and benches only, never CI goldens.** Every CI clone of a
+golden runs whatever job GitHub assigns it, including pull-request code, so a
+golden that carries a Tailscale identity (or `tailscale up` / an auth key) puts
+every such job on your tailnet as a trusted node. Join the *host* and persistent
+*bench* clones to Tailscale instead, and reach CI guests through the host. See
+[`security-hardening.md`](security-hardening.md).
 
 **Secondary Apple Silicon hosts (M-series pool members).** Keep host-specific
 aliases in your local SSH and Shipyard config, not in this repo. The reusable
@@ -371,7 +372,7 @@ tart pull ghcr.io/cirruslabs/macos-sequoia-xcode:latest
 
 # 2. Bake Tier 0 (toolchain): clone the base, install brew deps + ccache, inject keys
 tart clone ghcr.io/cirruslabs/macos-sequoia-xcode:latest macos-build-base
-#   ...provision inside (brew bundle, ccache, sshd keys, Tailscale)...
+#   ...provision inside (brew bundle, ccache, sshd keys; key-only SSH, no Tailscale)...
 
 # 3. Bake Tier 1 (project): clone Tier 0, bake immutable/expensive artifacts
 #    (Skia/Dawn static libs) into the golden so each clone gets them CoW-free
@@ -1253,8 +1254,9 @@ GitHub-hosted `windows-latest` until those smoke runs are consistently clean.
 A repo plugs in by dropping one `.shipyard/vm-image.<os>.toml` (or an
 `[[images]]` array) declaring `os` / `arch` / `target_arch` / `cross` / `base` /
 OS-scoped `[packages]` / `[caches]` / `[[mounts]]`. tartci bakes or clones a
-golden from it with zero hand-provisioning — keys, ssh-config, Tailscale, log
-collection, and cache mounts are inherited framework defaults. See `manifests/`
+golden from it with zero hand-provisioning — keys, ssh-config, log collection,
+and cache mounts are inherited framework defaults (Tailscale belongs on benches,
+never on CI goldens). See `manifests/`
 in this repo and the `README` "Per-project use" section.
 
 ### Bench (UTM) for GUI / DAW testing

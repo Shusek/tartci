@@ -110,7 +110,17 @@ class Harness:
 
     def stub_gh(self, *, fail: str | None = None) -> None:
         if fail is None:
-            self._exe("stub-gh", "#!/bin/bash\necho '{}'\n")
+            # The access proof reads the repository's visibility; a private
+            # repository needs no fork-approval lookup.
+            self._exe(
+                "stub-gh",
+                "#!/bin/bash\n"
+                "case \"${!#}\" in\n"
+                "  repos/*/*/*) echo '{}' ;;\n"
+                "  repos/*/*) echo '{\"private\":true,\"visibility\":\"private\"}' ;;\n"
+                "  *) echo '{}' ;;\n"
+                "esac\n",
+            )
         else:
             self._exe("stub-gh", f"#!/bin/bash\necho {fail!r} >&2\nexit 1\n")
 
@@ -297,7 +307,7 @@ class ProviderAccessBlockTests(unittest.TestCase):
         self.assertIn("jit_repository_access_denied", h.event_names())
 
     def test_the_control_a_parallel_admit_passes(self) -> None:
-        # Group 1 is repository-scoped and admitted without an API call.
+        # Group 1 is repository-scoped: only the repository's visibility is read.
         result, h = self._run(None, group=1)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("passed", result.stdout)
@@ -316,13 +326,15 @@ class TransientAccessFailureTests(unittest.TestCase):
         count = h.tmp / "gh-calls"
         group = json.dumps({"visibility": "selected"})
         repos = json.dumps({"total_count": 1, "repositories": [{"full_name": REPO}]})
+        private = json.dumps({"private": True, "visibility": "private"})
         # The first `failures` calls fail; later calls answer like GitHub.
         h._exe("stub-gh", (
             "#!/bin/bash\n"
             f"echo x >>{str(count)!r}\n"
             f"n=$(wc -l <{str(count)!r} | tr -d ' ')\n"
             f"if [ \"$n\" -le {failures} ]; then echo {fail!r} >&2; exit 1; fi\n"
-            f"case \"$2\" in *repositories*) echo {repos!r} ;; *) echo {group!r} ;; esac\n"))
+            f"case \"$2\" in *repositories*) echo {repos!r} ;; repos/*) echo {private!r} ;;"
+            f" *) echo {group!r} ;; esac\n"))
         denied = h.tmp / "denied"
         result = h.run(
             access_function()

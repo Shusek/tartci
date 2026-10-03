@@ -7,10 +7,31 @@
 # OpenSSH Server, creates a local `admin` account, and bypasses TPM/SecureBoot/
 # RAM/CPU checks (required for Win11 under AVF). Never bakes private keys.
 set -euo pipefail
+# Apply before creating any password-bearing file; chmod after writing is too late.
+umask 077
 OUT_DIR="${1:-${TARTCI_WIN:-$HOME/.tartci/windows}}"
 # Configurable key set (colon-separated paths via TARTCI_PUBKEYS); never bakes private keys.
 IFS=: read -ra PUBKEYS <<< "${TARTCI_PUBKEYS:-$HOME/.ssh/id_ed25519.pub}"
 mkdir -p "$OUT_DIR/media"
+
+# Every CI clone shares this account, and sibling guests can reach each other's
+# SSH forwards, so it must not be a well-known password. Generated unless
+# TARTCI_WIN_ADMIN_PASSWORD is set; kept beside the media (0600) for console
+# and bench logins. SSH below accepts keys only.
+ADMIN_PASSWORD="${TARTCI_WIN_ADMIN_PASSWORD:-}"
+if [ -z "$ADMIN_PASSWORD" ]; then
+  ADMIN_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24 || true)"
+fi
+case "$ADMIN_PASSWORD" in
+  ''|*[!A-Za-z0-9._-]*) echo "TARTCI_WIN_ADMIN_PASSWORD must be non-empty [A-Za-z0-9._-]" >&2; exit 2 ;;
+esac
+[ "${#ADMIN_PASSWORD}" -ge 12 ] || { echo "TARTCI_WIN_ADMIN_PASSWORD must have at least 12 characters" >&2; exit 2; }
+# A fresh private directory also protects against regeneration over old 0644
+# files and against tools that choose their own output permissions.
+STAGING_DIR="$(mktemp -d "$OUT_DIR/.unattend.XXXXXXXX")"
+trap 'rm -rf "$STAGING_DIR"' EXIT
+mkdir "$STAGING_DIR/media"
+printf '%s\n' "$ADMIN_PASSWORD" >"$STAGING_DIR/admin-password"
 
 # Build the authorized_keys block (one key per line), then XML-escape for embedding.
 AK=""
@@ -28,7 +49,7 @@ while IFS= read -r k; do
   order=$((order+1))
 done <<< "$AK"
 
-cat > "$OUT_DIR/media/autounattend.xml" <<XML
+cat > "$STAGING_DIR/media/autounattend.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
@@ -105,26 +126,35 @@ cat > "$OUT_DIR/media/autounattend.xml" <<XML
         <LocalAccounts>
           <LocalAccount wcm:action="add">
             <Name>admin</Name><Group>Administrators</Group><DisplayName>admin</DisplayName>
-            <Password><Value>admin</Value><PlainText>true</PlainText></Password>
+            <Password><Value>${ADMIN_PASSWORD}</Value><PlainText>true</PlainText></Password>
           </LocalAccount>
         </LocalAccounts>
       </UserAccounts>
-      <AutoLogon><Enabled>true</Enabled><Username>admin</Username><Password><Value>admin</Value><PlainText>true</PlainText></Password><LogonCount>3</LogonCount></AutoLogon>
+      <AutoLogon><Enabled>true</Enabled><Username>admin</Username><Password><Value>${ADMIN_PASSWORD}</Value><PlainText>true</PlainText></Password><LogonCount>3</LogonCount></AutoLogon>
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>powershell -ExecutionPolicy Bypass -Command "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>2</Order><CommandLine>powershell -Command "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>3</Order><CommandLine>cmd /c if not exist C:\ProgramData\ssh mkdir C:\ProgramData\ssh</CommandLine></SynchronousCommand>${KEY_CMDS}
         <SynchronousCommand wcm:action="add"><Order>90</Order><CommandLine>powershell -Command "icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'"</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>95</Order><CommandLine>powershell -Command "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22"</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>96</Order><CommandLine>powershell -Command "\$p = 'C:\ProgramData\ssh\sshd_config'; if (-not (Test-Path \$p)) { Copy-Item C:\Windows\System32\OpenSSH\sshd_config_default \$p }; if (Test-Path \$p) { \$c = Get-Content \$p; Set-Content \$p -Value (@('PasswordAuthentication no') + \$c); Restart-Service sshd }"</CommandLine></SynchronousCommand>
       </FirstLogonCommands>
     </component>
   </settings>
 </unattend>
 XML
-echo "wrote $OUT_DIR/media/autounattend.xml ($(wc -l < "$OUT_DIR/media/autounattend.xml") lines)"
+chmod 600 "$STAGING_DIR/media/autounattend.xml"
 
 # Build a small bootable-data ISO with autounattend.xml at the root. Windows
 # Setup auto-detects autounattend.xml on any attached removable media root.
 hdiutil makehybrid -iso -joliet -default-volume-name "UNATTEND" \
-  -o "$OUT_DIR/autounattend.iso" "$OUT_DIR/media" >/dev/null
+  -o "$STAGING_DIR/autounattend.iso" "$STAGING_DIR/media" >/dev/null
+# The ISO carries the admin password in plain text, like the XML.
+chmod 600 "$STAGING_DIR/autounattend.iso" "$STAGING_DIR/admin-password"
+# Publish complete, private files by rename; never truncate a public old inode.
+mv -f "$STAGING_DIR/admin-password" "$OUT_DIR/admin-password"
+mv -f "$STAGING_DIR/media/autounattend.xml" "$OUT_DIR/media/autounattend.xml"
+mv -f "$STAGING_DIR/autounattend.iso" "$OUT_DIR/autounattend.iso"
+echo "wrote $OUT_DIR/media/autounattend.xml ($(wc -l < "$OUT_DIR/media/autounattend.xml") lines)"
+echo "admin console password: $OUT_DIR/admin-password (SSH is key-only)"
 echo "built $OUT_DIR/autounattend.iso"

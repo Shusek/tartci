@@ -46,6 +46,7 @@ class Host(unittest.TestCase):
         self.unlock_rc = 0
         self.info = f'Keychain "{self.sibling}" no-timeout'
         self.calls: list[list[str]] = []
+        self.scripts: list[str] = []
         env = mock.patch.dict(os.environ, {"TARTCI_HOME": str(self.home / ".tartci")})
         env.start()
         self.addCleanup(env.stop)
@@ -68,17 +69,29 @@ class Host(unittest.TestCase):
         self.calls.append(argv)
         if argv[1] == "list-keychains":
             return 0, "".join(f'    "{p}"\n' for p in self.listed)
-        if argv[1] == "unlock-keychain":
-            return self.unlock_rc, "" if self.unlock_rc == 0 else "The specified keychain could not be unlocked"
+        if "unlock-keychain" in argv:
+            raise AssertionError("the keychain password must not be passed in argv")
         if argv[1] == "show-keychain-info":
             return 0, self.info
         raise AssertionError(argv)
 
+    def interactive_(self, script: str) -> tuple[int, str]:
+        self.scripts.append(script)
+        if script.startswith("unlock-keychain "):
+            return self.unlock_rc, "" if self.unlock_rc == 0 else "The specified keychain could not be unlocked"
+        raise AssertionError(script)
+
     def status(self) -> dict:
-        return guard.status(self.home, self.run_)
+        return guard.status(self.home, self.run_, interactive=self.interactive_)
 
 
 class GuardTests(Host):
+    def test_the_password_travels_over_stdin_not_argv(self) -> None:
+        self.status()
+        self.assertEqual(len(self.scripts), 1)
+        self.assertTrue(self.scripts[0].startswith('unlock-keychain -p "pw" '))
+        self.assertFalse(any("pw" in argv for argv in self.calls))
+
     def test_only_the_dedicated_keychain_and_login_is_ok(self) -> None:
         value = self.status()
         self.assertEqual(value["state"], "ok", value)

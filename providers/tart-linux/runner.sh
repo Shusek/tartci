@@ -66,7 +66,10 @@ LOOP=0
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-${PULP_RUNNER_IDLE_TIMEOUT_SECS:-900}}"
 BUILD_PARALLEL_LEVEL="${TARTCI_LINUX_BUILD_PARALLEL_LEVEL:-4}"
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
+# Guests run untrusted job code: offer only the guest key and never forward
+# the operator's agent or X11 into them, whatever ~/.ssh/config says.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes
+  -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no)
 CURRENT_VM=""
 CURRENT_VM_OWNED=0
 CURRENT_RPID=""
@@ -84,6 +87,9 @@ prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true
 
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
+# shellcheck source=providers/common/guest-isolation.lib.sh
+source "$TARTCI_ROOT/providers/common/guest-isolation.lib.sh"
+tartci_guest_isolation_configure || die "invalid guest isolation configuration"
 # shellcheck source=providers/common/vm-state.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
@@ -242,6 +248,16 @@ queued_work(){
     --match-labels "$QUEUE_MATCH_LABELS" 2>/dev/null || echo ERR
 }
 
+# Prove the repository boundary and the public-repository fork gate
+# (scripts/runner_group_repository_access.py). GitHub assigns any job whose
+# labels match, so this runs before a VM boots (a refusal must not boot VMs in
+# a loop) and again right before the JIT mint. $1 receives the receipt.
+verify_runner_repository_access(){
+  SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE=repo \
+    python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+    --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$1"
+}
+
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_mem lease_priority
   local build_parallel_effective
@@ -260,6 +276,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-linux \
     "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
   state_dir="$(tartci_provider_state_dir tart-linux)"
+  if ! verify_runner_repository_access "$logdir/repository-access.json"; then
+    note "[$i] runner repository access not proven — not booting a VM"
+    return 1
+  fi
   write_state(){
     TARTCI_STATE_LABELS="$LABELS" \
     TARTCI_STATE_REPO="$REPO" \
@@ -314,7 +334,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return 1
   }
   local boot_log; boot_log="$logdir/tart-run.log"
-  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tartci_vm_lease_guard_exec tart run --no-graphics \
+    --dir="ccache:$CACHE_ROOT/ccache-linux$(tartci_host_cache_mount_suffix)" \
+    ${TARTCI_TART_NETWORK_ARGS[@]+"${TARTCI_TART_NETWORK_ARGS[@]}"} \
+    "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   write_state booting
 
@@ -339,7 +362,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "sudo mkdir -p /mnt/host && \
      (sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || mountpoint -q /mnt/host) && \
-     bash -s -- /mnt/host/ccache" \
+     bash -s -- /mnt/host/ccache '' '$TARTCI_HOST_CACHE_ACCESS_MODE'" \
     <"$TARTCI_ROOT/providers/tart-linux/prepare-ccache.sh" \
     >"$logdir/ccache-setup.log" 2>&1; then
     note "[$i] host ccache binding failed — refusing to launch a silently cold JIT runner"
@@ -371,6 +394,11 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     fi
   fi
 
+  if ! verify_runner_repository_access "$logdir/repository-access.json"; then
+    note "[$i] runner repository access not proven — refusing JIT registration and discarding VM"
+    discard_current_linux_vm
+    return 1
+  fi
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
     discard_current_linux_vm
@@ -406,20 +434,37 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] vm $vm up at $ip — launching JIT runner (assignment_timeout=${IDLE_TIMEOUT}s, build_parallel=${build_parallel_effective}, one job)"
   write_state idle-wait
 
-  # Write the JIT config and run the agent once. A JIT runner processes exactly
-  # one job and deregisters. The host cache binding above is mandatory so a
-  # mount regression cannot silently turn every ephemeral job cold.
+  # Stream the JIT config over stdin into an owner-only guest file. Embedding
+  # it in the ssh command line exposed this runner credential to every local
+  # user on the host (ps) for the whole job.
+  if ! printf '%s' "$jit" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    'umask 077 && cat > ~/jit.cfg'; then
+    tartci_pool_lock_release
+    note "[$i] failed to stream JIT config into the guest — discarding VM"
+    discard_current_linux_vm
+    return 1
+  fi
+  jit=""
+
+  # Run the agent once. A JIT runner processes exactly one job and
+  # deregisters. The host cache binding above is mandatory so a mount
+  # regression cannot silently turn every ephemeral job cold.
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
-     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
-     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \
+    "cd ~/actions-runner && \
+     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_READONLY|CCACHE_TEMPDIR)$/' .env > .env.tartci && \
+     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
+     if [ '$TARTCI_HOST_CACHE_ACCESS_MODE' = ro ]; then mkdir -p \"\$HOME/.ccache-tmp\" && \
+       printf '%s\n' 'CCACHE_READONLY=true' \"CCACHE_TEMPDIR=\$HOME/.ccache-tmp\" >> .env.tartci && \
+       export CCACHE_READONLY=true CCACHE_TEMPDIR=\"\$HOME/.ccache-tmp\"; fi && \
+     mv .env.tartci .env && \
      export CCACHE_DIR=\"\$HOME/.ccache\" && \
      export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content && unset CCACHE_DEPEND && \
      export CMAKE_BUILD_PARALLEL_LEVEL='$build_parallel_effective' && \
      printf 'TARTCI_DIAG ccache_dir=%s\n' \"\$CCACHE_DIR\" && \
      printf 'TARTCI_DIAG cmake_build_parallel_level=%s\n' \"\$CMAKE_BUILD_PARALLEL_LEVEL\" && \
      umask 0022 && runner_umask=\"\$(umask)\" && printf 'TARTCI_DIAG runner_umask=%s\n' \"\$runner_umask\" && \
-     [ \"\$runner_umask\" = 0022 ] && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
+     [ \"\$runner_umask\" = 0022 ] && jit_config=\"\$(cat ~/jit.cfg)\" && rm -f ~/jit.cfg && \
+     ./run.sh --jitconfig \"\$jit_config\"" \
     >"$logdir/runner-output.log" 2>&1 &
   CURRENT_RUNNER_PID=$!
   if ! tartci_pool_lock_handoff_to_listener "$CURRENT_RUNNER_PID"; then
@@ -467,6 +512,8 @@ i=0
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 tartci_validate_runner_idle_timeout "$IDLE_TIMEOUT" \
   || die "invalid Linux runner assignment timeout configuration"
+tartci_validate_runner_job_timeout "${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}" \
+  || die "invalid Linux job timeout configuration"
 tartci_validate_bounded_positive_integer \
   TARTCI_LINUX_BUILD_PARALLEL_LEVEL "$BUILD_PARALLEL_LEVEL" 64 \
   || die "invalid Linux build parallelism configuration"

@@ -305,6 +305,15 @@ python3 "$HOME/.local/lib/tartci/pulp-render-generation.py" \
   --parent-digest "$parent_digest" \
   --output "$HOME/.config/tartci/pulp-render-generation.json"
 test -s "$HOME/.config/tartci/pulp-render-generation.json"
+
+# Every CI clone shares the base image's well-known admin password and sits on
+# the same host network as its siblings, so SSH must accept keys only (the
+# providers always authenticate with a key). 00- sorts before cloud-init's
+# drop-in, and the first value sshd reads wins.
+sudo install -d -m 755 /etc/ssh/sshd_config.d
+printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
+  | sudo tee /etc/ssh/sshd_config.d/00-tartci-key-only.conf >/dev/null
+sudo sshd -t
 GUEST
 
 note "§stop $NAME — golden ready. Tag it: tart stop $NAME (then keep as :latest, or"

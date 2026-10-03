@@ -44,6 +44,7 @@ class FakeSystem(su.System):
         self.home, self.sealed = home, sealed
         self.clock = NOW
         self.calls: list[tuple[list[str], str | None]] = []
+        self.inputs: list[str | None] = []
         self.pool_state = "on"
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -127,8 +128,9 @@ class FakeSystem(su.System):
                     break
         return out
 
-    def run(self, argv, *, cwd=None, env=None, timeout=900):  # noqa: C901
+    def run(self, argv, *, cwd=None, env=None, timeout=900, input=None):  # noqa: C901
         self.calls.append((list(argv), cwd))
+        self.inputs.append(input)
         a = list(argv)
         joined = " ".join(a)
         if self.hook:
@@ -141,7 +143,7 @@ class FakeSystem(su.System):
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
-        if a[0] == "security" and a[1] == "unlock-keychain":
+        if a[0] == "security" and a[1] == "-i" and (input or "").startswith("unlock-keychain"):
             self.unlocked = self.unlock_rc == 0
             return su.Result(self.unlock_rc, "", "" if self.unlock_rc == 0 else "bad password")
         if a[0] == "codesign" and "--timestamp" in a:
@@ -1086,9 +1088,12 @@ class SigningKeychainTests(Base):
         self.sys.locked = True
         self.assertUpdated(self.apply())
         unlock = self.calls("security")
-        self.assertEqual(unlock[0][:3], ["security", "unlock-keychain", "-p"])
-        self.assertEqual(unlock[0][-1],
-                         str(self.home / "Library/Keychains/pulp-signing.keychain-db"))
+        # The password travels over stdin; argv is readable by any local user.
+        self.assertEqual(unlock[0], ["security", "-i"])
+        script = self.sys.inputs[[a for a, _ in self.sys.calls].index(unlock[0])]
+        keychain = self.home / "Library/Keychains/pulp-signing.keychain-db"
+        self.assertEqual(script, f'unlock-keychain -p "s3cret" "{keychain}"\n')
+        self.assertFalse(any("s3cret" in " ".join(a) for a, _ in self.sys.calls))
         order = [("probe" if a[0] == "codesign" and "--timestamp" in a else a[0])
                  for a, _ in self.sys.calls if a[0] in ("security", "codesign")]
         self.assertLess(order.index("security"), order.index("probe"))

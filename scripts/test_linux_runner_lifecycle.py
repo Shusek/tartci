@@ -21,7 +21,9 @@ LAUNCHD_TEMPLATE = (
 
 
 class RunnerAssignmentTests(unittest.TestCase):
-    def _run_harness(self, runner_body: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    def _run_harness(
+        self, runner_body: str, extra_env: dict[str, str] | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
@@ -56,7 +58,7 @@ class RunnerAssignmentTests(unittest.TestCase):
         started = time.monotonic()
         proc = subprocess.run(
             ["bash", str(script)],
-            env={**os.environ, "TEST_ROOT": str(root)},
+            env={**os.environ, "TEST_ROOT": str(root), **(extra_env or {})},
             capture_output=True,
             text=True,
             check=False,
@@ -64,6 +66,37 @@ class RunnerAssignmentTests(unittest.TestCase):
         )
         proc.elapsed = time.monotonic() - started  # type: ignore[attr-defined]
         return proc, root
+
+    def test_assigned_job_past_the_host_deadline_is_killed_and_cleaned(self) -> None:
+        proc, root = self._run_harness(
+            "echo 'Running job: build'; sleep 5; printf should-not-finish > "
+            '"$TEST_ROOT/runner.finished"',
+            {"TARTCI_JOB_TIMEOUT_SECS": "1"},
+        )
+        self.assertEqual(proc.returncode, 124, proc.stderr)
+        self.assertTrue((root / "job.assigned").is_file())
+        self.assertTrue((root / "vm.deleted").is_file())
+        self.assertFalse((root / "runner.finished").exists())
+        self.assertIn("runner_job=timeout", proc.stderr)
+        self.assertLess(proc.elapsed, 4.5)  # type: ignore[attr-defined]
+
+    def test_invalid_job_deadline_stops_and_cleans_the_live_runner(self) -> None:
+        for value, message in (("soon", "must be a positive integer"),
+                               ("0", "must be a positive integer"),
+                               ("500000", "must be at most 432000")):
+            with self.subTest(value=value):
+                proc, root = self._run_harness(
+                    "sleep 3; printf finished > \"$TEST_ROOT/runner.finished\"",
+                    {"TARTCI_JOB_TIMEOUT_SECS": value},
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn(f"TARTCI_JOB_TIMEOUT_SECS {message}", proc.stderr)
+                self.assertTrue((root / "vm.deleted").is_file())
+                self.assertFalse((root / "runner.finished").exists())
+                self.assertLess(proc.elapsed, 2.5)  # type: ignore[attr-defined]
+        body = RUNNER.read_text(encoding="utf-8")
+        self.assertLess(body.index("tartci_validate_runner_job_timeout"),
+                        body.index('if [ "$LOOP" = 1 ]; then'))
 
     def test_never_assigned_runner_times_out_and_cleans_vm_and_lease(self) -> None:
         proc, root = self._run_harness(

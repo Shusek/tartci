@@ -20,6 +20,14 @@ The initial fork is based on `d7dba4d4e1692635c902d37db85dc47673ca0179`
   Foreign assignments are observed without cancelling or rerunning a job
   through the primary repository's API. See [queue policy](queue-policy.txt).
 
+- Security hardening for running tartci as the primary CI runner: a
+  public-repository fork-approval gate and optional workflow allow-list at every
+  JIT mint, enforcement of the queue policy at assignment time, no runner or
+  keychain credentials in host argv, a pinned Windows runner archive,
+  symlink-safe ccache promotion, opt-in read-only host caches and Tart Softnet,
+  host job deadlines on every provider, and key-only SSH in baked goldens.
+  See [security hardening](security-hardening.md).
+
 The driver mode is optional; existing provider bootstrap remains available.
 Queue admission is separate from GitHub's eventual job assignment. A live lane
 still needs a real GitHub job, drain and restart-recovery check before activation.

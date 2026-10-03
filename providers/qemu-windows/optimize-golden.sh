@@ -9,6 +9,15 @@ USER="${TARTCI_WIN_SSH_USER:-admin}"
 PORT="${TARTCI_WIN_SSH_PORT:-2222}"
 ARCHES="${TARTCI_WIN_VCVARS_ARCHES:-${TARTCI_WIN_VCVARS_ARCH:-arm64}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
+# SHA-256 of actions-runner-win-arm64-$RUNNER_VERSION.zip from the actions/runner
+# release notes; a golden must not bake an unverified runner binary.
+RUNNER_SHA256="${TARTCI_WIN_RUNNER_SHA256:-}"
+case "$RUNNER_VERSION" in ''|*[!0-9.]*) printf 'invalid Actions Runner version: %s\n' "$RUNNER_VERSION" >&2; exit 2;; esac
+case "$RUNNER_SHA256" in
+  '') ;;
+  *[!0-9a-fA-F]*) printf 'TARTCI_WIN_RUNNER_SHA256 must contain 64 hexadecimal characters\n' >&2; exit 2;;
+  *) [ "${#RUNNER_SHA256}" -eq 64 ] || { printf 'TARTCI_WIN_RUNNER_SHA256 must contain 64 hexadecimal characters\n' >&2; exit 2; };;
+esac
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
 SSH=(ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
@@ -20,6 +29,7 @@ note "optimizing Windows golden over ssh 127.0.0.1:$PORT (vcvars arches: $ARCHES
 ps_script='$ErrorActionPreference = "Continue"
 $arches = "'"$ARCHES"'".Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 $runnerVersion = "'"$RUNNER_VERSION"'"
+$expectedSha = "'"$RUNNER_SHA256"'".ToLowerInvariant()
 
 Write-Output "TARTCI_OPT host=$env:COMPUTERNAME"
 Write-Output "TARTCI_OPT arches=$($arches -join ",")"
@@ -134,6 +144,12 @@ if ($currentVersion -ne $runnerVersion) {
     exit 1
   }
   Write-Output ("TARTCI_OPT runner-download-bytes={0}" -f $zipInfo.Length)
+  $actualSha = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+  if (-not $expectedSha -or $actualSha -ne $expectedSha) {
+    Write-Output ("TARTCI_OPT runner-sha256-mismatch got={0} want={1} (set TARTCI_WIN_RUNNER_SHA256)" -f $actualSha, $expectedSha)
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    exit 1
+  }
   Expand-Archive -Path $zip -DestinationPath $runnerDir -Force
   Remove-Item $zip -Force -ErrorAction SilentlyContinue
 } else {

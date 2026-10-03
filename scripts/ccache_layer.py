@@ -50,12 +50,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 ENTRY_MAGIC = b"\xcc\xac"
 ENTRY_HEADER_MIN = 15
@@ -247,10 +249,53 @@ def settle(layout: Layout, vm: str, runner_rc: int, capture_status: str,
 # ── Promotion ──────────────────────────────────────────────────────────────
 
 
+@contextlib.contextmanager
+def directory_fd(path: Path, *, create: bool = False) -> Iterator[int]:
+    """Pin a directory without following symlinks in any guest-controlled part.
+
+    Checking/resolving a path before reopening it leaves a race. Walk from the
+    filesystem root using openat instead, and retain the fd for all operations.
+    macOS's fixed, root-owned /var, /tmp and /etc aliases are the only exception.
+    """
+    parts = Path(os.path.abspath(path)).parts[1:]
+    if sys.platform == "darwin" and parts and parts[0] in ("var", "tmp", "etc"):
+        parts = ("private", *parts)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
+    try:
+        for name in parts:
+            if create:
+                try:
+                    os.mkdir(name, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def regular_at(parent: int, name: str) -> int:
+    """Open a regular file relative to a pinned parent, without blocking on FIFOs."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(errno.EINVAL, "not a regular file", name)
+    return fd
+
+
+def open_regular(path: Path) -> int:
+    """Open a guest-written file without following leaf or ancestor symlinks."""
+    with directory_fd(path.parent) as parent:
+        return regular_at(parent, path.name)
+
+
 def entry_type(path: Path) -> int | None:
     """The ccache entry type byte, or None when the file is not an entry."""
     try:
-        with path.open("rb") as handle:
+        with os.fdopen(open_regular(path), "rb") as handle:
             header = handle.read(ENTRY_HEADER_MIN)
     except OSError:
         return None
@@ -262,72 +307,119 @@ def entry_type(path: Path) -> int | None:
 def iter_layer_entries(remote: Path) -> Iterator[tuple[str, str, Path]]:
     """(key-dir, name, path) for every candidate file; rejects are yielded too."""
     try:
-        subdirs = sorted(os.scandir(remote), key=lambda item: item.name)
-    except FileNotFoundError:
-        return
-    for sub in subdirs:
-        if sub.name == "CACHEDIR.TAG":
-            continue
-        if not sub.is_dir(follow_symlinks=False):
-            yield sub.name, "", Path(sub.path)
-            continue
-        for item in sorted(os.scandir(sub.path), key=lambda entry: entry.name):
-            yield sub.name, item.name, Path(item.path)
+        with directory_fd(remote) as parent:
+            with os.scandir(parent) as scan:
+                names = sorted(item.name for item in scan)
+            for name in names:
+                if name == "CACHEDIR.TAG":
+                    continue
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=parent)
+                except OSError:
+                    yield name, "", remote / name
+                    continue
+                try:
+                    with os.scandir(child) as scan:
+                        entries = sorted(item.name for item in scan)
+                    for item in entries:
+                        yield name, item, remote / name / item
+                finally:
+                    os.close(child)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
+            raise
+        yield "", "", remote
+
+
+def link_regular_at(src_fd: int, src_parent: int, src_name: str,
+                    dest_parent: int, dest_name: str) -> None:
+    """Link within pinned directories and reject a leaf changed since opening."""
+    os.link(src_name, dest_name, src_dir_fd=src_parent, dst_dir_fd=dest_parent,
+            follow_symlinks=False)
+    source = os.fstat(src_fd)
+    linked = os.stat(dest_name, dir_fd=dest_parent, follow_symlinks=False)
+    if (not stat.S_ISREG(linked.st_mode)
+            or (source.st_dev, source.st_ino) != (linked.st_dev, linked.st_ino)):
+        os.unlink(dest_name, dir_fd=dest_parent)
+        raise OSError(errno.EINVAL, "entry changed while linking", src_name)
+
+
+def link_regular(src: Path, dest: Path) -> None:
+    """Hard-link a regular file without following any part of either path."""
+    with directory_fd(src.parent) as source, directory_fd(dest.parent) as target:
+        with os.fdopen(regular_at(source, src.name), "rb") as reader:
+            link_regular_at(reader.fileno(), source, src.name, target, dest.name)
 
 
 def publish_result(src: Path, dest: Path) -> str:
     """Hard-link a result entry into place; an existing key always wins."""
-    try:
-        os.link(src, dest)
-        return "promoted"
-    except FileExistsError:
-        return "existing"
-    except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EMLINK):
-            raise
-    tmp = dest.parent / f"{TMP_PREFIX}{dest.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    try:
-        copy_synced(src, tmp)
-        try:
-            os.link(tmp, dest)
-        except FileExistsError:
-            return "existing"
-        return "promoted"
-    finally:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
+    with directory_fd(src.parent) as source, directory_fd(dest.parent) as target:
+        with os.fdopen(regular_at(source, src.name), "rb") as reader:
+            try:
+                link_regular_at(reader.fileno(), source, src.name, target, dest.name)
+                return "promoted"
+            except FileExistsError:
+                return "existing"
+            except OSError as exc:
+                if exc.errno not in (errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EMLINK):
+                    raise
+            tmp = f"{TMP_PREFIX}{dest.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            try:
+                copy_synced_at(reader, target, tmp)
+                with os.fdopen(regular_at(target, tmp), "rb") as copied:
+                    try:
+                        link_regular_at(copied.fileno(), target, tmp, target, dest.name)
+                    except FileExistsError:
+                        return "existing"
+                return "promoted"
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=target)
+
+
+def copy_synced_at(reader: BinaryIO, parent: int, name: str,
+                   *, preserve_times: bool = False) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=parent)
+    with os.fdopen(fd, "wb") as writer:
+        reader.seek(0)
+        shutil.copyfileobj(reader, writer)
+        writer.flush()
+        if preserve_times:
+            source = os.fstat(reader.fileno())
+            os.utime(writer.fileno(), ns=(source.st_atime_ns, source.st_mtime_ns))
+        os.fsync(writer.fileno())
 
 
 def copy_synced(src: Path, dest: Path) -> None:
-    with src.open("rb") as reader, dest.open("xb") as writer:
-        shutil.copyfileobj(reader, writer)
-        writer.flush()
-        os.fsync(writer.fileno())
+    with os.fdopen(open_regular(src), "rb") as reader, directory_fd(dest.parent) as target:
+        copy_synced_at(reader, target, dest.name)
 
 
 def publish_manifest(src: Path, dest: Path, lock_path: Path) -> str:
     """Publish a manifest, replacing an existing one only when strictly newer."""
-    with flock(lock_path):
-        try:
-            existing = dest.lstat()
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            if src.lstat().st_mtime_ns <= existing.st_mtime_ns:
-                return "existing"
-        tmp = dest.parent / f"{TMP_PREFIX}{dest.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        try:
+    with flock(lock_path), directory_fd(src.parent) as source, directory_fd(dest.parent) as target:
+        with os.fdopen(regular_at(source, src.name), "rb") as reader:
             try:
-                os.link(src, tmp)
-            except OSError:
-                copy_synced(src, tmp)
-                stat = src.lstat()
-                os.utime(tmp, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-            os.replace(tmp, dest)
-        finally:
-            with contextlib.suppress(OSError):
-                tmp.unlink()
-        return "replaced" if existing is not None else "promoted"
+                existing = os.stat(dest.name, dir_fd=target, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and os.fstat(reader.fileno()).st_mtime_ns <= existing.st_mtime_ns:
+                return "existing"
+            tmp = f"{TMP_PREFIX}{dest.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            try:
+                try:
+                    link_regular_at(reader.fileno(), source, src.name, target, tmp)
+                except OSError as exc:
+                    if exc.errno not in (errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EMLINK):
+                        raise
+                    copy_synced_at(reader, target, tmp, preserve_times=True)
+                os.replace(tmp, dest.name, src_dir_fd=target, dst_dir_fd=target)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=target)
+            return "replaced" if existing is not None else "promoted"
 
 
 def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
@@ -353,12 +445,19 @@ def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
             counts["rejected"] += 1
             continue
         dest_dir = layout.shared / key_dir
-        dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / name
-        if kind == ENTRY_TYPE_MANIFEST:
-            outcome = publish_manifest(path, dest, lock_path)
-        else:
-            outcome = publish_result(path, dest)
+        try:
+            with directory_fd(dest_dir, create=True):
+                pass
+            if kind == ENTRY_TYPE_MANIFEST:
+                outcome = publish_manifest(path, dest, lock_path)
+            else:
+                outcome = publish_result(path, dest)
+        except OSError as exc:
+            # Swapped for a symlink, FIFO or directory after the checks above.
+            if exc.errno not in (errno.EINVAL, errno.ELOOP, errno.ENOENT, errno.EISDIR, errno.ENOTDIR):
+                raise
+            outcome = "rejected"
         counts[outcome] += 1
         if outcome in ("promoted", "replaced"):
             counts["bytes"] += info.st_size
@@ -370,7 +469,8 @@ def layer_stats(layer: Path, ccache: str | None) -> dict[str, int] | None:
     """Hit/miss counters from the job's own stats, when a host ccache exists."""
     if not ccache:
         return None
-    env = dict(os.environ, CCACHE_DIR=str(layer / "local"))
+    # The layer is guest-written: read its stats, never its ccache.conf.
+    env = dict(os.environ, CCACHE_DIR=str(layer / "local"), CCACHE_CONFIGPATH=os.devnull)
     try:
         output = subprocess.run([ccache, "--print-stats"], env=env, text=True,
                                 capture_output=True, timeout=30, check=False)
@@ -491,45 +591,79 @@ def trim(layout: Layout, max_size: int, interval: float = DEFAULT_TRIM_INTERVAL,
          now: float | None = None) -> dict[str, int] | None:
     """Evict the oldest shared entries until under 90% of ``max_size``."""
     now = time.time() if now is None else now
-    stamp = layout.shared / TRIM_STAMP
     with flock(layout.locks / "trim.lock", blocking=False) as held:
         if not held:
             return None
-        try:
-            if interval > 0 and now - stamp.stat().st_mtime < interval:
-                return None
-        except FileNotFoundError:
-            pass
-        entries: list[tuple[float, int, Path]] = []
-        removed_tmp = 0
-        total = 0
-        for sub in os.scandir(layout.shared):
-            if not sub.is_dir(follow_symlinks=False):
-                continue
-            for item in os.scandir(sub.path):
+        with directory_fd(layout.shared) as shared:
+            try:
+                stamp = os.stat(TRIM_STAMP, dir_fd=shared, follow_symlinks=False)
+                if stat.S_ISREG(stamp.st_mode) and interval > 0 and now - stamp.st_mtime < interval:
+                    return None
+            except FileNotFoundError:
+                pass
+            # Keep identities as well as names. Reopening an eviction directory
+            # must neither follow a swapped symlink nor evict a replacement entry.
+            entries: list[tuple[float, int, str, str, tuple[int, int], tuple[int, int]]] = []
+            removed_tmp = 0
+            total = 0
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            with os.scandir(shared) as scan:
+                subdirs = sorted(item.name for item in scan)
+            for sub in subdirs:
                 try:
-                    info = item.stat(follow_symlinks=False)
+                    child = os.open(sub, flags, dir_fd=shared)
                 except OSError:
                     continue
-                if item.name.startswith(TMP_PREFIX):
-                    if now - info.st_mtime > STALE_TMP_SECONDS:
+                try:
+                    directory = os.fstat(child)
+                    identity = (directory.st_dev, directory.st_ino)
+                    with os.scandir(child) as scan:
+                        for item in scan:
+                            try:
+                                info = item.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            if item.name.startswith(TMP_PREFIX):
+                                if now - info.st_mtime > STALE_TMP_SECONDS:
+                                    with contextlib.suppress(OSError):
+                                        os.unlink(item.name, dir_fd=child)
+                                        removed_tmp += 1
+                                continue
+                            if stat.S_ISREG(info.st_mode):
+                                entries.append((info.st_mtime, info.st_size, sub, item.name,
+                                                identity, (info.st_dev, info.st_ino)))
+                                total += info.st_size
+                finally:
+                    os.close(child)
+            evicted = 0
+            if total > max_size:
+                target = int(max_size * 0.9)
+                for _, size, sub, name, directory_id, entry_id in sorted(entries, key=lambda row: row[0]):
+                    if total <= target:
+                        break
+                    try:
+                        child = os.open(sub, flags, dir_fd=shared)
+                    except OSError:
+                        continue
+                    try:
                         with contextlib.suppress(OSError):
-                            os.unlink(item.path)
-                            removed_tmp += 1
-                    continue
-                entries.append((info.st_mtime, info.st_size, Path(item.path)))
-                total += info.st_size
-        evicted = 0
-        if total > max_size:
-            target = int(max_size * 0.9)
-            for _, size, path in sorted(entries, key=lambda row: row[0]):
-                if total <= target:
-                    break
-                with contextlib.suppress(OSError):
-                    path.unlink()
-                    total -= size
-                    evicted += 1
-        stamp.touch()
+                            directory = os.fstat(child)
+                            info = os.stat(name, dir_fd=child, follow_symlinks=False)
+                            if ((directory.st_dev, directory.st_ino) == directory_id
+                                    and (info.st_dev, info.st_ino) == entry_id):
+                                os.unlink(name, dir_fd=child)
+                                total -= size
+                                evicted += 1
+                    finally:
+                        os.close(child)
+            fd = os.open(TRIM_STAMP, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=shared)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(errno.EINVAL, "not a regular trim stamp", TRIM_STAMP)
+                os.utime(fd, None)
+            finally:
+                os.close(fd)
         audit(layout, "trim", evicted=evicted, removed_tmp=removed_tmp,
               bytes_after=total, max_size=max_size)
         return {"evicted": evicted, "removed_tmp": removed_tmp, "bytes_after": total}

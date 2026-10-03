@@ -42,8 +42,7 @@ INTERVAL_SECS = 900
 Interactive = Callable[[str], tuple[int, str]]
 
 
-def _quote(text: str) -> str:
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+_quote = su.security_quote
 
 
 def _security_interactive(script: str) -> tuple[int, str]:

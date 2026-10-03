@@ -49,7 +49,8 @@ if "-X" in args and "POST" in args:
     open(state, "w", encoding="utf-8").write("cancelled")
     print("{}")
 elif path.endswith("/actions/workflows?per_page=100&page=1"):
-    print(json.dumps({"total_count":1,"workflows":[{"id":99,"name":"Build and Test"}]}))
+    print(json.dumps({"total_count":1,"workflows":[{"id":99,"name":"Build and Test",
+                                                    "path":".github/workflows/ci.yml"}]}))
 elif path.endswith("/actions/jobs/444"):
     terminal = open(state, encoding="utf-8").read().strip() == "cancelled"
     print(json.dumps({"id":444,"status":"completed" if terminal else "in_progress",
@@ -390,5 +391,23 @@ capture_current_job discover || true
 # failed measurement, so the shipped attempt timeout has to outlast it.
 grep -q 'TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-120}' "$ROOT/providers/tart-macos/runner.sh"
 grep -q 'TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-360}' "$ROOT/providers/tart-macos/runner.sh"
+
+# GitHub can hand the runner a run the queue policy refuses (the fixture run
+# carries no admitted event). That is a policy violation the supervisor stops,
+# not just an observation; a foreign repository keeps the old receipt.
+reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID="" CURRENT_JOB_CAPTURE_STATUS=not-attempted
+CURRENT_JOB_POLICY_VIOLATION=0 LIFECYCLE_HANG=0
+printf active >"$LIFECYCLE_STATE"
+printf '%s\n' '{"repository":"Generous-Corp/pulp","events":["push"],"workflow_paths":[".github/workflows/ci.yml"]}' \
+  >"$TMP/policy.json"
+policy_rc=0
+TARTCI_QUEUE_POLICY_FILE="$TMP/policy.json" capture_current_job discover || policy_rc=$?
+[ "$policy_rc" = 2 ]
+[ "$CURRENT_JOB_CAPTURE_STATUS" = policy_violation ]
+[ "$CURRENT_JOB_POLICY_VIOLATION" = 1 ]
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = policy_violation ]
+grep -q '^job_policy_violation|' "$EVENTS"
+grep -q 'GitHub assigned a run outside the queue policy' "$ROOT/providers/tart-macos/runner.sh"
 
 printf 'current job lifecycle: ok\n'
