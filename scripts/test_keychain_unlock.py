@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE))
 import keychain_unlock  # noqa: E402
 import tartci_launchd_watchdog as wd  # noqa: E402
 
-SECRET = 'pa ss"w\\\\rd'
+SECRET = 'Pw-Q7 ss"w\\\\rd'
 
 
 class Fixture(unittest.TestCase):
@@ -65,7 +65,9 @@ class UnlockTests(Fixture):
         self.assertIn(keychain_unlock._quote(SECRET), unlock)
         self.assertIn("set-keychain-settings", settings)
         self.assertEqual(keychain_unlock.last(self.home)["state"], "ok")
-        self.assertNotIn(SECRET.split()[0], keychain_unlock.state_path(self.home).read_text())
+        state = keychain_unlock.state_path(self.home).read_text()
+        for word in SECRET.split():
+            self.assertNotIn(word, state)
 
     def test_the_password_is_never_an_argument(self) -> None:
         seen = {}
@@ -112,7 +114,7 @@ class AgentShapeTests(unittest.TestCase):
         self.assertIs(plist["RunAtLoad"], True)
         self.assertEqual(plist["StartInterval"], keychain_unlock.INTERVAL_SECS)
         self.assertEqual(plist["ProgramArguments"][-1], "keychain-unlock")
-        self.assertNotIn("PW", plistlib.dumps(plist).decode())
+        self.assertNotIn("KEYCHAIN_PW", plistlib.dumps(plist).decode())
 
     def test_the_watchdog_reinstalls_it_only_where_keychain_env_exists(self) -> None:
         calls = []

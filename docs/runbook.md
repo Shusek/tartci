@@ -2456,7 +2456,12 @@ lanes change.
   once a minute, and never on a host whose census CLI is anonymous (see below).
 - **Capacity-floor refusals come in two kinds, and only one is overridable.**
   `last serving host` (the floor's exit 3) means the census answered and no
-  other host serves the label; `--allow-last-serving-host` takes it to zero
+  other host serves the label: none has an online runner carrying it, and no
+  host declaring it in the published supply proved, through its own `pool
+  status --json` over SSH, that it is on, participating, fleet-ready, free of
+  fleet problems (a stale heartbeat is one), with every supervisor running and
+  supply matching. The refusal lists each declaring peer and why it was not
+  counted; `--allow-last-serving-host` takes it to zero
   deliberately. `capacity unknown` (exit 4) means the census could not answer;
   `--allow-last-serving-host` does NOT override it, and the refusal names the
   cause. `census_unauthenticated` (e.g. `API rate limit exceeded for <ip>`):
