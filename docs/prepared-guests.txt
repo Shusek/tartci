@@ -1,0 +1,45 @@
+Prepared guest drivers (opt-in)
+
+TARTCI_GUEST_DRIVER must be an absolute executable path. Without it the
+existing bootstrap and provider behavior remain enabled. A prepared driver
+uses the provider's clone, lease, JIT, monitoring and disposal lifecycle while
+supplying an already provisioned guest. The driver must validate its baked
+runner version in preflight; the macOS provider does not download an archive
+or require an archive digest in this mode.
+
+Driver ABI: DRIVER OPERATION VM ENDPOINT [PROFILE]
+macOS ENDPOINT is the VM name; Windows ENDPOINT is the localhost SSH port.
+Operations: ready (macOS), preflight, run-jit, run-local, stop, and collect
+(Windows). Nonzero preflight refuses JIT. run-jit receives the encoded JIT
+configuration on stdin. It must not place credentials in host argv or logs.
+The guest transport may use the ordinary runner CLI inside the isolated VM.
+Use a fixed, protected guest entrypoint and a nonadmin build account.
+
+--once --local-job PROFILE requires a driver. It performs a credential-free
+local job through the same upstream VM lifecycle. It does not register a
+GitHub runner. Prepared macOS guests have no host shares and use Softnet.
+Prepared Windows guests use restricted QEMU user networking; GitHub mode
+requires an explicit guestfwd proxy command. Warm-mode macOS is unsupported
+with this driver. The driver mode is opt-in rather than a replacement for
+existing Pulp preparation.
+
+TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS defaults to 360. Hosts with slow cold
+storage can select a larger bounded preflight; local execution remains
+bounded by TARTCI_JOB_TIMEOUT_SECS. Windows prepared listener monitoring
+recognizes "Running job:" and defers termination of an assigned job until
+completion or the job deadline. It records assignment, drain and exit state.
+
+Explicit admission budgets:
+TARTCI_LEASE_CAPACITY_CORES / TARTCI_LEASE_CAPACITY_MEM_MB
+TARTCI_GATE_RESERVED_CORES / TARTCI_GATE_RESERVED_MEM_MB
+TARTCI_NON_GATE_CAPACITY_CORES (VM clamp)
+Explicit lease CLI flags take precedence over capacity/reserve environment
+inputs; when absent the host profile remains authoritative. Set the non-gate
+clamp consistently with capacity minus reserve. RAM is real guest RAM, not
+swap. These inputs let an isolated pilot reserve resources for an existing
+controller that does not participate in the TartCI lease store.
+
+Policy admission is not GitHub assignment authorization. Before enabling a
+real lane, verify runner group/workflow/label visibility, run a real job, and
+exercise live drain and restart recovery. A local or stubbed listener test
+cannot prove those GitHub behaviors.

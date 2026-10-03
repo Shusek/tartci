@@ -31,6 +31,8 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
+# shellcheck source=providers/common/runner-scope.lib.sh
+source "$TARTCI_ROOT/providers/common/runner-scope.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -117,14 +119,12 @@ runtime_emit_complete(){
     --gh-enrich \
     --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
-command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
 # GitHub CLI for all API calls. Default `gh`; hosts authenticating as a GitHub
 # App set TARTCI_GH_CLI=ghapp to move provider API traffic off the personal PAT
 # (the per-poll calls are the dominant throttle). Exported so the inline python
 # poller inherits it.
 export TARTCI_GH_CLI="${TARTCI_GH_CLI:-gh}"
 GH_CLI="$TARTCI_GH_CLI"
-command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT)"
 
 allocate_ssh_port(){
   python3 - "$WORKROOT/port-locks" <<'PY'
@@ -203,17 +203,31 @@ finally:
 PY
 }
 
+LOCAL_JOB=""
+GUEST_DRIVER="${TARTCI_GUEST_DRIVER:-}"
 PRINT_HOST_HEALTH=0
+PRINT_RUNNER_API_ROOT=0
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
+  --local-job) LOCAL_JOB="$2"; shift 2;;
   --golden) GOLDEN="$2"; shift 2;;
   --labels) LABELS="$2"; shift 2;;
   --repo) REPO="$2"; shift 2;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+if [ -n "$GUEST_DRIVER" ]; then
+  [ "${GUEST_DRIVER#/}" != "$GUEST_DRIVER" ] && [ -x "$GUEST_DRIVER" ] || die "TARTCI_GUEST_DRIVER must be an absolute executable path"
+fi
+[ -z "$LOCAL_JOB" ] || { [ -n "$GUEST_DRIVER" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires guest driver and --once"
+RUNNER_API_ROOT="$(tartci_runner_api_root "$REPO" "$RUNNER_GROUP_ID" "${TARTCI_RUNNER_SCOPE:-repo}")"
+[ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
+command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
+[ -n "$LOCAL_JOB" ] || command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT)"
 
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
@@ -222,9 +236,9 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN)"
-FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -f "$c" ] && FW="$c" && break; done
+FW="${TARTCI_WIN_FIRMWARE:-}"; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -n "$FW" ] && break; [ -f "$c" ] && FW="$c" && break; done
 [ -n "$FW" ] || die "no edk2-aarch64-code.fd"
-VARS_TPL=""; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
+VARS_TPL="${TARTCI_WIN_VARS_TEMPLATE:-}"; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -n "$VARS_TPL" ] && break; [ -f "$v" ] && VARS_TPL="$v" && break; done
 [ -n "$VARS_TPL" ] || die "no edk2 vars template"
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
@@ -232,25 +246,35 @@ case "$WIN_CPUS" in ''|*[!0-9]*) die "invalid TARTCI_WIN_CPUS='$WIN_CPUS'";; esa
 case "$WIN_MEMORY_MB" in ''|*[!0-9]*) die "invalid TARTCI_WIN_MEMORY_MB='$WIN_MEMORY_MB'";; esac
 
 delete_runner_registration(){
+  [ -z "${LOCAL_JOB:-}" ] || return 0
   local name="$1" ids id tries=0
   while [ "$tries" -lt 6 ]; do
     tries=$((tries + 1))
-    ids="$("$GH_CLI" api "repos/$REPO/actions/runners" --paginate \
+    ids="$("$GH_CLI" api "$RUNNER_API_ROOT" --paginate \
       --jq ".runners[] | select(.name==\"$name\" and .busy==false) | .id" 2>/dev/null || true)"
     if [ -n "$ids" ]; then
       for id in $ids; do
         note "deleting stale runner registration name=$name id=$id"
-        "$GH_CLI" api -X DELETE "repos/$REPO/actions/runners/$id" >/dev/null 2>&1 || true
+        "$GH_CLI" api -X DELETE "$RUNNER_API_ROOT/$id" >/dev/null 2>&1 || true
       done
     fi
-    ids="$("$GH_CLI" api "repos/$REPO/actions/runners" --paginate \
+    ids="$("$GH_CLI" api "$RUNNER_API_ROOT" --paginate \
       --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null || true)"
     [ -z "$ids" ] && return 0
     sleep 2
   done
 }
 
+CURRENT_PREPARED_LISTENER_PID=""
+WINDOWS_DRAIN_REQUESTED=0
+
 cleanup_active_windows_job(){
+  if [ -n "${CURRENT_PREPARED_LISTENER_PID:-}" ] && kill -0 "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null; then
+    kill -TERM "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
+    while kill -0 "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null; do sleep 1; done
+    wait "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
+  fi
+  CURRENT_PREPARED_LISTENER_PID=""
   [ "$CURRENT_WIN_CLEANED_UP" = 0 ] || return 0
   CURRENT_WIN_CLEANED_UP=1
   if [ -n "$CURRENT_WIN_QPID" ]; then
@@ -285,6 +309,11 @@ cleanup_active_windows_job(){
 }
 
 handle_windows_runner_signal(){
+  if [ -n "${CURRENT_PREPARED_LISTENER_PID:-}" ]; then
+    WINDOWS_DRAIN_REQUESTED=1
+    kill -TERM "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
+    return 0
+  fi
   cleanup_active_windows_job
   trap - EXIT
   exit 143
@@ -400,10 +429,18 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
     return 1
   fi
+  local network="user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22"
+  if [ -n "$GUEST_DRIVER" ]; then
+    network="$network,restrict=on"
+    if [ -z "$LOCAL_JOB" ]; then
+      [ -n "${TARTCI_WIN_PROXY_COMMAND:-}" ] || { cleanup_active_windows_job; return 1; }
+      network="$network,guestfwd=tcp:10.0.2.100:3128-cmd:$TARTCI_WIN_PROXY_COMMAND"
+    fi
+  fi
   tartci_vm_lease_guard_exec qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$effective_win_cpus" -m "$WIN_MEMORY_MB" \
     -drive if=pflash,format=raw,readonly=on,file="$FW" -drive if=pflash,format=raw,file="$efivars" \
     -device ramfb -device qemu-xhci,id=usb -device usb-kbd -device usb-tablet \
-    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=net0 \
+    -netdev "$network" -device virtio-net-pci,netdev=net0 \
     -drive file="$overlay",if=none,id=nvm,format=qcow2 -device nvme,drive=nvm,serial=pulpwin \
     -display none >"$logdir/qemu.log" 2>&1 & CURRENT_WIN_QPID=$!
   qpid="$CURRENT_WIN_QPID"
@@ -451,6 +488,42 @@ run_one(){ # $1=iteration index
     cleanup_job failure; return 1
   fi
   t_booted="$(now_epoch)"
+  if [ -n "$GUEST_DRIVER" ]; then
+    local prepared_rc=0 prepared_jit="" prepared_log="$logdir/actions-runner.log"
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation guest-preflight -- "$GUEST_DRIVER" preflight "$job" "$port" || prepared_rc=$?
+    if [ "$prepared_rc" = 0 ]; then
+      if [ -n "$LOCAL_JOB" ]; then
+        python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --operation local-job -- "$GUEST_DRIVER" run-local "$job" "$port" "$LOCAL_JOB" >"$prepared_log" 2>&1 || prepared_rc=$?
+      else
+        python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$logdir/repository-access.json" || prepared_rc=$?
+        if [ "$prepared_rc" = 0 ] && tartci_pool_lock_acquire; then
+          local prepared_labels=() label
+          IFS=',' read -r -a prepared_labels <<< "$LABELS"
+          label_args=(); for label in "${prepared_labels[@]}"; do label_args+=(-f "labels[]=$label"); done
+          prepared_jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" --jq '.encoded_jit_config')" || prepared_rc=$?
+          if [ "$prepared_rc" = 0 ] && [ -n "$prepared_jit" ]; then
+            printf '%s' "$prepared_jit" | python3 "$TARTCI_ROOT/scripts/guest_driver_listener.py" --idle-timeout "$IDLE_TIMEOUT" --job-timeout "${TARTCI_JOB_TIMEOUT_SECS:-7200}" --receipt "$logdir/listener.json" -- "$GUEST_DRIVER" run-jit "$job" "$port" >"$prepared_log" 2>&1 &
+            CURRENT_PREPARED_LISTENER_PID=$!
+            if ! tartci_pool_lock_handoff_to_listener "$CURRENT_PREPARED_LISTENER_PID"; then
+              kill -TERM "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null || true
+            fi
+            while kill -0 "$CURRENT_PREPARED_LISTENER_PID" 2>/dev/null; do
+              sleep 1
+            done
+            wait "$CURRENT_PREPARED_LISTENER_PID" || prepared_rc=$?
+            CURRENT_PREPARED_LISTENER_PID=""
+          else prepared_rc=1; fi
+          prepared_jit=""
+          tartci_pool_lock_release
+        else prepared_rc=75; fi
+      fi
+    fi
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 120 --operation guest-collect -- "$GUEST_DRIVER" collect "$job" "$port" || prepared_rc=1
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 30 --operation guest-stop -- "$GUEST_DRIVER" stop "$job" "$port" || prepared_rc=1
+    cleanup_job "$([ "$prepared_rc" = 0 ] && printf success || printf failure)"
+    return "$prepared_rc"
+  fi
+
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
     write_state admission-check
@@ -486,7 +559,7 @@ run_one(){ # $1=iteration index
     cleanup_job success
     return 75
   fi
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+  jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
         -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
@@ -783,7 +856,7 @@ if [ "$LOOP" = 1 ]; then
   # auth (the loop is idle at the top — run_one blocks — so nothing in flight is lost).
   blind=0
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
-  while true; do
+  while [ "${WINDOWS_DRAIN_REQUESTED:-0}" = 0 ]; do
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new Windows admission; waiting ${POLL}s"
       sleep "$POLL"
