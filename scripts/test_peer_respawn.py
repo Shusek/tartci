@@ -190,5 +190,102 @@ class PeerRespawnTests(unittest.TestCase):
         self.assertIn('--self-label "$TARTCI_LAUNCHD_LABEL"', body)
 
 
+
+REAP = "com.danielraffel.tartci.reap"
+SELF_UPDATE = "com.danielraffel.tartci.self-update"
+
+
+class IntervalFake:
+    """A launchctl whose interval agent has a scripted state and run count."""
+
+    def __init__(self, state: str = "not running", runs: int = 2593) -> None:
+        self.state, self.runs = state, runs
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd: list[str]) -> tuple[int, str, str]:
+        self.calls.append(cmd)
+        if cmd[1] == "print":
+            return 0, (f"\tstate = {self.state}\n\truns = {self.runs}\n"
+                       "\tpended nondemand spawn = interval\n\tlast exit code = 0\n"), ""
+        return 0, "", ""
+
+    def kicks(self) -> list[list[str]]:
+        return [cmd for cmd in self.calls if cmd[1] == "kickstart"]
+
+
+class IntervalAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ledger: dict = {}
+
+    def run_pass(self, fake: IntervalFake, now: float, label: str = REAP,
+                 log_age: float | None = None) -> list[tuple[str, str]]:
+        return peer_respawn.interval_pass(
+            agents=[(label, f"/LaunchAgents/{label}.plist")], ledger=self.ledger, run=fake,
+            now=now, domain=DOMAIN, interval_of=lambda _plist: 300,
+            log_age_of=lambda _plist: log_age)
+
+    def observe_then_wait(self, fake: IntervalFake, label: str = REAP) -> float:
+        """First observation, then a pass 3 intervals and a bit later."""
+        self.assertEqual(self.run_pass(fake, NOW, label), [])
+        return NOW + 3 * 300 + 1
+
+    def test_a_stale_not_running_agent_gets_one_plain_kick(self) -> None:
+        fake = IntervalFake()
+        events = self.run_pass(fake, self.observe_then_wait(fake))
+        self.assertEqual(fake.kicks(), [["launchctl", "kickstart", f"{DOMAIN}/{REAP}"]])
+        self.assertEqual(events[0][0], "interval_respawn")
+        self.assertIn("pended=yes", events[0][1])
+
+    def test_a_stale_but_running_agent_is_never_kicked(self) -> None:
+        fake = IntervalFake(state="running")
+        self.assertEqual(self.run_pass(fake, self.observe_then_wait(fake)), [])
+        self.assertEqual(fake.kicks(), [])
+
+    def test_an_agent_inside_three_intervals_is_not_kicked(self) -> None:
+        fake = IntervalFake()
+        self.run_pass(fake, NOW)
+        self.assertEqual(self.run_pass(fake, NOW + 3 * 300), [])
+        self.assertEqual(fake.kicks(), [])
+
+    def test_a_fresh_log_means_the_agent_ran(self) -> None:
+        fake = IntervalFake()
+        self.assertEqual(self.run_pass(fake, self.observe_then_wait(fake), log_age=60), [])
+        self.assertEqual(fake.kicks(), [])
+
+    def test_self_update_is_reported_stale_and_never_kicked(self) -> None:
+        fake = IntervalFake()
+        later = self.observe_then_wait(fake, SELF_UPDATE)
+        events = self.run_pass(fake, later, SELF_UPDATE)
+        self.assertEqual(fake.kicks(), [])
+        self.assertEqual([name for name, _ in events], ["interval_agent_stale"])
+        self.assertEqual(self.run_pass(fake, later + 60, SELF_UPDATE), [], "reported once")
+
+    def test_a_second_kick_inside_one_interval_is_suppressed(self) -> None:
+        fake = IntervalFake()
+        later = self.observe_then_wait(fake)
+        self.run_pass(fake, later)
+        events = self.run_pass(fake, later + 299)
+        self.assertEqual(len(fake.kicks()), 1)
+        self.assertEqual([name for name, _ in events], ["interval_respawn_unconfirmed"])
+
+    def test_a_kick_that_advances_runs_is_confirmed(self) -> None:
+        fake = IntervalFake()
+        later = self.observe_then_wait(fake)
+        self.run_pass(fake, later)
+        fake.runs += 1
+        events = self.run_pass(fake, later + 300)
+        self.assertEqual(events[0][0], "interval_respawn_confirmed")
+
+    def test_the_ceiling_fires_after_three_unconfirmed_kicks(self) -> None:
+        fake = IntervalFake()
+        now = self.observe_then_wait(fake)
+        events: list[tuple[str, str]] = []
+        for step in range(6):
+            events += self.run_pass(fake, now + step * 301)
+        self.assertEqual(len(fake.kicks()), 3)
+        names = [name for name, _ in events]
+        self.assertEqual(names.count("interval_respawn_unconfirmed"), 3)
+        self.assertEqual(names.count("interval_respawn_ceiling"), 1)
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,13 @@ restarted forever. A stopped sibling with any other exit code is reported and
 left to the watchdog's verdict: only 75 vouches that the lane's restart
 contract ran.
 
+The same pass covers tartci's own interval agents, which starve the same way
+(reap, launchd-watchdog and keychain-unlock froze on m3 for hours). One is
+kicked only when it is loaded and not running, its run count has not moved and
+its log has not been written for three of its intervals, and it was not kicked
+within the last interval. Self-update is never kicked: it drains and
+re-bootstraps lanes, so it is reported (`interval_agent_stale`) instead.
+
 Prints one `EVENT<TAB>name<TAB>detail` line per event for the caller to log.
 """
 
@@ -42,6 +49,13 @@ DEFAULT_MIN_INTERVAL_S = 300
 DEFAULT_MAX_PER_HOUR = 3
 HOUR_S = 3600
 STOPPED_STATES = {"not running", "spawn scheduled"}
+INTERVAL_STALE_FACTOR = 3
+INTERVAL_UNCONFIRMED_CEILING = 3
+AGENT_PREFIX = "com.danielraffel.tartci."
+# Idempotent and safe beside running lanes, so a lane may start them.
+KICKABLE_INTERVAL_AGENTS = ("reap", "launchd-watchdog", "keychain-unlock")
+# Reported when stale, never started by a lane: it drains and re-bootstraps lanes.
+REPORT_ONLY_INTERVAL_AGENTS = ("self-update",)
 
 Run = Callable[[list[str]], "tuple[int, str, str]"]
 
@@ -133,6 +147,101 @@ def run_pass(
     return events
 
 
+def _runs(printed: str) -> int | None:
+    for raw in printed.splitlines():
+        line = raw.strip()
+        if line.startswith("runs = "):
+            try:
+                return int(line[len("runs = "):])
+            except ValueError:
+                return None
+    return None
+
+
+def interval_pass(
+    *,
+    agents: list[tuple[str, str]],
+    ledger: dict,
+    run: Run,
+    now: float,
+    domain: str,
+    interval_of: Callable[[str], "int | None"],
+    log_age_of: Callable[[str], "float | None"],
+) -> list[tuple[str, str]]:
+    """One pass over (label, plist path) interval agents. Mutates `ledger`."""
+    events: list[tuple[str, str]] = []
+    for label, plist in agents:
+        name = label[len(AGENT_PREFIX):]
+        interval = interval_of(plist)
+        rc, out, _ = run(["launchctl", "print", f"{domain}/{label}"])
+        if rc != 0 or not interval:
+            continue  # not loaded, or no interval to judge staleness by
+        state, _ = watchdog.parse_launchctl_print(out)
+        runs = _runs(out)
+        record = ledger.setdefault(f"interval:{label}", {})
+        if runs is not None and runs != record.get("runs"):
+            record["runs"], record["runs_seen_at"] = runs, now
+        kicked_runs = record.pop("confirm_runs", None)
+        if kicked_runs is not None:
+            if runs is not None and runs > kicked_runs:
+                record["unconfirmed"] = 0
+                record.pop("ceiling_reported", None)
+                events.append(("interval_respawn_confirmed", f"label={name} runs={runs}"))
+            else:
+                record["unconfirmed"] = record.get("unconfirmed", 0) + 1
+                events.append(("interval_respawn_unconfirmed",
+                               f"label={name} runs={runs} unconfirmed={record['unconfirmed']}"))
+        if state == "running" or state is None:
+            continue  # a long run is legitimate; never kick a running job
+        bound = INTERVAL_STALE_FACTOR * interval
+        quiet_for = now - record.get("runs_seen_at", now)
+        log_age = log_age_of(plist)
+        if quiet_for <= bound or (log_age is not None and log_age <= bound):
+            continue
+        if name in REPORT_ONLY_INTERVAL_AGENTS:
+            if now - record.get("stale_reported_at", 0) >= bound:
+                record["stale_reported_at"] = now
+                events.append(("interval_agent_stale",
+                               f"label={name} age={int(quiet_for)}s interval={interval}s"))
+            continue
+        if name not in KICKABLE_INTERVAL_AGENTS:
+            continue
+        if record.get("unconfirmed", 0) >= INTERVAL_UNCONFIRMED_CEILING:
+            if not record.get("ceiling_reported"):
+                record["ceiling_reported"] = True
+                events.append(("interval_respawn_ceiling",
+                               f"label={name} unconfirmed={record['unconfirmed']}"))
+            continue
+        if now - record.get("kicked_at", 0) < interval:
+            continue
+        pended = "yes" if "pended nondemand spawn" in out else "no"
+        kick_rc, _, _ = run(["launchctl", "kickstart", f"{domain}/{label}"])
+        record["kicked_at"] = now
+        record["confirm_runs"] = runs if runs is not None else -1
+        events.append(("interval_respawn",
+                       f"label={name} age={int(quiet_for)}s interval={interval}s "
+                       f"runs={runs} pended={pended} kick_rc={kick_rc}"))
+    return events
+
+
+def _interval_agents(agents_dir: Path) -> list[tuple[str, str]]:
+    names = KICKABLE_INTERVAL_AGENTS + REPORT_ONLY_INTERVAL_AGENTS
+    found = []
+    for name in names:
+        plist = agents_dir / f"{AGENT_PREFIX}{name}.plist"
+        if plist.is_file():
+            found.append((f"{AGENT_PREFIX}{name}", str(plist)))
+    return found
+
+
+def _log_age(plist: str) -> float | None:
+    path = watchdog._log_path_from_plist(plist)
+    try:
+        return max(0.0, time.time() - os.path.getmtime(path)) if path else None
+    except OSError:
+        return None
+
+
 def _load(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -172,6 +281,15 @@ def main(argv: list[str] | None = None) -> int:
             now=time.time(),
             domain=watchdog._domain(),
             grace_s=args.grace_seconds,
+        )
+        events += interval_pass(
+            agents=_interval_agents(Path.home() / "Library/LaunchAgents"),
+            ledger=ledger,
+            run=watchdog._run,
+            now=time.time(),
+            domain=watchdog._domain(),
+            interval_of=watchdog._start_interval_from_plist,
+            log_age_of=_log_age,
         )
         tmp = args.ledger.with_suffix(".tmp")
         tmp.write_text(json.dumps(ledger), encoding="utf-8")
