@@ -746,6 +746,171 @@ class PreCloneProbeTests(RunnerFixture, unittest.TestCase):
         self.assertIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", result.stderr)
 
 
+class PreMintRetargetTests(RunnerFixture, unittest.TestCase):
+    """A booted VM whose class lost its job serves the class that is waiting.
+
+    On m3 on 2026-10-03 the merge-group-first gate lane discarded a booted
+    PR-head VM when a merge-group job arrived, then booted a second VM for it.
+    Tier 0 is merge-group and tier 1 is PR-head.
+    """
+
+    def _decide(self, tier: str) -> str:
+        result = self._runner("--print-pre-mint-retarget", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_a_pr_head_vm_is_retargeted_to_arriving_merge_group(self) -> None:
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._decide("1"), "0")
+
+    def test_a_vm_whose_job_vanished_serves_the_other_waiting_class(self) -> None:
+        self._state(merge=True)
+        self.assertEqual(self._decide("1"), "0")
+        self._state(pr=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    def test_no_demand_anywhere_discards(self) -> None:
+        # Control, same instrument: nothing waits, so nothing to retarget to.
+        self._state()
+        self.assertEqual(self._decide("1"), "discard")
+        self.assertEqual(self._decide("0"), "discard")
+
+    def test_a_class_that_still_admits_is_kept(self) -> None:
+        self._state(merge=True)
+        self.assertEqual(self._decide("0"), "keep")
+
+    def test_a_pr_first_slot_retargets_merge_group_to_arriving_pr_head(self) -> None:
+        self.env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = "pulp-build-pr-head,pulp-build-merge-group"
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    def test_the_mint_path_retargets_before_it_discards(self) -> None:
+        body = RUNNER.read_text(encoding="utf-8")
+        start = body.index('&& ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then')
+        denial = body[start:body.index("\n  fi\n", start)]
+        self.assertIn('retarget_after_pre_mint_denial "$i" "$selected_group_id" || return 75', denial)
+        self.assertNotIn("discard_current_vm", denial)
+        fn_start = body.index("retarget_after_pre_mint_denial(){")
+        block = body[fn_start:body.index("\n}\n", fn_start)]
+        self.assertLess(block.index("tartci_assignment_v2_pre_mint_retarget"),
+                        block.index("discard_current_vm"))
+        self.assertIn('selected_labels="$labels"', block)
+        self.assertIn("assignment_v2_pre_mint_retarget", block)
+        self.assertIn("assignment_v2_pre_mint_discard", block)
+
+
+class PreMintRetargetSafetyTests(unittest.TestCase):
+    """Exercise the real retarget path with an authority for the new class."""
+
+    def exercise(self, **settings: str) -> tuple[dict[str, str], list[str]]:
+        source = RUNNER.read_text(encoding="utf-8")
+        match = re.search(r"^retarget_after_pre_mint_denial\(\)\{\n.*?^\}$",
+                          source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory(prefix="retarget-safety-") as directory:
+            root = Path(directory)
+            trace = root / "trace"
+            script = r'''
+set -euo pipefail
+trace(){ printf '%s\n' "$*" >>"$TRACE"; }
+note(){ trace "note $*"; }
+event(){ trace "event $*"; }
+heartbeat(){ trace "heartbeat $*"; }
+tartci_assignment_v2_pre_mint_denied_event(){ trace "denied $*"; }
+tartci_assignment_v2_pre_mint_retarget(){ printf '0\n'; return "${TEST_SELECTION_RC:-0}"; }
+tartci_assignment_v2_tier_label_at(){ printf 'new-class\n'; }
+tartci_assignment_v2_tier_labels(){ printf 'base,new-class\n'; }
+runner_group_id_for_tier(){ printf '%s\n' "${TEST_GROUP:-11}"; }
+jit_admission_denied(){ return "${TEST_JIT_RC:-1}"; }
+tartci_admission_clean_enabled(){ [ "${TEST_MODE:-required}" = required ]; }
+tartci_admission_clean(){
+  trace "admission $1 $2"
+  printf '{"verdict":"fixture","reason":"fixture","labels":"%s"}\n' "$2"
+  return "${TEST_ADMISSION_RC:-0}"
+}
+tartci_admission_contention_event(){ trace 'contention'; }
+tartci_admission_clean_detail(){ printf 'reason=fixture'; }
+tartci_pool_lock_release(){ trace 'lock-release'; }
+discard_current_vm(){ trace 'discard'; return "${TEST_DISCARD_RC:-0}"; }
+tartci_release_vm_lease(){ trace 'lease-release'; }
+'''
+            script += match.group(0) + r'''
+exercise(){
+  local selected_tier=1 selected_labels=base,old-class vm=fixture-vm rc=0
+  CURRENT_LABELS="$selected_labels"
+  retarget_after_pre_mint_denial 1 11 || rc=$?
+  printf 'rc=%s\ntier=%s\nlabels=%s\ncurrent_labels=%s\n' \
+    "$rc" "$selected_tier" "$selected_labels" "$CURRENT_LABELS"
+}
+exercise
+'''
+            result = subprocess.run(
+                ["/bin/bash", "-c", script], text=True, capture_output=True, timeout=10,
+                env={**os.environ, "TRACE": str(trace), "STATE_DIR": str(root),
+                     "REPO": "fixture/repository", **settings})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return (dict(line.split("=", 1) for line in result.stdout.splitlines()),
+                    trace.read_text().splitlines())
+
+    def test_the_new_class_must_pass_required_admission(self) -> None:
+        for rc in ("1", "3"):
+            with self.subTest(admission_rc=rc):
+                result, trace = self.exercise(TEST_ADMISSION_RC=rc)
+                self.assertEqual(result["rc"], "1")
+                self.assertIn("admission fixture/repository base,new-class", trace)
+                self.assertEqual(result["labels"], "base,old-class")
+                self.assertEqual(result["current_labels"], "base,old-class")
+                self.assertEqual([step for step in trace if step in
+                                  ("lock-release", "discard", "lease-release")],
+                                 ["lock-release", "discard", "lease-release"])
+                self.assertFalse(any("event assignment_v2_pre_mint_retarget " in step
+                                     for step in trace))
+
+    def test_admitted_retarget_updates_observed_labels_and_keeps_the_lease(self) -> None:
+        result, trace = self.exercise()
+        self.assertEqual(result["rc"], "0")
+        self.assertEqual(result["tier"], "0")
+        self.assertEqual(result["labels"], "base,new-class")
+        self.assertEqual(result["current_labels"], "base,new-class")
+        self.assertIn("admission fixture/repository base,new-class", trace)
+        self.assertNotIn("discard", trace)
+        self.assertNotIn("lease-release", trace)
+
+    def test_disabled_admission_keeps_the_existing_retarget_behaviour(self) -> None:
+        result, trace = self.exercise(TEST_MODE="disabled", TEST_ADMISSION_RC="3")
+        self.assertEqual(result["rc"], "0")
+        self.assertEqual(result["current_labels"], "base,new-class")
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_another_runner_group_is_refused_before_any_new_admission(self) -> None:
+        result, trace = self.exercise(TEST_GROUP="22")
+        self.assertEqual(result["rc"], "1")
+        self.assertIn("discard", trace)
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_a_cached_jit_denial_prevents_retarget(self) -> None:
+        result, trace = self.exercise(TEST_JIT_RC="0")
+        self.assertEqual(result["rc"], "1")
+        self.assertIn("discard", trace)
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_no_waiting_class_discards_the_vm(self) -> None:
+        result, trace = self.exercise(TEST_SELECTION_RC="1")
+        self.assertEqual(result["rc"], "1")
+        self.assertIn("discard", trace)
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_failed_teardown_preserves_the_capacity_lease(self) -> None:
+        for settings in ({"TEST_SELECTION_RC": "1"}, {"TEST_ADMISSION_RC": "3"}):
+            with self.subTest(settings=settings):
+                result, trace = self.exercise(TEST_DISCARD_RC="1", **settings)
+                self.assertEqual(result["rc"], "1")
+                self.assertIn("lock-release", trace)
+                self.assertIn("discard", trace)
+                self.assertNotIn("lease-release", trace)
+                self.assertEqual(result["current_labels"], "base,old-class")
+
+
 class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
     """A per-slot class preference order (TARTCI_ASSIGNMENT_V2_TIER_ORDER).
 
