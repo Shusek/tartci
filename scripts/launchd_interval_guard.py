@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Start fleet timer jobs that launchd has stopped starting.
+
+A macOS automatic install that stalls part-way (m3, 2026-10-04: 27.0.1 began
+at 03:14 and never finished) can leave launchd's gui domain refusing every
+non-demand spawn. `launchctl print` then shows each StartInterval agent as
+`pended nondemand spawn = interval` with its `runs` counter frozen, and a
+KeepAlive agent that exits sits at `pended nondemand spawn` instead of being
+respawned. The VM reaper, the launchd watchdog, self-update and the reclaimer
+all stopped for 16 h while the long-running lane supervisors kept serving, so
+nothing looked down. Only a demand spawn (`launchctl kickstart`) still works.
+
+This guard therefore runs inside a process that is already alive: the lane
+supervisor starts it as a background child (providers/tart-macos/
+interval-guard.lib.sh). Every supervisor on a host starts one; an exclusive
+lock picks the single one that acts, and another takes over within one cadence
+when that supervisor exits. Each pass reads the fleet's LaunchAgents
+(com.danielraffel.*, com.pulp.*) and, with per-call timeouts:
+
+  * kicks a StartInterval agent that is not running and whose `runs` counter
+    has not moved for 2x its interval (event `interval_agent_kicked`);
+  * kicks a KeepAlive agent that is not running and has shown a pended spawn
+    for KEEPALIVE_PENDED_S (event `keepalive_agent_kicked`), so a lane that
+    exits for a restart comes back;
+  * opens a domain-wide episode when two or more interval agents have gone
+    2x their interval without launchd starting them on its own (event
+    `launchd_interval_spawns_stalled`, once per episode), and closes it
+    (`launchd_interval_spawns_recovered`) when launchd resumes.
+
+A run the guard caused does not count as launchd making progress, so the
+episode stays open for as long as launchd is broken even though the guard
+keeps the jobs running. Every pass writes a receipt that `tartci pool status`
+and `tartci doctor fleet` read.
+
+Python 3.9-safe: the launchd python on fleet hosts is /usr/bin/python3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import pathlib
+import plistlib
+import re
+import subprocess
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not on macOS/Linux
+    fcntl = None  # type: ignore[assignment]
+
+LABEL_PREFIXES = ("com.danielraffel.", "com.pulp.")
+STALL_FACTOR = 2
+DOMAIN_STALL_MIN_AGENTS = 2
+KEEPALIVE_PENDED_S = 120
+CADENCE_S = 60
+CALL_TIMEOUT_S = 5.0
+KICK_TIMEOUT_S = 10.0
+PASS_BUDGET_S = 40.0
+# A receipt this old means no supervisor on the host is running the guard.
+RECEIPT_STALE_S = 10 * 60
+STALL_HINT = ("macOS launchd stopped starting timer jobs, likely a stalled automatic "
+              "macOS install; the supervisor is starting them; a reboot clears it")
+
+Run = Callable[[List[str], float], Tuple[int, str, str]]
+
+
+def default_dir() -> pathlib.Path:
+    override = os.environ.get("TARTCI_INTERVAL_GUARD_DIR")
+    if override:
+        return pathlib.Path(override).expanduser()
+    home = os.environ.get("TARTCI_HOME", str(pathlib.Path.home() / ".tartci"))
+    return pathlib.Path(home).expanduser() / "state" / "launchd-interval-guard"
+
+
+def run_command(argv: List[str], timeout: float) -> Tuple[int, str, str]:
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              check=False)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout:g}s"
+    except OSError as exc:
+        return 127, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def fleet_agents(agents_dir: pathlib.Path) -> List[Dict[str, Any]]:
+    """Fleet LaunchAgents with a StartInterval or KeepAlive, from their plists."""
+    out: List[Dict[str, Any]] = []
+    try:
+        paths = sorted(agents_dir.glob("*.plist"))
+    except OSError:
+        return out
+    for path in paths:
+        if not path.name.startswith(LABEL_PREFIXES):
+            continue
+        try:
+            with path.open("rb") as handle:
+                spec = plistlib.load(handle)
+        except Exception:  # noqa: BLE001 - an unreadable plist is not ours to judge
+            continue
+        if not isinstance(spec, dict):
+            continue
+        label = spec.get("Label")
+        if not isinstance(label, str) or not label.startswith(LABEL_PREFIXES):
+            continue
+        interval = spec.get("StartInterval")
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+            interval = None
+        keepalive = spec.get("KeepAlive")
+        keepalive = keepalive is True or (isinstance(keepalive, dict) and bool(keepalive))
+        if interval is None and not keepalive:
+            continue
+        out.append({"label": label, "interval": interval,
+                    "keepalive": keepalive and interval is None})
+    return out
+
+
+_FIELD = re.compile(r"^\t([a-z][a-z ]*[a-z]) = (.*)$")
+
+
+def parse_print(text: str) -> Dict[str, str]:
+    """The top-level `key = value` fields of `launchctl print` (one tab deep)."""
+    fields: Dict[str, str] = {}
+    for line in text.splitlines():
+        match = _FIELD.match(line)
+        if match and match.group(1) not in fields:
+            fields[match.group(1)] = match.group(2).strip()
+    return fields
+
+
+def observe(label: str, domain: str, run: Run) -> Optional[Dict[str, Any]]:
+    """runs/state/pended for one label, or None when launchd does not hold it."""
+    rc, out, _ = run(["launchctl", "print", f"{domain}/{label}"], CALL_TIMEOUT_S)
+    if rc != 0:
+        return None
+    fields = parse_print(out)
+    try:
+        runs = int(fields.get("runs", ""))
+    except ValueError:
+        return None
+    return {"runs": runs, "running": fields.get("state") == "running",
+            "pended": fields.get("pended nondemand spawn")}
+
+
+class Guard:
+    def __init__(self, state_dir: pathlib.Path, agents_dir: pathlib.Path, *,
+                 domain: str, run: Run = run_command,
+                 clock: Callable[[], float] = time.time,
+                 event_log: Optional[pathlib.Path] = None, runner: str = "",
+                 owner_pid: Optional[int] = None) -> None:
+        self.state_dir = state_dir
+        self.agents_dir = agents_dir
+        self.domain = domain
+        self.run = run
+        self.clock = clock
+        self.event_log = event_log
+        self.runner = runner
+        self.owner_pid = owner_pid if owner_pid is not None else os.getpid()
+
+    # -- persistence -------------------------------------------------------
+    @property
+    def state_path(self) -> pathlib.Path:
+        return self.state_dir / "state.json"
+
+    @property
+    def receipt_path(self) -> pathlib.Path:
+        return self.state_dir / "status.json"
+
+    def _load(self) -> Dict[str, Any]:
+        try:
+            value = json.loads(self.state_path.read_text())
+        except (OSError, ValueError):
+            return {"agents": {}, "episode": None}
+        if not isinstance(value, dict) or not isinstance(value.get("agents"), dict):
+            return {"agents": {}, "episode": None}
+        value.setdefault("episode", None)
+        return value
+
+    def _write(self, path: pathlib.Path, value: Dict[str, Any]) -> None:
+        tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(value, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+
+    def emit(self, kind: str, detail: str, fields: Dict[str, Any]) -> None:
+        line = json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
+            "event": kind, "runner": self.runner, "vm": "", "detail": detail,
+            "fields": fields}, sort_keys=True)
+        for path in filter(None, (self.state_dir / "events.jsonl", self.event_log)):
+            try:
+                with open(path, "a") as handle:
+                    handle.write(line + "\n")
+            except OSError:
+                pass
+
+    # -- one pass ------------------------------------------------------------
+    def kick(self, label: str) -> Tuple[bool, str]:
+        rc, _, err = self.run(["launchctl", "kickstart", f"{self.domain}/{label}"],
+                              KICK_TIMEOUT_S)
+        return rc == 0, (err or "").strip()[:200]
+
+    def pass_once(self) -> Dict[str, Any]:
+        started = self.clock()
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        state = self._load()
+        memory: Dict[str, Any] = state["agents"]
+        agents = fleet_agents(self.agents_dir)
+        seen = {agent["label"] for agent in agents}
+        stalled: List[Dict[str, Any]] = []
+        kicked: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        checked = 0
+        for agent in agents:
+            if self.clock() - started > PASS_BUDGET_S:
+                errors.append("pass budget exhausted; remaining agents skipped")
+                break
+            label = agent["label"]
+            try:
+                obs = observe(label, self.domain, self.run)
+            except Exception as exc:  # noqa: BLE001 - one agent never stops the pass
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
+                continue
+            if obs is None:
+                continue
+            checked += 1
+            now = self.clock()
+            if agent["interval"] is not None:
+                self._interval(agent, obs, memory, now, stalled, kicked, errors)
+            else:
+                self._keepalive(agent, obs, memory, now, kicked, errors)
+        # Forget only agents whose plist is gone; a failed read keeps the history.
+        for label in list(memory):
+            if label not in seen:
+                del memory[label]
+        now = self.clock()
+        if checked or not agents:
+            episode = self._episode(state, stalled, now)
+        else:
+            # Nothing could be read this pass: neither open nor close an episode.
+            current = state.get("episode")
+            episode = {"active": isinstance(current, dict),
+                       "labels": current.get("labels", []) if isinstance(current, dict) else []}
+            if isinstance(current, dict):
+                episode["started_ts"] = current.get("started_ts")
+        self._write(self.state_path, state)
+        receipt = {
+            "ts": now, "owner_pid": self.owner_pid, "runner": self.runner,
+            "agents_checked": checked, "stalled": stalled, "kicked": kicked,
+            "errors": errors, "episode": episode,
+        }
+        self._write(self.receipt_path, receipt)
+        return receipt
+
+    def _interval(self, agent: Dict[str, Any], obs: Dict[str, Any],
+                  memory: Dict[str, Any], now: float, stalled: List[Dict[str, Any]],
+                  kicked: List[Dict[str, Any]], errors: List[str]) -> None:
+        label, interval = agent["label"], agent["interval"]
+        mem = memory.get(label)
+        if not isinstance(mem, dict) or not isinstance(mem.get("runs"), int) \
+                or obs["runs"] < mem["runs"]:
+            # First sight, or the counter reset (re-registered): start measuring now.
+            memory[label] = {"runs": obs["runs"], "progress_ts": now,
+                             "natural_ts": now, "pending_kicks": 0}
+            return
+        delta = obs["runs"] - mem["runs"]
+        if delta > 0:
+            ours = min(delta, int(mem.get("pending_kicks", 0)))
+            mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) - ours
+            if delta > ours:
+                # launchd started it on its own. A run the guard caused was
+                # already counted as progress when it was kicked.
+                mem["progress_ts"] = now
+                mem["natural_ts"] = now
+            mem["runs"] = obs["runs"]
+        limit = STALL_FACTOR * interval
+        natural_age = now - float(mem.get("natural_ts", now))
+        if obs["running"]:
+            # Running is progress for the kick decision, never for launchd.
+            mem["progress_ts"] = now
+        if natural_age > limit:
+            stalled.append({"label": label, "interval": interval,
+                            "seconds_since_launchd_start": int(natural_age)})
+        since = now - float(mem.get("progress_ts", now))
+        if obs["running"] or since < limit:
+            return
+        ok, err = self.kick(label)
+        if ok:
+            mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) + 1
+            mem["progress_ts"] = now
+            kicked.append({"label": label, "interval": interval,
+                           "seconds_since_progress": int(since)})
+            self.emit("interval_agent_kicked",
+                      f"label={label} interval={interval} seconds_since_progress={int(since)}",
+                      {"label": label, "interval": interval,
+                       "seconds_since_progress": int(since), "pended": obs["pended"] or ""})
+        else:
+            errors.append(f"{label}: kickstart failed: {err}")
+            self.emit("interval_agent_kick_failed", f"label={label} error={err}",
+                      {"label": label, "interval": interval})
+
+    def _keepalive(self, agent: Dict[str, Any], obs: Dict[str, Any],
+                   memory: Dict[str, Any], now: float, kicked: List[Dict[str, Any]],
+                   errors: List[str]) -> None:
+        label = agent["label"]
+        if obs["running"] or not obs["pended"]:
+            memory.pop(label, None)
+            return
+        mem = memory.get(label)
+        if not isinstance(mem, dict) or mem.get("runs") != obs["runs"] \
+                or "pended_since" not in mem:
+            memory[label] = {"runs": obs["runs"], "pended_since": now}
+            return
+        since = now - float(mem["pended_since"])
+        if since < KEEPALIVE_PENDED_S:
+            return
+        ok, err = self.kick(label)
+        if ok:
+            mem["pended_since"] = now
+            kicked.append({"label": label, "keepalive": True,
+                           "seconds_pended": int(since)})
+            self.emit("keepalive_agent_kicked",
+                      f"label={label} pended={obs['pended']} seconds_pended={int(since)}",
+                      {"label": label, "seconds_pended": int(since),
+                       "pended": obs["pended"]})
+        else:
+            errors.append(f"{label}: kickstart failed: {err}")
+            self.emit("keepalive_agent_kick_failed", f"label={label} error={err}",
+                      {"label": label})
+
+    def _episode(self, state: Dict[str, Any], stalled: List[Dict[str, Any]],
+                 now: float) -> Dict[str, Any]:
+        labels = sorted(row["label"] for row in stalled)
+        current = state.get("episode")
+        if len(labels) >= DOMAIN_STALL_MIN_AGENTS:
+            if not isinstance(current, dict):
+                current = {"started_ts": now, "labels": labels}
+                state["episode"] = current
+                self.emit("launchd_interval_spawns_stalled",
+                          f"agents={len(labels)} labels={','.join(labels)}",
+                          {"agents": len(labels), "labels": ",".join(labels)})
+            else:
+                current["labels"] = labels
+            return {"active": True, "started_ts": current["started_ts"], "labels": labels}
+        if isinstance(current, dict):
+            self.emit("launchd_interval_spawns_recovered",
+                      f"seconds={int(now - float(current.get('started_ts', now)))}",
+                      {"seconds": int(now - float(current.get("started_ts", now)))})
+        state["episode"] = None
+        return {"active": False, "labels": labels}
+
+
+# -- ownership + loop ----------------------------------------------------------
+def acquire_lock(path: pathlib.Path) -> Optional[Any]:
+    """An exclusive, non-blocking lock held for this process's life, or None."""
+    if fcntl is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def owner_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def loop(guard: Guard, *, owner_pid: int, cadence: float = CADENCE_S,
+         sleep: Callable[[float], None] = time.sleep, max_passes: Optional[int] = None,
+         log: Callable[[str], None] = lambda text: print(text, file=sys.stderr, flush=True)
+         ) -> int:
+    """Run passes once a cadence while the owning supervisor lives.
+
+    A process that cannot take the lock keeps trying, so the duty moves to
+    another supervisor within one cadence of the owner exiting.
+    """
+    lock = None
+    passes = 0
+    while owner_alive(owner_pid):
+        if lock is None:
+            try:
+                lock = acquire_lock(guard.state_dir / "owner.lock")
+            except OSError as exc:
+                log(f"interval guard: lock error: {exc}")
+        if lock is not None:
+            try:
+                guard.pass_once()
+            except Exception as exc:  # noqa: BLE001 - the loop must outlive any pass
+                log(f"interval guard: pass failed: {type(exc).__name__}: {exc}")
+        passes += 1
+        if max_passes is not None and passes >= max_passes:
+            break
+        sleep(cadence)
+    return 0
+
+
+# -- status ----------------------------------------------------------------------
+def status(state_dir: Optional[pathlib.Path] = None, *,
+           now: Optional[float] = None) -> Dict[str, Any]:
+    path = (state_dir or default_dir()) / "status.json"
+    now = time.time() if now is None else now
+    out: Dict[str, Any] = {"receipt": str(path), "stale_after_s": RECEIPT_STALE_S}
+    try:
+        receipt = json.loads(path.read_text())
+    except FileNotFoundError:
+        out["state"] = "never"
+        return out
+    except (OSError, ValueError) as exc:
+        out.update(state="unreadable", error=str(exc))
+        return out
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("ts"), (int, float)):
+        out.update(state="unreadable", error="receipt has no ts")
+        return out
+    episode = receipt.get("episode") if isinstance(receipt.get("episode"), dict) else {}
+    age = max(0.0, now - float(receipt["ts"]))
+    out.update(age_seconds=int(age), agents_checked=receipt.get("agents_checked"),
+               stalled=receipt.get("stalled") or [], kicked=receipt.get("kicked") or [],
+               errors=receipt.get("errors") or [], episode=episode,
+               owner_pid=receipt.get("owner_pid"), runner=receipt.get("runner"))
+    if age > RECEIPT_STALE_S:
+        out["state"] = "stale"
+    elif episode.get("active"):
+        out["state"] = "stalled"
+    else:
+        out["state"] = "ok"
+    return out
+
+
+def describe(value: Dict[str, Any]) -> str:
+    state = value.get("state")
+    if state == "never":
+        return ("launchd timers: guard has not run on this host yet "
+                f"(no receipt at {value['receipt']})")
+    if state == "unreadable":
+        return f"launchd timers: guard receipt UNREADABLE ({value.get('error')})"
+    if state == "stale":
+        return (f"launchd timers: guard NOT RUNNING, last pass "
+                f"{value['age_seconds'] / 60:.0f}m ago (no lane supervisor is running it)")
+    if state == "stalled":
+        episode = value.get("episode") or {}
+        labels = episode.get("labels") or []
+        since = episode.get("started_ts")
+        age = "" if not isinstance(since, (int, float)) else \
+            f" for {(time.time() - since) / 3600:.1f}h"
+        return (f"launchd timers: STALLED{age}, {len(labels)} agents not started by "
+                f"launchd ({', '.join(labels)}); {STALL_HINT}")
+    kicked = value.get("kicked") or []
+    tail = f", kicked {len(kicked)} this pass" if kicked else ""
+    return (f"launchd timers: ok ({value.get('agents_checked')} fleet agents checked "
+            f"{value.get('age_seconds')}s ago{tail})")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="launchd_interval_guard")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("loop", "once"):
+        p = sub.add_parser(name)
+        p.add_argument("--state-dir", default=None)
+        p.add_argument("--agents-dir",
+                       default=str(pathlib.Path.home() / "Library" / "LaunchAgents"))
+        p.add_argument("--domain", default=f"gui/{os.getuid()}")
+        p.add_argument("--event-log", default=None)
+        p.add_argument("--runner", default="")
+        p.add_argument("--owner-pid", type=int, default=None)
+        p.add_argument("--cadence", type=float, default=CADENCE_S)
+    st = sub.add_parser("status")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--state-dir", default=None)
+    args = parser.parse_args(argv)
+    if args.cmd == "status":
+        value = status(pathlib.Path(args.state_dir) if args.state_dir else None)
+        print(json.dumps(value, sort_keys=True) if args.json else describe(value))
+        return 0
+    owner = args.owner_pid if args.owner_pid is not None else os.getppid()
+    guard = Guard(pathlib.Path(args.state_dir) if args.state_dir else default_dir(),
+                  pathlib.Path(args.agents_dir), domain=args.domain,
+                  event_log=pathlib.Path(args.event_log) if args.event_log else None,
+                  runner=args.runner, owner_pid=owner)
+    if args.cmd == "once":
+        lock = acquire_lock(guard.state_dir / "owner.lock")
+        if lock is None:
+            print("interval guard: another supervisor owns the duty", file=sys.stderr)
+            return 3
+        print(json.dumps(guard.pass_once(), sort_keys=True))
+        return 0
+    return loop(guard, owner_pid=owner, cadence=args.cadence)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

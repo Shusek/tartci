@@ -77,6 +77,11 @@ CODES: tuple[str, ...] = (
     "launchd_registration_leaked",
     "launchd_registrations_ok",
     "launchd_registrations_unreadable",
+    "launchd_timers_never",
+    "launchd_timers_not_running",
+    "launchd_timers_ok",
+    "launchd_timers_stalled",
+    "launchd_timers_unreadable",
     "lease_fit_ok",
     "lease_fit_unmeasured",
     "no_installed_profile",
@@ -875,6 +880,26 @@ def check_worktrees_in_tmp(value: dict | None, *, reason: str = "") -> Finding:
                    "or deletes them; their owners must.", facts)
 
 
+def check_launchd_timers(value: dict | None) -> Finding:
+    """Whether launchd still starts the fleet's timer jobs (launchd_interval_guard.py)."""
+    import launchd_interval_guard
+
+    value = value or {"state": "unreadable", "error": "no status"}
+    state = value.get("state")
+    facts = {"launchd_timers": value}
+    if state == "unreadable":
+        return Finding("launchd_timers", UNKNOWN, "launchd_timers_unreadable",
+                       f"interval guard status unreadable: {value.get('error')}", facts)
+    detail = launchd_interval_guard.describe(value)
+    if state == "stalled":
+        return Finding("launchd_timers", PROBLEM, "launchd_timers_stalled", detail, facts)
+    if state == "stale":
+        return Finding("launchd_timers", UNKNOWN, "launchd_timers_not_running", detail, facts)
+    if state == "never":
+        return Finding("launchd_timers", UNKNOWN, "launchd_timers_never", detail, facts)
+    return Finding("launchd_timers", OK, "launchd_timers_ok", detail, facts)
+
+
 def check_reclaim(value: dict | None) -> Finding:
     """The disk reclaimer's last pass, from its receipt (scripts/reclaim_status.py)."""
     import reclaim_status
@@ -1155,6 +1180,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
+            launchd_timers_value: dict | None = None,
             power_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
@@ -1247,6 +1273,15 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             reclaim_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_reclaim(reclaim_value))
+    if launchd_timers_value is None:
+        try:
+            import launchd_interval_guard
+            launchd_timers_value = launchd_interval_guard.status(
+                None if os.environ.get("TARTCI_INTERVAL_GUARD_DIR")
+                else home / ".tartci" / "state" / "launchd-interval-guard")
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            launchd_timers_value = {"state": "unreadable", "error": str(exc)}
+    findings.append(check_launchd_timers(launchd_timers_value))
     if power_value is None:
         try:
             import power_status
