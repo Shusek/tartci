@@ -373,10 +373,32 @@ def tmp_worktrees(repo: pathlib.Path, runner: Runner = subprocess.run,
     return out
 
 
+def pulp_worktrees_under(root: pathlib.Path, repo_common: str,
+                         runner: Runner = subprocess.run) -> list[str]:
+    """Direct children of `root` that are worktrees of the repository at `repo_common`.
+
+    A child counts only when its `.git` is a gitdir file and git resolves its
+    common dir to the configured repository's. This is the one gate on running
+    a reaper over a root that is not the profile's worktrees_root.
+    """
+    found: list[str] = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return found
+    for child in children:
+        if not (child / ".git").is_file():
+            continue
+        if _common_dir(child, runner) == repo_common:
+            found.append(str(child))
+    return found
+
+
 def run(*, fix: bool, profile: pathlib.Path | None = None,
         state_dir: pathlib.Path | None = None,
         runner: Runner = subprocess.run, stream: Any = None,
-        reaper: Callable[..., dict[str, Any]] = run_reaper) -> dict[str, Any]:
+        reaper: Callable[..., dict[str, Any]] = run_reaper,
+        discovered_roots: list[pathlib.Path] | None = None) -> dict[str, Any]:
     """One pass of the opt-in Pulp reapers. Never raises, never deletes itself."""
     profile = profile or default_profile_path()
     settings, why = load_settings(profile)
@@ -434,6 +456,33 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         report["runs"].append(record)
         report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
     report["free_bytes_after"] = free_bytes(root)
+    # Agents do not always create worktrees where the profile says: on m5s on
+    # 2026-10-04, 32 coverage build dirs (~725 GB) in ~/Code worktrees filled
+    # the boot volume while this ran only over the profile's root on another
+    # volume. The cheap coverage reaper therefore also runs, every pass, over
+    # every discovered Code root that holds this repository's worktrees.
+    # The heavier reaper stays on the configured root.
+    report["outside_profile_roots"] = []
+    repo_common = _common_dir(pathlib.Path(settings["repo"]), runner)
+    configured = os.path.realpath(root)
+    for extra in discovered_roots or []:
+        resolved = os.path.realpath(extra)
+        if repo_common is None or resolved == configured:
+            continue
+        worktrees = pulp_worktrees_under(pathlib.Path(resolved), repo_common, runner)
+        if not worktrees:
+            continue
+        warning = f"worktrees_outside_profile_root root={resolved} count={len(worktrees)}"
+        report["outside_profile_roots"].append({"root": resolved, "count": len(worktrees)})
+        print(f"pulp_reapers: WARNING {warning} (profile worktrees_root={configured})",
+              file=stream or sys.stderr, flush=True)
+        record = reaper(checkout / "tools" / "scripts" / f"{BUILD_COV}.sh", fix=fix,
+                        worktrees_root=resolved, measure_path=pathlib.Path(resolved),
+                        timeout_s=REAPER_TIMEOUT_S[BUILD_COV],
+                        idle_hours=settings["worktree_build_idle_hours"], stream=stream)
+        record["reason"] = "discovered_pulp_root"
+        report["runs"].append(record)
+        report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
     failed = [r["reaper"] for r in report["runs"] if r.get("exit_code") != 0]
     if failed:
         report["error"] = f"reaper(s) did not exit 0: {', '.join(failed)}"
