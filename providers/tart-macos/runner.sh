@@ -1945,6 +1945,30 @@ retarget_after_pre_mint_denial(){
       reason=""
     fi
   fi
+  # The boundary proof above admitted the original labels. A different class
+  # needs its own live Shipyard verdict; that cached proof cannot authorize it.
+  if [ -z "$reason" ] && tartci_admission_clean_enabled; then
+    local retarget_admission_json="" retarget_admission_rc=0 retarget_admission_detail=""
+    heartbeat admission-retarget-check
+    event admission_check "repo=$REPO labels=$labels source=retarget"
+    if retarget_admission_json="$(tartci_admission_clean "$REPO" "$labels")"; then
+      retarget_admission_rc=0
+    else
+      retarget_admission_rc=$?
+    fi
+    [ -z "$retarget_admission_json" ] \
+      || printf '%s\n' "$retarget_admission_json" >"$STATE_DIR/$vm.admission-clean.json"
+    tartci_admission_contention_event "$retarget_admission_json" retarget
+    if [ "$retarget_admission_rc" -ne 0 ]; then
+      reason="admission_clean_denied"
+      retarget_admission_detail="$(tartci_admission_clean_detail "$retarget_admission_json")" \
+        || retarget_admission_detail="reason=unreadable"
+      heartbeat "$([ "$retarget_admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
+      event "$([ "$retarget_admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
+        "rc=$retarget_admission_rc labels=$labels source=retarget unregistered=true $retarget_admission_detail"
+      note "[$i] Shipyard admission refused retarget labels=$labels ($retarget_admission_detail)"
+    fi
+  fi
   if [ -n "$reason" ]; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($reason)"
@@ -1961,6 +1985,7 @@ retarget_after_pre_mint_denial(){
     "from_tier=$selected_tier" "to_tier=$tier"
   selected_tier="$tier"
   selected_labels="$labels"
+  CURRENT_LABELS="$labels"
 }
 
 run_one(){

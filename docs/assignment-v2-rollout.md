@@ -238,9 +238,13 @@ runners).
 class, the lane re-runs admission for every class in its preference order that
 has queued demand, live, and mints the VM with the first class that admits
 (`assignment_v2_pre_mint_retarget from_tier=… to_tier=…`). The VM is discarded
-(`assignment_v2_pre_mint_discard reason=no_class_waiting|runner_group_differs|jit_admission_denied`)
+(`assignment_v2_pre_mint_discard reason=no_class_waiting|runner_group_differs|jit_admission_denied|admission_clean_denied`)
 only when no class with demand admits, the new class lives in another runner
-group, or its JIT admission is refused. The lease is kept, not re-acquired:
+group, or its JIT admission is refused. When admission-clean is required, the
+fork also asks Shipyard for a fresh verdict for the new labels; a defer or
+error discards the VM before minting. The successful retarget updates the
+labels published in the runner's heartbeat and runtime measurements.
+The lease is kept, not re-acquired:
 every gate class is at or above the gate priority threshold, so the lease store
 treats them alike, and releasing it would let another lane take the slot between
 release and re-acquire. `--print-pre-mint-retarget <tier>` prints `keep`, the

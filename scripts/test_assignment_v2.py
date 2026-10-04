@@ -799,6 +799,108 @@ class PreMintRetargetTests(RunnerFixture, unittest.TestCase):
         self.assertIn("assignment_v2_pre_mint_discard", block)
 
 
+class PreMintRetargetSafetyTests(unittest.TestCase):
+    """Exercise the real retarget path with an authority for the new class."""
+
+    def exercise(self, **settings: str) -> tuple[dict[str, str], list[str]]:
+        source = RUNNER.read_text(encoding="utf-8")
+        match = re.search(r"^retarget_after_pre_mint_denial\(\)\{\n.*?^\}$",
+                          source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory(prefix="retarget-safety-") as directory:
+            root = Path(directory)
+            trace = root / "trace"
+            script = r'''
+set -euo pipefail
+trace(){ printf '%s\n' "$*" >>"$TRACE"; }
+note(){ trace "note $*"; }
+event(){ trace "event $*"; }
+heartbeat(){ trace "heartbeat $*"; }
+tartci_assignment_v2_pre_mint_denied_event(){ trace "denied $*"; }
+tartci_assignment_v2_pre_mint_retarget(){ printf '0\n'; return "${TEST_SELECTION_RC:-0}"; }
+tartci_assignment_v2_tier_label_at(){ printf 'new-class\n'; }
+tartci_assignment_v2_tier_labels(){ printf 'base,new-class\n'; }
+runner_group_id_for_tier(){ printf '%s\n' "${TEST_GROUP:-11}"; }
+jit_admission_denied(){ return "${TEST_JIT_RC:-1}"; }
+tartci_admission_clean_enabled(){ [ "${TEST_MODE:-required}" = required ]; }
+tartci_admission_clean(){
+  trace "admission $1 $2"
+  printf '{"verdict":"fixture","reason":"fixture","labels":"%s"}\n' "$2"
+  return "${TEST_ADMISSION_RC:-0}"
+}
+tartci_admission_contention_event(){ trace 'contention'; }
+tartci_admission_clean_detail(){ printf 'reason=fixture'; }
+tartci_pool_lock_release(){ trace 'lock-release'; }
+discard_current_vm(){ trace 'discard'; }
+tartci_release_vm_lease(){ trace 'lease-release'; }
+'''
+            script += match.group(0) + r'''
+exercise(){
+  local selected_tier=1 selected_labels=base,old-class vm=fixture-vm rc=0
+  CURRENT_LABELS="$selected_labels"
+  retarget_after_pre_mint_denial 1 11 || rc=$?
+  printf 'rc=%s\ntier=%s\nlabels=%s\ncurrent_labels=%s\n' \
+    "$rc" "$selected_tier" "$selected_labels" "$CURRENT_LABELS"
+}
+exercise
+'''
+            result = subprocess.run(
+                ["/bin/bash", "-c", script], text=True, capture_output=True, timeout=10,
+                env={**os.environ, "TRACE": str(trace), "STATE_DIR": str(root),
+                     "REPO": "fixture/repository", **settings})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return (dict(line.split("=", 1) for line in result.stdout.splitlines()),
+                    trace.read_text().splitlines())
+
+    def test_the_new_class_must_pass_required_admission(self) -> None:
+        for rc in ("1", "3"):
+            with self.subTest(admission_rc=rc):
+                result, trace = self.exercise(TEST_ADMISSION_RC=rc)
+                self.assertEqual(result["rc"], "1")
+                self.assertIn("admission fixture/repository base,new-class", trace)
+                self.assertEqual(result["labels"], "base,old-class")
+                self.assertEqual(result["current_labels"], "base,old-class")
+                self.assertEqual([step for step in trace if step in
+                                  ("lock-release", "discard", "lease-release")],
+                                 ["lock-release", "discard", "lease-release"])
+                self.assertFalse(any("event assignment_v2_pre_mint_retarget " in step
+                                     for step in trace))
+
+    def test_admitted_retarget_updates_observed_labels_and_keeps_the_lease(self) -> None:
+        result, trace = self.exercise()
+        self.assertEqual(result["rc"], "0")
+        self.assertEqual(result["tier"], "0")
+        self.assertEqual(result["labels"], "base,new-class")
+        self.assertEqual(result["current_labels"], "base,new-class")
+        self.assertIn("admission fixture/repository base,new-class", trace)
+        self.assertNotIn("discard", trace)
+        self.assertNotIn("lease-release", trace)
+
+    def test_disabled_admission_keeps_the_existing_retarget_behaviour(self) -> None:
+        result, trace = self.exercise(TEST_MODE="disabled", TEST_ADMISSION_RC="3")
+        self.assertEqual(result["rc"], "0")
+        self.assertEqual(result["current_labels"], "base,new-class")
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_another_runner_group_is_refused_before_any_new_admission(self) -> None:
+        result, trace = self.exercise(TEST_GROUP="22")
+        self.assertEqual(result["rc"], "1")
+        self.assertIn("discard", trace)
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_a_cached_jit_denial_prevents_retarget(self) -> None:
+        result, trace = self.exercise(TEST_JIT_RC="0")
+        self.assertEqual(result["rc"], "1")
+        self.assertIn("discard", trace)
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_no_waiting_class_discards_the_vm(self) -> None:
+        result, trace = self.exercise(TEST_SELECTION_RC="1")
+        self.assertEqual(result["rc"], "1")
+        self.assertIn("discard", trace)
+        self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+
 class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
     """A per-slot class preference order (TARTCI_ASSIGNMENT_V2_TIER_ORDER).
 
