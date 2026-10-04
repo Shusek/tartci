@@ -363,8 +363,9 @@ class OwnershipTests(GuardCase):
         self.assertEqual(self.launchd.calls, [])
         self.assertEqual(sleeps, [lig.CADENCE_S] * 2)
         owner.close()
-        self.assertIsNotNone(lig.acquire_lock(self.state / "owner.lock"),
-                             "the duty did not move once the owner let go")
+        successor = lig.acquire_lock(self.state / "owner.lock")
+        self.assertIsNotNone(successor, "the duty did not move once the owner let go")
+        successor.close()
 
     def test_a_failing_pass_does_not_end_the_loop(self) -> None:
         g = self.guard()
@@ -468,6 +469,7 @@ class SupervisorChildTests(GuardCase):
         proc = subprocess.Popen(["/bin/bash", "-c", script], stdout=subprocess.PIPE,
                                 text=True, start_new_session=True)
         child = int(proc.stdout.readline())
+        proc.stdout.close()
         os.kill(proc.pid, signal.SIGKILL)  # no cleanup trap runs
         proc.wait()
         deadline = time.time() + 10
