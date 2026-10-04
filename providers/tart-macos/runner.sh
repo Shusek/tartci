@@ -1949,7 +1949,7 @@ retarget_after_pre_mint_denial(){
   # needs its own live Shipyard verdict; that cached proof cannot authorize it.
   if [ -z "$reason" ] && tartci_admission_clean_enabled; then
     local retarget_admission_json="" retarget_admission_rc=0 retarget_admission_detail=""
-    heartbeat admission-retarget-check
+    heartbeat admission-check
     event admission_check "repo=$REPO labels=$labels source=retarget"
     if retarget_admission_json="$(tartci_admission_clean "$REPO" "$labels")"; then
       retarget_admission_rc=0
