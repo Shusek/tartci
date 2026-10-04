@@ -1158,10 +1158,11 @@ discard_current_vm(){
   fi
   CURRENT_RPID=""
   bounded_teardown_command tart-stop tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
-  if ! bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1 \
+  if ! tartci_tart_delete "$CURRENT_VM" \
     && ! tart_vm_proved_absent "$CURRENT_VM"; then
     note "teardown incomplete — guardian is terminal but VM deletion was not proved"
     event teardown_incomplete "vm=$CURRENT_VM reason=delete_unproved"
+    event delete_unproved "vm=$CURRENT_VM site=teardown $TARTCI_DELETE_EVIDENCE"
     # The guardian is terminal, so the guest is not running; only its disk
     # remains unproved. The loop may keep that VM as pending-delete instead of
     # restarting the supervisor (see reconcile_pending_delete).
@@ -1171,6 +1172,27 @@ discard_current_vm(){
   CURRENT_VM=""
   CURRENT_IP=""
   CURRENT_AQUA_LABEL=""
+}
+
+# One bounded `tart delete`. Its output used to go to /dev/null, so an
+# unproved delete could not say whether the bound fired or tart refused. On
+# failure TARTCI_DELETE_EVIDENCE holds rc, elapsed_ms, bounded, load1 and the
+# last stderr lines (scripts/delete_evidence.py) for the delete_unproved event.
+TARTCI_DELETE_EVIDENCE=""
+tartci_tart_delete(){
+  local vm="$1" status err rc=0
+  TARTCI_DELETE_EVIDENCE=""
+  status="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-status.XXXXXX")" || return 1
+  err="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-stderr.XXXXXX")" || { rm -f "$status"; return 1; }
+  python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
+    --timeout "$TEARDOWN_STEP_TIMEOUT" --operation tart-delete --status-file "$status" -- \
+    tart delete "$vm" >/dev/null 2>"$err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    TARTCI_DELETE_EVIDENCE="$(python3 "$TARTCI_ROOT/scripts/delete_evidence.py" \
+      --status "$status" --stderr "$err" 2>/dev/null)" || TARTCI_DELETE_EVIDENCE="evidence=unavailable"
+  fi
+  rm -f "$status" "$err"
+  return "$rc"
 }
 
 # A timed-out `tart delete` is killed with its process group, so it is no
@@ -1192,7 +1214,7 @@ tart_vm_proved_absent(){
 reconcile_pending_delete(){
   [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ] || return 2
   PENDING_DELETE_ATTEMPTS=$((PENDING_DELETE_ATTEMPTS + 1))
-  if bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1 \
+  if tartci_tart_delete "$CURRENT_VM" \
     || tart_vm_proved_absent "$CURRENT_VM"; then
     note "pending-delete VM $CURRENT_VM proved gone (attempt $PENDING_DELETE_ATTEMPTS) — releasing its capacity"
     event teardown_reconciled "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS"
@@ -1206,6 +1228,7 @@ reconcile_pending_delete(){
     CURRENT_RESV=""
     return 0
   fi
+  event delete_unproved "vm=$CURRENT_VM site=pending_delete attempt=$PENDING_DELETE_ATTEMPTS $TARTCI_DELETE_EVIDENCE"
   if [ "$PENDING_DELETE_ATTEMPTS" -ge "$PENDING_DELETE_MAX_ATTEMPTS" ]; then
     note "pending-delete VM $CURRENT_VM still unproved after $PENDING_DELETE_ATTEMPTS attempts — falling back to a fail-closed restart"
     return 2
