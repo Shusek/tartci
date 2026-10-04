@@ -467,20 +467,47 @@ Run reads deliberately omit the server-side `branch=` filter: a cold
 `branch=main` read intermittently returns a page weeks old, which would read as
 overdue. The ref is selected client-side from an unfiltered page instead.
 
-Install on exactly one always-on host. Dry-run first (`TARTCI_BACKSTOP_APPLY=0`,
-the default, logs `would_dispatch` paced as apply would pace it); go live with
-`TARTCI_BACKSTOP_APPLY=1` and `TARTCI_BACKSTOP_AUTHORITY=1`. Steady state is
-about 50 App API calls per hour. Decision logic is covered hermetically by
-`scripts/test_schedule_backstop.py`. Install:
+Install on exactly one always-on host, chosen by the fleet profile's top-level
+`schedule_backstop` key (above the first table):
+
+| value | agent installed by `tartci setup` |
+|---|---|
+| `"live"` | yes, `TARTCI_BACKSTOP_APPLY=1` and `TARTCI_BACKSTOP_AUTHORITY=1` |
+| `"dry-run"` | yes, both `0`: logs `would_dispatch`, paced as apply would pace it |
+| `"off"` (default, key unset) | nothing |
+
+Only `profiles/m3-macos-fleet.toml` says `"live"`; there is no standby host, so
+with m3 down the crons carry on alone. `tartci setup` runs
+`scripts/install_schedule_backstop_agent.sh --install` (non-fatal; `--plan`
+shows what it would do and writes nothing). It reads the installed profile
+snapshot (`~/.config/tartci/macos-fleet-profile.toml`, or
+`TARTCI_FLEET_PROFILE`), renders the template so the agent runs
+`~/.local/bin/tartci schedule-backstop` (the installed generation, so a
+self-update carries the script), and bootstraps and kickstarts it only when the
+rendered agent differs or is not loaded. It refuses a temporary HOME before any
+launchctl call. When the profile says `"off"` but an agent is present it is
+reported and left alone, because a profile snapshot older than the key reads as
+off; a mode it cannot read (no tomllib, an invalid value) changes nothing and
+exits 5. The backstop's state, `~/.local/state/tartci/schedule-backstop.json`,
+is never touched, so its own-dispatch pacing survives a reinstall. The launchd
+watchdog also re-renders a loaded agent that drifted from the template, keeping
+its `TARTCI_BACKSTOP_*` switches.
+
+Steady state is about 50 App API calls per hour. Decision logic is covered
+hermetically by `scripts/test_schedule_backstop.py`, the installer and profile
+gate by `scripts/test_install_schedule_backstop_agent.py`.
+
+Undo on a host:
 
 ```
-mkdir -p "$HOME/Library/Logs"
-sed -e "s|\$HOME|$HOME|g" \
-  launchd/com.danielraffel.pulp.schedule-backstop.plist.template \
-  > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
-launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.schedule-backstop"
+scripts/install_schedule_backstop_agent.sh --uninstall
+# equivalently:
+launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.schedule-backstop"
+rm "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
 ```
+
+then set `schedule_backstop = "off"` (or remove the key) in that host's profile
+so the next `tartci setup` does not reinstall it.
 
 Judge it by runs per listed workflow per day against `1440 / cadence_minutes`,
 with total Actions runs and minutes as the control.

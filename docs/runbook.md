@@ -2392,6 +2392,11 @@ installing prereqs + creating stores, it now:
    budget (`PULP_BUILD_JOBS`) and the lease store answers. If either fails,
    `tartci setup` reports the host is not fully onboarded instead of exiting
    clean, so a half-provisioned host is visible.
+3. **Installs the host agents**: the disk reclaimer, the artifact-cache
+   refresher, the keychain unlocker, and the schedule backstop where the fleet
+   profile says `schedule_backstop = "live"` or `"dry-run"` (only m3 is live;
+   see `launchd/README.md`, "Schedule backstop"). Each installer is idempotent
+   and non-fatal.
 
 After `tartci setup`, deploy the clean receipt-bound support generation through
 `tartci fleet-macos install` as described above and — for a CI host — register
