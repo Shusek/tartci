@@ -1891,16 +1891,23 @@ retarget_after_pre_mint_denial(){
 # and never able to stop this lane.
 PEER_RESPAWN_LAST=0
 tartci_peer_respawn_tick(){
-  local now name detail
+  local now tag name detail out err rc=0
   now="$(date +%s)"
   [ $((now - PEER_RESPAWN_LAST)) -ge "${TARTCI_PEER_RESPAWN_SECS:-300}" ] || return 0
   PEER_RESPAWN_LAST="$now"
   [ -n "${TARTCI_LAUNCHD_LABEL:-}" ] || return 0
-  while IFS=$'\t' read -r _ name detail; do
-    [ -n "$name" ] && event "$name" "$detail"
-  done < <(python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 30 \
+  err="$(mktemp "${TMPDIR:-/tmp}/tartci-peer-respawn.XXXXXX")" || return 0
+  out="$(python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 30 \
     --operation peer-respawn -- python3 "$TARTCI_ROOT/scripts/peer_respawn.py" \
-    --self-label "$TARTCI_LAUNCHD_LABEL" 2>/dev/null | grep '^EVENT'$'\t' || true)
+    --self-label "$TARTCI_LAUNCHD_LABEL" 2>"$err")" || rc=$?
+  while IFS=$'\t' read -r tag name detail; do
+    [ "$tag" = EVENT ] && [ -n "$name" ] && event "$name" "$detail"
+  done <<<"$out"
+  # A pass that crashed or timed out must not read as "nobody needed a kick".
+  if [ "$rc" -ne 0 ]; then
+    event peer_respawn_error "rc=$rc err=\"$(tail -n 3 "$err" | tr '\n"' " '" | cut -c1-300)\""
+  fi
+  rm -f "$err"
   return 0
 }
 

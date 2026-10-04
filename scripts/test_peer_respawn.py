@@ -183,6 +183,45 @@ class PeerRespawnTests(unittest.TestCase):
         names = [name for name, _ in events]
         self.assertEqual(names.count("peer_respawn_ceiling"), 1)
 
+    def test_an_unloaded_sibling_is_neither_kicked_nor_reported(self) -> None:
+        self.write_state("stopped", 200)
+        # launchctl print failed: whatever text came with it is not trusted,
+        # even text that would otherwise read as an owed respawn.
+        fake = FakeLaunchctl(launchctl_print("not running", "75: EX_TEMPFAIL"), rc=113)
+        self.assertEqual(self.run_pass(fake), [])
+        self.assertEqual(fake.kicks(), [])
+
+    def run_tick(self, module: str) -> list[str]:
+        """Run the lane's own tick against a stand-in peer_respawn.py."""
+        body = (HERE.parent / "providers" / "tart-macos" / "runner.sh").read_text()
+        start = body.index("PEER_RESPAWN_LAST=0\ntartci_peer_respawn_tick(){")
+        end = body.index("\n}\n", start) + 3
+        root = Path(self.tmp.name) / "root"
+        (root / "scripts").mkdir(parents=True)
+        for name in ("bounded_command.py", "bounded_subprocess.py"):
+            (root / "scripts" / name).write_text((HERE / name).read_text())
+        (root / "scripts" / "peer_respawn.py").write_text(module)
+        events = Path(self.tmp.name) / "events"
+        script = (f"TARTCI_ROOT={str(root)!r}\nTARTCI_LAUNCHD_LABEL={SELF!r}\n"
+                  f"event(){{ printf '%s|%s\\n' \"$1\" \"$2\" >> {str(events)!r}; }}\n"
+                  f"{body[start:end]}\ntartci_peer_respawn_tick; echo tick_rc=$?\n")
+        result = __import__("subprocess").run(["/bin/bash", "-c", script], capture_output=True,
+                                              text=True, timeout=60,
+                                              env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin",
+                                                   "TMPDIR": self.tmp.name})
+        self.assertIn("tick_rc=0", result.stdout, result.stderr)
+        return events.read_text().splitlines() if events.exists() else []
+
+    def test_a_crashed_pass_is_reported_not_silent(self) -> None:
+        lines = self.run_tick("import sys\nsys.stderr.write('Traceback: boom \"x\"\\n')\nsys.exit(3)\n")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("peer_respawn_error|rc=3 err="), lines)
+        self.assertIn("Traceback: boom", lines[0])
+
+    def test_a_clean_pass_forwards_its_events_and_reports_no_error(self) -> None:
+        lines = self.run_tick("print('EVENT\\tpeer_respawn\\tlabel=x kick_rc=0')\n")
+        self.assertEqual(lines, ["peer_respawn|label=x kick_rc=0"])
+
     def test_the_lane_loop_runs_the_tick(self) -> None:
         body = (HERE.parent / "providers" / "tart-macos" / "runner.sh").read_text()
         loop = body[body.index("  while true; do\n    if [ -n \"$CURRENT_VM\" ]; then"):]
