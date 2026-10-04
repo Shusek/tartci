@@ -458,6 +458,50 @@ tartci_assignment_v2_pre_mint_admit(){
   return 1
 }
 
+# After a pre-mint denial, the class an already-booted VM should serve instead.
+# Every class runs on the same golden; only the JIT labels and runner group
+# differ, so a VM booted for a class whose demand vanished, or that a preferred
+# class's arrival outranked, can register for the class that is waiting rather
+# than being thrown away. On m3 on 2026-10-03 the gate lane discarded 4 of 5
+# booted VMs in half an hour this way, each after a 4-5 minute boot, and a
+# merge-group job waited for a second boot. Prints the first class in this
+# slot's preference order with demand that passes pre-mint itself (the denied
+# class has none, or a class preferred over it outranks it); fails when none
+# does or demand is uncertain, and the caller then discards. The denial's
+# blocker is kept for the caller's event.
+tartci_assignment_v2_pre_mint_retarget(){
+  local tier_label tier q blocker="$ASSIGNMENT_V2_PRE_MINT_BLOCKER"
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] || continue
+    tier="$(tartci_assignment_v2_tier_index "$tier_label")" || return 1
+    q="$(tartci_assignment_v2_tier_demand "$tier_label" 0 "$MIN_QUEUED_AGE")" || return 1
+    printf '%s' "$q" | grep -qxE '[0-9]+' || return 1
+    [ "$q" -gt 0 ] || continue
+    if tartci_assignment_v2_pre_mint_admit "$tier"; then
+      ASSIGNMENT_V2_PRE_MINT_BLOCKER="$blocker"
+      printf '%s\n' "$tier"
+      return 0
+    fi
+    ASSIGNMENT_V2_PRE_MINT_BLOCKER="$blocker"
+    return 1
+  done <<< "$ASSIGNMENT_V2_ORDER_LABELS"
+  return 1
+}
+
+# The class label at a configured tier index (the inverse of tier_index).
+tartci_assignment_v2_tier_label_at(){
+  local wanted="$1" tier_label tier=0
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] || continue
+    if [ "$tier" = "$wanted" ]; then
+      printf '%s\n' "$tier_label"
+      return 0
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  return 1
+}
+
 # Pre-clone demand check (opt-in: TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK=1).
 #
 # The selection a lane boots for can be up to the selection-cache TTL old, and

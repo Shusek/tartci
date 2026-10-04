@@ -398,6 +398,8 @@ cmd_artifact_cache() { exec "$HERE/scripts/artifact-cache.sh" "$@"; }
 # Unlock the dedicated signing keychain in this session (the keychain-unlock
 # LaunchAgent runs it at login and every 15 minutes).
 cmd_keychain_unlock() { tartci_toml_exec "$HERE/scripts/keychain_unlock.py" "$@"; }
+# Booted VMs retargeted vs discarded at the pre-mint check, per lane per day.
+cmd_pre_mint_outcomes() { tartci_toml_exec_or_python3 "$HERE/scripts/pre_mint_outcomes.py" "$@"; }
 
 # launchd agents run these through ~/.local/bin/tartci so each follows the
 # installed generation; a copied script path is never refreshed by self-update.
@@ -1390,6 +1392,7 @@ case "${1:-help}" in
   reclaim) shift; cmd_reclaim "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
+  pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;
   network-relay) shift; cmd_network_relay "$@" ;;
   schedule-backstop) shift; cmd_schedule_backstop "$@" ;;
   queue-tick) shift; cmd_queue_tick "$@" ;;
