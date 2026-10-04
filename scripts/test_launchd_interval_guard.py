@@ -217,20 +217,42 @@ class IntervalKickTests(GuardCase):
         self.assertEqual(self.launchd.jobs["com.danielraffel.tartci.reap"]["runs"], 11)
 
 
-class NeverKickTests(GuardCase):
-    def test_self_update_is_observed_but_never_kicked(self) -> None:
-        self.interval_agent("com.danielraffel.tartci.self-update", 1800)
+class SelfUpdatePauseTests(GuardCase):
+    SELF_UPDATE = "com.danielraffel.tartci.self-update"
+
+    def test_self_update_is_not_kicked_while_a_stall_episode_is_open(self) -> None:
+        self.interval_agent(self.SELF_UPDATE, 1800)
+        self.interval_agent("com.danielraffel.tartci.reap", 300)
+        self.interval_agent("com.danielraffel.tartci.launchd-watchdog", 300)
+        g = self.guard()
+        g.pass_once()
+        for _ in range(16):  # 80 minutes: self-update is overdue, the domain stalled
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertTrue(receipt["episode"]["active"])
+        self.assertNotIn(self.SELF_UPDATE, self.launchd.kicks())
+        self.assertIn("com.danielraffel.tartci.reap", self.launchd.kicks())
+        self.assertEqual([row["label"] for row in receipt["paused"]], [self.SELF_UPDATE])
+        # Still counted: a stuck self-update is part of the domain stall.
+        self.assertIn(self.SELF_UPDATE, receipt["episode"]["labels"])
+        value = lig.status(self.state, now=self.clock.now)
+        line = lig.describe(value)
+        self.assertIn("self-update paused: launchd timers stalled; a reboot resumes it", line)
+        self.assertIn("self-update paused", fd.check_launchd_timers(value).detail)
+
+    def test_an_overdue_self_update_is_kicked_when_no_episode_is_open(self) -> None:
+        self.interval_agent(self.SELF_UPDATE, 1800)
         self.interval_agent("com.danielraffel.tartci.reap", 300)
         g = self.guard()
         g.pass_once()
-        for _ in range(16):
+        for _ in range(13):  # reap keeps running on its own; only self-update is stuck
             self.clock.now += 300
+            self.launchd.jobs["com.danielraffel.tartci.reap"]["runs"] += 1
             receipt = g.pass_once()
-        self.assertNotIn("com.danielraffel.tartci.self-update", self.launchd.kicks())
-        self.assertIn("com.danielraffel.tartci.reap", self.launchd.kicks())
-        # Still counted: a stuck self-update is part of the domain stall.
-        self.assertIn("com.danielraffel.tartci.self-update", receipt["episode"]["labels"])
-        self.assertTrue(receipt["episode"]["active"])
+        self.assertFalse(receipt["episode"]["active"])
+        self.assertEqual(self.launchd.kicks(), [self.SELF_UPDATE])
+        self.assertEqual(receipt["paused"], [])
+        self.assertNotIn("paused", lig.describe(lig.status(self.state, now=self.clock.now)))
 
 
 class KeepAliveKickTests(GuardCase):
