@@ -823,6 +823,20 @@ so status cannot disagree with the janitor about which volumes are scanned, and
 it prints `unknown` rather than a figure when a volume cannot be read. An
 unreadable volume is not a healthy one.
 
+With the fleet profile's `[reclaim] pulp_worktree_builds` on, the pass also
+runs Pulp's own reapers from a fresh origin/main (`scripts/pulp_reapers.py`):
+`clean_build_cov.sh` every pass over `worktrees_root`, and
+`clean_worktree_builds.sh` there only under pressure. The cheap coverage reaper
+additionally runs, every pass, over each discovered scan root that holds this
+repository's worktrees (a direct child whose `.git` gitdir file resolves to the
+configured repo's common dir), and the pass warns
+`worktrees_outside_profile_root root=… count=N` for each. m5studio's boot
+volume filled to 99% on 2026-10-04 with coverage dirs in `~/Code` worktrees
+while the reaper ran only over its Atelier root. The heavier reaper never
+follows a discovered root. The root-level check is not a per-child filter:
+`clean_build_cov.sh` removes `build-cov*` under any direct child of a root it
+runs over, as it always has for `worktrees_root`.
+
 Pulp ships its own `tools/scripts/clean_build_cov.sh`, which covers only
 `build-cov*` inside one checkout. That stays: it is the repo-local convenience
 for an external cloner who has no tartci. This agent is the fleet-wide job, and
