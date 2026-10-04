@@ -435,6 +435,8 @@ source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/lease-fit.lib.sh"
 # shellcheck source=providers/tart-macos/heartbeat-keepalive.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/heartbeat-keepalive.lib.sh"
+# shellcheck source=providers/tart-macos/interval-guard.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/interval-guard.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
@@ -1214,6 +1216,7 @@ reconcile_pending_delete(){
 
 cleanup(){
   tartci_heartbeat_keepalive_stop
+  tartci_interval_guard_stop
   tartci_pool_lock_release
   tartci_boundary_proof_abandon
   tartci_job_claim_release
@@ -2375,6 +2378,8 @@ if [ "$LOOP" = 1 ]; then
   BLIND_RESTART_MAX="${TARTCI_SCAN_BLIND_RESTART_MAX:-3}"
   BLIND_RESTART_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-restarts"
   BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
+  # Starts launchd timer jobs if launchd stops starting them (interval-guard.lib.sh).
+  tartci_interval_guard_start
   heartbeat loop
   while true; do
     if [ -n "$CURRENT_VM" ]; then

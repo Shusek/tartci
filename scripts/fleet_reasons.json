@@ -138,6 +138,31 @@
       "why": "Without launchctl there is no way to see a shadowing registration, so this is unknown rather than clean.",
       "remedy": "Run `launchctl list` as the host's account; on a non-macOS host this is expected."
     },
+    "launchd_timers_never": {
+      "summary": "No interval guard receipt on this host yet.",
+      "why": "A host whose supervisors predate the guard, or whose pool has been off since it shipped, has never run it.",
+      "remedy": "Self-update the host; the supervisors start the guard."
+    },
+    "launchd_timers_not_running": {
+      "summary": "The interval guard's receipt is older than ten minutes.",
+      "why": "The guard runs inside the lane supervisors, so no running supervisor means no guard. Reported as unknown rather than a problem: a host with its pool off has no supervisors by design.",
+      "remedy": "Check the lane supervisors (`tartci pool status`); when they run, the guard writes a receipt within a minute."
+    },
+    "launchd_timers_ok": {
+      "summary": "launchd is starting the fleet's timer jobs on its own.",
+      "why": "The interval guard compares each StartInterval agent's run counter with its interval every minute, and no two agents have gone twice their interval without launchd starting them."
+    },
+    "launchd_timers_stalled": {
+      "summary": "macOS launchd stopped starting timer jobs, likely a stalled automatic macOS install; the supervisor is starting them; a reboot clears it.",
+      "why": "On m3 (2026-10-04) a macOS automatic install that never finished left launchd refusing every non-demand spawn: StartInterval agents showed `pended nondemand spawn = interval` with frozen run counters for 16 h, and a lane that exited was not respawned for an hour. Lane supervisors started before the stall kept serving, so nothing else looked down. The interval guard inside the supervisors kicks each overdue agent with `launchctl kickstart`, which still works, and keeps this finding open while launchd itself starts nothing.",
+      "remedy": "Reboot the host when its lanes are idle (or let the pending macOS install finish); the finding clears once launchd starts the timers on its own. Until then the guard keeps them running: see interval_agent_kicked events in ~/.tartci/state/launchd-interval-guard/events.jsonl.",
+      "do_not": "Do not read `serving: ok` or a loaded label as proof that launchd still runs the host's timers, and do not bootout/bootstrap lanes to fix it: a re-bootstrapped agent is a non-demand spawn and pends."
+    },
+    "launchd_timers_unreadable": {
+      "summary": "The interval guard's receipt could not be read.",
+      "why": "An unparseable receipt is not evidence that launchd is healthy.",
+      "remedy": "Inspect ~/.tartci/state/launchd-interval-guard/status.json; the next pass rewrites it atomically."
+    },
     "lease_fit_ok": {
       "summary": "Every measured lane can lease its VM, and identical lanes can run together.",
       "why": "Each lane records its own lease-fit verdict against the lease store's capacity model."
