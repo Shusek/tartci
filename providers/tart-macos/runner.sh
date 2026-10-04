@@ -227,6 +227,7 @@ PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
 PRINT_PRE_CLONE_SELECTION=""
+PRINT_PRE_MINT_RETARGET=""
 PRINT_IDLE_RETARGET=""
 PRINT_FALLBACK_DECISION=""
 PRINT_HIGHER_PRIORITY=""
@@ -508,6 +509,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-assignment-parity) PRINT_ASSIGNMENT_PARITY=1; shift;;
   --print-pre-mint-selection) PRINT_PRE_MINT_SELECTION="$2"; shift 2;;
   --print-pre-clone-selection) PRINT_PRE_CLONE_SELECTION="$2"; shift 2;;
+  --print-pre-mint-retarget) PRINT_PRE_MINT_RETARGET="$2"; shift 2;;
   --print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;
   --print-fallback-decision) PRINT_FALLBACK_DECISION="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
@@ -2142,12 +2144,41 @@ run_one(){
   fi
   if [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
      && ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then
-    tartci_pool_lock_release
-    note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM"
     tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
-    discard_current_vm
-    tartci_release_vm_lease
-    return 75
+    # The booted VM serves whichever class is waiting now, when one is; it is
+    # discarded only when none is. A retarget stays inside the runner group
+    # whose repository access was just proven. The VM lease is kept: both
+    # classes hold gate-priority leases, which the lease store treats alike.
+    local retarget_tier="" retarget_label="" retarget_labels="" retarget_reason="no_class_waiting"
+    if retarget_tier="$(tartci_assignment_v2_pre_mint_retarget)" \
+       && retarget_label="$(tartci_assignment_v2_tier_label_at "$retarget_tier")"; then
+      retarget_labels="$(tartci_assignment_v2_tier_labels "$retarget_label")"
+      if [ "$(runner_group_id_for_tier "$retarget_tier")" != "$selected_group_id" ]; then
+        retarget_reason="runner_group_differs"
+      elif jit_admission_denied "$selected_group_id" "$retarget_labels"; then
+        retarget_reason="jit_admission_denied"
+      else
+        retarget_reason=""
+      fi
+    else
+      retarget_tier=""
+    fi
+    if [ -n "$retarget_reason" ]; then
+      tartci_pool_lock_release
+      note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($retarget_reason)"
+      event assignment_v2_pre_mint_discard \
+        "selected_tier=$selected_tier labels=$selected_labels reason=$retarget_reason" \
+        "selected_tier=$selected_tier" "reason=$retarget_reason"
+      discard_current_vm
+      tartci_release_vm_lease
+      return 75
+    fi
+    note "[$i] V2 assignment demand moved before JIT mint — retargeting the booted VM from tier $selected_tier to tier $retarget_tier ($retarget_label)"
+    event assignment_v2_pre_mint_retarget \
+      "from_tier=$selected_tier to_tier=$retarget_tier labels=$retarget_labels" \
+      "from_tier=$selected_tier" "to_tier=$retarget_tier"
+    selected_tier="$retarget_tier"
+    selected_labels="$retarget_labels"
   fi
   # Re-check emergency admission at the last possible boundary.
   if ! tartci_pool_admission_open; then
@@ -2251,6 +2282,15 @@ i=0
 [ -n "$PRINT_PRE_MINT_SELECTION" ] && {
   if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'
   else printf '0\n'; printf '%s\n' "$ASSIGNMENT_V2_PRE_MINT_BLOCKER" >&2; fi
+  exit 0
+}
+[ -n "$PRINT_PRE_MINT_RETARGET" ] && {
+  # The pre-mint decision for a VM booted for this tier: "keep" when its class
+  # still admits, the tier it would be retargeted to, or "discard".
+  if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_RETARGET"; then printf 'keep\n'
+  elif tier="$(tartci_assignment_v2_pre_mint_retarget)"; then
+    printf '%s\n' "$tier"
+  else printf 'discard\n'; fi
   exit 0
 }
 [ -n "$PRINT_PRE_CLONE_SELECTION" ] && {

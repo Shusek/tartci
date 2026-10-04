@@ -746,6 +746,55 @@ class PreCloneProbeTests(RunnerFixture, unittest.TestCase):
         self.assertIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", result.stderr)
 
 
+class PreMintRetargetTests(RunnerFixture, unittest.TestCase):
+    """A booted VM whose class lost its job serves the class that is waiting.
+
+    On m3 on 2026-10-03 the merge-group-first gate lane discarded a booted
+    PR-head VM when a merge-group job arrived, then booted a second VM for it.
+    Tier 0 is merge-group and tier 1 is PR-head.
+    """
+
+    def _decide(self, tier: str) -> str:
+        result = self._runner("--print-pre-mint-retarget", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_a_pr_head_vm_is_retargeted_to_arriving_merge_group(self) -> None:
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._decide("1"), "0")
+
+    def test_a_vm_whose_job_vanished_serves_the_other_waiting_class(self) -> None:
+        self._state(merge=True)
+        self.assertEqual(self._decide("1"), "0")
+        self._state(pr=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    def test_no_demand_anywhere_discards(self) -> None:
+        # Control, same instrument: nothing waits, so nothing to retarget to.
+        self._state()
+        self.assertEqual(self._decide("1"), "discard")
+        self.assertEqual(self._decide("0"), "discard")
+
+    def test_a_class_that_still_admits_is_kept(self) -> None:
+        self._state(merge=True)
+        self.assertEqual(self._decide("0"), "keep")
+
+    def test_a_pr_first_slot_retargets_merge_group_to_arriving_pr_head(self) -> None:
+        self.env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = "pulp-build-pr-head,pulp-build-merge-group"
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    def test_the_mint_path_retargets_before_it_discards(self) -> None:
+        body = RUNNER.read_text(encoding="utf-8")
+        start = body.index('&& ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then')
+        block = body[start:body.index('event mint_jit', start)]
+        self.assertLess(block.index("tartci_assignment_v2_pre_mint_retarget"),
+                        block.index("discard_current_vm"))
+        self.assertIn('selected_labels="$retarget_labels"', block)
+        self.assertIn("assignment_v2_pre_mint_retarget", block)
+        self.assertIn("assignment_v2_pre_mint_discard", block)
+
+
 class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
     """A per-slot class preference order (TARTCI_ASSIGNMENT_V2_TIER_ORDER).
 
