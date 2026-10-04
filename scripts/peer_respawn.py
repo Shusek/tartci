@@ -180,6 +180,11 @@ def interval_pass(
         runs = _runs(out)
         record = ledger.setdefault(f"interval:{label}", {})
         if runs is not None and runs != record.get("runs"):
+            if "runs" in record:
+                # The agent ran on its own: whatever stalled it has cleared,
+                # so a later stall is a new one and may be kicked again.
+                record["unconfirmed"] = 0
+                record.pop("ceiling_reported", None)
             record["runs"], record["runs_seen_at"] = runs, now
         kicked_runs = record.pop("confirm_runs", None)
         if kicked_runs is not None:

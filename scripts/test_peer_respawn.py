@@ -326,5 +326,22 @@ class IntervalAgentTests(unittest.TestCase):
         self.assertEqual(names.count("interval_respawn_unconfirmed"), 3)
         self.assertEqual(names.count("interval_respawn_ceiling"), 1)
 
+    def test_a_ceiling_clears_when_the_run_count_advances_on_its_own(self) -> None:
+        fake = IntervalFake()
+        now = self.observe_then_wait(fake)
+        for step in range(6):
+            self.run_pass(fake, now + step * 301)
+        self.assertEqual(len(fake.kicks()), 3, "ceiling reached")
+        # Recovery: the agent runs on its own three times.
+        now += 6 * 301
+        for step in range(3):
+            fake.runs += 1
+            self.run_pass(fake, now + step * 301)
+        # Relapse: it stalls again past three intervals and is kicked once more.
+        now += 3 * 301
+        events = self.run_pass(fake, now + 3 * 300 + 1)
+        self.assertEqual(len(fake.kicks()), 4)
+        self.assertEqual(events[-1][0], "interval_respawn")
+
 if __name__ == "__main__":
     unittest.main()
