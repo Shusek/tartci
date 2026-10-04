@@ -214,8 +214,8 @@ def owes_exit75_respawn(
     A lane supervisor exits 75 (EX_TEMPFAIL) only after its fail-closed
     restart contract has run, expecting KeepAlive to start it again. Past the
     grace, an agent still not running has been owed that respawn, whatever
-    launchd's reason. The watchdog's wedged verdict and the peer respawn in
-    `peer_respawn.py` share this one definition.
+    launchd's reason. The watchdog's wedged verdict and the interval guard's
+    lane kick (`launchd_interval_guard.py`) share this one definition.
     """
     return (
         expected_loaded

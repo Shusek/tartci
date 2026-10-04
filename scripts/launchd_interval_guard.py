@@ -19,11 +19,20 @@ when that supervisor exits. Each pass reads the fleet's LaunchAgents
 
   * kicks a StartInterval agent that is not running and whose `runs` counter
     has not moved for 2x its interval (event `interval_agent_kicked`);
-  * kicks a fleet runner lane (KeepAlive) that is not running and has shown a
-    pended spawn for KEEPALIVE_PENDED_S (event `keepalive_agent_kicked`), so a
-    lane that exits for a restart comes back. A pended spawn means launchd
-    itself intends to run it, so a lane taken down by pool off/drain
-    (disabled and booted out) is never touched;
+  * kicks a fleet runner lane (KeepAlive) that launchd owes a respawn
+    (event `keepalive_agent_kicked`): it exited 75, the code a lane uses only
+    after its fail-closed restart contract ran, it is not running, it has
+    stayed that way for KEEPALIVE_PENDED_S, pool participation is on and
+    launchd does not list it as disabled. The rule is the watchdog's own
+    (`owes_exit75_respawn`), and unknown enablement kicks nothing. A pended
+    spawn line is recorded as evidence, never required. A lane stopped with
+    any other exit code did not vouch for its own state: it is reported once
+    (`keepalive_agent_stopped`) and left to the watchdog's verdict;
+  * stops after KICK_CEILING kicks in a row that did not take (the agent
+    neither ran nor advanced its run count by the next pass), emitting
+    `interval_kick_ceiling` / `keepalive_kick_ceiling` once, so a job that
+    cannot start fails loud instead of being kicked forever. The ceiling
+    clears when the agent next runs or advances on its own;
   * does not kick self-update (PAUSE_DURING_STALL) while a domain stall
     episode is open: an update stops every supervisor, so no guard runs and
     any lane restart it leaves to launchd would pend unattended. Outside an
@@ -56,6 +65,9 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import tartci_launchd_watchdog as watchdog  # noqa: E402
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - not on macOS/Linux
@@ -72,6 +84,8 @@ KEEPALIVE_KICK = ("tart-runner-macos-fleet",)
 STALL_FACTOR = 2
 DOMAIN_STALL_MIN_AGENTS = 2
 KEEPALIVE_PENDED_S = 120
+KICK_CEILING = 3
+STOPPED_STATES = ("not running", "spawn scheduled")
 CADENCE_S = 60
 CALL_TIMEOUT_S = 5.0
 KICK_TIMEOUT_S = 10.0
@@ -149,7 +163,10 @@ def parse_print(text: str) -> Dict[str, str]:
 
 
 def observe(label: str, domain: str, run: Run) -> Optional[Dict[str, Any]]:
-    """runs/state/pended for one label, or None when launchd does not hold it."""
+    """runs/state/pended/last exit for one label, or None when launchd does not hold it.
+
+    A failed print is not read at all, whatever text came with it.
+    """
     rc, out, _ = run(["launchctl", "print", f"{domain}/{label}"], CALL_TIMEOUT_S)
     if rc != 0:
         return None
@@ -158,7 +175,9 @@ def observe(label: str, domain: str, run: Run) -> Optional[Dict[str, Any]]:
         runs = int(fields.get("runs", ""))
     except ValueError:
         return None
+    state, last_exit = watchdog.parse_launchctl_print(out)
     return {"runs": runs, "running": fields.get("state") == "running",
+            "state": state, "last_exit": last_exit,
             "pended": fields.get("pended nondemand spawn")}
 
 
@@ -167,7 +186,8 @@ class Guard:
                  domain: str, run: Run = run_command,
                  clock: Callable[[], float] = time.time,
                  event_log: Optional[pathlib.Path] = None, runner: str = "",
-                 owner_pid: Optional[int] = None) -> None:
+                 owner_pid: Optional[int] = None,
+                 participation_file: Optional[pathlib.Path] = None) -> None:
         self.state_dir = state_dir
         self.agents_dir = agents_dir
         self.domain = domain
@@ -177,6 +197,9 @@ class Guard:
         self.runner = runner
         self.owner_pid = owner_pid if owner_pid is not None else os.getpid()
         self._deferred: List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], float]] = []
+        self.participation_file = participation_file or (
+            pathlib.Path.home() / ".config" / "tartci" / "native-build-participation")
+        self.disabled: Optional[set] = None
 
     # -- persistence -------------------------------------------------------
     @property
@@ -232,6 +255,9 @@ class Guard:
         errors: List[str] = []
         self._deferred = []
         checked = 0
+        # Enablement is read once per pass; None (unreadable) kicks no lane.
+        rc, out, _ = self.run(["launchctl", "print-disabled", self.domain], CALL_TIMEOUT_S)
+        self.disabled = watchdog.parse_disabled_services(out) if rc == 0 else None
         for agent in agents:
             if self.clock() - started > PASS_BUDGET_S:
                 errors.append("pass budget exhausted; remaining agents skipped")
@@ -293,6 +319,15 @@ class Guard:
                              "natural_ts": now, "pending_kicks": 0}
             return
         delta = obs["runs"] - mem["runs"]
+        if "kicked_runs" in mem:
+            # Did the last kick take? It ran (or is running) by now, or it did not.
+            if obs["runs"] > int(mem.pop("kicked_runs")) or obs["running"]:
+                mem["unconfirmed"] = 0
+            else:
+                mem["unconfirmed"] = int(mem.get("unconfirmed", 0)) + 1
+                # A kick that started nothing caused no run, so it must not
+                # claim a later run launchd starts on its own.
+                mem["pending_kicks"] = max(0, int(mem.get("pending_kicks", 0)) - 1)
         if delta > 0:
             ours = min(delta, int(mem.get("pending_kicks", 0)))
             mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) - ours
@@ -301,6 +336,8 @@ class Guard:
                 # already counted as progress when it was kicked.
                 mem["progress_ts"] = now
                 mem["natural_ts"] = now
+                mem["unconfirmed"] = 0
+                mem.pop("ceiling_reported", None)
             mem["runs"] = obs["runs"]
         limit = STALL_FACTOR * interval
         natural_age = now - float(mem.get("natural_ts", now))
@@ -322,9 +359,12 @@ class Guard:
                        mem: Dict[str, Any], now: float, since: float,
                        kicked: List[Dict[str, Any]], errors: List[str]) -> None:
         label, interval = agent["label"], agent["interval"]
+        if self._at_ceiling(mem, label, "interval_kick_ceiling"):
+            return
         ok, err = self.kick(label)
         if ok:
             mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) + 1
+            mem["kicked_runs"] = obs["runs"]
             mem["progress_ts"] = now
             kicked.append({"label": label, "interval": interval,
                            "seconds_since_progress": int(since)})
@@ -337,6 +377,17 @@ class Guard:
             self.emit("interval_agent_kick_failed", f"label={label} error={err}",
                       {"label": label, "interval": interval})
 
+    def _at_ceiling(self, mem: Dict[str, Any], label: str, event: str) -> bool:
+        """Whether KICK_CEILING kicks in a row did not take; reported once."""
+        unconfirmed = int(mem.get("unconfirmed", 0))
+        if unconfirmed < KICK_CEILING:
+            return False
+        if not mem.get("ceiling_reported"):
+            mem["ceiling_reported"] = True
+            self.emit(event, f"label={label} unconfirmed={unconfirmed}",
+                      {"label": label, "unconfirmed": unconfirmed})
+        return True
+
     def _keepalive(self, agent: Dict[str, Any], obs: Dict[str, Any],
                    memory: Dict[str, Any], now: float, kicked: List[Dict[str, Any]],
                    errors: List[str]) -> None:
@@ -344,26 +395,51 @@ class Guard:
         if not any(part in label for part in KEEPALIVE_KICK) \
                 or any(part in label for part in PAUSE_DURING_STALL):
             return
-        if obs["running"] or not obs["pended"]:
-            memory.pop(label, None)
-            return
         mem = memory.get(label)
-        if not isinstance(mem, dict) or mem.get("runs") != obs["runs"] \
-                or "pended_since" not in mem:
-            memory[label] = {"runs": obs["runs"], "pended_since": now}
+        if not isinstance(mem, dict):
+            mem = memory[label] = {"runs": obs["runs"]}
+        if "kicked_runs" in mem:
+            if obs["runs"] > int(mem.pop("kicked_runs")) or obs["running"]:
+                mem["unconfirmed"] = 0
+            else:
+                mem["unconfirmed"] = int(mem.get("unconfirmed", 0)) + 1
+        if obs["running"]:
+            # Seen running: whatever stopped it has cleared.
+            memory[label] = {"runs": obs["runs"]}
             return
-        since = now - float(mem["pended_since"])
-        if since < KEEPALIVE_PENDED_S:
+        if obs["state"] not in STOPPED_STATES:
             return
+        last_exit = obs["last_exit"]
+        if last_exit not in (None, 0, 75):
+            if mem.get("reported_exit") != last_exit:
+                mem["reported_exit"] = last_exit
+                self.emit("keepalive_agent_stopped", f"label={label} last_exit={last_exit}",
+                          {"label": label, "last_exit": last_exit})
+            return
+        if mem.get("runs") != obs["runs"] or "stopped_since" not in mem:
+            mem["runs"], mem["stopped_since"] = obs["runs"], now
+        since = now - float(mem["stopped_since"])
+        if self.disabled is None:
+            return
+        expected_loaded = (watchdog.pool_participating(str(self.participation_file))
+                           and label not in self.disabled)
+        if not watchdog.owes_exit75_respawn(obs["state"], last_exit, since,
+                                            expected_loaded, KEEPALIVE_PENDED_S):
+            return
+        if self._at_ceiling(mem, label, "keepalive_kick_ceiling"):
+            return
+        pended = obs["pended"] or ""
         ok, err = self.kick(label)
         if ok:
-            mem["pended_since"] = now
+            mem["stopped_since"] = now
+            mem["kicked_runs"] = obs["runs"]
             kicked.append({"label": label, "keepalive": True,
-                           "seconds_pended": int(since)})
+                           "seconds_stopped": int(since)})
             self.emit("keepalive_agent_kicked",
-                      f"label={label} pended={obs['pended']} seconds_pended={int(since)}",
-                      {"label": label, "seconds_pended": int(since),
-                       "pended": obs["pended"]})
+                      f"label={label} last_exit=75 seconds_stopped={int(since)} "
+                      f"pended={pended or 'no'}",
+                      {"label": label, "seconds_stopped": int(since), "last_exit": 75,
+                       "pended": pended})
         else:
             errors.append(f"{label}: kickstart failed: {err}")
             self.emit("keepalive_agent_kick_failed", f"label={label} error={err}",
@@ -444,6 +520,10 @@ def loop(guard: Guard, *, owner_pid: int, cadence: float = CADENCE_S,
                 guard.pass_once()
             except Exception as exc:  # noqa: BLE001 - the loop must outlive any pass
                 log(f"interval guard: pass failed: {type(exc).__name__}: {exc}")
+                # The lane's event log, not only this process's log file, so a
+                # guard that keeps failing is visible where its kicks would be.
+                guard.emit("launchd_guard_pass_failed", f"{type(exc).__name__}: {exc}"[:300],
+                           {"error": f"{type(exc).__name__}: {exc}"[:300]})
         passes += 1
         if max_passes is not None and passes >= max_passes:
             break

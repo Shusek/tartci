@@ -48,16 +48,24 @@ class FakeLaunchd:
         self.calls: List[List[str]] = []
         self.fail_print = False
         self.raise_on_print = False
+        self.disabled: List[str] = []
+        self.fail_disabled = False
 
     def add(self, label: str, runs: int = 10, running: bool = False,
-            pended: str = "interval") -> None:
-        self.jobs[label] = {"runs": runs, "running": running, "pended": pended}
+            pended: str = "interval", last_exit: str = "0", state: str = "") -> None:
+        self.jobs[label] = {"runs": runs, "running": running, "pended": pended,
+                            "last_exit": last_exit, "state": state}
 
     def kicks(self) -> List[str]:
         return [c[2].rsplit("/", 1)[1] for c in self.calls if c[1] == "kickstart"]
 
     def __call__(self, argv: List[str], timeout: float) -> Tuple[int, str, str]:
         self.calls.append(argv)
+        if argv[1] == "print-disabled":
+            if self.fail_disabled:
+                return 5, "", "launchctl print-disabled failed"
+            body = "".join(f'\t"{label}" => disabled\n' for label in self.disabled)
+            return 0, f"disabled services = {{\n{body}}}\n", ""
         label = argv[2].rsplit("/", 1)[1]
         job = self.jobs.get(label)
         if argv[1] == "print":
@@ -67,17 +75,18 @@ class FakeLaunchd:
                 return 124, "", "timed out"
             if job is None:
                 return 113, "", "Could not find service"
-            lines = [f"{argv[2]} = {{", "\tactive count = 0",
-                     f"\tstate = {'running' if job['running'] else 'not running'}",
+            state = job["state"] or ("running" if job["running"] else "not running")
+            lines = [f"{argv[2]} = {{", "\tactive count = 0", f"\tstate = {state}",
                      "", f"\truns = {job['runs']}"]
             if job["pended"] and not job["running"]:
                 lines.append(f"\tpended nondemand spawn = {job['pended']}")
-            lines += ["\tlast exit code = 0", "}"]
+            lines += [f"\tlast exit code = {job['last_exit']}", "}"]
             return 0, "\n".join(lines) + "\n", ""
         if argv[1] == "kickstart":
             if job is None:
                 return 113, "", "Could not find service"
-            job["runs"] += 1  # a demand spawn runs it once and it exits
+            if label not in getattr(self, "kick_noop", set()):
+                job["runs"] += 1  # a demand spawn runs it once and it exits
             return 0, "", ""
         return 64, "", "usage"
 
@@ -102,6 +111,10 @@ class GuardCase(unittest.TestCase):
         self.clock = Clock()
 
     def guard(self, **kw) -> lig.Guard:
+        participation = self.tmp / "native-build-participation"
+        if not participation.exists():
+            participation.write_text("1\n")
+        kw.setdefault("participation_file", participation)
         return lig.Guard(self.state, self.agents, domain="gui/501", run=self.launchd,
                          clock=self.clock, event_log=self.events,
                          runner="studio-pulp-gate-01", **kw)
@@ -256,46 +269,201 @@ class SelfUpdatePauseTests(GuardCase):
 
 
 class KeepAliveKickTests(GuardCase):
-    def lane(self, **job) -> str:
-        label = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate"
-        write_plist(self.agents, label, KeepAlive=True, RunAtLoad=True)
-        self.launchd.add(label, **job)
-        return label
+    LANE = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate"
 
-    def test_a_pended_lane_is_kicked_after_two_minutes(self) -> None:
-        label = self.lane(pended="speculative")
+    def lane(self, **job) -> str:
+        write_plist(self.agents, self.LANE, KeepAlive=True, RunAtLoad=True)
+        job.setdefault("last_exit", "75: EX_TEMPFAIL")
+        self.launchd.add(self.LANE, **job)
+        return self.LANE
+
+    def passes(self, guard: lig.Guard, count: int, step: float) -> None:
+        for _ in range(count):
+            guard.pass_once()
+            self.clock.now += step
+
+    def test_a_lane_that_exited_75_is_kicked_after_two_minutes(self) -> None:
+        # m3, 2026-10-04: studio-pulp-gate-01 exited 75 after an unproved
+        # delete and launchd never respawned it.
+        label = self.lane(pended="inefficient")
         g = self.guard()
         g.pass_once()
         self.clock.now += 119
         g.pass_once()
         self.assertEqual(self.launchd.kicks(), [])
-        self.clock.now += 1
+        self.clock.now += 2
         g.pass_once()
         self.assertEqual(self.launchd.kicks(), [label])
-        self.assertIn("keepalive_agent_kicked", [e["event"] for e in self.lane_events()])
+        kicked = [e for e in self.lane_events() if e["event"] == "keepalive_agent_kicked"]
+        self.assertEqual(len(kicked), 1)
+        self.assertIn("last_exit=75", kicked[0]["detail"])
+        self.assertEqual(kicked[0]["fields"]["pended"], "inefficient")
+        # The kick is a plain kickstart of the lane's label, never -k.
+        self.assertIn(["launchctl", "kickstart", f"gui/501/{label}"], self.launchd.calls)
+        self.assertFalse([c for c in self.launchd.calls if "-k" in c])
+
+    def test_the_pended_line_is_evidence_not_a_gate(self) -> None:
+        self.lane(pended="")
+        g = self.guard()
+        self.passes(g, 3, 121)
+        self.assertEqual(len(self.launchd.kicks()), 1)
+        kicked = [e for e in self.lane_events() if e["event"] == "keepalive_agent_kicked"]
+        self.assertIn("pended=no", kicked[0]["detail"])
+
+    def test_spawn_scheduled_counts_as_stopped(self) -> None:
+        self.lane(state="spawn scheduled")
+        self.passes(self.guard(), 3, 121)
+        self.assertEqual(len(self.launchd.kicks()), 1)
+
+    def test_a_running_lane_is_never_kicked(self) -> None:
+        self.lane(running=True)
+        self.passes(self.guard(), 5, 600)
+        self.assertEqual(self.launchd.kicks(), [])
+
+    def test_a_clean_exit_is_never_kicked(self) -> None:
+        self.lane(last_exit="0", pended="speculative")
+        self.passes(self.guard(), 5, 600)
+        self.assertEqual(self.launchd.kicks(), [])
+
+    def test_another_exit_code_is_reported_once_and_never_kicked(self) -> None:
+        self.lane(last_exit="1", pended="speculative")
+        self.passes(self.guard(), 5, 600)
+        self.assertEqual(self.launchd.kicks(), [])
+        stopped = [e for e in self.lane_events() if e["event"] == "keepalive_agent_stopped"]
+        self.assertEqual(len(stopped), 1)
+        self.assertEqual(stopped[0]["fields"]["last_exit"], 1)
+
+    def test_a_disabled_lane_that_exited_75_is_never_kicked(self) -> None:
+        self.launchd.disabled = [self.lane()]
+        self.passes(self.guard(), 5, 600)
+        self.assertEqual(self.launchd.kicks(), [])
+
+    def test_pool_participation_off_kicks_no_lane(self) -> None:
+        self.lane()
+        (self.tmp / "native-build-participation").write_text("0\n")
+        self.passes(self.guard(), 5, 600)
+        self.assertEqual(self.launchd.kicks(), [])
+
+    def test_unknown_enablement_kicks_no_lane(self) -> None:
+        self.lane()
+        self.launchd.fail_disabled = True
+        self.passes(self.guard(), 5, 600)
+        self.assertEqual(self.launchd.kicks(), [])
+
+    def test_a_failed_print_is_not_read_whatever_it_says(self) -> None:
+        # A print that failed (rc 113) but carries text that would otherwise
+        # read as an owed exit-75 respawn: nothing is kicked or reported.
+        self.lane()
+        real = self.launchd.__call__
+
+        def deceptive(argv, timeout):
+            rc, out, err = real(argv, timeout)
+            return (113, out, "Could not find service") if argv[1] == "print" else (rc, out, err)
+        g = lig.Guard(self.state, self.agents, domain="gui/501", run=deceptive,
+                      clock=self.clock, event_log=self.events, runner="r",
+                      participation_file=self.tmp / "p")
+        (self.tmp / "p").write_text("1\n")
+        for _ in range(5):
+            g.pass_once()
+            self.clock.now += 600
+        self.assertFalse([c for c in self.launchd.calls if c[1] == "kickstart"])
+        self.assertEqual(self.lane_events(), [])
 
     def test_a_pended_keepalive_agent_that_is_not_a_lane_is_never_kicked(self) -> None:
         write_plist(self.agents, "com.danielraffel.tartci.http-connect-ssh-relay",
                     KeepAlive=True)
         self.launchd.add("com.danielraffel.tartci.http-connect-ssh-relay",
-                         pended="speculative")
-        g = self.guard()
-        for _ in range(5):
-            g.pass_once()
-            self.clock.now += 600
+                         pended="speculative", last_exit="75: EX_TEMPFAIL")
+        self.passes(self.guard(), 5, 600)
         self.assertEqual(self.launchd.kicks(), [])
 
-    def test_a_running_or_unpended_lane_is_never_kicked(self) -> None:
-        self.lane(running=True)
+    def test_a_lane_whose_kicks_do_not_take_hits_the_ceiling_once(self) -> None:
+        label = self.lane()
+        self.launchd.kick_noop = {label}
+        self.passes(self.guard(), 12, 121)
+        self.assertEqual(len(self.launchd.kicks()), lig.KICK_CEILING)
+        ceilings = [e for e in self.lane_events() if e["event"] == "keepalive_kick_ceiling"]
+        self.assertEqual(len(ceilings), 1)
+
+    def test_a_lane_seen_running_clears_its_ceiling(self) -> None:
+        label = self.lane()
+        self.launchd.kick_noop = {label}
         g = self.guard()
-        for _ in range(5):
+        self.passes(g, 12, 121)
+        self.assertEqual(len(self.launchd.kicks()), lig.KICK_CEILING)
+        # Recovery: it runs again, then relapses into an exit-75 stop.
+        self.launchd.jobs[label].update(running=True)
+        self.passes(g, 1, 121)
+        self.launchd.jobs[label].update(running=False)
+        self.passes(g, 2, 121)  # first sight of the stop, then past the grace
+        self.assertEqual(len(self.launchd.kicks()), lig.KICK_CEILING + 1)
+
+
+class IntervalCeilingTests(GuardCase):
+    REAP = "com.danielraffel.tartci.reap"
+
+    def test_an_interval_agent_whose_kicks_do_not_take_hits_the_ceiling_once(self) -> None:
+        self.interval_agent(self.REAP, 300)
+        self.launchd.kick_noop = {self.REAP}
+        g = self.guard()
+        for _ in range(20):
             g.pass_once()
-            self.clock.now += 600
-        self.launchd.jobs[next(iter(self.launchd.jobs))].update(running=False, pended="")
-        for _ in range(5):
+            self.clock.now += 601
+        self.assertEqual(len(self.launchd.kicks()), lig.KICK_CEILING)
+        ceilings = [e for e in self.lane_events() if e["event"] == "interval_kick_ceiling"]
+        self.assertEqual(len(ceilings), 1)
+
+    def test_kicks_that_take_never_reach_the_ceiling(self) -> None:
+        # On a starved host every run is a kicked one; a working kick is not a failure.
+        self.interval_agent(self.REAP, 300)
+        g = self.guard()
+        for _ in range(20):
             g.pass_once()
-            self.clock.now += 600
-        self.assertEqual(self.launchd.kicks(), [])
+            self.clock.now += 601
+        self.assertGreater(len(self.launchd.kicks()), lig.KICK_CEILING)
+
+    def test_a_ceiling_clears_when_the_agent_runs_on_its_own(self) -> None:
+        self.interval_agent(self.REAP, 300)
+        self.launchd.kick_noop = {self.REAP}
+        g = self.guard()
+        for _ in range(20):
+            g.pass_once()
+            self.clock.now += 601
+        self.assertEqual(len(self.launchd.kicks()), lig.KICK_CEILING)
+        # Recovery: launchd starts it itself.
+        self.launchd.jobs[self.REAP]["runs"] += 1
+        g.pass_once()
+        # Relapse: it stalls again, is kicked again up to the ceiling, and the
+        # second ceiling is reported in its turn.
+        for _ in range(10):
+            self.clock.now += 601
+            g.pass_once()
+        self.assertEqual(len(self.launchd.kicks()), 2 * lig.KICK_CEILING)
+        ceilings = [e for e in self.lane_events() if e["event"] == "interval_kick_ceiling"]
+        self.assertEqual(len(ceilings), 2)
+
+
+class FailureVisibilityTests(GuardCase):
+    def test_a_failed_pass_reaches_the_lane_event_log(self) -> None:
+        g = self.guard()
+
+        def explode():
+            raise OSError("disk full")
+        g.pass_once = explode  # type: ignore[assignment]
+        lig.loop(g, owner_pid=os.getpid(), sleep=lambda s: None, max_passes=1,
+                 log=lambda text: None)
+        failed = [e for e in self.lane_events() if e["event"] == "launchd_guard_pass_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("disk full", failed[0]["detail"])
+
+    def test_a_stale_receipt_is_a_doctor_finding(self) -> None:
+        self.state.mkdir()
+        (self.state / "status.json").write_text(json.dumps(
+            {"ts": 100.0, "agents_checked": 3, "episode": {"active": False}}))
+        finding = fd.check_launchd_timers(lig.status(self.state,
+                                                     now=100.0 + lig.RECEIPT_STALE_S + 1))
+        self.assertEqual(finding.code, "launchd_timers_not_running")
+        self.assertNotEqual(finding.state, fd.OK)
 
 
 class DomainStallTests(GuardCase):
