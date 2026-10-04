@@ -1,5 +1,11 @@
 schema = 1
 name = "m3-macos-fleet"
+# The ONE host that dispatches the schedule backstop (scripts/schedule_backstop.py),
+# installed by `tartci setup` (scripts/install_schedule_backstop_agent.sh).
+# Canary 2026-10-03: the ten covered Pulp workflows ran 48 to 50 times a day
+# against 48 expected (4 to 5 before), with no double dispatch. Every other
+# profile leaves this unset (off). Fail-open: with it off the crons carry on.
+schedule_backstop = "live"
 
 # Shipyard's durable host tag for M3 is `studio`. The profile name remains M3
 # operator vocabulary, but install authority is bound to that exact live tag.
