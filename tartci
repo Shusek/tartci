@@ -1222,13 +1222,19 @@ EOF
       power_json="$(python3 "$HERE/scripts/power_status.py" --json 2>/dev/null)" \
         || power_json='{"state":"unknown"}'
       [ -n "$power_json" ] || power_json='{"state":"unknown"}'
+      # Whether launchd still starts this host's timer jobs, from the receipt
+      # the lane supervisors' interval guard writes every minute.
+      local launchd_timers_json
+      launchd_timers_json="$(python3 "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
+        || launchd_timers_json='{"state":"unreadable"}'
+      [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
       if [ "$status_json" = 1 ]; then
         local lease_fit_json
         lease_fit_json="$(python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
           || lease_fit_json='{"managed":null}'
         [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
-        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json"
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json" "$launchd_timers_json"
         local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -1247,6 +1253,8 @@ EOF
         python3 "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
         python3 "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
         python3 "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
+        python3 "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
+          || echo "launchd timers: UNREADABLE"
         python3 "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
           || echo "signing prompts: UNREADABLE"
         # The readiness payload is already computed above; JSON formatting does
