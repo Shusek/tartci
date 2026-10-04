@@ -27,7 +27,7 @@ class MacosTeardownOrderTests(unittest.TestCase):
         body = function_body(RUNNER.read_text(), "discard_current_vm")
         guardian = body.index("terminate_current_guardian")
         stop = body.index("bounded_teardown_command tart-stop")
-        delete = body.index("bounded_teardown_command tart-delete")
+        delete = body.index('tartci_tart_delete "$CURRENT_VM"')
         self.assertLess(guardian, stop)
         self.assertLess(stop, delete)
         self.assertNotIn("tart stop", body.replace("bounded_teardown_command tart-stop tart stop", ""))
@@ -45,6 +45,7 @@ class MacosTeardownOrderTests(unittest.TestCase):
             f"{name}(){{\n{function_body(source, name)}}}"
             for name in (
                 "bounded_teardown_command",
+                "tartci_tart_delete",
                 "terminate_current_guardian",
                 "stop_current_aqua_runner",
                 "discard_current_vm",
@@ -99,6 +100,7 @@ class MacosTeardownOrderTests(unittest.TestCase):
             f"{name}(){{\n{function_body(source, name)}}}"
             for name in (
                 "bounded_teardown_command",
+                "tartci_tart_delete",
                 "terminate_current_guardian",
                 "stop_current_aqua_runner",
                 "discard_current_vm",
@@ -193,6 +195,7 @@ class PendingDeleteTests(unittest.TestCase):
 
     FUNCTIONS = (
         "bounded_teardown_command",
+        "tartci_tart_delete",
         "terminate_current_guardian",
         "stop_current_aqua_runner",
         "discard_current_vm",
