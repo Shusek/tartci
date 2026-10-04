@@ -24,9 +24,11 @@ when that supervisor exits. Each pass reads the fleet's LaunchAgents
     lane that exits for a restart comes back. A pended spawn means launchd
     itself intends to run it, so a lane taken down by pool off/drain
     (disabled and booted out) is never touched;
-  * never kicks self-update (NEVER_KICK): it restarts every lane, and its
-    failure paths can rely on the KeepAlive respawns a stuck domain withholds.
-    It is still observed and counts toward the domain stall;
+  * does not kick self-update (PAUSE_DURING_STALL) while a domain stall
+    episode is open: an update stops every supervisor, so no guard runs and
+    any lane restart it leaves to launchd would pend unattended. Outside an
+    episode launchd starts it on its own, and an overdue one is kicked like
+    any other. It still counts toward the domain stall;
   * opens a domain-wide episode when two or more interval agents have gone
     2x their interval without launchd starting them on its own (event
     `launchd_interval_spawns_stalled`, once per episode), and closes it
@@ -60,10 +62,11 @@ except ImportError:  # pragma: no cover - not on macOS/Linux
     fcntl = None  # type: ignore[assignment]
 
 LABEL_PREFIXES = ("com.danielraffel.", "com.pulp.")
-# Never kicked, only observed (it still counts toward a domain stall).
-# Self-update restarts every lane, and its failure paths can rely on KeepAlive
-# respawns, which is exactly what a stuck domain stops starting.
-NEVER_KICK = ("self-update",)
+# Not kicked while a domain stall episode is open (still observed, and still
+# counted toward the stall). Self-update stops every supervisor, so during the
+# update no guard runs, and a lane restart left to launchd would pend.
+PAUSE_DURING_STALL = ("self-update",)
+PAUSED_HINT = "self-update paused: launchd timers stalled; a reboot resumes it"
 # The only KeepAlive agents kicked: the fleet runner lanes.
 KEEPALIVE_KICK = ("tart-runner-macos-fleet",)
 STALL_FACTOR = 2
@@ -173,6 +176,7 @@ class Guard:
         self.event_log = event_log
         self.runner = runner
         self.owner_pid = owner_pid if owner_pid is not None else os.getpid()
+        self._deferred: List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], float]] = []
 
     # -- persistence -------------------------------------------------------
     @property
@@ -226,6 +230,7 @@ class Guard:
         stalled: List[Dict[str, Any]] = []
         kicked: List[Dict[str, Any]] = []
         errors: List[str] = []
+        self._deferred = []
         checked = 0
         for agent in agents:
             if self.clock() - started > PASS_BUDGET_S:
@@ -259,11 +264,19 @@ class Guard:
                        "labels": current.get("labels", []) if isinstance(current, dict) else []}
             if isinstance(current, dict):
                 episode["started_ts"] = current.get("started_ts")
+        # Decided after the episode, so a pass that opens one never kicks.
+        paused: List[Dict[str, Any]] = []
+        for agent, obs, mem, since in self._deferred:
+            if episode.get("active"):
+                paused.append({"label": agent["label"], "interval": agent["interval"],
+                               "seconds_since_progress": int(since)})
+            else:
+                self._kick_interval(agent, obs, mem, now, since, kicked, errors)
         self._write(self.state_path, state)
         receipt = {
             "ts": now, "owner_pid": self.owner_pid, "runner": self.runner,
             "agents_checked": checked, "stalled": stalled, "kicked": kicked,
-            "errors": errors, "episode": episode,
+            "errors": errors, "episode": episode, "paused": paused,
         }
         self._write(self.receipt_path, receipt)
         return receipt
@@ -300,8 +313,15 @@ class Guard:
         since = now - float(mem.get("progress_ts", now))
         if obs["running"] or since < limit:
             return
-        if any(part in label for part in NEVER_KICK):
+        if any(part in label for part in PAUSE_DURING_STALL):
+            self._deferred.append((agent, obs, mem, since))
             return
+        self._kick_interval(agent, obs, mem, now, since, kicked, errors)
+
+    def _kick_interval(self, agent: Dict[str, Any], obs: Dict[str, Any],
+                       mem: Dict[str, Any], now: float, since: float,
+                       kicked: List[Dict[str, Any]], errors: List[str]) -> None:
+        label, interval = agent["label"], agent["interval"]
         ok, err = self.kick(label)
         if ok:
             mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) + 1
@@ -322,7 +342,7 @@ class Guard:
                    errors: List[str]) -> None:
         label = agent["label"]
         if not any(part in label for part in KEEPALIVE_KICK) \
-                or any(part in label for part in NEVER_KICK):
+                or any(part in label for part in PAUSE_DURING_STALL):
             return
         if obs["running"] or not obs["pended"]:
             memory.pop(label, None)
@@ -453,6 +473,7 @@ def status(state_dir: Optional[pathlib.Path] = None, *,
     out.update(age_seconds=int(age), agents_checked=receipt.get("agents_checked"),
                stalled=receipt.get("stalled") or [], kicked=receipt.get("kicked") or [],
                errors=receipt.get("errors") or [], episode=episode,
+               paused=receipt.get("paused") or [],
                owner_pid=receipt.get("owner_pid"), runner=receipt.get("runner"))
     if age > RECEIPT_STALE_S:
         out["state"] = "stale"
@@ -480,7 +501,8 @@ def describe(value: Dict[str, Any]) -> str:
         age = "" if not isinstance(since, (int, float)) else \
             f" for {(time.time() - since) / 3600:.1f}h"
         return (f"launchd timers: STALLED{age}, {len(labels)} agents not started by "
-                f"launchd ({', '.join(labels)}); {STALL_HINT}")
+                f"launchd ({', '.join(labels)}); {STALL_HINT}"
+                + (f"; {PAUSED_HINT}" if value.get("paused") else ""))
     kicked = value.get("kicked") or []
     tail = f", kicked {len(kicked)} this pass" if kicked else ""
     return (f"launchd timers: ok ({value.get('agents_checked')} fleet agents checked "
