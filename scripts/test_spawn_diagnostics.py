@@ -33,6 +33,10 @@ GUEST_TOOLS = {
                'head -c "${FAKE_BODY_BYTES:-0}" /dev/zero | tr "\\0" x\n',
     "log": '#!/bin/sh\necho "kernel: fake unified log line"\n',
     "codesign": "#!/bin/sh\nexit 0\n",
+    # The guest is macOS; Linux CI has no Mach-O to describe, so these answer
+    # as the guest's own tools would.
+    "file": '#!/bin/sh\necho "$1: Mach-O 64-bit executable arm64"\n',
+    "shasum": '#!/bin/sh\necho "0123abcd  $3"\n',
 }
 
 ERROR_LINE = ("[2026-10-04 16:48:05Z ERR  StepsRunner] An error occurred trying to start "
@@ -55,7 +59,7 @@ class SpawnDiagnosticsTests(unittest.TestCase):
         (diag / "Worker_20261004-161846-utc.log").write_text(worker_log)
         node = guest_home / "actions-runner" / "externals" / "node24" / "bin" / "node"
         node.parent.mkdir(parents=True)
-        node.write_bytes(Path("/bin/sh").read_bytes())
+        node.write_bytes(b"\xcf\xfa\xed\xfe")
         guest_bin = tmp / "guest-bin"
         guest_bin.mkdir()
         for name, body in GUEST_TOOLS.items():
@@ -98,7 +102,8 @@ echo "rc=$?"
         text = saved[0].read_text()
         self.assertIn("Exec format error", text)
         self.assertIn("Pages free: 1234.", text)
-        self.assertIn("Mach-O", text)
+        self.assertIn("node: Mach-O 64-bit executable arm64", text)
+        self.assertIn("0123abcd", text)
         self.assertIn("codesign ok:", text)
         self.assertIn("fake unified log line", text)
         self.assertEqual([event["event"] for event in recorded], ["guest_spawn_error_diagnostics"])
