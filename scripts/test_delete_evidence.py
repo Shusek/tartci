@@ -58,6 +58,12 @@ class DeleteEvidenceTests(unittest.TestCase):
         self.assertIn("elapsed_ms=5003", fired)
         self.assertIn("load1=14.80", fired)
 
+    def test_a_missing_status_is_unknown_not_a_bound_that_did_not_fire(self) -> None:
+        rendered = delete_evidence.render({}, "", None)
+        self.assertIn("rc=?", rendered)
+        self.assertIn("bounded=?", rendered)
+        self.assertNotIn("bounded=no", rendered)
+
     def test_stderr_keeps_its_last_lines_capped_and_quote_safe(self) -> None:
         text = "\n".join(f'line {i} "q"' for i in range(50)) + "\n" + "x" * 1000
         rendered = delete_evidence.render({"returncode": 1}, text, None)

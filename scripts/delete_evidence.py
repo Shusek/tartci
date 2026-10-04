@@ -20,6 +20,15 @@ import sys
 STDERR_MAX_CHARS = 300
 
 
+def _bounded(status: dict) -> str:
+    # No status file means no information: "?" never reads as "the bound did
+    # not fire", which would bias the split these events exist to measure.
+    timed_out = status.get("timed_out")
+    if timed_out is None:
+        return "?"
+    return "yes" if timed_out else "no"
+
+
 def render(status: dict, stderr: str, load1: float | None) -> str:
     tail = " | ".join(line.strip() for line in stderr.strip().splitlines()[-3:] if line.strip())
     if len(tail) > STDERR_MAX_CHARS:
@@ -28,7 +37,7 @@ def render(status: dict, stderr: str, load1: float | None) -> str:
     return (
         f"rc={status.get('returncode', '?')} "
         f"elapsed_ms={status.get('elapsed_ms', '?')} "
-        f"bounded={'yes' if status.get('timed_out') else 'no'} "
+        f"bounded={_bounded(status)} "
         f"load1={'?' if load1 is None else f'{load1:.2f}'} "
         f'stderr="{tail}"'
     )
