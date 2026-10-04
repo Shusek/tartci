@@ -1093,6 +1093,11 @@ def template_agent_pass(label: str, keep_prefix: str, name: str, home: str | Non
             capture_output=True, text=True, timeout=30)
         boot = run(["launchctl", "bootstrap", domain, plist_path],
                    capture_output=True, text=True, timeout=30)
+        if boot.returncode == 0:
+            # A RunAtLoad launch is speculative and launchd can defer it
+            # indefinitely on a busy host; kickstart makes it on-demand.
+            run(["launchctl", "kickstart", f"{domain}/{label}"],
+                capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"{_iso(utcnow())} launchd-watchdog: WARN {name} re-render FAILED ({exc})"
     if boot.returncode != 0:

@@ -48,6 +48,7 @@ case "$1" in
   print)
     [ -f "$state" ] || exit 3
     printf '%s\\n%s\\n' "$HOME/.local/bin/tartci" "$HOME/.config/shipyard/steward-scheduler.json"
+    [ -f "$HOME/.launchctl-ran" ] || printf '\\truns = 0\\n'
     ;;
   bootout)
     [ "${FAIL_BOOTOUT-0}" != 1 ] || exit 19
@@ -58,11 +59,18 @@ case "$1" in
       exit 17
     fi
     : > "$state"
-    if [ -x "$HOME/.local/bin/tartci" ]; then
+    # DEFER_RUNATLOAD models a busy host: the RunAtLoad launch never happens.
+    if [ "${DEFER_RUNATLOAD-0}" != 1 ] && [ -x "$HOME/.local/bin/tartci" ]; then
+      : > "$HOME/.launchctl-ran"
       "$HOME/.local/bin/tartci" steward-scheduler --config "$HOME/.config/shipyard/steward-scheduler.json"
     fi
     ;;
-  kickstart) exit 99 ;;
+  kickstart)
+    # A job that already ran must not be started again.
+    [ ! -f "$HOME/.launchctl-ran" ] || exit 99
+    : > "$HOME/.launchctl-ran"
+    "$HOME/.local/bin/tartci" steward-scheduler --config "$HOME/.config/shipyard/steward-scheduler.json"
+    ;;
   *) exit 98 ;;
 esac
 """,
@@ -88,7 +96,8 @@ esac
         self.temporary.cleanup()
 
     def run_installer(
-        self, *extra: str, fail_bootstrap: bool = False, fail_bootout: bool = False
+        self, *extra: str, fail_bootstrap: bool = False, fail_bootout: bool = False,
+        defer_runatload: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(
@@ -98,6 +107,7 @@ esac
                 "SHIPYARD_STEWARD_INSTALL_HEALTH_WAIT_SECS": "3",
                 "FAIL_BOOTSTRAP": "1" if fail_bootstrap else "0",
                 "FAIL_BOOTOUT": "1" if fail_bootout else "0",
+                "DEFER_RUNATLOAD": "1" if defer_runatload else "0",
                 "TARTCI_LAUNCHCTL_BIN": str(self.bin / "launchctl-test-double"),
                 "TARTCI_LAUNCHCTL_INTERPRETER": "/bin/sh",
             }
@@ -127,6 +137,13 @@ esac
         result = self.run_installer("--mode", "live")
         self.assertEqual(result.returncode, 2)
         self.assertIn("requires --authority", result.stderr)
+
+    def test_an_install_on_a_host_that_defers_runatload_still_runs_the_scheduler(self) -> None:
+        # launchd never performs the RunAtLoad launch; only the installer's
+        # kickstart of a job that has never run gets the first tick going.
+        result = self.run_installer("--install", defer_runatload=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.home / ".launchctl-ran").exists())
 
     def test_disabled_install_publishes_exact_config_and_health(self) -> None:
         result = self.run_installer("--install")

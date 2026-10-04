@@ -174,6 +174,9 @@ rollback_and_cleanup() {
         publish_unloaded_health "rollback could not re-bootstrap $PLIST"
         rc=$EXIT_LEFT_UNLOADED
       else
+        # A RunAtLoad launch is speculative and launchd can defer it
+        # indefinitely on a busy host; kickstart makes it an on-demand spawn.
+        launchctl kickstart "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
         echo "rolled back: the prior $LABEL is loaded again" >&2
       fi
     fi

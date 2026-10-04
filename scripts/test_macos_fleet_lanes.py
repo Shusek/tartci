@@ -216,7 +216,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "launch_helper": helper,
             }), mock.patch.object(
                 macos_launcher_probe.subprocess, "run",
-                side_effect=[missing, ok, terminal, ok],
+                side_effect=[missing, ok, ok, terminal, ok],
             ) as run:
                 result = fleet.probe_launch_helper(
                     Path("receipt"), config, root / "agents", root / "support"
@@ -224,6 +224,10 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertEqual(result["path"], "/Volumes/Workshop/VMs")
             self.assertEqual(run.call_args_list[-1].args[0][1], "bootout")
+            # launchd can defer the probe's RunAtLoad launch indefinitely on a
+            # busy host, so it is kickstarted right after bootstrap.
+            verbs = [call.args[0][1] for call in run.call_args_list]
+            self.assertEqual(verbs[verbs.index("bootstrap") + 1], "kickstart")
 
             cleanup_failed = subprocess.CompletedProcess(
                 [], 5, "", "bootout failed\n"
@@ -232,7 +236,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "launch_helper": helper,
             }), mock.patch.object(
                 macos_launcher_probe.subprocess, "run",
-                side_effect=[missing, ok, terminal, cleanup_failed],
+                side_effect=[missing, ok, ok, terminal, cleanup_failed],
             ):
                 with self.assertRaisesRegex(ValueError, "could not remove"):
                     fleet.probe_launch_helper(
@@ -246,7 +250,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "launch_helper": helper,
             }), mock.patch.object(
                 macos_launcher_probe.subprocess, "run",
-                side_effect=[missing, ok, probe_failed, cleanup_failed],
+                side_effect=[missing, ok, ok, probe_failed, cleanup_failed],
             ):
                 with self.assertRaisesRegex(
                     ValueError, "exited 74; .*could not remove"

@@ -59,7 +59,8 @@ class QueueSaturationReconcileTests(unittest.TestCase):
         self.assertEqual(env["PULP_SAT_APPLY"], "1")
         self.assertEqual(env["PULP_SAT_QUEUE_TRIP"], "40")
         self.assertEqual([c[:2] for c in self.calls],
-                         [["launchctl", "bootout"], ["launchctl", "bootstrap"]])
+                         [["launchctl", "bootout"], ["launchctl", "bootstrap"],
+                          ["launchctl", "kickstart"]])
 
     def test_a_current_agent_is_left_alone(self) -> None:
         # Control, same instrument: the installed copy already is the template.
@@ -116,7 +117,8 @@ class ScheduleBackstopReconcileTests(unittest.TestCase):
         env = value["EnvironmentVariables"]
         self.assertEqual((env["TARTCI_BACKSTOP_APPLY"], env["TARTCI_BACKSTOP_AUTHORITY"]), ("1", "1"))
         self.assertEqual([c[:2] for c in self.calls],
-                         [["launchctl", "bootout"], ["launchctl", "bootstrap"]])
+                         [["launchctl", "bootout"], ["launchctl", "bootstrap"],
+                          ["launchctl", "kickstart"]])
 
     def test_a_current_or_unloaded_backstop_is_left_alone(self) -> None:
         # Controls: already the template, or someone switched it off.
