@@ -393,6 +393,139 @@ class WorktreesInTmp(Isolated):
             self.assertIn(code, reasons)
 
 
+class DiscoveredPulpRoots(Isolated):
+    """Coverage dirs are reaped in every Code root that holds this repo's worktrees."""
+
+    def recorder(self):
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append((script.stem, kwargs["worktrees_root"], kwargs.get("timeout_s")))
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0,
+                    "worktrees_root": kwargs["worktrees_root"]}
+        return calls, reaper
+
+    def other_root_worktree(self, repo: PulpRepo, root: pathlib.Path, name: str) -> pathlib.Path:
+        root.mkdir(exist_ok=True)
+        path = root / name
+        git(repo.primary, "worktree", "add", "-q", "-b", f"feat/{name}", str(path), repo.first)
+        return path
+
+    def run_with(self, repo: PulpRepo, roots, *, fix: bool = True, **overrides):
+        calls, reaper = self.recorder()
+        profile = repo.profile(self.tmp / "p.toml", **overrides)
+        (out, log) = self.quiet(pr.run, fix=fix, profile=profile, state_dir=self.state,
+                                reaper=reaper, discovered_roots=roots)
+        return calls, out, log
+
+    def extra_runs(self, calls, roots):
+        wanted = {str(os.path.realpath(r)) for r in roots}
+        return [c for c in calls if c[1] in wanted and c[0] == "clean_build_cov"]
+
+    def test_the_m5s_boot_volume_root_gets_its_own_coverage_run(self):
+        # m5s, 2026-10-04: worktrees in ~/Code on the boot volume, the profile's
+        # worktrees_root on another volume. The boot root was never reaped.
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "pulp-wave2e")
+        calls, out, log = self.run_with(repo, [boot_code])
+        extra = self.extra_runs(calls, [boot_code])
+        self.assertEqual(len(extra), 1, calls)
+        record = [r for r in out["runs"] if r.get("reason") == "discovered_pulp_root"]
+        self.assertEqual(len(record), 1, out)
+        self.assertEqual(out["outside_profile_roots"],
+                         [{"root": str(os.path.realpath(boot_code)), "count": 1}])
+        self.assertEqual(log.count("worktrees_outside_profile_root"), 1, log)
+        # The heavier reaper never follows a discovered root.
+        self.assertFalse([c for c in calls if c[0] == "clean_worktree_builds"
+                          and c[1] == str(os.path.realpath(boot_code))], calls)
+
+    def test_two_discovered_roots_get_one_run_each(self):
+        repo = PulpRepo(self.tmp)
+        first, second = self.tmp / "code-a", self.tmp / "code-b"
+        self.other_root_worktree(repo, first, "wt-a")
+        self.other_root_worktree(repo, second, "wt-b")
+        calls, out, _ = self.run_with(repo, [first, second])
+        self.assertEqual(len(self.extra_runs(calls, [first])), 1, calls)
+        self.assertEqual(len(self.extra_runs(calls, [second])), 1, calls)
+
+    def test_the_profile_root_is_not_run_twice(self):
+        repo = PulpRepo(self.tmp)
+        repo.worktree("wt", "feat/wt")
+        calls, out, _ = self.run_with(repo, [repo.worktrees])
+        runs = [c for c in calls if c[0] == "clean_build_cov"]
+        self.assertEqual(len(runs), 1, calls)
+        self.assertEqual(out["outside_profile_roots"], [])
+
+    def test_a_root_holding_only_a_foreign_repo_is_left_alone(self):
+        repo = PulpRepo(self.tmp)
+        foreign_root = self.tmp / "foreign-code"
+        foreign_root.mkdir()
+        other = self.tmp / "other-repo"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+        (other / "f").write_text("x")
+        git(other, "add", "-A")
+        git(other, "commit", "-q", "-m", "o")
+        git(other, "worktree", "add", "-q", "-b", "x", str(foreign_root / "wt"))
+        calls, out, log = self.run_with(repo, [foreign_root])
+        self.assertEqual(self.extra_runs(calls, [foreign_root]), [], calls)
+        self.assertNotIn("worktrees_outside_profile_root", log)
+
+    def test_the_primary_checkout_is_not_a_worktree_outside_the_profile(self):
+        # m3 keeps its primary checkout in /Volumes/Workshop/Code beside
+        # agent-worktrees; that root holds the repository itself, not worktrees.
+        repo = PulpRepo(self.tmp)
+        calls, out, log = self.run_with(repo, [repo.root])
+        self.assertEqual(self.extra_runs(calls, [repo.root]), [], calls)
+        self.assertNotIn("worktrees_outside_profile_root", log)
+
+    def test_a_root_of_plain_dirs_is_left_alone(self):
+        repo = PulpRepo(self.tmp)
+        plain = self.tmp / "plain-code"
+        (plain / "project" / "build-cov").mkdir(parents=True)
+        calls, out, _ = self.run_with(repo, [plain])
+        self.assertEqual(self.extra_runs(calls, [plain]), [], calls)
+
+    def test_disabled_pulp_worktree_builds_runs_nothing_anywhere(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "wt")
+        calls, out, _ = self.run_with(repo, [boot_code], pulp_worktree_builds=False)
+        self.assertEqual(calls, [])
+        self.assertFalse(out["enabled"])
+
+    def test_the_discovered_root_run_follows_the_pass_mode(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "wt")
+        modes = []
+
+        def reaper(script, **kwargs):
+            modes.append((kwargs["worktrees_root"], kwargs["fix"]))
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+        profile = repo.profile(self.tmp / "p.toml")
+        for fix in (False, True):
+            modes.clear()
+            self.quiet(pr.run, fix=fix, profile=profile, state_dir=self.state,
+                       reaper=reaper, discovered_roots=[boot_code])
+            extra = [m for m in modes if m[0] == str(os.path.realpath(boot_code))]
+            self.assertEqual(extra, [(str(os.path.realpath(boot_code)), fix)])
+
+    def test_the_real_reaper_clears_coverage_in_the_discovered_root(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        wt = self.other_root_worktree(repo, boot_code, "pulp-wave2f")
+        cov = fill(wt / "build-cov", days=2)
+        kept = fill(repo.worktrees / "wt" / "build-cov", days=2)
+        profile = repo.profile(self.tmp / "p.toml", pressure_free_gb=1)
+        (out, log) = self.quiet(pr.run, fix=True, profile=profile, state_dir=self.state,
+                                discovered_roots=[boot_code])
+        self.assertFalse(cov.exists(), log)
+        self.assertFalse(kept.exists(), log)
+        extra = [r for r in out["runs"] if r.get("reason") == "discovered_pulp_root"]
+        self.assertEqual(extra[0]["exit_code"], 0, log)
+
+
 class DiskReclaimIntegration(Isolated):
     def test_receipt_event_and_log_line_carry_the_pulp_result(self):
         repo = PulpRepo(self.tmp)
@@ -424,6 +557,25 @@ class DiskReclaimIntegration(Isolated):
         self.assertEqual([e["fields"]["reaper"] for e in events[1:]],
                          ["clean_build_cov", "clean_worktree_builds"])
         self.assertIn('"event": "reclaim_pass"', err.getvalue())
+
+    def test_the_reclaim_pass_hands_its_scan_roots_to_the_reapers(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        boot_code.mkdir()
+        git(repo.primary, "worktree", "add", "-q", "-b", "feat/boot", str(boot_code / "wt"),
+            repo.first)
+        cov = fill(boot_code / "wt" / "build-cov", days=2)
+        os.environ["TARTCI_FLEET_PROFILE"] = str(repo.profile(self.tmp / "p.toml"))
+        state = self.tmp / "reclaim-state"
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()) as err:
+            code = dr.main(["--roots", str(boot_code), "--json", "--fix",
+                            "--state-dir", str(state), "--boot-floor-gb", "0"])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertFalse(cov.exists(), err.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["pulp_reapers"]["outside_profile_roots"],
+                         [{"root": str(os.path.realpath(boot_code)), "count": 1}])
 
     def test_a_failed_pass_still_leaves_a_receipt(self):
         state = self.tmp / "reclaim-state"
