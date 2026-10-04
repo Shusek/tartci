@@ -217,6 +217,22 @@ class IntervalKickTests(GuardCase):
         self.assertEqual(self.launchd.jobs["com.danielraffel.tartci.reap"]["runs"], 11)
 
 
+class NeverKickTests(GuardCase):
+    def test_self_update_is_observed_but_never_kicked(self) -> None:
+        self.interval_agent("com.danielraffel.tartci.self-update", 1800)
+        self.interval_agent("com.danielraffel.tartci.reap", 300)
+        g = self.guard()
+        g.pass_once()
+        for _ in range(16):
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertNotIn("com.danielraffel.tartci.self-update", self.launchd.kicks())
+        self.assertIn("com.danielraffel.tartci.reap", self.launchd.kicks())
+        # Still counted: a stuck self-update is part of the domain stall.
+        self.assertIn("com.danielraffel.tartci.self-update", receipt["episode"]["labels"])
+        self.assertTrue(receipt["episode"]["active"])
+
+
 class KeepAliveKickTests(GuardCase):
     def lane(self, **job) -> str:
         label = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate"
@@ -235,6 +251,17 @@ class KeepAliveKickTests(GuardCase):
         g.pass_once()
         self.assertEqual(self.launchd.kicks(), [label])
         self.assertIn("keepalive_agent_kicked", [e["event"] for e in self.lane_events()])
+
+    def test_a_pended_keepalive_agent_that_is_not_a_lane_is_never_kicked(self) -> None:
+        write_plist(self.agents, "com.danielraffel.tartci.http-connect-ssh-relay",
+                    KeepAlive=True)
+        self.launchd.add("com.danielraffel.tartci.http-connect-ssh-relay",
+                         pended="speculative")
+        g = self.guard()
+        for _ in range(5):
+            g.pass_once()
+            self.clock.now += 600
+        self.assertEqual(self.launchd.kicks(), [])
 
     def test_a_running_or_unpended_lane_is_never_kicked(self) -> None:
         self.lane(running=True)
