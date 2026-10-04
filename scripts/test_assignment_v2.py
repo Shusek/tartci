@@ -787,10 +787,14 @@ class PreMintRetargetTests(RunnerFixture, unittest.TestCase):
     def test_the_mint_path_retargets_before_it_discards(self) -> None:
         body = RUNNER.read_text(encoding="utf-8")
         start = body.index('&& ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then')
-        block = body[start:body.index('event mint_jit', start)]
+        denial = body[start:body.index("\n  fi\n", start)]
+        self.assertIn('retarget_after_pre_mint_denial "$i" "$selected_group_id" || return 75', denial)
+        self.assertNotIn("discard_current_vm", denial)
+        fn_start = body.index("retarget_after_pre_mint_denial(){")
+        block = body[fn_start:body.index("\n}\n", fn_start)]
         self.assertLess(block.index("tartci_assignment_v2_pre_mint_retarget"),
                         block.index("discard_current_vm"))
-        self.assertIn('selected_labels="$retarget_labels"', block)
+        self.assertIn('selected_labels="$labels"', block)
         self.assertIn("assignment_v2_pre_mint_retarget", block)
         self.assertIn("assignment_v2_pre_mint_discard", block)
 

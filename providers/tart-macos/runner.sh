@@ -1845,6 +1845,45 @@ boot_vm_to_ssh(){
   return 0
 }
 
+# A VM booted for a class the pre-mint check just denied serves whichever class
+# is waiting now, when one is; it is discarded only when none is. A retarget
+# stays inside the runner group whose repository access was just proven, and
+# keeps the VM lease: every gate class holds a gate-priority lease, which the
+# lease store treats alike, and releasing it would let another lane take the
+# slot. Runs inside run_one under the mint lock and rewrites its selected_tier
+# and selected_labels; returns 1 after discarding the VM.
+retarget_after_pre_mint_denial(){
+  local i="$1" group_id="$2" tier="" label="" labels="" reason="no_class_waiting"
+  tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
+  if tier="$(tartci_assignment_v2_pre_mint_retarget)" \
+     && label="$(tartci_assignment_v2_tier_label_at "$tier")"; then
+    labels="$(tartci_assignment_v2_tier_labels "$label")"
+    if [ "$(runner_group_id_for_tier "$tier")" != "$group_id" ]; then
+      reason="runner_group_differs"
+    elif jit_admission_denied "$group_id" "$labels"; then
+      reason="jit_admission_denied"
+    else
+      reason=""
+    fi
+  fi
+  if [ -n "$reason" ]; then
+    tartci_pool_lock_release
+    note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($reason)"
+    event assignment_v2_pre_mint_discard \
+      "selected_tier=$selected_tier labels=$selected_labels reason=$reason" \
+      "selected_tier=$selected_tier" "reason=$reason"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
+  fi
+  note "[$i] V2 assignment demand moved before JIT mint — retargeting the booted VM from tier $selected_tier to tier $tier ($label)"
+  event assignment_v2_pre_mint_retarget \
+    "from_tier=$selected_tier to_tier=$tier labels=$labels" \
+    "from_tier=$selected_tier" "to_tier=$tier"
+  selected_tier="$tier"
+  selected_labels="$labels"
+}
+
 run_one(){
   # Per-boot EPHEMERAL registration name (see ephemeral_boot_name) — never the bare
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
@@ -2144,41 +2183,7 @@ run_one(){
   fi
   if [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
      && ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then
-    tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
-    # The booted VM serves whichever class is waiting now, when one is; it is
-    # discarded only when none is. A retarget stays inside the runner group
-    # whose repository access was just proven. The VM lease is kept: both
-    # classes hold gate-priority leases, which the lease store treats alike.
-    local retarget_tier="" retarget_label="" retarget_labels="" retarget_reason="no_class_waiting"
-    if retarget_tier="$(tartci_assignment_v2_pre_mint_retarget)" \
-       && retarget_label="$(tartci_assignment_v2_tier_label_at "$retarget_tier")"; then
-      retarget_labels="$(tartci_assignment_v2_tier_labels "$retarget_label")"
-      if [ "$(runner_group_id_for_tier "$retarget_tier")" != "$selected_group_id" ]; then
-        retarget_reason="runner_group_differs"
-      elif jit_admission_denied "$selected_group_id" "$retarget_labels"; then
-        retarget_reason="jit_admission_denied"
-      else
-        retarget_reason=""
-      fi
-    else
-      retarget_tier=""
-    fi
-    if [ -n "$retarget_reason" ]; then
-      tartci_pool_lock_release
-      note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($retarget_reason)"
-      event assignment_v2_pre_mint_discard \
-        "selected_tier=$selected_tier labels=$selected_labels reason=$retarget_reason" \
-        "selected_tier=$selected_tier" "reason=$retarget_reason"
-      discard_current_vm
-      tartci_release_vm_lease
-      return 75
-    fi
-    note "[$i] V2 assignment demand moved before JIT mint — retargeting the booted VM from tier $selected_tier to tier $retarget_tier ($retarget_label)"
-    event assignment_v2_pre_mint_retarget \
-      "from_tier=$selected_tier to_tier=$retarget_tier labels=$retarget_labels" \
-      "from_tier=$selected_tier" "to_tier=$retarget_tier"
-    selected_tier="$retarget_tier"
-    selected_labels="$retarget_labels"
+    retarget_after_pre_mint_denial "$i" "$selected_group_id" || return 75
   fi
   # Re-check emergency admission at the last possible boundary.
   if ! tartci_pool_admission_open; then
