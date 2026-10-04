@@ -202,6 +202,30 @@ def parse_launchctl_exit_timeout(text: str) -> float | None:
     return None
 
 
+def owes_exit75_respawn(
+    state: str | None,
+    last_exit_code: int | None,
+    age_s: float | None,
+    expected_loaded: bool,
+    restart_grace_s: int,
+) -> bool:
+    """Whether launchd owes this agent the respawn its exit 75 asked for. Pure.
+
+    A lane supervisor exits 75 (EX_TEMPFAIL) only after its fail-closed
+    restart contract has run, expecting KeepAlive to start it again. Past the
+    grace, an agent still not running has been owed that respawn, whatever
+    launchd's reason. The watchdog's wedged verdict and the peer respawn in
+    `peer_respawn.py` share this one definition.
+    """
+    return (
+        expected_loaded
+        and last_exit_code == 75
+        and state in {"not running", "spawn scheduled"}
+        and age_s is not None
+        and age_s > restart_grace_s
+    )
+
+
 def classify(
     state: str | None,
     last_exit_code: int | None,
@@ -242,13 +266,7 @@ def classify(
     resembles."""
     if state is None and expected_loaded:
         return "wedged", "not loaded while pool participation is enabled"
-    if (
-        expected_loaded
-        and last_exit_code == 75
-        and state in {"not running", "spawn scheduled"}
-        and log_age_s is not None
-        and log_age_s > restart_grace_s
-    ):
+    if owes_exit75_respawn(state, last_exit_code, log_age_s, expected_loaded, restart_grace_s):
         return (
             "wedged",
             f"EX_TEMPFAIL self-restart did not respawn within {restart_grace_s}s "

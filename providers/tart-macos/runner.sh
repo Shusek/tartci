@@ -1886,6 +1886,24 @@ retarget_after_pre_mint_denial(){
   selected_labels="$labels"
 }
 
+# Start a sibling lane that exited 75 and that launchd never respawned (see
+# scripts/peer_respawn.py). At most once per TARTCI_PEER_RESPAWN_SECS; bounded,
+# and never able to stop this lane.
+PEER_RESPAWN_LAST=0
+tartci_peer_respawn_tick(){
+  local now name detail
+  now="$(date +%s)"
+  [ $((now - PEER_RESPAWN_LAST)) -ge "${TARTCI_PEER_RESPAWN_SECS:-300}" ] || return 0
+  PEER_RESPAWN_LAST="$now"
+  [ -n "${TARTCI_LAUNCHD_LABEL:-}" ] || return 0
+  while IFS=$'\t' read -r _ name detail; do
+    [ -n "$name" ] && event "$name" "$detail"
+  done < <(python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 30 \
+    --operation peer-respawn -- python3 "$TARTCI_ROOT/scripts/peer_respawn.py" \
+    --self-label "$TARTCI_LAUNCHD_LABEL" 2>/dev/null | grep '^EVENT'$'\t' || true)
+  return 0
+}
+
 run_one(){
   # Per-boot EPHEMERAL registration name (see ephemeral_boot_name) — never the bare
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
@@ -2394,6 +2412,7 @@ if [ "$LOOP" = 1 ]; then
       fi
       heartbeat loop
     fi
+    tartci_peer_respawn_tick
     # A parked warm VM expires, yields or follows the pool before anything
     # else. A warm teardown that did not complete is now CURRENT_VM, which the
     # block above reconciles (pending delete) or exits on, on the next pass.
