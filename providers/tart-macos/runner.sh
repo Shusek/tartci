@@ -445,6 +445,8 @@ source "$TARTCI_ROOT/providers/tart-macos/artifact-cache.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 # shellcheck source=providers/tart-macos/guest-dns.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/guest-dns.lib.sh"
+# shellcheck source=providers/tart-macos/spawn-diagnostics.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/spawn-diagnostics.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -2229,6 +2231,9 @@ run_one(){
 
   run_runner_until_done "$vm" "$ip" "$jit" "$selected_tier" || rc=$?
   tartci_pool_lock_release
+  # The guest is the only witness to a tool the runner could not start; read
+  # it before the VM is discarded. Bounded, and silent when there is nothing.
+  tartci_capture_guest_spawn_errors "$vm" "$ip"
   t_runner_done="$(now_epoch)"
   if [ "$rc" -eq "$IDLE_RETARGET_RC" ]; then
     # The cached selection is what booted this class; a fresh live selection
