@@ -361,6 +361,10 @@ cmd_setup() {
   # Keeps any artifact-cache git mirror current; a no-op on a host that has none.
   "$HERE/scripts/install_artifact_cache_refresh_agent.sh" --install ||
     echo "setup: could not install the artifact-cache refresher" >&2
+  # The schedule backstop, live only where the fleet profile says so (m3);
+  # installs nothing on a host whose profile leaves it off.
+  "$HERE/scripts/install_schedule_backstop_agent.sh" --install ||
+    echo "setup: could not install the schedule backstop" >&2
   # Keeps the dedicated signing keychain unlocked in the GUI session, where a
   # locked one raises password dialogs; a no-op without keychain.env.
   "$HERE/scripts/install_keychain_unlock_agent.sh" --install ||
