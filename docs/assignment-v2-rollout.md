@@ -234,6 +234,23 @@ loser still discards at pre-mint. Removing that needs a fleet-wide boot claim
 (today `job_claim.py` sees only this host's boots and the fleet's minted idle
 runners).
 
+**Retarget instead of discard.** When the pre-mint check denies a booted VM's
+class, the lane re-runs admission for every class in its preference order that
+has queued demand, live, and mints the VM with the first class that admits
+(`assignment_v2_pre_mint_retarget from_tier=… to_tier=…`). The VM is discarded
+(`assignment_v2_pre_mint_discard reason=no_class_waiting|runner_group_differs|jit_admission_denied`)
+only when no class with demand admits, the new class lives in another runner
+group, or its JIT admission is refused. The lease is kept, not re-acquired:
+every gate class is at or above the gate priority threshold, so the lease store
+treats them alike, and releasing it would let another lane take the slot between
+release and re-acquire. `--print-pre-mint-retarget <tier>` prints `keep`, the
+retarget tier, or `discard` as a safe preflight.
+
+`tartci pre-mint-outcomes [--days N] [--json]` counts retargets and discards per
+lane per day from each lane's `events.jsonl`. Every pre-mint denial ends in one
+of the two, so discards are denials minus retargets, which keeps logs written
+before retargeting existed comparable.
+
 **Canary: m3 `pulp-gate` (both slots).** m3 has the highest share of
 catchable denials (42 of 74 pre-mint discards in the baseline) and the most
 served jobs per day, so the sample accrues fastest; m5, with more discards,
