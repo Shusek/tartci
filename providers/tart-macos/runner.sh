@@ -1975,7 +1975,7 @@ retarget_after_pre_mint_denial(){
     event assignment_v2_pre_mint_discard \
       "selected_tier=$selected_tier labels=$selected_labels reason=$reason" \
       "selected_tier=$selected_tier" "reason=$reason"
-    discard_current_vm
+    discard_current_vm || return 1
     tartci_release_vm_lease
     return 1
   fi

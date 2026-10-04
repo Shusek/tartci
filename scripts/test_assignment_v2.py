@@ -831,7 +831,7 @@ tartci_admission_clean(){
 tartci_admission_contention_event(){ trace 'contention'; }
 tartci_admission_clean_detail(){ printf 'reason=fixture'; }
 tartci_pool_lock_release(){ trace 'lock-release'; }
-discard_current_vm(){ trace 'discard'; }
+discard_current_vm(){ trace 'discard'; return "${TEST_DISCARD_RC:-0}"; }
 tartci_release_vm_lease(){ trace 'lease-release'; }
 '''
             script += match.group(0) + r'''
@@ -899,6 +899,16 @@ exercise
         self.assertEqual(result["rc"], "1")
         self.assertIn("discard", trace)
         self.assertFalse(any(step.startswith("admission ") for step in trace))
+
+    def test_failed_teardown_preserves_the_capacity_lease(self) -> None:
+        for settings in ({"TEST_SELECTION_RC": "1"}, {"TEST_ADMISSION_RC": "3"}):
+            with self.subTest(settings=settings):
+                result, trace = self.exercise(TEST_DISCARD_RC="1", **settings)
+                self.assertEqual(result["rc"], "1")
+                self.assertIn("lock-release", trace)
+                self.assertIn("discard", trace)
+                self.assertNotIn("lease-release", trace)
+                self.assertEqual(result["current_labels"], "base,old-class")
 
 
 class SlotTierOrderTests(RunnerFixture, unittest.TestCase):

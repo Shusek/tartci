@@ -242,7 +242,8 @@ has queued demand, live, and mints the VM with the first class that admits
 only when no class with demand admits, the new class lives in another runner
 group, or its JIT admission is refused. When admission-clean is required, the
 fork also asks Shipyard for a fresh verdict for the new labels; a defer or
-error discards the VM before minting. The successful retarget updates the
+error discards the VM before minting. If teardown fails, the capacity lease
+is kept until the VM's teardown is proved. The successful retarget updates the
 labels published in the runner's heartbeat and runtime measurements.
 The lease is kept, not re-acquired:
 every gate class is at or above the gate priority threshold, so the lease store
