@@ -142,6 +142,16 @@ launchctl_command() {
   fi
 }
 
+# A RunAtLoad launch is speculative, and launchd can defer it indefinitely on a
+# busy host (`runs = 0`, `pended nondemand spawn = speculative`). Start a job
+# that has never run; leave one that already ran alone, so a tick is never
+# doubled.
+kickstart_if_never_ran() {
+  launchctl_command print "gui/$(id -u)/$LABEL" 2>/dev/null \
+    | grep -Eq '^[[:space:]]*runs = 0[[:space:]]*$' || return 0
+  launchctl_command kickstart "gui/$(id -u)/$LABEL"
+}
+
 rollback() {
   rc=$?
   trap - EXIT
@@ -154,6 +164,7 @@ rollback() {
     done
     if [ "$PRIOR_LOADED" = 1 ] && [ -f "$PLIST" ]; then
       if ! launchctl_command bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 \
+        || ! kickstart_if_never_ran >/dev/null 2>&1 \
         || ! launchctl_command print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
       then
         echo "ROLLBACK FAILURE: prior LaunchAgent files were restored but its registration was not" >&2
@@ -244,6 +255,7 @@ mv "$STAGED_CONFIG" "$CONFIG"
 mv "$STAGED_PLIST" "$PLIST"
 rm -f "$HEALTH" "$STARTUP"
 launchctl_command bootstrap "gui/$(id -u)" "$PLIST"
+kickstart_if_never_ran
 PRINTED="$(launchctl_command print "gui/$(id -u)/$LABEL")"
 grep -Fq "$ENTRYPOINT" <<<"$PRINTED" && grep -Fq "$CONFIG" <<<"$PRINTED" || {
   echo "live launchd registration does not match installed paths" >&2
