@@ -19,9 +19,14 @@ when that supervisor exits. Each pass reads the fleet's LaunchAgents
 
   * kicks a StartInterval agent that is not running and whose `runs` counter
     has not moved for 2x its interval (event `interval_agent_kicked`);
-  * kicks a KeepAlive agent that is not running and has shown a pended spawn
-    for KEEPALIVE_PENDED_S (event `keepalive_agent_kicked`), so a lane that
-    exits for a restart comes back;
+  * kicks a fleet runner lane (KeepAlive) that is not running and has shown a
+    pended spawn for KEEPALIVE_PENDED_S (event `keepalive_agent_kicked`), so a
+    lane that exits for a restart comes back. A pended spawn means launchd
+    itself intends to run it, so a lane taken down by pool off/drain
+    (disabled and booted out) is never touched;
+  * never kicks self-update (NEVER_KICK): it restarts every lane, and its
+    failure paths can rely on the KeepAlive respawns a stuck domain withholds.
+    It is still observed and counts toward the domain stall;
   * opens a domain-wide episode when two or more interval agents have gone
     2x their interval without launchd starting them on its own (event
     `launchd_interval_spawns_stalled`, once per episode), and closes it
@@ -55,6 +60,12 @@ except ImportError:  # pragma: no cover - not on macOS/Linux
     fcntl = None  # type: ignore[assignment]
 
 LABEL_PREFIXES = ("com.danielraffel.", "com.pulp.")
+# Never kicked, only observed (it still counts toward a domain stall).
+# Self-update restarts every lane, and its failure paths can rely on KeepAlive
+# respawns, which is exactly what a stuck domain stops starting.
+NEVER_KICK = ("self-update",)
+# The only KeepAlive agents kicked: the fleet runner lanes.
+KEEPALIVE_KICK = ("tart-runner-macos-fleet",)
 STALL_FACTOR = 2
 DOMAIN_STALL_MIN_AGENTS = 2
 KEEPALIVE_PENDED_S = 120
@@ -289,6 +300,8 @@ class Guard:
         since = now - float(mem.get("progress_ts", now))
         if obs["running"] or since < limit:
             return
+        if any(part in label for part in NEVER_KICK):
+            return
         ok, err = self.kick(label)
         if ok:
             mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) + 1
@@ -308,6 +321,9 @@ class Guard:
                    memory: Dict[str, Any], now: float, kicked: List[Dict[str, Any]],
                    errors: List[str]) -> None:
         label = agent["label"]
+        if not any(part in label for part in KEEPALIVE_KICK) \
+                or any(part in label for part in NEVER_KICK):
+            return
         if obs["running"] or not obs["pended"]:
             memory.pop(label, None)
             return
