@@ -196,7 +196,10 @@ def run_bounded(
         if leaked_descendant:
             detail = "unexpected descendant survived observation leader"
             stderr = f"{stderr.rstrip()}\n{detail}".lstrip()
-        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(command, returncode, stdout, stderr)
+        # The bound and the command can both exit 124; only this says which.
+        result.timed_out = timed_out  # type: ignore[attr-defined]
+        return result
 
 
 def require_success(

@@ -31,6 +31,7 @@ import macos_launcher_probe
 import host_profile
 import network_profile
 import pulp_reapers
+import schedule_backstop_mode
 import power_status
 
 
@@ -46,7 +47,7 @@ DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
-    "reclaim", "leases", "guest_network",
+    "reclaim", "leases", "guest_network", "schedule_backstop",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -459,6 +460,12 @@ def load(path: Path) -> dict:
         problems = pulp_reapers.validate_table(reclaim)
         if problems:
             fail("; ".join(problems))
+    # Which host dispatches the schedule backstop (live), rehearses it
+    # (dry-run), or carries none (off, the default). Same reader as the
+    # installer, so a profile that installs is a profile it acts on.
+    problems = schedule_backstop_mode.validate(data.get(schedule_backstop_mode.KEY))
+    if problems:
+        fail("; ".join(problems))
     lease_policy = data.get("leases")
     if lease_policy is not None:
         if not isinstance(lease_policy, dict):
