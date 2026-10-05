@@ -73,6 +73,21 @@ class Measure(Base):
         self.assertEqual(report["total_bytes"], 0)
 
 
+class DefaultPaths(unittest.TestCase):
+    def test_runner_folders_and_stale_stores_are_measured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            for name in ("actions-runner-pulp-preamble", "actions-runner-v8", "actions-ci"):
+                (home / name).mkdir()
+            with mock.patch.object(pathlib.Path, "home", return_value=home):
+                paths = bu.default_paths(None)
+        names = {p.name for p in paths}
+        for name in ("actions-runner-pulp-preamble", "actions-runner-v8", "actions-ci",
+                     ".tart", "ccache", "pulp-trace-work", "DerivedData", ".codex"):
+            self.assertIn(name, names)
+        self.assertEqual(len(paths), len(set(paths)))
+
+
 class Evaluate(unittest.TestCase):
     def test_over_the_total_names_the_largest_paths(self):
         warnings = bu.evaluate([sample(0, **{"/c": 100, "/d": 60, "/e": 1})], 150, 10)

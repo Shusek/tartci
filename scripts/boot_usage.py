@@ -56,7 +56,6 @@ HOME_PATHS = (
     ".pulp",
     ".tartci",
     "Code",
-    "actions-ci",
     "Library/Caches/Pulp",
     "Library/Caches/go-build",
     "Library/Caches/pip-tools",
@@ -64,7 +63,13 @@ HOME_PATHS = (
     "Library/Developer/CoreSimulator",
     "Library/Developer/Xcode/DerivedData",
     "Library/Logs/tartci",
+    "Library/Caches/ccache",   # host (non-gate) ccache: 96 GiB on m5
+    ".tart",                   # Tart's default store, stale once TART_HOME moved
+    "pulp-trace-work",
+    "VM-Recovery",
 )
+# Globs under HOME, for families of directories (host Actions runners).
+HOME_GLOBS = ("actions-runner*", "actions-ci")
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -72,6 +77,8 @@ Runner = Callable[..., subprocess.CompletedProcess]
 def default_paths(user_tmp: pathlib.Path | None) -> list[pathlib.Path]:
     home = pathlib.Path.home()
     paths = [home / relative for relative in HOME_PATHS]
+    for pattern in HOME_GLOBS:
+        paths.extend(p for p in sorted(home.glob(pattern)) if p not in paths)
     paths.append(pathlib.Path("/private/tmp"))
     if user_tmp is not None:
         paths.append(user_tmp)
