@@ -114,12 +114,19 @@ CODES: tuple[str, ...] = (
     "self_update_current",
     "self_update_problem",
     "self_update_unmeasured",
+    "support_agents_drift",
+    "support_agents_never",
+    "support_agents_ok",
+    "support_agents_pending",
+    "support_agents_unreadable",
     "supply_match",
     "supply_mismatch",
     "supply_unknown",
     "tool_freshness_current",
     "tool_freshness_stale",
     "tool_freshness_unmeasured",
+    "undeclared_fleet_agent",
+    "undeclared_fleet_agents_none",
     "warm_vm_none",
     "warm_vm_overdue",
     "warm_vm_parked",
@@ -926,6 +933,45 @@ def check_reclaim(value: dict | None) -> Finding:
     return Finding("reclaim", UNKNOWN, "reclaim_unreadable", detail, facts)
 
 
+def check_support_agents(value: dict | None) -> list[Finding]:
+    """The declared support agents' last pass, and any undeclared fleet agent.
+
+    Both come from the receipt `support_agents.py` writes after every
+    self-update (scripts/support_agents.py).
+    """
+    value = value or {"state": "unreadable", "error": "no status"}
+    state = value.get("state")
+    facts = {"support_agents": value}
+    changes = ", ".join(value.get("changes") or [])
+    if state == "ok":
+        agents = value.get("agents") or {}
+        found = Finding("support_agents", OK, "support_agents_ok",
+                        f"{len(agents)} declared support agents match their renders", facts)
+    elif state == "pending":
+        found = Finding("support_agents", UNKNOWN, "support_agents_pending",
+                        f"bootstrap is off; would install or change: {changes}", facts)
+    elif state == "drift":
+        found = Finding("support_agents", PROBLEM, "support_agents_drift",
+                        f"declared support agents not converged: {changes}", facts)
+    elif state == "never":
+        found = Finding("support_agents", UNKNOWN, "support_agents_never",
+                        "no support-agents receipt yet", facts)
+    else:
+        found = Finding("support_agents", UNKNOWN, "support_agents_unreadable",
+                        f"support-agents status unreadable: {value.get('error')}", facts)
+    undeclared = [u.get("label") for u in value.get("undeclared") or []]
+    if undeclared:
+        extra = Finding("undeclared_fleet_agent", PROBLEM, "undeclared_fleet_agent",
+                        f"installed but declared nowhere (reported, never removed): "
+                        f"{', '.join(undeclared)}", facts)
+    else:
+        extra = Finding("undeclared_fleet_agent", OK, "undeclared_fleet_agents_none",
+                        "every tartci-prefix agent is declared or owned by a named installer"
+                        if state in ("ok", "pending", "drift") else
+                        "no receipt to scan yet", facts)
+    return [found, extra]
+
+
 def check_power(value: dict | None) -> Finding:
     """Whether the host stays awake on AC (scripts/power_status.py)."""
     import power_status
@@ -1181,6 +1227,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
             launchd_timers_value: dict | None = None,
+            support_agents_value: dict | None = None,
             power_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
@@ -1282,6 +1329,14 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             launchd_timers_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_launchd_timers(launchd_timers_value))
+    if support_agents_value is None:
+        try:
+            import support_agents
+            support_agents_value = support_agents.status(
+                home / ".tartci" / "state" / "support-agents")
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            support_agents_value = {"state": "unreadable", "error": str(exc)}
+    findings.extend(check_support_agents(support_agents_value))
     if power_value is None:
         try:
             import power_status

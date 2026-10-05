@@ -32,6 +32,7 @@ import host_profile
 import network_profile
 import pulp_reapers
 import schedule_backstop_mode
+import support_agents
 import power_status
 
 
@@ -47,7 +48,7 @@ DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
-    "reclaim", "leases", "guest_network", "schedule_backstop",
+    "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -464,6 +465,11 @@ def load(path: Path) -> dict:
     # (dry-run), or carries none (off, the default). Same reader as the
     # installer, so a profile that installs is a profile it acts on.
     problems = schedule_backstop_mode.validate(data.get(schedule_backstop_mode.KEY))
+    if problems:
+        fail("; ".join(problems))
+    # Which support LaunchAgents this host carries. Same validator as the
+    # runtime reader, so a profile that installs is a profile it acts on.
+    problems = support_agents.validate(data)
     if problems:
         fail("; ".join(problems))
     lease_policy = data.get("leases")

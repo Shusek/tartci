@@ -1205,6 +1205,14 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
     if check.rc != 0:
         raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
+    # Every support agent the profile declares must render from the target
+    # checkout, checked here so a missing or broken template refuses the update
+    # before any drain rather than after the lanes are back.
+    agents = sys_.run(["python3", "scripts/support_agents.py", "check-templates",
+                       "--profile-file", str(profile)], cwd=str(cfg.checkout))
+    if agents.rc != 0:
+        raise Refused(f"declared support agents do not render from {target[:12]}: "
+                      f"{agents.text.strip()[:300]}")
 
 
 # ── receipts ───────────────────────────────────────────────────────────────
@@ -1772,6 +1780,24 @@ class Run:
             raise Failed("pool on failed after install")
         self.phase = "verify"
         verify(cfg, sys_, self.target, self.receipt)
+        self.phase = "support-agents"
+        self._support_agents()
+
+    def _support_agents(self) -> None:
+        """Converge the declared support agents with the installed generation.
+
+        Non-fatal by design: the lanes are verified and serving by now, and a
+        janitor's plist must not be able to take the serving generation back.
+        A failure is a receipt step with ok=False, an event in the support
+        agents' own log, and a `tartci doctor fleet` finding.
+        """
+        try:
+            result = installed_tartci(self.cfg, self.sys, "fleet-macos", "support-agents",
+                                      "auto", timeout=300)
+        except Exception as exc:  # noqa: BLE001 - never fails the lane update
+            self.receipt.step("support-agents", f"{type(exc).__name__}: {exc}", ok=False)
+            return
+        self.receipt.step("support-agents", result.text.strip()[-1500:], ok=result.rc == 0)
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
         deadline = self.sys.now() + self.cfg.wait_seconds
