@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Evict gate ccache entries nobody has used for N days, from the reclaim pass.
 
-Why this exists: the shared gate ccache (`<cache_root>/ccache`, mounted
+Why this exists: the shared gate ccache (`$TARTCI_CI_CACHE/ccache`, mounted
 read-write into every gate guest) has no working bound. The guests cap it at
 `TARTCI_CCACHE_MAX_SIZE` (40G), which a 14 GB cache never reaches, and ccache
 decides when to clean up from its per-directory size counters, which read
@@ -44,6 +44,16 @@ after its old entries were removed on 2026-10-04, the same rate m3 (370k) and
 m5 (507k) get. A 14-day window keeps 150k entries on m5 and 184k on m3, five to
 six days' working sets, so only work idle for two weeks recompiles. A size cap
 would act through the same counters that are 100x low.
+
+The cache is the one the macOS runners mount: `TARTCI_CI_CACHE`, else
+`PULP_CI_CACHE` (the same order as `providers/tart-macos/runner.sh`), else the
+profile's `[host].cache_root` (what the fleet renders into the runner plists
+as `TARTCI_CI_CACHE`), else `~/.cache/pulp-ci`, each plus `/ccache`. A host
+whose cache moves only has to move it for the runners.
+
+Each eviction logs the entries and bytes on disk before and after (one walk
+of the fan-out directories each; ccache's own counters are not used for
+"before", because they are the undercount described above).
 
 Opt-in per host through the installed fleet profile:
 
@@ -117,12 +127,32 @@ def load_settings(profile: pathlib.Path) -> tuple[dict[str, Any] | None, str]:
     if problems:
         return None, "; ".join(problems)
     host = data.get("host") if isinstance(data.get("host"), dict) else {}
-    cache_root = host.get("cache_root") or DEFAULT_CACHE_ROOT
     return {
         "max_age_days": table.get("gate_ccache_max_age_days", DEFAULT_MAX_AGE_DAYS),
         "interval_hours": table.get("gate_ccache_trim_interval_hours", DEFAULT_INTERVAL_HOURS),
-        "cache": pathlib.Path(str(cache_root)).expanduser() / "ccache",
+        "cache": cache_dir(host.get("cache_root")),
     }, "enabled"
+
+
+def cache_dir(profile_cache_root: Any = None, env: dict[str, str] | None = None) -> pathlib.Path:
+    """The gate ccache the runners mount: `<TARTCI_CI_CACHE>/ccache`."""
+    env = os.environ if env is None else env
+    root = (env.get("TARTCI_CI_CACHE") or env.get("PULP_CI_CACHE")
+            or (profile_cache_root if isinstance(profile_cache_root, str) else None)
+            or DEFAULT_CACHE_ROOT)
+    return pathlib.Path(root).expanduser() / "ccache"
+
+
+def measure(cache: pathlib.Path) -> dict[str, int]:
+    """Entries and bytes on disk, from the files themselves."""
+    entries = size = 0
+    for entry in ccache_guard.iter_entries(cache):
+        try:
+            size += os.lstat(entry).st_size
+        except OSError:
+            continue
+        entries += 1
+    return {"entries": entries, "bytes": size}
 
 
 def read_stamp(state_dir: pathlib.Path) -> float | None:
@@ -176,7 +206,7 @@ def evict(*, cache: pathlib.Path, max_age_days: int, fix: bool, ccache: str | No
     if not lock.acquire(0.0):
         return {**report, "status": "skipped", "reason": "the pre-boot ccache guard holds its lock"}
     try:
-        report["before"] = counters(ccache, cache, runner)
+        report["before"] = measure(cache)
         started = time.monotonic()
         try:
             proc = runner(command, capture_output=True, text=True, timeout=EVICT_TIMEOUT_S)
@@ -186,8 +216,10 @@ def evict(*, cache: pathlib.Path, max_age_days: int, fix: bool, ccache: str | No
         if proc.returncode != 0:
             return {**report, "status": "error",
                     "reason": f"ccache exited {proc.returncode}: {proc.stderr.strip()[:300]}"}
-        # The eviction recounted every directory, so these are the real totals.
-        report["after"] = counters(ccache, cache, runner)
+        report["after"] = measure(cache)
+        # The eviction recounted every directory, so ccache's counters should
+        # now match the walk; a mismatch here means they drifted again.
+        report["counters_after"] = counters(ccache, cache, runner)
     finally:
         lock.release()
     return {**report, "status": "evicted"}
@@ -214,6 +246,7 @@ def run(*, fix: bool, profile: pathlib.Path, state_dir: pathlib.Path,
         return {"enabled": True, "status": "error", "reason": f"gate ccache trim failed: {exc}"}
     if report.get("status") == "evicted":
         write_stamp(state_dir, {"completed_at": now, "max_age_days": settings["max_age_days"],
+                                "cache": str(settings["cache"]),
                                 "before": report.get("before"), "after": report.get("after")})
     report["enabled"] = True
     report["interval_hours"] = settings["interval_hours"]
