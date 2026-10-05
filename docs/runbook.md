@@ -1625,6 +1625,20 @@ the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
 
+### Lane python3 cannot import tomllib (`lane_python_no_tomllib`)
+
+Lanes run `gate_supply.py decide` (gate placement), `macos_fleet_lanes.py
+render` and `host_profile.py` with a bare `python3`. That is correct only while
+the lane plist's PATH puts a 3.11+ python3 (Homebrew's `/opt/homebrew/bin`)
+ahead of `/usr/bin`, because macOS's `/usr/bin/python3` is 3.9 and has no
+tomllib. `tartci doctor fleet` takes the PATH from each installed lane plist,
+resolves `python3` on it the way a shell would, runs it once, and reports
+`lane_python_no_tomllib` with the interpreter path, its version and the lanes
+that use it when it cannot import tomllib (`scripts/lane_python.py`). Fix the
+interpreter (reinstall Homebrew's python3), not the helpers: they read the
+fleet profile, and a guess in its place is a mis-placed gate. An interactive
+ssh shell has a different PATH and is not what this checks.
+
 ### VM DHCP not answering (`vm_dhcp_unanswered`)
 
 A booted VM gets its address from the host's DHCP server: bootpd, a
