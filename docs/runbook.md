@@ -1618,6 +1618,53 @@ the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
 
+### VM DHCP not answering (`vm_dhcp_unanswered`)
+
+A booted VM gets its address from the host's DHCP server: bootpd, a
+socket-activated system daemon that macOS Internet Sharing manages. When bootpd
+stops answering, every boot waits 120 s for an address (`boot_failed no_ip`) and
+is discarded. On m5 this happened on 2026-09-23 (13 VMs in 47 min) and
+2026-10-04 (10 VMs in 40 min). On 10-04, bootpd ran nothing from 20:53Z until
+macOS itself disabled and re-enabled it at 21:48:51Z.
+
+Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
+`~/.tartci/state/vm-dhcp/breaker.json`):
+
+- **Opens** on two `no_ip` in a row within 15 min, with no address in between.
+  A single `no_ip` has never been an outage. `vm_dhcp_unanswered` records
+  bootpd's state, run count and last exit at that moment, and the `no_ip`
+  times.
+- **While open,** no lane clones. Each pass is idle, not blocked, and takes no
+  job claim: the breaker is the first pre-boot check, before the job claim and
+  the pre-clone demand check. One lane probes with a single VM every 300 s, or
+  at once when bootpd's run count moves (`vm_dhcp_probe result=ip|no_ip`).
+- **Closes** on the first address any VM on the host gets, or when the host
+  rebooted after the breaker opened. `vm_dhcp_recovered` reports `reason`,
+  `open_s`, `vms_spent`, `probes`, and `latency_s` (time since the last probe,
+  or since bootpd's run count moved).
+- **The trade:** an outage costs about one VM per 300 s instead of one per lane
+  every 2 to 4 min. Recovery is noticed within 300 s plus a boot instead of
+  within minutes. `latency_s` above 300 s plus boot p99 means the cadence is
+  wrong.
+- **Fails open:** an unreadable breaker reads as closed. Writes are atomic
+  under a lock.
+- **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
+  it for one host.
+
+Recovery needs root, and tartci never runs it:
+
+1. `sudo launchctl print system/com.apple.bootpd` and
+   `/usr/bin/log show --last 30m --predicate 'process == "bootpd"'` (expect
+   silence).
+2. `sudo launchctl kickstart -k system/com.apple.bootpd`.
+3. If no address arrives within 2 min, run
+   `sudo launchctl disable system/com.apple.bootpd && sudo launchctl enable system/com.apple.bootpd`,
+   then if needed `sudo launchctl kickstart -k system/com.apple.NetworkSharing`.
+   A reboot also clears it.
+
+The probe fires at once when step 2 or 3 moves bootpd's run count. `tartci
+doctor fleet` shows the open breaker as `vm_dhcp_unanswered`.
+
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
 launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
