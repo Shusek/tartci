@@ -53,6 +53,8 @@ import time
 from typing import Any, Callable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import boot_usage  # noqa: E402
+import gate_ccache_trim  # noqa: E402
 import scratch_dirs  # noqa: E402
 import tmp_checkouts  # noqa: E402
 
@@ -69,9 +71,15 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            # read by tmp_checkouts.py; validated here so one
                            # install-time check covers the whole table
                            "tmp_checkouts", "tmp_checkout_idle_hours",
-                           "worktree_root_checkouts",
+                           "worktree_root_checkouts", "extra_worktree_roots",
                            # read by scratch_dirs.py
-                           "scratch_dirs", "scratch_idle_hours"})
+                           "scratch_dirs", "scratch_idle_hours",
+                           # read by gate_ccache_trim.py
+                           "gate_ccache_trim", "gate_ccache_max_age_days",
+                           "gate_ccache_trim_interval_hours",
+                           # read by boot_usage.py
+                           "boot_usage", "boot_usage_warn_gb",
+                           "boot_usage_growth_gb_per_day"})
 # How long a merged worktree's build tree must sit unwritten before the worktree
 # reaper may take it (its own PULP_WORKTREE_BUILD_IDLE_HOURS gate). The ceiling
 # is a disk-arithmetic fact, not a preference. Measured on m3, 2026-09-27: one
@@ -151,6 +159,8 @@ def validate_table(table: Any) -> list[str]:
                         f"{MIN_IDLE_HOURS} through {MAX_IDLE_HOURS}")
     problems.extend(tmp_checkouts.validate(table))
     problems.extend(scratch_dirs.validate(table))
+    problems.extend(gate_ccache_trim.validate(table))
+    problems.extend(boot_usage.validate(table))
     return problems
 
 
