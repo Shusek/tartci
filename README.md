@@ -260,7 +260,9 @@ Before each VM boots, the runner quarantines suspect direct-mode manifests
 (no include files, naming a result whose `.d` lists headers or that is
 missing) from the shared cache (`scripts/ccache_guard.py`, fail-open,
 `TARTCI_CCACHE_GUARD=0` disables, `TARTCI_CCACHE_GUARD_BUDGET_SECS` bounds it,
-default 120). Such a manifest matches every lookup and once linked another
+default 120; a run the budget cuts short leaves `cursor.json` in the
+quarantine root and the next run resumes there, so a cache too large for one
+budget is still covered across boots). Such a manifest matches every lookup and once linked another
 source's object into every gate build on one host; see `docs/gotchas.md`.
 `tartci ccache scan|quarantine|reset` is the operator surface.
 

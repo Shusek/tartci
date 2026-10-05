@@ -330,9 +330,9 @@ class GuardTests(unittest.TestCase):
         self.assertIsNotNone(first["cursor"])
         self.assertNotIn("resumed_from", first)
         rc, second = self.fx.run("quarantine", "--budget", "30")
-        self.assertEqual(second["resumed_from"], first["cursor"])
         self.assertFalse(late.exists(), "the resumed run must reach the tail")
         self.assertIn(self.rel(late), self.quarantined(second))
+        self.assertEqual(second.get("resumed_from"), first["cursor"])
 
     def test_without_the_cursor_every_exhausted_run_stops_at_the_head(self) -> None:
         # Control for the test above: the same budget, cursor removed between
