@@ -298,7 +298,7 @@ class FallbackSupervisorTests(RunnerFixture, unittest.TestCase):
         self.peers.mkdir()
         _write_exec(self.root / "ssh", (
             "#!/usr/bin/env bash\n"
-            "for a in \"$@\"; do case \"$a\" in -o) ;; *=*) ;; *) target=\"$a\"; break;; esac; done\n"
+            "for a in \"$@\"; do case \"$a\" in -o) ;; -*) ;; *=*) ;; *) target=\"$a\"; break;; esac; done\n"
             f"f=\"{self.peers}/$target.json\"\n"
             "[ -f \"$f\" ] || { echo \"ssh: connect to host $target: Connection refused\" >&2; exit 255; }\n"
             "cat \"$f\"\n"))
