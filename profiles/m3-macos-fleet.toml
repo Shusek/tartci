@@ -106,7 +106,13 @@ repo = "Generous-Corp/pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
-vm_cores = 12
+# 7, not 12: this dedicated-builder host reserves 14 of its 26 lease cores for
+# gates, so a second 12-core gate VM fit only while non-gate builds held at most
+# 2 cores. Agent builds routinely held the other 12 and a gate slot was refused
+# its lease (capacity_exceeded) while jobs queued. 2 x 7 = the 14-core gate
+# reserve, as m5studio sizes 2 x 8 to its 16. Memory: 7 cores derive a 12288 MB
+# lease, and 2 x 12288 fits inside the 44110 MB gate memory reserve.
+vm_cores = 7
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]

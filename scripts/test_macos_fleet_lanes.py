@@ -751,7 +751,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertNotIn("priority", pulp_lane)
                 self.assertEqual(
                     pulp_lane.get("vm_cores"),
-                    12 if host_id == "studio" else None,
+                    7 if host_id == "studio" else None,
                 )
                 self.assertEqual(
                     pulp_lane["supervisors"], 2
@@ -901,7 +901,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     for value in values:
                         env = value["EnvironmentVariables"]
                         expected_vm_cores = (
-                            "12"
+                            "7"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
                             else None
