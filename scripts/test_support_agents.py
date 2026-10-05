@@ -116,6 +116,47 @@ class Case(unittest.TestCase):
 
 
 @unittest.skipIf(sa.tomllib is None, "needs tomllib")
+class HostMaintenanceAgents(Case):
+    """The watchdog and the reaper are declared like every other support agent.
+
+    They were rendered by hand from launchd/README.md, so m5studio was brought
+    up serving gate VMs with no watchdog: no heal pass, no skew or tool
+    freshness refresh, and nothing reported it.
+    """
+
+    def test_m5studio_without_a_watchdog_reads_missing(self):
+        self.write_profile(table(["launchd-watchdog", "reap"]).replace(
+            '[host]\nid = "t"\n', '[host]\nid = "m5studio"\ntart_home = "/Volumes/Atelier/VMs"\n'))
+        self.install_rendered("reap")
+        self.assertEqual(self.run_pass("plan"), sa.EXIT_OK)
+        agents = self.receipt()["agents"]
+        self.assertEqual(agents["launchd-watchdog"]["state"], "missing")
+        self.assertEqual(agents["reap"]["state"], "match_bytes")
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_each_render_carries_its_own_hosts_tart_home(self):
+        for host, store in (("m3", "/Volumes/Workshop/VMs"), ("m5studio", "/Volumes/Atelier/VMs")):
+            profile = {"host": {"id": host, "tart_home": store}}
+            for name in ("launchd-watchdog", "reap"):
+                rendered, err = sa.System.render(self.sys, sa.REGISTRY[name], profile)
+                self.assertIsNotNone(rendered, err)
+                env = plistlib.loads(rendered)["EnvironmentVariables"]
+                self.assertEqual(env.get("TART_HOME"), store, (host, name))
+
+    def test_every_shipped_profile_declares_them(self):
+        for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
+            data, _ = sa.load_profile(path)
+            declared = (data.get("support_agents") or {}).get("declared") or []
+            with self.subTest(profile=path.name):
+                self.assertIn("launchd-watchdog", declared)
+                self.assertIn("reap", declared)
+
+    def test_they_are_no_longer_owned_by_hand(self):
+        for label in ("com.danielraffel.tartci.launchd-watchdog", "com.danielraffel.tartci.reap"):
+            self.assertNotIn(label, sa.OTHER_OWNERS)
+
+
+@unittest.skipIf(sa.tomllib is None, "needs tomllib")
 class Plan(Case):
     def test_missing_matching_and_differing_are_named_and_nothing_is_written(self):
         self.write_profile(table(THREE))
@@ -463,7 +504,7 @@ class Validate(unittest.TestCase):
 
     def test_the_fleet_validator_rejects_a_bad_table(self):
         source = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
-        good = 'declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]'
+        good = 'declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]'
         self.assertIn(good, source)
         with tempfile.TemporaryDirectory() as td:
             bad = Path(td) / "bad.toml"

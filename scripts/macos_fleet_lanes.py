@@ -72,6 +72,7 @@ HOST_KEYS = {
     "current_job_lifecycle_budget_seconds",
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
+    "vm_dhcp_breaker",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -375,6 +376,11 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    # The host VM-DHCP breaker (scripts/vm_dhcp_breaker.py) is on by default;
+    # only `false` is ever written, to turn it off on one host.
+    dhcp_breaker = host.get("vm_dhcp_breaker")
+    if dhcp_breaker is not None and type(dhcp_breaker) is not bool:
+        fail("host.vm_dhcp_breaker must be a boolean")
     agent_floor_qos = host.get("agent_floor_qos")
     if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
         fail('host.agent_floor_qos must be "utility" or "background"')
@@ -2341,6 +2347,8 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
+    if host.get("vm_dhcp_breaker") is False:
+        env["TARTCI_VM_DHCP_BREAKER"] = "0"
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
     if "current_job_attempt_timeout_seconds" in host:
