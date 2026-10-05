@@ -33,6 +33,7 @@ import network_profile
 import pulp_reapers
 import schedule_backstop_mode
 import support_agents
+import reuse_canary
 import power_status
 
 
@@ -49,6 +50,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
+    "reuse_canary",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -467,7 +469,14 @@ def load(path: Path) -> dict:
     problems = schedule_backstop_mode.validate(data.get(schedule_backstop_mode.KEY))
     if problems:
         fail("; ".join(problems))
-    # Which support LaunchAgents this host carries. Same validator as the
+    # Which hosts run the reuse canary. Same validator as the runtime reader.
+    canary = data.get(reuse_canary.TABLE)
+    if canary is not None:
+        problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Which support LaunchAgents this host carries (checked after the agents'
+    # own tables, whose errors are more specific). Same validator as the
     # runtime reader, so a profile that installs is a profile it acts on.
     problems = support_agents.validate(data)
     if problems:

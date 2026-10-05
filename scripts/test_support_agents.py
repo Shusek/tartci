@@ -361,7 +361,8 @@ class Registry(unittest.TestCase):
         for name, agent in sa.REGISTRY.items():
             with self.subTest(name=name):
                 self.assertTrue(agent.template.is_file())
-                self.assertTrue((ROOT / agent.installer).is_file())
+                if agent.installer is not None:
+                    self.assertTrue((ROOT / agent.installer).is_file())
                 run_at_load = plistlib.loads(
                     __import__("re").sub(rb"<!--.*?-->", b"", agent.template.read_bytes(),
                                          flags=__import__("re").DOTALL)).get("RunAtLoad")
@@ -378,8 +379,24 @@ class Registry(unittest.TestCase):
 class RenderParity(unittest.TestCase):
     """The registry renders each agent byte-identically to its install script."""
 
+    def test_the_canary_renders_from_its_template_and_is_never_kickstarted(self):
+        agent = sa.REGISTRY["reuse-canary"]
+        self.assertIsNone(agent.installer)
+        self.assertFalse(agent.kickstart)
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            rendered, err = sa.System(home).render(agent, {})
+            self.assertIsNotNone(rendered, err)
+            spec = plistlib.loads(rendered)
+            self.assertEqual(spec["Label"], "com.danielraffel.tartci.reuse-canary")
+            self.assertEqual(spec["ProgramArguments"],
+                             ["/bin/bash", f"{home}/.local/bin/tartci", "reuse-canary", "run"])
+            self.assertIs(spec["RunAtLoad"], False)
+
     def test_byte_identical_to_each_installer(self):
-        for name, agent in sa.REGISTRY.items():
+        with_installer = {n: a for n, a in sa.REGISTRY.items() if a.installer}
+        self.assertEqual(len(with_installer), 4, "control: the four installers")
+        for name, agent in with_installer.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 home = root / "home"
@@ -423,6 +440,10 @@ class Validate(unittest.TestCase):
         self.assertTrue(self.problems(table(THREE).replace("bootstrap = false", "extra = 1")))
         self.assertTrue(self.problems(table(FOUR)), "backstop declared while off")
         self.assertTrue(self.problems(table(THREE, backstop="live")), "backstop live, undeclared")
+        canary = '[reuse_canary]\nenabled = true\nrepo = "/r"\nworktrees_root = "/w"\n'
+        self.assertEqual(self.problems(table(THREE + ["reuse-canary"]) + canary), [])
+        self.assertTrue(self.problems(table(THREE) + canary), "canary enabled, undeclared")
+        self.assertTrue(self.problems(table(THREE + ["reuse-canary"])), "canary declared, not enabled")
 
     def test_repo_profiles_declare_and_validate(self):
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
@@ -433,6 +454,9 @@ class Validate(unittest.TestCase):
                 self.assertIsNotNone(data, why)
                 self.assertIs(data[sa.TABLE]["bootstrap"], False, "bootstrap stays off until approved")
                 self.assertTrue(set(THREE) <= set(data[sa.TABLE]["declared"]))
+                canary = (data.get("reuse_canary") or {}).get("enabled") is True
+                self.assertEqual(canary, "reuse-canary" in data[sa.TABLE]["declared"])
+                self.assertEqual(canary, path.name in ("m3-macos-fleet.toml", "m1-macos-fleet.toml"))
                 res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
                                       str(path)], cwd=ROOT, capture_output=True, text=True)
                 self.assertEqual(res.returncode, 0, res.stderr)

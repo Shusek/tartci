@@ -116,6 +116,9 @@ UNINTERRUPTIBLE_AGENTS: frozenset[str] = frozenset({
     # Quiet for up to 90 minutes while it waits for lanes to go idle, and
     # mid-install after that: a bootout there strands the host drained.
     "com.danielraffel.tartci.self-update",
+    # Up to three hours inside `shipyard run`: a run cut mid-way leaves a
+    # half-run no later pass can classify.
+    "com.danielraffel.tartci.reuse-canary",
 })
 APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
     "com.danielraffel.tartci.reclaim": {
@@ -129,6 +132,12 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
             "deferred in the update queue past the starvation bound; host untouched"),
         4: "an update failed and the host was restored to the previous generation",
         5: "tartci skew could not be measured",
+    },
+    "com.danielraffel.tartci.reuse-canary": {
+        3: "a gate refused (pool off or draining, Shipyard not in shadow_compare); host untouched",
+        4: "shipyard run failed or exceeded its bound",
+        5: "shipyard reuse records unreadable, or the [reuse_canary] profile table is invalid",
+        6: "origin/main's head or the canary worktree could not be prepared",
     },
 }
 # Rate limit: at most this many heals per label inside the window.
