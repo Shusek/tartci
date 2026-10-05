@@ -202,6 +202,13 @@ class FleetPeerTests(StoreTests):
         self.assertEqual(self.acquire("c", 1, ttl=1000,
                                       peers=[peer("m1", ("m1-vm", 1200), max_age=1800)])[1], 0)
 
+    def test_a_claim_dated_in_the_future_does_not_count(self) -> None:
+        # A negative age is clock skew between hosts, not a claim in flight.
+        self.assertEqual(self.acquire("a", 1, peers=[peer("m3", ("studio-vm-1", -5))])[1], 0)
+        self.release("a")
+        # The control: the same claim at age zero stands.
+        self.assertEqual(self.acquire("b", 1, peers=[peer("m3", ("studio-vm-1", 0))])[1], 3)
+
     def test_a_peer_claim_that_already_minted_is_counted_once(self) -> None:
         # The runner name IS the VM name (generate-jitconfig name=$vm), so the
         # same identity appears in both inputs and stands once.
