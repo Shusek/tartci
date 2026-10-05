@@ -39,10 +39,15 @@ ROOTS = {
                          '/usr/bin/python3 "$TARTCI_ROOT/scripts/worktree_cleanup.py"'),
     "http_connect_ssh_relay": ("scripts/http_connect_ssh_relay.py",
                                "The deployed interpreter is macOS's /usr/bin/python3 (3.9)"),
-    "vm_dhcp_breaker": ("providers/tart-macos/vm-dhcp.lib.sh",
-                        'python3 "$TARTCI_ROOT/scripts/vm_dhcp_breaker.py" check'),
 }
 SELF_DECLARED = "3.9-safe"
+# The modules whose own source says SELF_DECLARED. Pinned, so that adding or
+# dropping the declaration is a visible edit here rather than a silent change
+# to which tests must run on 3.9.
+EXPECTED_SELF_DECLARED = frozenset({
+    "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard", "state_age",
+    "vm_dhcp_breaker",
+})
 
 LANES = ("3.11-only: asserts a macos_fleet_lanes surface (pool status, validate, render), "
          "which imports tomllib and runs under the lane PATH's python3")
@@ -339,6 +344,9 @@ class SystemPythonTestsRunTests(unittest.TestCase):
             with self.subTest(module=module):
                 self.assertTrue((SCRIPTS / f"{module}.py").is_file())
                 self.assertIn(text, (ROOT / where).read_text(), where)
+
+    def test_the_self_declared_set_is_pinned(self) -> None:
+        self.assertEqual(self_declared(), EXPECTED_SELF_DECLARED)
 
     def test_class_one_tests_skip_only_for_listed_3_11_only_behaviour(self) -> None:
         found = {(path.name, site): module

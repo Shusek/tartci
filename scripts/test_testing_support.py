@@ -37,7 +37,11 @@ class CiLaneTests(unittest.TestCase):
         job = text.split("  python-39-tests:", 1)[1].split("\n  python-floor:", 1)[0]
         self.assertIn('python-version: "3.9"', job)
         self.assertIn("raise SystemExit(0 if v == (3, 9) else 1)", job)
-        self.assertIn("! python3 -c 'import tomllib'", job)
+        # An explicit exit, not `! cmd`: set -e ignores a negated command, so
+        # `!` would refuse only while it happened to be the step's last line.
+        self.assertIn("if python3 -c 'import tomllib' 2>/dev/null; then", job)
+        self.assertIn("exit 1", job[job.index("import tomllib' 2>/dev/null; then"):])
+        self.assertNotIn("! python3 -c 'import tomllib'", job)
         self.assertIn("python3 -m unittest discover -s scripts -p 'test_*.py'", job)
 
 
