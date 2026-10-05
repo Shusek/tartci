@@ -58,6 +58,9 @@ pressure_free_gb = 200
 # Remove finished git checkouts agents left in /private/tmp (48 h idle,
 # clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py
 tmp_checkouts = true
+# Finished agent worktrees (clean, pushed, idle 48 h, lineage not active) in
+# ~/Code, beside the primary checkouts. Worktrees only: every plain clone there is kept. scripts/tmp_checkouts.py
+extra_worktree_roots = ["/Users/danielraffel/Code"]
 # Remove test and validation scratch from /private/tmp, the per-user temp dir
 # and Chrome's code-sign clones (12 h idle, nothing open, no live process
 # naming it; 4 h while the boot volume is below its floor). scripts/scratch_dirs.py
