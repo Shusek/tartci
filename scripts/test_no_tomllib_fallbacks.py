@@ -3,8 +3,9 @@
 
 These modules run through `tartci_toml_exec_or_python3`, which prefers a
 tomllib Python and falls back to the hosts' /usr/bin/python3 (3.9) only when
-none exists. Under that fallback the fleet profile cannot be read, and each
-module must say so and do nothing, rather than crash or act on defaults. That
+none exists, or are imported by a module a 3.9 interpreter runs. Without
+tomllib the fleet profile cannot be read, and each module must say so and do
+nothing with it, rather than crash or act on defaults. That
 fallback is the production behaviour on such a host, so it is tested here on
 every interpreter: tomllib is removed from the module for the test, which runs
 the same branch the real 3.9 does.
@@ -23,8 +24,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import boot_usage  # noqa: E402
 import build_disagreement_watch  # noqa: E402
 import disk_reclaim  # noqa: E402
+import gate_ccache_trim  # noqa: E402
 import pulp_reapers  # noqa: E402
 import scratch_dirs  # noqa: E402
+import tartci_launchd_watchdog  # noqa: E402
 import tmp_checkouts  # noqa: E402
 
 REASON = "no tomllib (needs Python 3.11+)"
@@ -42,7 +45,8 @@ class NoTomllib(unittest.TestCase):
         # A real, opted-in profile: only the missing parser keeps it unread.
         self.profile = self.dir / "profile.toml"
         self.profile.write_text("[reclaim]\npulp_worktree_builds = true\ntmp_checkouts = true\n"
-                                "scratch_dirs = true\n[build_disagreement]\nenabled = true\n")
+                                "scratch_dirs = true\ngate_ccache_trim = true\n"
+                                "[host]\ntart_home = \"/Volumes/Store\"\n[build_disagreement]\nenabled = true\n")
 
     def without(self, module) -> mock._patch:
         patch = mock.patch.object(module, "tomllib", None)
@@ -87,6 +91,18 @@ class NoTomllib(unittest.TestCase):
                 mock.patch.dict(disk_reclaim.os.environ, {"TART_HOME": ""}):
             self.assertEqual(disk_reclaim.profile_root_candidates(), [])
             self.assertIsNone(disk_reclaim.resolve_lease_path(None))
+
+    def test_gate_ccache_trim_reads_no_settings(self) -> None:
+        self.without(gate_ccache_trim)
+        self.assertEqual(gate_ccache_trim.load_settings(self.profile), (None, REASON))
+
+    def test_the_watchdog_reads_no_tart_store_from_the_profile(self) -> None:
+        # A partial parse could read a torn profile as an idle default store,
+        # so without tomllib the store must come from TART_HOME or not at all.
+        self.assertEqual(tartci_launchd_watchdog._profile_tart_home(str(self.profile)),
+                         "/Volumes/Store" if tartci_launchd_watchdog.tomllib else None)
+        self.without(tartci_launchd_watchdog)
+        self.assertIsNone(tartci_launchd_watchdog._profile_tart_home(str(self.profile)))
 
 
 if __name__ == "__main__":

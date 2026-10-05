@@ -8,8 +8,6 @@ pool, and the only signal was a watchdog log line.
 
 from __future__ import annotations
 
-import testing_support  # noqa: E402
-testing_support.skip_module_without_tomllib()
 import json
 import os
 import shutil
@@ -23,9 +21,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_off  # noqa: E402
-import macos_fleet_lanes as fleet  # noqa: E402
 import macos_launcher_probe  # noqa: E402
 import tartci_launchd_watchdog as wd  # noqa: E402
+import testing_support  # noqa: E402
 
 LEFT_AT = 1_790_000_000.0
 
@@ -171,7 +169,9 @@ class SurfaceTests(Fixture):
         self.env.start()
         self.addCleanup(self.env.stop)
 
+    @testing_support.requires_tomllib
     def test_pool_status_names_the_reason(self) -> None:
+        import macos_fleet_lanes as fleet
         self.left_off()
         problem = fleet.host_off_problem("off")
         self.assertEqual(problem["code"], "host_off_unexpected")
@@ -179,12 +179,17 @@ class SurfaceTests(Fixture):
         self.pool.write_text("on\n")
         self.assertIsNone(fleet.host_off_problem("on"))
 
+    @testing_support.requires_tomllib
     def test_a_check_that_raises_is_a_problem_not_a_clean_bill(self) -> None:
+        import macos_fleet_lanes as fleet
         with mock.patch.object(host_off, "status", side_effect=OSError("state dir unreadable")):
             problem = fleet.host_off_problem("off")
-            line = wd.host_off_pass(now=time.time())
         self.assertEqual(problem["code"], "host_off_unverified")
         self.assertIn("state dir unreadable", problem["detail"])
+
+    def test_a_check_that_raises_warns_in_the_watchdog(self) -> None:
+        with mock.patch.object(host_off, "status", side_effect=OSError("state dir unreadable")):
+            line = wd.host_off_pass(now=time.time())
         self.assertIn("WARN host-off check FAILED", line)
 
     def test_the_watchdog_recovers_and_warns_every_pass(self) -> None:

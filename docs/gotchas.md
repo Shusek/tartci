@@ -122,6 +122,14 @@ Import a tomllib-only module (`macos_fleet_lanes`, `fleet_self_update`, ...)
 inside the test that needs it, not at module level, so the module's other
 tests still run on the hosts' Python.
 
+That skip is not available everywhere. For a module a 3.9 interpreter runs
+(reachable by import from an explicit `/usr/bin/python3` site, or declaring
+itself "3.9-safe"), a skip on 3.9 removes exactly the coverage the job exists
+for, so `scripts/test_system_python_tests_run.py` fails on any
+tomllib-conditional skip in that module's tests unless it is listed in
+`ALLOWED` with the 3.11-only behaviour it guards. Make the test run on 3.9
+first; list it only when what it asserts really needs tomllib.
+
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
