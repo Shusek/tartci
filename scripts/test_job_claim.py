@@ -266,7 +266,8 @@ class PeerGatherTests(unittest.TestCase):
         self.ssh.write_text(
             "#!/bin/bash\n"
             f"printf '%s\\n' \"$*\" >> {str(self.calls)!r}\n"
-            "target=\"$5\"\n"
+            "target=\"${@: -2:1}\"\n"
+            f"cat >> {str(self.tmp / 'stdin-seen')!r}\n"
             "case \"$target\" in\n"
             f"  m1) echo '{good}' ;;\n"
             "  m3) sleep 31.731 ;;\n"
@@ -303,6 +304,20 @@ class PeerGatherTests(unittest.TestCase):
         time.sleep(0.3)
         left = subprocess.run(["pgrep", "-f", "sleep 31.731"], capture_output=True, text=True)
         self.assertEqual(left.stdout.strip(), "", "the straggler's children outlived the budget")
+
+    def test_a_peer_read_never_takes_the_callers_stdin(self) -> None:
+        out = self.tmp / "peers.jsonl"
+        subprocess.run([sys.executable, "-B", str(CLAIM), "gather-peers", "--out", str(out),
+                        "--self-host", "studio", "--supply", str(self.supply),
+                        "--read-secs", "1.5", "--ssh", str(self.ssh)],
+                       input="the rest of the caller's loop\n", capture_output=True,
+                       text=True, check=True, timeout=30)
+        self.assertEqual((self.tmp / "stdin-seen").read_text(), "",
+                         "a peer's ssh drained the caller's stdin")
+        for line in self.calls.read_text().splitlines():
+            self.assertEqual(line.split()[0], "-n", line)
+        lib = (ROOT / "providers" / "tart-macos" / "job-claim.lib.sh").read_text()
+        self.assertIn('</dev/null >/dev/null 2>&1 || : >"$out_file"', lib)
 
     def test_the_read_is_the_published_status_and_nothing_else(self) -> None:
         self.gather("studio")

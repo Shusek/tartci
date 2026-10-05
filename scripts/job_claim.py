@@ -378,14 +378,18 @@ def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     me = args.self_host
     targets = peer_targets(pathlib.Path(args.supply), me)
     procs: dict[str, subprocess.Popen] = {}
+    ssh = args.ssh
     for host, target in targets.items():
-        argv = [args.ssh, "-o", "BatchMode=yes", "-o",
+        # -n and a null stdin: the caller runs inside the supervisor's loops,
+        # and an ssh that inherits their stdin drains the rest of the list.
+        argv = [ssh, "-n", "-o", "BatchMode=yes", "-o",
                 f"ConnectTimeout={PEER_CONNECT_TIMEOUT_SECS}", target,
                 "cd ~ && ~/.local/bin/tartci job-claim status --publish"]
         try:
             # Own process group: a straggler is killed with everything it
             # started, so nothing can hold its pipe open past the budget.
-            procs[host] = subprocess.Popen(argv, stdout=subprocess.PIPE,
+            procs[host] = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE,
                                            stderr=subprocess.DEVNULL, text=True,
                                            start_new_session=True)
         except OSError:

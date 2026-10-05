@@ -70,7 +70,7 @@ tartci_job_claim_fleet_peer_claims(){
     --self-host "$TARTCI_RECEIPT_HOST_ID" \
     --supply "${TARTCI_JOB_CLAIM_SUPPLY:-$TARTCI_ROOT/fleet/advertised-labels.json}" \
     --read-secs "${TARTCI_JOB_CLAIM_FLEET_READ_SECS:-5}" \
-    --ssh "${TARTCI_JOB_CLAIM_SSH:-ssh}" >/dev/null 2>&1 || : >"$out_file"
+    --ssh "${TARTCI_JOB_CLAIM_SSH:-ssh}" </dev/null >/dev/null 2>&1 || : >"$out_file"
 }
 # One job_claim_peer_unread event per peer per hour; the per-attempt count is
 # carried on every job_claim / job_claim_contended event (peers_unread=N).
