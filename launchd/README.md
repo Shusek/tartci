@@ -921,12 +921,20 @@ With the fleet profile's `[reclaim] pulp_worktree_builds` on, the pass also
 runs Pulp's own reapers from a fresh origin/main (`scripts/pulp_reapers.py`):
 `clean_build_cov.sh` every pass over `worktrees_root`, and
 `clean_worktree_builds.sh` there only under pressure. The cheap coverage reaper
-additionally runs, every pass, over each discovered scan root that holds this
-repository's worktrees (a direct child whose `.git` gitdir file resolves to the
-configured repo's common dir), and the pass warns
-`worktrees_outside_profile_root root=… count=N` for each. m5studio's boot
-volume filled to 99% on 2026-10-04 with coverage dirs in `~/Code` worktrees
-while the reaper ran only over its Atelier root. The heavier reaper never
+additionally runs, every pass, over each discovered scan root that holds
+worktrees of any clone of this repository: a direct child whose `.git` is a
+gitdir file and whose repository's `remote.origin.url` normalizes to the
+configured repo's (`git@host:path`, `ssh://`, and `https://` forms compare equal).
+The pass warns `worktrees_outside_profile_root root=… count=N` for each. m5studio's
+boot volume filled to 99% on 2026-10-04 with coverage dirs in `~/Code` worktrees
+while the reaper ran only over its Atelier root, and those worktrees belong to a
+second clone (`~/Code/pulp`), so matching the configured clone alone missed them.
+If the configured repo's origin cannot be read, nothing outside the profile root
+is scanned and the receipt says `configured_origin_unreadable`; a child whose
+origin cannot be read is never counted. The receipt's `pulp_reapers.discovery`
+records the roots scanned and the children seen, so "scanned N, matched 0" reads
+differently from "did not run", and `outside_profile_roots` plus each run's
+`reason` and `worktrees_root` are kept in `last-run.json`. The heavier reaper never
 follows a discovered root. The root-level check is not a per-child filter:
 `clean_build_cov.sh` removes `build-cov*` under any direct child of a root it
 runs over, as it always has for `worktrees_root`.

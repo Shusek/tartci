@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from typing import Optional
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -411,11 +412,12 @@ class DiscoveredPulpRoots(Isolated):
         git(repo.primary, "worktree", "add", "-q", "-b", f"feat/{name}", str(path), repo.first)
         return path
 
-    def run_with(self, repo: PulpRepo, roots, *, fix: bool = True, **overrides):
+    def run_with(self, repo: PulpRepo, roots, *, fix: bool = True, runner=subprocess.run,
+                 **overrides):
         calls, reaper = self.recorder()
         profile = repo.profile(self.tmp / "p.toml", **overrides)
         (out, log) = self.quiet(pr.run, fix=fix, profile=profile, state_dir=self.state,
-                                reaper=reaper, discovered_roots=roots)
+                                reaper=reaper, discovered_roots=roots, runner=runner)
         return calls, out, log
 
     def extra_runs(self, calls, roots):
@@ -439,6 +441,105 @@ class DiscoveredPulpRoots(Isolated):
         # The heavier reaper never follows a discovered root.
         self.assertFalse([c for c in calls if c[0] == "clean_worktree_builds"
                           and c[1] == str(os.path.realpath(boot_code))], calls)
+
+    def second_clone_worktree(self, repo: PulpRepo, root: pathlib.Path, name: str,
+                              *, url: Optional[str] = None) -> pathlib.Path:
+        """A worktree of a SECOND clone of the same origin, as in m5s's ~/Code."""
+        clone = self.tmp / f"clone-{name}"
+        subprocess.run(["git", "clone", "-q", str(repo.origin), str(clone)], check=True)
+        if url is not None:
+            git(clone, "remote", "set-url", "origin", url)
+        root.mkdir(exist_ok=True)
+        path = root / name
+        git(clone, "worktree", "add", "-q", "-b", f"feat/{name}", str(path), repo.first)
+        return path
+
+    def test_a_second_clone_of_the_same_origin_is_reaped(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt-a")
+        self.second_clone_worktree(repo, boot_code, "wt-b")
+        calls, out, log = self.run_with(repo, [boot_code])
+        resolved = str(os.path.realpath(boot_code))
+        self.assertEqual(len(self.extra_runs(calls, [boot_code])), 1, calls)
+        self.assertEqual(out["outside_profile_roots"], [{"root": resolved, "count": 2}])
+        self.assertEqual(out["discovery"]["children_seen"], 2)
+        self.assertIn(resolved, out["discovery"]["roots"])
+        self.assertEqual(log.count(f"worktrees_outside_profile_root root={resolved} count=2"), 1)
+
+    def test_a_clone_of_another_origin_is_not_counted(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt", url="git@github.com:Someone/else.git")
+        calls, out, log = self.run_with(repo, [boot_code])
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(out["outside_profile_roots"], [])
+        self.assertEqual(out["discovery"]["children_seen"], 1, "scanned, matched nothing")
+        self.assertNotIn("worktrees_outside_profile_root", log)
+
+    def test_a_child_whose_url_cannot_be_read_is_not_counted_and_is_recorded(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        broken = boot_code / "broken"
+        broken.mkdir(parents=True)
+        (broken / ".git").write_text("gitdir: /nonexistent/worktrees/broken\n")
+        calls, out, _ = self.run_with(repo, [boot_code])
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(out["discovery"]["unreadable"], [str(broken)])
+
+    def test_an_unreadable_configured_origin_runs_nothing_outside_and_says_so(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt")
+        primary = str(repo.primary)
+
+        def runner(argv, **kwargs):
+            # The configured clone's origin cannot be read; everything else can.
+            if argv[:4] == ["git", "-C", primary, "config"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.run(argv, **kwargs)
+        calls, out, _ = self.run_with(repo, [boot_code], runner=runner)
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(out["discovery"]["reason"], "configured_origin_unreadable")
+        self.assertEqual((out["discovery"]["roots"], out["discovery"]["children_seen"]), ([], 0),
+                         "with no identity nothing outside the profile root is even scanned")
+        self.assertEqual(out["outside_profile_roots"], [])
+        self.assertTrue([c for c in calls if c[0] == "clean_build_cov"], "the profile root still runs")
+
+    def test_discovery_that_did_not_run_reads_differently_from_a_zero(self):
+        repo = PulpRepo(self.tmp)
+        calls, out, _ = self.run_with(repo, [], worktrees_root=str(self.tmp / "absent"))
+        self.assertEqual(out["discovery"]["reason"], "not_reached")
+        calls, out, _ = self.run_with(repo, [])
+        self.assertIsNone(out["discovery"]["reason"])
+        self.assertEqual(out["discovery"]["children_seen"], 0)
+
+    def test_origin_urls_normalize_across_forms(self):
+        same = ["git@github.com:Generous-Corp/pulp.git", "ssh://git@github.com/Generous-Corp/pulp",
+                "https://github.com/Generous-Corp/pulp.git", "https://GitHub.com/generous-corp/pulp/",
+                "http://github.com/Generous-Corp/pulp"]
+        self.assertEqual({pr.normalize_origin(u) for u in same}, {"github.com/generous-corp/pulp"})
+        self.assertNotEqual(pr.normalize_origin("git@github.com:Generous-Corp/pulp-planning.git"),
+                            pr.normalize_origin(same[0]))
+
+    def test_the_receipt_carries_every_field_a_control_reads(self):
+        # Structural: whatever run() reports for a discovered root must survive
+        # the receipt projection. The landed control reads last-run.json, and
+        # a projection that dropped these made it unpassable.
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt")
+        _, out, _ = self.run_with(repo, [boot_code])
+        summary = dr.pass_summary({"pulp_reapers": out, "mode": "fix", "report": {}}, 0)
+        projected = summary["pulp_reapers"]
+        self.assertEqual(projected["outside_profile_roots"], out["outside_profile_roots"])
+        for key in ("reason", "roots", "children_seen", "configured_origin"):
+            self.assertEqual(projected["discovery"][key], out["discovery"][key], key)
+        self.assertEqual(len(projected["runs"]), len(out["runs"]))
+        for record, shown in zip(out["runs"], projected["runs"]):
+            for key in ("reaper", "reason", "worktrees_root", "exit_code", "reclaimed_bytes"):
+                self.assertEqual(shown.get(key), record.get(key), key)
+        self.assertTrue([r for r in projected["runs"] if r.get("reason") == "discovered_pulp_root"])
 
     def test_two_discovered_roots_get_one_run_each(self):
         repo = PulpRepo(self.tmp)
@@ -576,6 +677,14 @@ class DiskReclaimIntegration(Isolated):
         report = json.loads(out.getvalue())
         self.assertEqual(report["pulp_reapers"]["outside_profile_roots"],
                          [{"root": str(os.path.realpath(boot_code)), "count": 1}])
+        # The landed control reads the receipt, not stdout.
+        receipt = json.loads((state / "last-run.json").read_text())["pulp_reapers"]
+        self.assertEqual(receipt["outside_profile_roots"],
+                         [{"root": str(os.path.realpath(boot_code)), "count": 1}])
+        self.assertEqual([(r["reason"], r["worktrees_root"]) for r in receipt["runs"]
+                          if r.get("reason")],
+                         [("discovered_pulp_root", str(os.path.realpath(boot_code)))])
+        self.assertGreaterEqual(receipt["discovery"]["children_seen"], 1)
 
     def test_a_failed_pass_still_leaves_a_receipt(self):
         state = self.tmp / "reclaim-state"
