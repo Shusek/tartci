@@ -93,6 +93,13 @@ class ShellTests(unittest.TestCase):
                      '# ssh host true\n'):
             self.assertEqual(shell(text), [], text)
 
+    def test_a_plain_comment_is_not_an_exemption(self) -> None:
+        # Only `ssh-stdin: <reason>` exempts; any other comment, on the line or
+        # the line above, leaves the ssh flagged.
+        self.assertEqual(len(shell("# just a note about the peer read\nssh host uptime\n")), 1)
+        self.assertEqual(len(shell("ssh host uptime  # reads the peer\n")), 1)
+        self.assertEqual(len(python('a = ["ssh", "-o", "BatchMode=yes", h]  # peer read\n')), 1)
+
     def test_an_exemption_on_the_line_or_the_line_above_is_honoured(self) -> None:
         self.assertEqual(shell('''
             # ssh-stdin: callers pipe the guest script in
