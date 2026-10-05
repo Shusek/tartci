@@ -72,6 +72,7 @@ except ImportError:  # Python < 3.11 (/usr/bin/python3 on macOS is 3.9)
     tomllib = None  # type: ignore[assignment]
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import reuse_canary  # noqa: E402
 import schedule_backstop_mode  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,8 +94,8 @@ def _backstop_env(profile: Dict[str, Any]) -> Dict[str, str]:
 class Agent:
     """One declarable support agent: how its install script renders it."""
     label: str
-    installer: str
-    kickstart: bool                       # the installer kickstarts after bootstrap
+    installer: Optional[str]              # its install script; None when only declared
+    kickstart: bool                       # bootstrap is followed by a kickstart
     environment: Callable[[Dict[str, Any]], Dict[str, str]] = field(
         default=lambda profile: {})
 
@@ -114,6 +115,9 @@ REGISTRY: Dict[str, Agent] = {
     "schedule-backstop": Agent("com.danielraffel.pulp.schedule-backstop",
                                "scripts/install_schedule_backstop_agent.sh", kickstart=True,
                                environment=_backstop_env),
+    # Installed only through this declaration; RunAtLoad is off because one
+    # pass builds Pulp for hours, so nothing kickstarts it.
+    "reuse-canary": Agent(reuse_canary.LABEL, None, kickstart=False),
 }
 
 # Agents in the scanned prefixes that another codified path installs or
@@ -156,6 +160,11 @@ def validate(data: Dict[str, Any]) -> List[str]:
         problems.append("support_agents.declared lists an agent twice")
     if type(table.get("bootstrap", False)) is not bool:
         problems.append("support_agents.bootstrap must be a boolean")
+    canary = data.get(reuse_canary.TABLE)
+    canary_on = isinstance(canary, dict) and canary.get("enabled") is True
+    if canary_on != ("reuse-canary" in declared):
+        problems.append("support_agents.declared must list reuse-canary exactly when "
+                        "[reuse_canary] enabled = true")
     mode, _ = schedule_backstop_mode.mode_of(data)
     backstop_on = mode in ("live", "dry-run")
     if backstop_on != ("schedule-backstop" in declared):
