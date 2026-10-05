@@ -1217,11 +1217,30 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
 
 # ── receipts ───────────────────────────────────────────────────────────────
 
+_GENERATION_DIR = re.compile(r"tartci-generations/([0-9a-f]{7,40})(?:-[0-9a-f]+)?(?:/|$)")
+
+
+def orchestrator_generation(script: Path | None = None) -> str | None:
+    """The tartci commit whose code is running this self-update.
+
+    The orchestration (gates, drain, install sequencing, verify, rollback) is
+    the INSTALLED generation's code: the agent runs ~/.local/bin/tartci. Only
+    the steps run through `tartci()` (support-manifest, validate, install) and
+    the template check run the TARGET's code. So a change to orchestration takes
+    effect from the update after the one that installs it. Recording which code
+    orchestrated each attempt makes that visible. None when the code is not
+    running from an installed generation (a checkout).
+    """
+    match = _GENERATION_DIR.search(str((script or Path(__file__)).resolve()))
+    return match.group(1) if match else None
+
+
 class Receipt:
     def __init__(self, cfg: Config, sys_: System, target: str | None, mode: str) -> None:
         self.cfg, self.sys = cfg, sys_
         now = sys_.now()
         self.value: dict[str, Any] = {"schema": SCHEMA, "mode": mode, "target": target,
+                                      "orchestrator_generation": orchestrator_generation(),
                                       "started_at": _iso(now), "steps": [], "status": "running",
                                       "pid": os.getpid(),
                                       "pid_start": sys_.process_start(os.getpid())}
