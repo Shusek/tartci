@@ -54,7 +54,10 @@ def setUpModule():
                        ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml")),
                        # The boot-volume watch would judge the real boot disk;
                        # test_scratch_dirs.BootVolumeWatch covers it hermetically.
-                       ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0")):
+                       ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0"),
+                       # Likewise the boot-usage sensor would measure the real
+                       # home; test_boot_usage covers it hermetically.
+                       ("TARTCI_BOOT_USAGE", "0")):
         _SAVED_ENV[key] = os.environ.get(key)
         os.environ[key] = value
 
