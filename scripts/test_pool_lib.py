@@ -403,7 +403,11 @@ class RunnerAgentLoadedTests(unittest.TestCase):
             self.assertEqual(proc.stdout.strip(), "selected-marker", proc.stderr)
 
     def test_toml_helpers_use_supported_python_selection(self) -> None:
-        source = (ROOT / "tartci").read_text()
+        # The resolver lives in a lib the shim sources, so provider scripts an
+        # operator runs directly can use the same one.
+        lib = (ROOT / "providers" / "common" / "toml-python.lib.sh").read_text()
+        source = (ROOT / "tartci").read_text() + lib
+        self.assertIn('. "$HERE/providers/common/toml-python.lib.sh"', source)
         self.assertIn("tartci_toml_python()", source)
         self.assertIn("TARTCI_PYTHON", source)
         self.assertIn("/opt/homebrew/bin/python3.11", source)

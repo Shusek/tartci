@@ -820,6 +820,10 @@ class HealPassTests(unittest.TestCase):
         root = tmp / "tartci-root"
         (root / "scripts").mkdir(parents=True)
         shutil.copy(HERE.parent / "tartci", root / "tartci")
+        # The shim sources its Python resolver from this lib.
+        (root / "providers" / "common").mkdir(parents=True)
+        shutil.copy(HERE.parent / "providers" / "common" / "toml-python.lib.sh",
+                    root / "providers" / "common" / "toml-python.lib.sh")
         marker = tmp / "watchdog-ran"
         (root / "scripts" / "network_profile.py").write_text(textwrap.dedent(f"""\
             import sys

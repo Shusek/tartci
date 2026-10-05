@@ -26,6 +26,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST="$ROOT/manifests/pulp.linux.toml"
 COMMON="$ROOT/providers/common"
 SOURCE_PIN_RESOLVER="$COMMON/pulp-source-pin.py"
+# The resolver imports tomllib; an operator ssh shell may resolve python3 to 3.9.
+# shellcheck source=../common/toml-python.lib.sh
+. "$COMMON/toml-python.lib.sh"
 RENDER_VERIFIER="$COMMON/pulp-render-generation.py"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -49,7 +52,7 @@ esac; done
 for required in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
   [ -f "$required" ] || die "versioned golden input missing: $required"
 done
-source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+source_identity="$(tartci_toml_python "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
   --require-skia-release chrome/m153 \
   --require-v8-disposition baked-provider-only)" \
   || die "could not resolve immutable Pulp source from $MANIFEST"
