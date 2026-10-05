@@ -85,6 +85,17 @@ SCAN_PREFIXES = ("com.danielraffel.tartci.", "com.danielraffel.tmp.")
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED = 0, 3, 4
 
 
+def _tart_home(profile: Dict[str, Any]) -> Dict[str, str]:
+    """This host's Tart store, which the watchdog and reaper must not guess.
+
+    A LaunchAgent inherits no login shell; rendered without it, the agent reads
+    Tart's default store and sees an empty inventory.
+    """
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    tart_home = host.get("tart_home")
+    return {"TART_HOME": tart_home} if isinstance(tart_home, str) and tart_home else {}
+
+
 def _backstop_env(profile: Dict[str, Any]) -> Dict[str, str]:
     mode, _ = schedule_backstop_mode.mode_of(profile)
     return dict(schedule_backstop_mode.ENVIRONMENT.get(mode or "", {}))
@@ -97,6 +108,9 @@ class Agent:
     installer: Optional[str]              # its install script; None when only declared
     kickstart: bool                       # bootstrap is followed by a kickstart
     environment: Callable[[Dict[str, Any]], Dict[str, str]] = field(
+        default=lambda profile: {})
+    # Template placeholders beyond $HOME, from the host's own profile.
+    settings: Callable[[Dict[str, Any]], Dict[str, str]] = field(
         default=lambda profile: {})
 
     @property
@@ -118,6 +132,13 @@ REGISTRY: Dict[str, Agent] = {
     # Installed only through this declaration; RunAtLoad is off because one
     # pass builds Pulp for hours, so nothing kickstarts it.
     "reuse-canary": Agent(reuse_canary.LABEL, None, kickstart=False),
+    # The self-heal watchdog (heal pass, skew and tool-freshness refresh,
+    # config warnings) and the Tier-2 reaper were rendered by hand from
+    # launchd/README.md, so a host could be brought up without them: m5studio
+    # served gate VMs with no watchdog and its freshness was never measured.
+    "launchd-watchdog": Agent("com.danielraffel.tartci.launchd-watchdog", None,
+                              kickstart=True, settings=_tart_home),
+    "reap": Agent("com.danielraffel.tartci.reap", None, kickstart=True, settings=_tart_home),
 }
 
 # Agents in the scanned prefixes that another codified path installs or
@@ -125,8 +146,6 @@ REGISTRY: Dict[str, Agent] = {
 # registry to exactly the templates in launchd/.
 OTHER_OWNERS: Dict[str, str] = {
     "com.danielraffel.tartci.self-update": "scripts/install_self_update_agent.sh",
-    "com.danielraffel.tartci.launchd-watchdog": "launchd/README.md (rendered by hand)",
-    "com.danielraffel.tartci.reap": "launchd/README.md (rendered by hand)",
     "com.danielraffel.tartci.http-connect-ssh-relay": "scripts/network_profile.py reconcile",
     "com.danielraffel.tartci.orchard-worker": "scripts/disable_orchard.sh (retirement)",
 }
@@ -223,6 +242,8 @@ class System:
         """The install script's exact render: same script, same arguments."""
         argv = ["python3", str(ROOT / "scripts" / "render_launchd_template.py"),
                 str(agent.template), "--set", f"HOME={self.home}"]
+        for name, value in agent.settings(profile).items():
+            argv += ["--set", f"{name}={value}"]
         for name, value in agent.environment(profile).items():
             argv += ["--environment", f"{name}={value}"]
         try:

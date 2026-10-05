@@ -73,6 +73,7 @@ HOST_KEYS = {
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
     "home_volume_floor_mode",
+    "vm_dhcp_breaker",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -376,6 +377,11 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    # The host VM-DHCP breaker (scripts/vm_dhcp_breaker.py) is on by default;
+    # only `false` is ever written, to turn it off on one host.
+    dhcp_breaker = host.get("vm_dhcp_breaker")
+    if dhcp_breaker is not None and type(dhcp_breaker) is not bool:
+        fail("host.vm_dhcp_breaker must be a boolean")
     agent_floor_qos = host.get("agent_floor_qos")
     if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
         fail('host.agent_floor_qos must be "utility" or "background"')
@@ -2345,6 +2351,8 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
+    if host.get("vm_dhcp_breaker") is False:
+        env["TARTCI_VM_DHCP_BREAKER"] = "0"
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
     if "home_volume_floor_mode" in host:
@@ -2892,6 +2900,8 @@ def tool_freshness_summary() -> dict:
 
 
 FSEVENTSD_WARN_MB = 1024
+# The host-vitals sensor publishes every 60 s (Pulp com.pulp.host-vitals).
+HOST_VITALS_INTERVAL_S = 60
 
 
 def host_vitals_summary(path: Path | None = None) -> dict:
@@ -2926,14 +2936,20 @@ def _fseventsd_summary(path: Path | None = None) -> dict:
     except (OSError, json.JSONDecodeError):
         return {"lines": [f"fseventsd: UNKNOWN (no host-vitals reading at {path})"],
                 "problem": None}
+    import state_age
+
     sampled = reading.get("sampled_at") if isinstance(reading, dict) else None
     age = f", sampled {int(time.time() - sampled)}s ago" if isinstance(sampled, int) else ""
+    aged = state_age.stale_note(sampled, HOST_VITALS_INTERVAL_S, "host-vitals sensor")
     fsev = reading.get("fseventsd") if isinstance(reading, dict) else None
     if not isinstance(fsev, dict) or not isinstance(fsev.get("rss_mb"), int):
         return {"lines": [f"fseventsd: UNKNOWN (host-vitals reading has no fseventsd field{age}; "
                           "reinstall the sensor)"], "problem": None}
     limit = fsev.get("warn_mb") if isinstance(fsev.get("warn_mb"), int) else FSEVENTSD_WARN_MB
     text = f"fseventsd: {fsev['rss_mb']} MB RSS, {fsev.get('cpu_pct')}% CPU{age}"
+    if aged:
+        # A reading the sensor stopped refreshing says nothing about now.
+        return {"lines": [f"{text} {aged}"], "problem": f"host vitals {aged}", "fseventsd": fsev}
     if fsev["rss_mb"] > limit:
         problem = f"fseventsd {fsev['rss_mb']} MB RSS > {limit} MB"
         return {"lines": [f"{text} WARN (> {limit} MB; restart with sudo killall fseventsd)"],

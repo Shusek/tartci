@@ -227,7 +227,7 @@ replaces_launchd_labels = []
 # Self-update renders and compares them after every update; with bootstrap =
 # false it only reports, and installs or changes nothing.
 [support_agents]
-declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary"]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
 bootstrap = false
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in

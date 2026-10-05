@@ -66,6 +66,9 @@ except ModuleNotFoundError:  # pragma: no cover - the launchd python is 3.9
     tomllib = None  # type: ignore[assignment]
 
 SCHEMA = "tartci.self-update/v1"
+# How often the launchd watchdog re-measures skew (tartci_launchd_watchdog.py
+# refresh_skew); a cached skew older than state_age.STALE_FACTOR of these reads STALE.
+SKEW_REFRESH_S = 1800
 REPO_URL = "https://github.com/danielraffel/tartci.git"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_SOAK_SECONDS = 1800
@@ -354,6 +357,15 @@ def state_dir_for(home: Path) -> Path:
     return Path(root) / "state" / "self-update"
 
 
+def skew_stale_note(skew: dict | None, now: float | None = None) -> str | None:
+    """STALE when the cached skew is older than the watchdog refreshes it."""
+    if not skew:
+        return None
+    import state_age
+    return state_age.stale_note(skew.get("measured_at"), SKEW_REFRESH_S,
+                                "launchd watchdog (tartci launchd heal)", now)
+
+
 def summary(home: Path | None = None) -> dict:
     """Cached skew + last attempt for status surfaces. Never fetches or raises."""
     state = state_dir_for(home or Path.home())
@@ -382,6 +394,9 @@ def summary(home: Path | None = None) -> dict:
     halted = halt_reason(state)
     if halted:
         problem = f"{problem}; {halted}" if problem else halted
+    aged = skew_stale_note(skew)
+    if aged:
+        problem = f"{problem}; skew {aged}" if problem else f"skew {aged}"
     return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem}
 
 
@@ -1684,6 +1699,24 @@ class Run:
                              pin_path=str(self.pin_path) if self.pin_path else None)
 
     # ── entry ───────────────────────────────────────────────────────────
+    def _record_skew_after_apply(self) -> None:
+        """Rewrite skew.json for the generation this run just verified.
+
+        skew.json is otherwise written only before the run, so a successful
+        update left status reading the PRE-update skew until the watchdog's
+        next refresh, which is never when the watchdog is not running. Checks
+        are not re-queried: verification already proved this generation runs.
+        Best effort: the update has succeeded whatever this does.
+        """
+        try:
+            skew = measure_skew(self.cfg, self.sys, self.target, self.sys.now(),
+                                verify_checks=False)
+            skew["recorded_by"] = "verified_apply"
+            _write_json(self.cfg.state_dir / "skew.json", skew)
+            self.receipt.step("skew", render_skew(skew))
+        except Exception as exc:  # noqa: BLE001 - never turn a success into a failure
+            self.receipt.step("skew", f"not recorded: {type(exc).__name__}: {exc}", ok=False)
+
     def execute(self) -> int:
         import signal
         previous_handler = signal.signal(signal.SIGTERM, _raise_terminated)
@@ -1705,6 +1738,7 @@ class Run:
                                           terminated=True)
             except Exception as exc:  # noqa: BLE001 - never leave the host out
                 return self._safe_recover(f"{type(exc).__name__} during {self.phase}: {exc}")
+            self._record_skew_after_apply()
             self.receipt.finish("succeeded")
             prune_dirs(self.cfg.state_dir / "rollback", KEEP_SNAPSHOTS)
             return EXIT_OK
@@ -2201,7 +2235,9 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
 
 def status_lines(state_dir: Path) -> list[str]:
     """For pool status / doctor / watchdog: skew and the last attempt."""
-    lines = [render_skew(_read_json(state_dir / "skew.json"))]
+    skew = _read_json(state_dir / "skew.json")
+    aged = skew_stale_note(skew)
+    lines = [render_skew(skew) + (f" {aged}" if aged else "")]
     last = _read_json(state_dir / "last.json")
     if last and last.get("status") in ("failed", "rolled_back"):
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"

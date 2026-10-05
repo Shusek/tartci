@@ -138,6 +138,9 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_dhcp_ok",
+    "vm_dhcp_unanswered",
+    "vm_dhcp_unreadable",
     "warm_vm_none",
     "warm_vm_overdue",
     "warm_vm_parked",
@@ -1054,6 +1057,22 @@ def check_reuse_canary(value: dict | None) -> Finding:
                    f"reuse canary status unreadable: {value.get('error')}", facts)
 
 
+def check_vm_dhcp(value: dict | None) -> Finding:
+    """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py)."""
+    value = value or {"state": "unreadable", "error": "no status"}
+    facts = {"vm_dhcp": value}
+    if value.get("state") == "open":
+        opened = value.get("opened_at")
+        return Finding("vm_dhcp", PROBLEM, "vm_dhcp_unanswered",
+                       "VM DHCP is not answering on this host: no lane clones except one probe "
+                       f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "
+                       f"{value.get('probes')} probes)", facts)
+    if value.get("state") == "closed":
+        return Finding("vm_dhcp", OK, "vm_dhcp_ok", "VM DHCP breaker closed", facts)
+    return Finding("vm_dhcp", UNKNOWN, "vm_dhcp_unreadable",
+                   f"VM DHCP breaker unreadable: {value.get('error')}", facts)
+
+
 def check_power(value: dict | None) -> Finding:
     """Whether the host stays awake on AC (scripts/power_status.py)."""
     import power_status
@@ -1309,6 +1328,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
             launchd_timers_value: dict | None = None,
+            vm_dhcp_value: dict | None = None,
             support_agents_value: dict | None = None,
             reuse_canary_value: dict | None = None,
             power_value: dict | None = None,
@@ -1419,6 +1439,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             launchd_timers_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_launchd_timers(launchd_timers_value))
+    if vm_dhcp_value is None:
+        try:
+            import vm_dhcp_breaker
+            vm_dhcp_value = vm_dhcp_breaker.status(home / ".tartci" / "state" / "vm-dhcp")
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            vm_dhcp_value = {"state": "unreadable", "error": str(exc)}
+    findings.append(check_vm_dhcp(vm_dhcp_value))
     if support_agents_value is None:
         try:
             import support_agents
