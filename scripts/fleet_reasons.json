@@ -397,6 +397,39 @@
       "summary": "Worktrees under /tmp were not checked.",
       "why": "The check needs the [reclaim] table (for the Pulp repo path) and a readable repo; without one this host has no configured Pulp checkout to ask.",
       "remedy": "Enable [reclaim] in the fleet profile, or run `git -C <pulp> worktree list` by hand."
+    },
+    "support_agents_drift": {
+      "summary": "bootstrap is on, but a declared support agent did not converge.",
+      "why": "The last self-update's support-agents step failed to install or reload an agent the profile declares; the receipt names which and why.",
+      "remedy": "Read ~/.tartci/state/support-agents/last.json (failures, per-agent action), then run `tartci fleet-macos support-agents apply` on the host."
+    },
+    "support_agents_never": {
+      "summary": "No support-agents receipt on this host yet.",
+      "why": "The receipt is written by self-update after it verifies the lanes; a host that has not updated since the step shipped has none.",
+      "remedy": "Run `tartci fleet-macos support-agents plan` (writes only its receipt), or wait for the next self-update."
+    },
+    "support_agents_ok": {
+      "summary": "Every declared support agent's installed plist matches its render and is loaded from it.",
+      "why": "The render uses the same render_launchd_template.py arguments as each agent's install script, so a match means the host carries exactly what the profile declares."
+    },
+    "support_agents_pending": {
+      "summary": "bootstrap is off; some declared support agent is missing or differs from its render.",
+      "why": "With `[support_agents] bootstrap = false` the step only reports. The finding names the agents it would install or change, and the receipt carries each differing key path.",
+      "remedy": "Read the per-agent diff in ~/.tartci/state/support-agents/last.json. Set bootstrap = true in the host's profile only after that diff is explained and approved."
+    },
+    "support_agents_unreadable": {
+      "summary": "The support-agents receipt or the fleet profile could not be read.",
+      "why": "An unreadable receipt or profile is not evidence the agents are right.",
+      "remedy": "Inspect ~/.tartci/state/support-agents/last.json and the [support_agents] table of ~/.config/tartci/macos-fleet-profile.toml."
+    },
+    "undeclared_fleet_agent": {
+      "summary": "A LaunchAgent under the tartci or tmp. prefix is installed but declared nowhere.",
+      "why": "Hand-installed agents drift: on 2026-10-04 a stopgap kicker installed outside any installer ran beside the interval guard on every host. The scan accounts for lanes, declared agents, and agents another codified installer owns; anything else is listed here.",
+      "remedy": "Declare it (add it to the registry and the profile), or retire it deliberately: boot it out and move its plist aside.",
+      "do_not": "Do not expect the support-agents step to remove it; it never removes an agent it does not manage."
+    },
+    "undeclared_fleet_agents_none": {
+      "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
     }
   }
 }

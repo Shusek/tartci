@@ -91,6 +91,9 @@ class FakeSystem(su.System):
         self.settling_code = "heartbeat_missing"
         self.bundle_commit = None      # what the built bundle claims (default: target)
         self.codesign_verify_rc = 0
+        self.agents_check_rc = 0
+        self.agents_rc = 0
+        self.agents_raises = False
         self.installed_after = None    # commit the host executes after install
         self.checked_out = None
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
@@ -195,6 +198,9 @@ class FakeSystem(su.System):
                              else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
             return self._render(a)
+        if a[:3] == ["python3", "scripts/support_agents.py", "check-templates"]:
+            return su.Result(self.agents_check_rc, "4 declared agents render" if
+                             self.agents_check_rc == 0 else "reclaim: missing template")
         if a[0] == "codesign" and "--extract-certificates" in joined:
             return ok()
         if a[0] == "codesign" and "--verify" in a:
@@ -308,6 +314,11 @@ class FakeSystem(su.System):
             return ok(json.dumps(self.status_after_on))
         if args[:2] == ["launchd", "guard"]:
             return su.Result(self.guard_rcs[0] if "kickstart" in args[-1] else self.guard_rcs[1])
+        if args[:3] == ["fleet-macos", "support-agents", "auto"]:
+            if self.agents_raises:
+                raise OSError("shim vanished")
+            return su.Result(self.agents_rc, "support agents: ok" if self.agents_rc == 0
+                             else "support agents: drift")
         raise AssertionError(f"unexpected shim {args}")
 
     def _set_installed(self, commit):
@@ -1160,7 +1171,8 @@ class SealedTests(Base):
 
     def test_bad_bundle_refuses_before_drain(self) -> None:
         for mutate in (lambda s: setattr(s, "bundle_commit", "9" * 40),
-                       lambda s: setattr(s, "codesign_verify_rc", 1)):
+                       lambda s: setattr(s, "codesign_verify_rc", 1),
+                       lambda s: setattr(s, "agents_check_rc", 3)):
             with self.subTest():
                 self.tearDown()
                 self.setUp()
@@ -1168,6 +1180,22 @@ class SealedTests(Base):
                 self.assertEqual(self.apply(), su.EXIT_REFUSED)
                 self.assertEqual(self.sys.mutations(), [])
                 self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
+
+    def test_support_agents_run_after_verify_and_never_fail_the_update(self) -> None:
+        for mutate in (lambda s: None,
+                       lambda s: setattr(s, "agents_rc", 4),
+                       lambda s: setattr(s, "agents_raises", True)):
+            with self.subTest():
+                self.tearDown()
+                self.setUp()
+                mutate(self.sys)
+                self.assertUpdated(self.apply())
+                steps = json.loads(Path(self.last()["receipt"]).read_text())["steps"]
+                names = [step["step"] for step in steps]
+                self.assertIn("support-agents", names)
+                self.assertLess(names.index("verify"), names.index("support-agents"))
+                agents = next(step for step in steps if step["step"] == "support-agents")
+                self.assertEqual(agents["ok"], self.sys.agents_rc == 0 and not self.sys.agents_raises)
 
     def test_same_sealed_target_can_be_planned_and_applied_again(self) -> None:
         # A previous run's build is left read-only by build_macos_launcher.sh.

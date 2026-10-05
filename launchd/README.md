@@ -512,6 +512,47 @@ so the next `tartci setup` does not reinstall it.
 Judge it by runs per listed workflow per day against `1440 / cadence_minutes`,
 with total Actions runs and minutes as the control.
 
+## Declared support agents
+
+The fleet profile names the support LaunchAgents a host carries:
+
+```toml
+[support_agents]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]
+bootstrap = false
+```
+
+`scripts/support_agents.py` holds the registry of declarable agents (today the
+disk reclaimer, the artifact-cache refresher, the keychain unlocker, and the
+schedule backstop). Each renders with exactly the `render_launchd_template.py`
+arguments its `install_*_agent.sh` uses, so a host those scripts installed
+reads byte-identical; `scripts/test_support_agents.py` proves that per agent.
+An agent's own settings stay where they are (`schedule_backstop`, `[reclaim]`);
+this table only says which agents the host carries. `schedule-backstop` must be
+declared exactly when `schedule_backstop` is `live` or `dry-run`.
+
+After self-update verifies the lanes it runs `tartci fleet-macos support-agents
+auto`. With `bootstrap = false` that is a plan: it compares each declared
+agent's installed plist with its render (`match_bytes`, `match_plist` for key
+order only, `differs` with each key path named, `missing`), lists every agent
+under the `com.danielraffel.tartci.` and `com.danielraffel.tmp.` prefixes that
+is neither declared, a lane, nor owned by another named installer, and writes
+`~/.tartci/state/support-agents/last.json`. Nothing on the host changes. With
+`bootstrap = true` it renders every declared agent first (one failing render
+changes nothing in the pass), then writes and (re)bootstraps what is missing or
+differs, kickstarting only agents whose template has `RunAtLoad`, and leaves a
+matching, loaded agent alone. A declaration dropped from a present table, that
+the previous receipt shows declared under a present table, is booted out and its
+plist moved to `~/.local/share/tartci-support-agents.retired-<date>/`; its log
+stays. An absent table manages and removes nothing.
+
+The step never fails the update: a failure is a receipt step with `ok=false`
+and a `tartci doctor fleet` finding (`support_agents_pending`,
+`support_agents_drift`, `undeclared_fleet_agent`). Before draining, self-update
+refuses a target whose checkout cannot render a declared agent. The
+`install_*_agent.sh` scripts and their `tartci setup` calls remain until
+`bootstrap = true` is proven across the fleet.
+
 ## Release CLI macOS launchd rule
 
 `Release CLI` is a different workload from `Build and Test`, so serve it with a

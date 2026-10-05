@@ -184,3 +184,10 @@ min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
 replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
+
+# The support LaunchAgents this host carries (scripts/support_agents.py).
+# Self-update renders and compares them after every update; with bootstrap =
+# false it only reports, and installs or changes nothing.
+[support_agents]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]
+bootstrap = false
