@@ -569,6 +569,20 @@ class DiscoveredPulpRoots(Isolated):
                  and c[1] in (str(configured), str(second))]
         self.assertEqual(heavy, [], "the heavier reaper never follows these")
 
+    def test_the_configured_clones_agent_worktrees_run_once_when_also_discovered(self):
+        # m3: every matching child of /Volumes/Workshop/Code is a worktree of
+        # the CONFIGURED clone, so discovery finds that clone too. Its
+        # .claude/worktrees must still be reaped exactly once, as configured.
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "wt")
+        agent = repo.primary / ".claude" / "worktrees"
+        agent.mkdir(parents=True)
+        calls, out, _ = self.run_with(repo, [boot_code])
+        runs = [r for r in out["runs"] if r.get("worktrees_root") == str(agent)]
+        self.assertEqual([r["reason"] for r in runs], ["configured_clone_agent_worktrees"], runs)
+        self.assertEqual(len([c for c in calls if c[1] == str(agent)]), 1, calls)
+
     def test_two_discovered_roots_get_one_run_each(self):
         repo = PulpRepo(self.tmp)
         first, second = self.tmp / "code-a", self.tmp / "code-b"
