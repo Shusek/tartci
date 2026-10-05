@@ -431,6 +431,8 @@ source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
 # shellcheck source=providers/tart-macos/job-claim.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
+# shellcheck source=providers/tart-macos/vm-dhcp.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/vm-dhcp.lib.sh"
 # shellcheck source=providers/tart-macos/lease-fit.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/lease-fit.lib.sh"
 # shellcheck source=providers/tart-macos/heartbeat-keepalive.lib.sh
@@ -1850,11 +1852,13 @@ boot_vm_to_ssh(){
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
     rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" no_ip "$vm"
     discard_current_vm
     tartci_release_vm_lease
     return 1
   fi
   CURRENT_IP="$ip"
+  tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
   rm -f "$boot_log"
   local sshok=0
   for _ in $(seq 1 90); do
@@ -1922,6 +1926,7 @@ run_one(){
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
   PRE_CLONE_DEMAND_GONE=0
+  VM_DHCP_BACKOFF=0
   LAST_RUN_LEASE_DENIED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l ip="" rc=0
@@ -1939,6 +1944,16 @@ run_one(){
   fi
   if ! tartci_pool_lock_absent; then
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
+    return 75
+  fi
+  # The host's VM DHCP breaker comes first: while the host's DHCP server is
+  # not answering no boot can succeed, so nothing else is worth doing, and a
+  # lane that backs off here has taken no job claim. Order of the pre-boot
+  # checks: this breaker, then the job claim, then (after the admission
+  # precheck) the pre-clone demand check. See vm-dhcp.lib.sh.
+  if ! tartci_vm_dhcp_check "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}"; then
+    heartbeat vm-dhcp-breaker-open
+    note "[$i] VM DHCP on this host is not answering (breaker open) — not cloning; one probe every ${TARTCI_VM_DHCP_PROBE_SECS:-300}s"
     return 75
   fi
   # One booting VM per queued job: a lane whose class's queued jobs are all
@@ -2376,6 +2391,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 tartci_boundary_proof_validate \
   || die "invalid parallel boundary-proof configuration"
 tartci_job_claim_validate || die "invalid job-claim configuration"
+tartci_vm_dhcp_validate || die "invalid VM DHCP breaker configuration"
 tartci_lease_fit_validate || die "invalid lease-fit configuration"
 tartci_heartbeat_keepalive_validate || die "invalid heartbeat keepalive configuration"
 
@@ -2552,6 +2568,7 @@ if [ "$LOOP" = 1 ]; then
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
       if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
+         || [ "${VM_DHCP_BACKOFF:-0}" = 1 ] \
          || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0

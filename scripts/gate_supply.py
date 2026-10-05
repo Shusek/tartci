@@ -84,6 +84,8 @@ BLOCKED_PHASES = frozenset({
     "admission-precheck-error", "teardown-pending",
     # lease-fit.lib.sh: this lane's VM lease cannot be granted now, or ever.
     "lease-wait", "lease-never-fits",
+    # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.
+    "vm-dhcp-breaker-open",
 })
 # A heartbeat older than this many polls (floor below) is not current.
 HEARTBEAT_STALE_POLLS = 6
