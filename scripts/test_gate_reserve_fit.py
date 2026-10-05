@@ -14,7 +14,6 @@ import json
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 
@@ -22,6 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_doctor as fd  # noqa: E402
 import gate_reserve_fit as grf  # noqa: E402
+
+try:  # the shipped profiles are TOML; /usr/bin/python3 3.9 has no tomllib
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None  # type: ignore[assignment]
+requires_tomllib = unittest.skipIf(tomllib is None, "reads TOML profiles (Python 3.11+)")
 
 ROOT = Path(__file__).resolve().parents[1]
 HOSTS = {
@@ -45,6 +50,7 @@ def pulp_gate(data: dict) -> dict:
 
 
 class FitTests(unittest.TestCase):
+    @requires_tomllib
     def test_m3_and_m5studio_fit_and_m1_and_m5_overcommit_cores(self) -> None:
         expected = {"m3": [], "m5studio": [],
                     "m1": ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=6 reserve=3"],
@@ -67,7 +73,35 @@ class FitTests(unittest.TestCase):
         self.assertEqual([int(v) for v in out], [grf.vm_mem_mb(c) for c in (1, 3, 6, 7, 8, 14)])
 
 
+class MemoryAxisTests(unittest.TestCase):
+    """Pure fixtures (no TOML), so these run under the hosts' Python 3.9 too.
+
+    A host with a small gate memory reserve: two 7-core slots need 2 x 12288 MB
+    and fit 14 cores, but not 20000 MB.
+    """
+    HOST = {"reserved_gate_cores": 14, "vm_pool_cores": 14,
+            "reserved_gate_mem_mb": 20000, "per_compile_job_mem_mb": 1536}
+
+    def lane(self, cores: int) -> dict:
+        return {"lane": [{"id": "pulp-gate", "vm_cores": cores, "supervisors": 2}]}
+
+    def test_memory_overcommits_while_cores_fit(self) -> None:
+        self.assertEqual(grf.finding_lines(grf.fit(self.lane(7), self.HOST)),
+                         ["gate_reserve_overcommitted lane=pulp-gate axis=memory "
+                          "demand=24576 reserve=20000"])
+
+    def test_a_target_that_grows_memory_is_refused_on_the_memory_axis(self) -> None:
+        # 8 cores: 2 x 14336 MB = 28672; cores 16 > 14 too. Each axis ratchets
+        # on its own, so both refusals are named.
+        rows, refusals = grf.ratchet(self.lane(7), self.lane(8), self.HOST)
+        self.assertIn("gate_reserve_worse lane=pulp-gate axis=memory installed_over=4576 "
+                      "target_over=8672 reserve=20000", refusals)
+        _, same = grf.ratchet(self.lane(7), self.lane(7), self.HOST)
+        self.assertEqual(same, [])
+
+
 class RatchetTests(unittest.TestCase):
+    @requires_tomllib
     def test_the_373_sizing_is_refused_against_the_installed_profile(self) -> None:
         installed, target = profile("m3"), profile("m3")
         pulp_gate(target)["vm_cores"] = 12
@@ -75,6 +109,7 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(refusals, ["gate_reserve_worse lane=pulp-gate axis=cores "
                                     "installed_over=0 target_over=10 reserve=14"])
 
+    @requires_tomllib
     def test_m1_and_m5_report_on_every_update_and_never_block(self) -> None:
         for host in ("m1", "m5"):
             with self.subTest(host=host):
@@ -82,6 +117,7 @@ class RatchetTests(unittest.TestCase):
                 self.assertEqual(refusals, [])
                 self.assertEqual(len(grf.finding_lines(rows)), 1)
 
+    @requires_tomllib
     def test_a_smaller_overcommit_passes_and_reports_smaller(self) -> None:
         target = profile("m5")
         pulp_gate(target)["vm_cores"] = 5
@@ -90,11 +126,13 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(grf.finding_lines(rows),
                          ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=10 reserve=8"])
 
+    @requires_tomllib
     def test_a_first_install_reports_and_refuses_nothing(self) -> None:
         rows, refusals = grf.ratchet(None, profile("m1"), HOSTS["m1"])
         self.assertEqual((len(grf.finding_lines(rows)), refusals), (1, []))
 
 
+@requires_tomllib
 class ValidateCliTests(unittest.TestCase):
     def run_validate(self, host: str, target_text: str) -> subprocess.CompletedProcess:
         with tempfile.TemporaryDirectory() as td:
