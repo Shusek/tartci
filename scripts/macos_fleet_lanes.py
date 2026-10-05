@@ -2851,6 +2851,8 @@ def config_verdicts(config: Path, support_root: Path,
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
                 "self_update": self_update_summary(),
+                "gate_reserve": {"lines": ["gate reserve: n/a (no installed fleet profile)"],
+                                 "problem": None},
                 "tool_freshness": tool_freshness_summary(),
                 "host_vitals": host_vitals_summary()}
     value: dict = {}
@@ -2885,6 +2887,7 @@ def config_verdicts(config: Path, support_root: Path,
     except Exception as exc:  # noqa: BLE001
         value["supply"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
     value["self_update"] = self_update_summary()
+    value["gate_reserve"] = gate_reserve_summary(config)
     value["tool_freshness"] = tool_freshness_summary()
     value["host_vitals"] = host_vitals_summary()
     return value
@@ -2970,6 +2973,62 @@ def _fseventsd_summary(path: Path | None = None) -> dict:
     return {"lines": [text], "problem": None, "fseventsd": fsev}
 
 
+DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
+
+
+def live_host_profile(config: Path, override: Path | None = None) -> dict:
+    if override is not None:
+        return json.loads(override.read_text())
+    import host_profile
+    return host_profile.build_profile(fleet_profile=str(config))
+
+
+def check_reserve(target: dict, installed_path: Path, host_json: Path | None,
+                  config: Path) -> int:
+    """`validate --check-reserve`: report every overcommit, refuse only a worse one."""
+    import gate_reserve_fit
+    host = live_host_profile(config, host_json)
+    installed = None
+    if installed_path.is_file():
+        with installed_path.open("rb") as fh:
+            installed = tomllib.load(fh)
+    rows, refusals = gate_reserve_fit.ratchet(installed, target, host)
+    for line in gate_reserve_fit.not_applicable_lines(target, host):
+        print(line)
+    for line in gate_reserve_fit.finding_lines(rows):
+        print(line)
+    for line in refusals:
+        print(line, file=sys.stderr)
+    if refusals:
+        print("refusing: this profile overcommits the gate reserve more than the installed "
+              "one; resizing gate lanes is a profile decision with the host's owner",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def gate_reserve_summary(config: Path) -> dict:
+    """The installed profile's fit against this host's live gate reserve."""
+    try:
+        import gate_reserve_fit
+        with config.open("rb") as fh:
+            profile = tomllib.load(fh)
+        host = live_host_profile(config)
+        lines = gate_reserve_fit.finding_lines(gate_reserve_fit.fit(profile, host))
+        not_applicable = gate_reserve_fit.not_applicable_lines(profile, host)
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
+                "problem": None}
+    if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
+        return {"lines": not_applicable, "problem": None}
+    if not lines:
+        return {"lines": ["gate reserve: every gate lane fits", *not_applicable],
+                "problem": None}
+    return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines]
+            + not_applicable,
+            "problem": "; ".join(line.split(" ", 1)[1] for line in lines)}
+
+
 def self_update_summary() -> dict:
     """Cached tartci skew and last self-update attempt. Never fetches."""
     try:
@@ -3001,7 +3060,7 @@ def render_config_verdicts(value: dict | None) -> str:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     lines.extend(self_update.get("lines") or
                  ["tartci: skew UNKNOWN (not checked from here)"])
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         lines.extend(row.get("lines") or [f"{key}: UNKNOWN (not checked from here)"])
     supply = value.get("supply") if isinstance(value.get("supply"), dict) else {}
@@ -3184,6 +3243,16 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("config", type=Path)
         if name == "render":
             cmd.add_argument("--output", required=True, type=Path)
+        if name == "validate":
+            cmd.add_argument(
+                "--check-reserve", action="store_true",
+                help="also fit each gate lane into THIS host's gate reserve (live host "
+                     "profile): report every overcommit, refuse only one the config makes "
+                     "worse than the installed profile (scripts/gate_reserve_fit.py)")
+            cmd.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE,
+                             help="the installed profile the ratchet compares against")
+            cmd.add_argument("--host-profile-json", type=Path, default=None,
+                             help=argparse.SUPPRESS)
     receipt = sub.add_parser("write-receipt")
     receipt.add_argument("config", type=Path)
     receipt.add_argument("--agents-dir", required=True, type=Path)
@@ -3349,6 +3418,8 @@ def main(argv: list[str] | None = None) -> int:
         data = load(args.config)
         if args.command == "validate":
             print(f"valid: host={data['host']['id']} lanes={len(data['lane'])} activation=unchanged")
+            if args.check_reserve:
+                return check_reserve(data, args.installed, args.host_profile_json, args.config)
             return 0
         if args.command == "write-receipt":
             write_receipt(

@@ -80,6 +80,30 @@
       "summary": "The installed generation reports the fleet ready.",
       "why": "Readiness is reported from the installed generation because that is the tree the running supervisors execute."
     },
+    "gate_reserve_fits": {
+      "summary": "Every gate lane's slots fit together inside this host's gate reserve.",
+      "why": "Agent builds may hold every core outside the reserve; slots that fit inside it can always run together.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not grow a gate lane without re-reading this line."
+    },
+    "gate_reserve_not_applicable": {
+      "summary": "No installed fleet profile on this host.",
+      "why": "Only a managed fleet host has gate lanes to fit.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not install a fleet profile only to clear this."
+    },
+    "gate_reserve_overcommitted": {
+      "summary": "A gate lane's slots together need more cores or memory than this host's gate reserve.",
+      "why": "With agent builds holding the rest of the host, the second slot is lease-denied while jobs queue (m3 2026-10-04, #373: 2 x 12 cores against 14).",
+      "remedy": "A profile decision with the host's owner: fewer gate slots, smaller VMs, or a larger reserve. Self-update refuses only a profile that makes it worse; it never resizes on its own.",
+      "do_not": "Do not take agent cores to fit gate VMs, and do not resize from this finding without the owner."
+    },
+    "gate_reserve_unknown": {
+      "summary": "The gate-reserve fit could not be computed (host profile or installed profile unreadable).",
+      "why": "An uncomputed fit is not a fitting one.",
+      "remedy": "Run `tartci host-profile --json` and `tartci fleet-macos validate <profile> --check-reserve` on the host.",
+      "do_not": "Do not read unknown as fits."
+    },
     "generation_path_exec": {
       "summary": "Agents exec a generation path directly, so a staged generation reaches them.",
       "why": "This is the delivery shape in which install means what it appears to mean: the next generation replaces what execs."
@@ -208,6 +232,26 @@
     "no_persistent_runners": {
       "summary": "No persistent Actions listener is installed, so drain terminalizes on provider agents alone.",
       "why": "Ephemeral providers finish their current job and then wait at the admission gate, which is a safe local drain primitive. Only a stock persistent listener lacks one."
+    },
+    "peer_reachability_ok": {
+      "summary": "Every peer was readable at this host's last self-update survey."
+    },
+    "peer_reachability_unreadable": {
+      "summary": "This host's record of unreachable peers could not be read.",
+      "why": "Without it the doctor cannot say which peers are dark or whether one has stopped holding the update turn. The next self-update survey rewrites the record.",
+      "remedy": "Wait for the next self-update attempt (every 30 min), or run `tartci fleet-macos self-update --plan` to read every peer now."
+    },
+    "peer_unreachable": {
+      "summary": "A peer's pool status could not be read at this host's last self-update survey, so it still blocks this host's update turn.",
+      "why": "An unreadable peer may be mid-update, so it counts as busy and no host updates while it is dark. It stops holding the turn only after 4 consecutive unreadable reads over at least 3 h (the age at which a peer's update marker already counts as stale), with this host reading a majority of the fleet and every readable peer also unable to read it within the last hour. A peer that flaps between readable and unreadable never meets that and keeps blocking; self_update_starved reports it after 6 h.",
+      "remedy": "Reach the peer: ssh to it and run `tartci pool status --json`. If the machine is asleep, off, or off the network, it needs someone at it.",
+      "do_not": "Do not remove the peer from the published supply to unblock updates: that also drops its lanes from the capacity floor's view while they may still be running."
+    },
+    "peer_unreachable_excluded": {
+      "summary": "A peer has been unreachable long enough that it no longer holds the update turn: the other hosts update without it.",
+      "why": "It was unreadable for 4 consecutive reads over at least 3 h, this host read a majority of the fleet, and every readable peer also failed to read it within the last hour. A peer read holding an update marker that old already counts as not updating, so the dark peer is trusted no more than a stale one. It still serves nothing for the capacity floor, so a drain that would leave a required label unserved still refuses. It rejoins on its first readable read (peer_unreachable_rejoined).",
+      "remedy": "Bring the peer back: it needs someone at the machine if ssh times out. Nothing on this host needs to change; the exclusion ends by itself when the peer answers.",
+      "do_not": "Do not treat the excluded peer as serving: its lanes take no jobs while it is dark."
     },
     "persistent_runners_without_hold_receipt": {
       "summary": "Drain will refuse, and it refuses after the host is already opted out.",

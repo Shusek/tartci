@@ -1185,7 +1185,7 @@ def config_problem(value: dict) -> str | None:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     if self_update.get("problem"):
         parts.append(f"self_update={self_update['problem']}")
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         if row.get("problem"):
             parts.append(f"{key}={row['problem']}")
