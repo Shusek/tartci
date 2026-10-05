@@ -71,7 +71,7 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            # read by tmp_checkouts.py; validated here so one
                            # install-time check covers the whole table
                            "tmp_checkouts", "tmp_checkout_idle_hours",
-                           "worktree_root_checkouts",
+                           "worktree_root_checkouts", "extra_worktree_roots",
                            # read by scratch_dirs.py
                            "scratch_dirs", "scratch_idle_hours",
                            # read by gate_ccache_trim.py
