@@ -482,17 +482,39 @@ if not isinstance(d, dict):
 axis = d.get("exceeded_axis") if isinstance(d.get("exceeded_axis"), dict) else {}
 axes = "+".join(k for k in ("cores", "memory", "disk") if axis.get(k) is True) or "none"
 disk = d.get("disk") if isinstance(d.get("disk"), dict) else {}
+home = d.get("home_volume") if isinstance(d.get("home_volume"), dict) else {}
 def num(v):
     return v if type(v) is int else ""
-print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s" % (
+extra = ""
+if home.get("state") == "below":
+    extra = " volume=home free=%s floor=%s" % (num(home.get("free_bytes")), num(home.get("floor_bytes")))
+print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s%s" % (
     axes, str(d.get("reason") or "unreadable").replace(" ", "_"),
     num(d.get("requested_cores")), num(d.get("requested_mem_mb")),
     num(disk.get("requested_bytes")), num(disk.get("free_bytes")),
-    num(disk.get("required_bytes"))))
+    num(disk.get("required_bytes")), extra))
 ' 2>/dev/null)" || parsed="axis=none reason=unreadable"
   local fields=()
   read -r -a fields <<< "$parsed rc=$rc kind=$kind lease_cores=$cores lease_mem_mb=${mem_mb:-auto} priority=$priority"
   event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
+}
+
+# A grant that skipped the home-volume floor because the volume could not be
+# read: the axis fails open, so the event is what keeps it from failing silent.
+tartci_vm_lease_home_unread_event(){
+  local out="$1" home_unread
+  declare -F event >/dev/null 2>&1 || return 0
+  home_unread="$(printf '%s' "$out" | python3 -c 'import json,sys
+try:
+    h = json.load(sys.stdin).get("home_volume") or {}
+except ValueError:
+    h = {}
+if isinstance(h, dict) and h.get("state") == "unread":
+    print("volume=home reason=" + str(h.get("reason") or "unknown").replace(" ", "_"))' 2>/dev/null || true)"
+  [ -n "$home_unread" ] || return 0
+  local unread_fields=()
+  read -r -a unread_fields <<< "$home_unread"
+  event disk_axis_unread "$home_unread" ${unread_fields[@]+"${unread_fields[@]}"}
 }
 
 # The cores a VM lease of $1 at priority $2 is granted: a non-gate lane is
@@ -688,6 +710,12 @@ tartci_acquire_vm_lease(){
       --disk-floor-mb "$((disk_floor_gb * 1024))"
     )
     [ -z "$disk_expected_device_id" ] || disk_args+=(--disk-expected-device-id "$disk_expected_device_id")
+    # The home volume holds the supervisors' temp files and the build trees; a
+    # VM lease also refuses a new clone while it is below its per-host floor
+    # (scripts/home_volume_floor.py). TARTCI_HOME_VOLUME_FLOOR=0 turns it off.
+    if [ "${TARTCI_HOME_VOLUME_FLOOR:-1}" = 1 ] && [ -n "${HOME:-}" ]; then
+      disk_args+=(--home-floor-path "$HOME" --home-floor-hours "${TARTCI_HOME_VOLUME_FLOOR_HOURS:-1}")
+    fi
     [ -z "$disk_expected_mount_path" ] || disk_args+=(--disk-expected-mount-path "$disk_expected_mount_path")
   fi
   lease_id="vm-$kind-$vm_name"
@@ -752,6 +780,7 @@ tartci_acquire_vm_lease(){
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  tartci_vm_lease_home_unread_event "$out"
   if declare -F event >/dev/null 2>&1; then
     event lease_acquired "kind=$kind priority=$priority lease_cores=$cores" \
       "kind=$kind" "priority=$priority" "lease_cores=$cores" "lease_mem_mb=${mem_mb:-auto}"

@@ -49,6 +49,18 @@
       "remedy": "Inspect the named LaunchAgent's ProgramArguments before planning a deploy.",
       "do_not": "Do not start a deploy on the assumption that the unresolved agent behaves like its siblings."
     },
+    "disk_axis_unread": {
+      "summary": "The home volume could not be read for at least a reclaim cadence, so VM admissions skipped it.",
+      "why": "The axis fails open so a probe failure never becomes an outage, and must therefore never fail silently.",
+      "remedy": "Check the path in unread_reason and the volume's mount; disk_axis_unread events in the supervisor log show each skipped admission.",
+      "do_not": "Do not read an unread axis as a healthy volume."
+    },
+    "disk_floor_refusing": {
+      "summary": "VM admissions have been refused below the home-volume floor as many times in a row as this host has lanes.",
+      "why": "A floor that denies everything looks exactly like a full disk from outside, so a streak needs a person: either the volume is full or the computed floor is wrong.",
+      "remedy": "Read ~/.tartci/state/leases/home-volume.json (free, floor, fill rate); reclaim the volume (tartci reclaim, clean_build_cov.sh) or set TARTCI_HOME_VOLUME_FLOOR=0 on the lane while investigating.",
+      "do_not": "Do not raise the floor's cap or delete running jobs' files to clear it."
+    },
     "effective_generation_matches": {
       "summary": "Every managed agent executes the cohort the receipt records as installed.",
       "why": "Installed and effective are separate facts. They agree here, which is the only state in which a receipt can be read as a statement about what runs."
@@ -81,6 +93,18 @@
     "hold_receipt_present": {
       "summary": "Persistent listeners are covered by an exact held-idle receipt.",
       "why": "The receipt authorizes exactly one drain era and is invalidated when the pool reopens."
+    },
+    "home_volume_floor_not_judged": {
+      "summary": "No VM admission has judged the home volume.",
+      "why": "On a host whose Tart store is on the home volume, the store's own disk axis already judges it.",
+      "remedy": "Nothing to do unless the store is on another volume and leases have been taken.",
+      "do_not": "Do not read not-judged as ok on a host whose store is external."
+    },
+    "home_volume_floor_ok": {
+      "summary": "The home volume is judged at VM admission and is not refusing in a streak.",
+      "why": "The home volume holds supervisor temp files and build trees; a full one kills running supervisors (m5studio 2026-10-04).",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read one refusal as a problem; a refusal is the floor working."
     },
     "host_agents_missing": {
       "summary": "This managed fleet host is missing the launchd watchdog or the self-update agent.",
@@ -191,6 +215,20 @@
       "remedy": "Do not begin a drain on this host. If one has already refused, return the host to service with tartci pool on, which also invalidates any stale hold receipt.",
       "do_not": "Do not create the held-idle receipt by hand. It asserts that a scheduler observed every persistent runner idle. Writing it locally asserts an observation nothing made, and authorizes stopping a listener that may be holding a live job."
     },
+    "power_ok": {
+      "summary": "The host never sleeps on AC power (pmset AC `sleep` is 0)."
+    },
+    "power_sleeps": {
+      "summary": "The host is configured to sleep after N idle minutes on AC power.",
+      "why": "A sleeping Mac takes its runners, SSH, lease store and VMs with it while launchd still reports every lane loaded. m5studio ran for days with the setting off and spent 4-6 hours a day asleep. `pmset -g` can print `sleep N (sleep prevented by ...)` while an app holds an assertion, which hides it until that app lets go.",
+      "remedy": "System Settings > Energy > turn on 'Prevent automatic sleeping when the display is off' (or `sudo pmset -c sleep 0`), then confirm `pmset -g custom` shows `sleep 0` under AC Power.",
+      "do_not": "Do not read an awake host, or `sleep prevented by ...`, as the setting being on."
+    },
+    "power_unknown": {
+      "summary": "The AC Power profile could not be read from `pmset -g custom`.",
+      "why": "An unreadable power profile is not evidence that the host stays awake.",
+      "remedy": "Run `pmset -g custom` on the host and read the AC Power section."
+    },
     "profile_drift": {
       "summary": "The installed fleet profile differs from the checked-in profile with the same name.",
       "why": "Every receipt check verifies the installed copy against itself, so a host edited in place, or installed before the checked-in profile moved on, passes all of them while running settings nobody reviewed (for example a missing github_api_timeout_seconds silently reverting to the 15-second default).",
@@ -225,39 +263,6 @@
       "why": "Readiness is computed against a support root, and the support root comes from whichever copy of the CLI asked. A git checkout and the installed generation therefore disagree at the same instant, each correct about the tree it measured and each read as a statement about the fleet. A checkout reports receipt_mismatch because the receipt names the installed generation's root, not the checkout's.",
       "remedy": "Read the installed generation's verdict as authoritative, since that is the tree the running supervisors execute. Run the installed CLI, not a checkout, when asking whether the fleet is up.",
       "do_not": "Do not report a checkout's readiness verdict as the host's."
-    },
-    "power_ok": {
-      "summary": "The host never sleeps on AC power (pmset AC `sleep` is 0)."
-    },
-    "signing_prompts_not_applicable": {
-      "summary": "No dedicated signing keychain is configured on this host (no ~/.config/pulp/secrets/keychain.env).",
-      "why": "Nothing on this host signs unattended, so there is no keychain to keep from prompting."
-    },
-    "signing_prompts_ok": {
-      "summary": "Only the dedicated signing keychain and login are on the user search list, the dedicated keychain unlocks with keychain.env's password, and it does not re-lock on its own.",
-      "why": "Read without prompting: list-keychains, then unlock-keychain -p, and only then show-keychain-info."
-    },
-    "signing_prompts_risk": {
-      "summary": "This host's keychain setup can put a password dialog on screen.",
-      "why": "A process in the GUI session that touches a locked non-login keychain makes securityd start SecurityAgent and ask for that keychain's password, which only keychain.env holds. On 2026-10-02 a legacy pulp-signing keychain beside its -unattended replacement, walked by an unpinned codesign, put such dialogs on m5studio at each self-update attempt.",
-      "remedy": "Run `pulp ship doctor` on the host. Then keep only the dedicated keychain and login on the search list (`security list-keychains -d user -s <dedicated> ~/Library/Keychains/login.keychain-db`), leaving the legacy file on disk.",
-      "do_not": "Never answer the dialog, never type a password into it, and never put the login keychain to work for signing."
-    },
-    "signing_prompts_unknown": {
-      "summary": "The keychain setup could not be read.",
-      "why": "An unreadable search list cannot be told apart from a safe one.",
-      "remedy": "Run `python3 scripts/signing_prompt_guard.py --json` on the host and read the detail."
-    },
-    "power_sleeps": {
-      "summary": "The host is configured to sleep after N idle minutes on AC power.",
-      "why": "A sleeping Mac takes its runners, SSH, lease store and VMs with it while launchd still reports every lane loaded. m5studio ran for days with the setting off and spent 4-6 hours a day asleep. `pmset -g` can print `sleep N (sleep prevented by ...)` while an app holds an assertion, which hides it until that app lets go.",
-      "remedy": "System Settings > Energy > turn on 'Prevent automatic sleeping when the display is off' (or `sudo pmset -c sleep 0`), then confirm `pmset -g custom` shows `sleep 0` under AC Power.",
-      "do_not": "Do not read an awake host, or `sleep prevented by ...`, as the setting being on."
-    },
-    "power_unknown": {
-      "summary": "The AC Power profile could not be read from `pmset -g custom`.",
-      "why": "An unreadable power profile is not evidence that the host stays awake.",
-      "remedy": "Run `pmset -g custom` on the host and read the AC Power section."
     },
     "reclaim_boot_low": {
       "summary": "The reclaimer's last pass ran; the Tart store's volume is fine, but the boot data volume, which no lease floor covers, is still below its own floor (exit 5).",
@@ -356,6 +361,25 @@
       "why": "The launchd watchdog re-measures it every 30 minutes on a managed host; until then the answer is unknown, not current.",
       "remedy": "Run `tartci fleet-macos self-update --plan` (read-only)."
     },
+    "signing_prompts_not_applicable": {
+      "summary": "No dedicated signing keychain is configured on this host (no ~/.config/pulp/secrets/keychain.env).",
+      "why": "Nothing on this host signs unattended, so there is no keychain to keep from prompting."
+    },
+    "signing_prompts_ok": {
+      "summary": "Only the dedicated signing keychain and login are on the user search list, the dedicated keychain unlocks with keychain.env's password, and it does not re-lock on its own.",
+      "why": "Read without prompting: list-keychains, then unlock-keychain -p, and only then show-keychain-info."
+    },
+    "signing_prompts_risk": {
+      "summary": "This host's keychain setup can put a password dialog on screen.",
+      "why": "A process in the GUI session that touches a locked non-login keychain makes securityd start SecurityAgent and ask for that keychain's password, which only keychain.env holds. On 2026-10-02 a legacy pulp-signing keychain beside its -unattended replacement, walked by an unpinned codesign, put such dialogs on m5studio at each self-update attempt.",
+      "remedy": "Run `pulp ship doctor` on the host. Then keep only the dedicated keychain and login on the search list (`security list-keychains -d user -s <dedicated> ~/Library/Keychains/login.keychain-db`), leaving the legacy file on disk.",
+      "do_not": "Never answer the dialog, never type a password into it, and never put the login keychain to work for signing."
+    },
+    "signing_prompts_unknown": {
+      "summary": "The keychain setup could not be read.",
+      "why": "An unreadable search list cannot be told apart from a safe one.",
+      "remedy": "Run `python3 scripts/signing_prompt_guard.py --json` on the host and read the detail."
+    },
     "supply_match": {
       "summary": "Every registration this host's installed profile mints matches the published declared supply.",
       "why": "The published fleet/advertised-labels.json is what other projects read to learn which labels this fleet serves; it is generated from git, so only a comparison with the installed profile says the machine serves what git publishes."
@@ -370,6 +394,30 @@
       "summary": "The installed registrations could not be compared with the published supply.",
       "why": "An unreadable installed profile or published file, or a host_id the published file does not declare, leaves the comparison unanswered, which is not the same as a match.",
       "remedy": "Run `tartci fleet-macos verify-supply` for the specific reason."
+    },
+    "support_agents_drift": {
+      "summary": "bootstrap is on, but a declared support agent did not converge.",
+      "why": "The last self-update's support-agents step failed to install or reload an agent the profile declares; the receipt names which and why.",
+      "remedy": "Read ~/.tartci/state/support-agents/last.json (failures, per-agent action), then run `tartci fleet-macos support-agents apply` on the host."
+    },
+    "support_agents_never": {
+      "summary": "No support-agents receipt on this host yet.",
+      "why": "The receipt is written by self-update after it verifies the lanes; a host that has not updated since the step shipped has none.",
+      "remedy": "Run `tartci fleet-macos support-agents plan` (writes only its receipt), or wait for the next self-update."
+    },
+    "support_agents_ok": {
+      "summary": "Every declared support agent's installed plist matches its render and is loaded from it.",
+      "why": "The render uses the same render_launchd_template.py arguments as each agent's install script, so a match means the host carries exactly what the profile declares."
+    },
+    "support_agents_pending": {
+      "summary": "bootstrap is off; some declared support agent is missing or differs from its render.",
+      "why": "With `[support_agents] bootstrap = false` the step only reports. The finding names the agents it would install or change, and the receipt carries each differing key path.",
+      "remedy": "Read the per-agent diff in ~/.tartci/state/support-agents/last.json. Set bootstrap = true in the host's profile only after that diff is explained and approved."
+    },
+    "support_agents_unreadable": {
+      "summary": "The support-agents receipt or the fleet profile could not be read.",
+      "why": "An unreadable receipt or profile is not evidence the agents are right.",
+      "remedy": "Inspect ~/.tartci/state/support-agents/last.json and the [support_agents] table of ~/.config/tartci/macos-fleet-profile.toml."
     },
     "tool_freshness_current": {
       "summary": "Shipyard and the pulp CLI are at their latest releases, or behind for less than the stale window.",
@@ -388,6 +436,15 @@
       "why": "The launchd watchdog measures it every 30 minutes, so an unmeasured host usually means the watchdog is not running its pass.",
       "remedy": "Run `tartci fleet-macos tool-freshness --refresh`, then check the watchdog log for why it did not.",
       "do_not": "Do not read unmeasured as current."
+    },
+    "undeclared_fleet_agent": {
+      "summary": "A LaunchAgent under the tartci or tmp. prefix is installed but declared nowhere.",
+      "why": "Hand-installed agents drift: on 2026-10-04 a stopgap kicker installed outside any installer ran beside the interval guard on every host. The scan accounts for lanes, declared agents, and agents another codified installer owns; anything else is listed here.",
+      "remedy": "Declare it (add it to the registry and the profile), or retire it deliberately: boot it out and move its plist aside.",
+      "do_not": "Do not expect the support-agents step to remove it; it never removes an agent it does not manage."
+    },
+    "undeclared_fleet_agents_none": {
+      "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
     },
     "warm_vm_none": {
       "summary": "No warm gate VM is parked on this host.",
@@ -430,39 +487,6 @@
       "summary": "Worktrees under /tmp were not checked.",
       "why": "The check needs the [reclaim] table (for the Pulp repo path) and a readable repo; without one this host has no configured Pulp checkout to ask.",
       "remedy": "Enable [reclaim] in the fleet profile, or run `git -C <pulp> worktree list` by hand."
-    },
-    "support_agents_drift": {
-      "summary": "bootstrap is on, but a declared support agent did not converge.",
-      "why": "The last self-update's support-agents step failed to install or reload an agent the profile declares; the receipt names which and why.",
-      "remedy": "Read ~/.tartci/state/support-agents/last.json (failures, per-agent action), then run `tartci fleet-macos support-agents apply` on the host."
-    },
-    "support_agents_never": {
-      "summary": "No support-agents receipt on this host yet.",
-      "why": "The receipt is written by self-update after it verifies the lanes; a host that has not updated since the step shipped has none.",
-      "remedy": "Run `tartci fleet-macos support-agents plan` (writes only its receipt), or wait for the next self-update."
-    },
-    "support_agents_ok": {
-      "summary": "Every declared support agent's installed plist matches its render and is loaded from it.",
-      "why": "The render uses the same render_launchd_template.py arguments as each agent's install script, so a match means the host carries exactly what the profile declares."
-    },
-    "support_agents_pending": {
-      "summary": "bootstrap is off; some declared support agent is missing or differs from its render.",
-      "why": "With `[support_agents] bootstrap = false` the step only reports. The finding names the agents it would install or change, and the receipt carries each differing key path.",
-      "remedy": "Read the per-agent diff in ~/.tartci/state/support-agents/last.json. Set bootstrap = true in the host's profile only after that diff is explained and approved."
-    },
-    "support_agents_unreadable": {
-      "summary": "The support-agents receipt or the fleet profile could not be read.",
-      "why": "An unreadable receipt or profile is not evidence the agents are right.",
-      "remedy": "Inspect ~/.tartci/state/support-agents/last.json and the [support_agents] table of ~/.config/tartci/macos-fleet-profile.toml."
-    },
-    "undeclared_fleet_agent": {
-      "summary": "A LaunchAgent under the tartci or tmp. prefix is installed but declared nowhere.",
-      "why": "Hand-installed agents drift: on 2026-10-04 a stopgap kicker installed outside any installer ran beside the interval guard on every host. The scan accounts for lanes, declared agents, and agents another codified installer owns; anything else is listed here.",
-      "remedy": "Declare it (add it to the registry and the profile), or retire it deliberately: boot it out and move its plist aside.",
-      "do_not": "Do not expect the support-agents step to remove it; it never removes an agent it does not manage."
-    },
-    "undeclared_fleet_agents_none": {
-      "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
     }
   }
 }

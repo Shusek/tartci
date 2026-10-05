@@ -184,6 +184,19 @@ def parse_args(
         help="optional persisted filesystem device identity for --disk-path",
     )
     acquire_parser.add_argument(
+        "--home-floor-path",
+        default="",
+        help="with --disk-path: also judge this path's volume (the home volume) "
+             "against a per-host free-space floor when it is not --disk-path's "
+             "device; a NEW VM lease below it is refused (home_volume_floor.py)",
+    )
+    acquire_parser.add_argument(
+        "--home-floor-hours",
+        type=float,
+        default=1.0,
+        help="hours until the next reclaim pass; the floor covers that much fill",
+    )
+    acquire_parser.add_argument(
         "--disk-expected-mount-path",
         default="",
         help="optional expected mounted filesystem root for --disk-path",

@@ -1572,6 +1572,31 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 75
+        home_volume = None
+        if disk is not None and getattr(args, "home_floor_path", ""):
+            import home_volume_floor
+            home_volume = home_volume_floor.judge(
+                args.home_floor_path, store_dir, time.time(),
+                store_device=str(disk.get("device_id")),
+                hours_to_next_pass=float(getattr(args, "home_floor_hours", 1.0) or 1.0))
+            if home_volume["state"] == "below":
+                # Only a NEW clone is refused here; nothing running is touched.
+                write_records(store_dir, active)
+                settle_waiter(
+                    store_dir, cfg, str(getattr(args, "waiter_id", "") or ""), granted=False
+                )
+                return {
+                    "ok": False,
+                    "reason": "home_volume_below_floor",
+                    "exceeded_axis": {"cores": False, "memory": False, "disk": True},
+                    "requested_cores": lease_size,
+                    "priority": priority,
+                    "priority_class": priority_class,
+                    "disk": disk,
+                    "home_volume": home_volume,
+                    "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems),
+                }, 75
         current_usage = usage(active, cfg)
         build_class = getattr(args, "build_class", None)
         if build_class is not None and priority >= cfg["gate_priority"]:
@@ -1779,6 +1804,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             # commitment and requested is this lease. Status reports the
             # post-commit aggregate separately.
             "disk": disk_state,
+            "home_volume": home_volume,
             "reaped": reaped_summary(reaped),
             "problems": problem_summary(problems),
         }, 0
