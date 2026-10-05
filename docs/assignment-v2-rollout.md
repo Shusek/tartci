@@ -186,7 +186,7 @@ inverts the stated preference on the class that lands code, and the observed
 starvation was an idle hold, not merge-group work consuming both slots. Both
 stay open until a measurement shows the retarget leaves either problem behind.
 
-## Pre-clone demand check (opt-in, m3 canary)
+## Pre-clone demand check (on for every pulp-gate lane)
 
 A V2 lane acquires its VM lease before it clones (`boot_vm_to_ssh` in
 `providers/tart-macos/runner.sh`), and lease acquisition never waits, so no VM
@@ -227,6 +227,14 @@ would refuse on the same observation, and costs one exhaustive scan per clone
 attempt. A skip counts as an idle pass, not a blocked one (like a contended job
 claim), and withdraws the lane's ranked lease waiter. `--print-pre-clone-selection
 <tier>` reports the decision as a safe preflight.
+
+Canary result, m3 both slots, 2026-10-01T09:19Z to 10-04T17:18Z against the
+preceding 80 h: 68 clones skipped (`assignment_v2_pre_clone_denied`), 10
+fail-open clones (`_uncertain`), served jobs up from 156 to 229, no refused
+work. The per-job fall in pre-mint `own_class_empty` matched the no-knob control
+host, so the measured win is the skipped clones, not a lower discard rate. On
+that evidence the key is set on the pulp-gate lane of every shipped profile
+(m1, m3, m5, m5studio).
 
 What it does not fix: two hosts that both clone for the same single job inside
 the same few seconds. Neither can see the other's boot until one mints, so the

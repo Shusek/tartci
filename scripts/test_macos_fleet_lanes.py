@@ -1795,7 +1795,9 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_pre_clone_check_is_a_v2_boolean(self) -> None:
         key = "assignment_pre_clone_demand_check"
-        base = CONFIG.read_text()
+        # The shipped m1 profile enables it; fixtures inject their own value.
+        base, count = re.subn(rf"^{key} = true\n", "", CONFIG.read_text(), flags=re.M)
+        self.assertEqual(count, 1)
         self.assertNotIn(key, base)
         anchor = "assignment_feed_rescue = true"
         self.assertEqual(base.count(anchor), 1)
@@ -1830,9 +1832,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", env)
                     self.assertEqual(pulp_slots, 2)
 
-    def test_pre_clone_check_canary_is_m3_pulp_gate_only(self) -> None:
-        """One canary host: m3's two pulp-gate slots, and no other shipped
-        host or lane."""
+    def test_pre_clone_check_is_on_every_pulp_gate_slot_and_nowhere_else(self) -> None:
+        """Every shipped host's two pulp-gate slots, and no other lane."""
         env_key = "TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertGreaterEqual(len(profiles), 4)
@@ -1847,8 +1848,14 @@ class MacosFleetLaneTests(unittest.TestCase):
                         self.assertEqual(env[env_key], "1")
                         self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
         self.assertEqual(sorted(enabled), [
+            ("m1-macos-fleet.toml", "m1-pulp-gate"),
+            ("m1-macos-fleet.toml", "m1-pulp-gate-slot2"),
             ("m3-macos-fleet.toml", "studio-pulp-gate"),
             ("m3-macos-fleet.toml", "studio-pulp-gate-slot2"),
+            ("m5-macos-fleet.toml", "m5-pulp-gate"),
+            ("m5-macos-fleet.toml", "m5-pulp-gate-slot2"),
+            ("m5studio-macos-fleet.toml", "m5studio-pulp-gate"),
+            ("m5studio-macos-fleet.toml", "m5studio-pulp-gate-slot2"),
         ])
 
     @staticmethod
