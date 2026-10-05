@@ -1679,7 +1679,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         for name, args in (
                 ("support-manifest", ["support-manifest", "write", "--root", ".",
                                       "--output", ".tartci-support-manifest.json"]),
-                ("validate", ["fleet-macos", "validate", str(profile)])):
+                ("validate", ["fleet-macos", "validate", str(profile), "--check-reserve"])):
             result = tartci(cfg, sys_, *args)
             if result.rc != 0:
                 raise Refused(f"{name} failed: {result.text}")
