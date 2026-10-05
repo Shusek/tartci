@@ -35,9 +35,9 @@ log = os.environ["STUB_LOG"]
 with open(log, "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\n")
 if "--print-stats" in sys.argv:
-    calls = sum(1 for _ in open(log))
-    print("files_in_cache\t%d" % (500 if calls < 3 else 150))
-    print("cache_size_kibibyte\t%d" % (5000 if calls < 3 else 1500))
+    evicted = any("--evict-older-than" in line for line in open(log))
+    print("files_in_cache\t%d" % (150 if evicted else 500))
+    print("cache_size_kibibyte\t%d" % (1500 if evicted else 5000))
 sys.exit(int(os.environ.get("STUB_RC", "0")))
 '''
 
@@ -47,7 +47,10 @@ class StubFixture(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.cache = self.tmp / "ccache"
-        (self.cache / "0").mkdir(parents=True)
+        (self.cache / "0" / "1").mkdir(parents=True)
+        for name, size in (("a", 100), ("b", 250)):
+            (self.cache / "0" / "1" / name).write_bytes(b"x" * size)
+        (self.cache / "0" / "stats").write_text("0\n")
         self.state = self.tmp / "state"
         self.log = self.tmp / "calls.jsonl"
         self.stub = self.tmp / "ccache-stub"
@@ -77,13 +80,21 @@ class Evict(StubFixture):
         self.assertEqual(report["status"], "evicted")
         evictions = [call for call in self.calls() if "--evict-older-than" in call]
         self.assertEqual(evictions, [["-d", str(self.cache), "--evict-older-than", "14d"]])
-        self.assertEqual(report["before"]["files_in_cache"], 500)
-        self.assertEqual(report["after"]["files_in_cache"], 150)
+        # Entries and bytes come from the files, not ccache's counters.
+        self.assertEqual(report["before"], {"entries": 2, "bytes": 350})
+        self.assertEqual(report["after"], {"entries": 2, "bytes": 350})
+        self.assertEqual(report["counters_after"]["files_in_cache"], 150)
 
     def test_a_running_or_leased_vm_blocks_the_trim(self):
         report = self.evict(busy="a Tart VM is running on this host")
         self.assertEqual(report["status"], "skipped")
         self.assertIn("Tart VM", report["reason"])
+        self.assertEqual(self.calls(), [])
+
+    def test_a_held_vm_lease_blocks_the_trim(self):
+        report = self.evict(busy="1 VM lease(s) held on this host")
+        self.assertEqual(report["status"], "skipped")
+        self.assertIn("VM lease", report["reason"])
         self.assertEqual(self.calls(), [])
 
     def test_a_held_guard_lock_blocks_the_trim(self):
@@ -134,6 +145,18 @@ class Evict(StubFixture):
         self.assertEqual(report["status"], "skipped")
 
 
+class CacheDir(unittest.TestCase):
+    def test_the_runners_variable_wins_then_the_legacy_one_then_the_profile(self):
+        both = {"TARTCI_CI_CACHE": "/Volumes/Workshop/ci-cache", "PULP_CI_CACHE": "/legacy"}
+        self.assertEqual(trim.cache_dir("/profile/root", env=both),
+                         Path("/Volumes/Workshop/ci-cache/ccache"))
+        self.assertEqual(trim.cache_dir("/profile/root", env={"PULP_CI_CACHE": "/legacy"}),
+                         Path("/legacy/ccache"))
+        self.assertEqual(trim.cache_dir("/profile/root", env={}), Path("/profile/root/ccache"))
+        self.assertEqual(trim.cache_dir(None, env={}),
+                         Path("~/.cache/pulp-ci").expanduser() / "ccache")
+
+
 class Settings(unittest.TestCase):
     def test_bounds(self):
         self.assertEqual(trim.validate({"gate_ccache_trim": True}), [])
@@ -156,12 +179,12 @@ class ReclaimEvent(unittest.TestCase):
     def test_the_pass_event_names_the_eviction_and_hides_a_pass_that_was_not_due(self):
         receipt = {"mode": "fix", "report": {}, "pulp_reapers": {},
                    "gate_ccache_trim": {"enabled": True, "status": "evicted", "max_age_days": 14,
-                                        "before": {"files_in_cache": 690},
-                                        "after": {"files_in_cache": 149655}}}
+                                        "before": {"entries": 506745, "bytes": 14_300_000_000},
+                                        "after": {"entries": 149655, "bytes": 5_500_000_000}}}
         summary = disk_reclaim.pass_summary(receipt, 0)
-        self.assertEqual(summary["gate_ccache_trim"]["after"], {"files_in_cache": 149655})
+        self.assertEqual(summary["gate_ccache_trim"]["after"]["entries"], 149655)
         self.assertEqual(disk_reclaim.gate_ccache_detail(summary["gate_ccache_trim"]),
-                         "; gate ccache evicted >14d: 690 -> 149655 files")
+                         "; gate ccache evicted >14d: 506745 -> 149655 entries (14.3 -> 5.5 GB)")
         self.assertEqual(disk_reclaim.gate_ccache_detail({"enabled": True, "status": "not_due"}), "")
         self.assertIn("Tart VM", disk_reclaim.gate_ccache_detail(
             {"enabled": True, "status": "skipped", "reason": "a Tart VM is running on this host"}))
@@ -178,6 +201,13 @@ class Run(StubFixture):
         return trim.run(fix=True, profile=profile, state_dir=self.state, now=now,
                         ccache=str(self.stub), busy_probe=lambda: busy)
 
+    def setUp(self) -> None:
+        super().setUp()
+        for name in ("TARTCI_CI_CACHE", "PULP_CI_CACHE"):
+            self.addCleanup(os.environ.__setitem__, name, os.environ[name]) \
+                if name in os.environ else self.addCleanup(os.environ.pop, name, None)
+            os.environ.pop(name, None)
+
     def opted_in(self, extra: str = "") -> Path:
         return self.profile(f'[host]\ncache_root = "{self.tmp}"\n'
                             f"[reclaim]\ngate_ccache_trim = true\n{extra}")
@@ -191,6 +221,21 @@ class Run(StubFixture):
         report = self.run_pass(self.opted_in("gate_ccache_max_age_days = 21\n"), now=1e9)
         self.assertEqual(report["status"], "evicted")
         self.assertIn(["-d", str(self.cache), "--evict-older-than", "21d"], self.calls())
+
+    def test_tartci_ci_cache_overrides_the_profile_cache_root(self):
+        os.environ["TARTCI_CI_CACHE"] = str(self.tmp)
+        profile = self.profile('[host]\ncache_root = "/nonexistent/elsewhere"\n'
+                               "[reclaim]\ngate_ccache_trim = true\n")
+        report = self.run_pass(profile, now=1e9)
+        self.assertEqual(report["status"], "evicted")
+        self.assertIn(["-d", str(self.cache), "--evict-older-than", "14d"], self.calls())
+
+    def test_disabled_is_a_no_op(self):
+        report = self.run_pass(self.profile('[host]\ncache_root = "%s"\n[reclaim]\n'
+                                            "gate_ccache_trim = false\n" % self.tmp), now=1e9)
+        self.assertFalse(report["enabled"])
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.state / trim.STAMP_FILE).exists())
 
     def test_at_most_once_per_interval_and_a_skip_retries_next_pass(self):
         profile = self.opted_in("gate_ccache_trim_interval_hours = 24\n")
@@ -260,7 +305,10 @@ class RealCcacheTests(unittest.TestCase):
         remaining = self.entries()
         self.assertFalse(old & remaining, "entries unused for 30 days must be evicted")
         self.assertEqual(recent, remaining, "recent entries must stay")
-        self.assertEqual(report["after"]["files_in_cache"], len(remaining))
+        sizes = sum(path.stat().st_size for path in remaining)
+        self.assertEqual(report["after"], {"entries": len(remaining), "bytes": sizes})
+        self.assertGreater(report["before"]["entries"], report["after"]["entries"])
+        self.assertEqual(report["counters_after"]["files_in_cache"], len(remaining))
 
 
 if __name__ == "__main__":

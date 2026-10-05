@@ -894,8 +894,8 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
                      if receipt.get("mode") == "fix" else 0)
     gate_ccache = receipt.get("gate_ccache_trim") or report.get("gate_ccache_trim") or {}
     summary["gate_ccache_trim"] = ({key: gate_ccache.get(key) for key in (
-        "enabled", "status", "reason", "max_age_days", "interval_hours", "elapsed_s",
-        "before", "after", "last_completed_at")} if gate_ccache else None)
+        "enabled", "status", "reason", "cache", "max_age_days", "interval_hours", "elapsed_s",
+        "before", "after", "counters_after", "last_completed_at")} if gate_ccache else None)
     summary["boot_volume"] = report.get("boot_volume")
     summary["scan_timeouts"] = report.get("scan_timeouts") or []
     summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
@@ -945,14 +945,19 @@ def scratch_detail(scratch: dict[str, Any] | None) -> str:
 
 
 def gate_ccache_detail(trim: dict[str, Any] | None) -> str:
-    """"; gate ccache evicted >14d: 506745 -> 149655 files"."""
+    """"; gate ccache evicted >14d: 506745 -> 149655 entries (14.3 -> 5.5 GB)"."""
     if not trim or not trim.get("enabled") or trim.get("status") == "not_due":
         return ""
     if trim.get("status") != "evicted":
         return f"; gate ccache {trim.get('status')}: {trim.get('reason') or '-'}"
-    before = (trim.get("before") or {}).get("files_in_cache", "?")
-    after = (trim.get("after") or {}).get("files_in_cache", "?")
-    return f"; gate ccache evicted >{trim.get('max_age_days')}d: {before} -> {after} files"
+    before, after = trim.get("before") or {}, trim.get("after") or {}
+
+    def gb(side: dict[str, Any]) -> str:
+        return f"{side['bytes'] / 1e9:.1f}" if isinstance(side.get("bytes"), int) else "?"
+
+    return (f"; gate ccache evicted >{trim.get('max_age_days')}d: "
+            f"{before.get('entries', '?')} -> {after.get('entries', '?')} entries "
+            f"({gb(before)} -> {gb(after)} GB)")
 
 
 def boot_detail(boot: dict[str, Any] | None) -> str:

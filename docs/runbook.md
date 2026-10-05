@@ -2239,13 +2239,15 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 
   With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
   default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs
-  `ccache -d <cache_root>/ccache --evict-older-than <N>d` on the gate ccache,
+  `ccache -d $TARTCI_CI_CACHE/ccache --evict-older-than <N>d` on the gate ccache
+  (the cache the runners mount; without the variable, the profile's
+  `[host].cache_root`),
   at most once per interval and only while no Tart VM runs or holds a VM lease
   and the pre-boot guard's lock is free (`scripts/gate_ccache_trim.py`). ccache
   recounts its files and size counters during the eviction, which the gate
   cache needs: its counters drift about 100x low, so ccache's own cleanup never
-  starts. The event's `gate_ccache_trim` field shows the counts before and
-  after. Never run a bare `ccache -c` on that cache from the host: the host's
+  starts. The event's `gate_ccache_trim` field shows the entries and bytes on
+  disk before and after. Never run a bare `ccache -c` on that cache from the host: the host's
   `ccache` has no `ccache.conf` there and treats its 5 GiB default as the cap,
   not the guests' 40G; once the counters are recounted that evicts by size.
 
