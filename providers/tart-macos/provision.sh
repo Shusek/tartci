@@ -13,6 +13,9 @@ export TART_HOME="${TART_HOME:-$HOME/VMs}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PULP_MANIFEST="$ROOT/manifests/pulp.macos.toml"
 PULP_READINESS="$ROOT/providers/common/pulp-macos-readiness.py"
+# The readiness reporter imports tomllib; an operator ssh shell may resolve python3 to 3.9.
+# shellcheck source=../common/toml-python.lib.sh
+. "$ROOT/providers/common/toml-python.lib.sh"
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -66,7 +69,7 @@ case "$cmd" in
   pulp-readiness)
     [ -f "$PULP_MANIFEST" ] || die "Pulp macOS manifest missing: $PULP_MANIFEST"
     [ -f "$PULP_READINESS" ] || die "Pulp readiness reporter missing: $PULP_READINESS"
-    python3 "$PULP_READINESS" "$PULP_MANIFEST"
+    tartci_toml_python "$PULP_READINESS" "$PULP_MANIFEST"
     ;;
   help|-h|--help)
     usage

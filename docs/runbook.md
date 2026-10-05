@@ -804,6 +804,13 @@ providers/proxmox-linux/bake-pulp-golden.sh \
   --guest-host <candidate-ip>
 ```
 
+The bake, `tart-linux/provision.sh` and `tart-macos/provision.sh pulp-readiness`
+read their TOML manifests through `tartci_toml_python`
+(`providers/common/toml-python.lib.sh`, the resolver the `tartci` shim sources),
+not a bare `python3`: an operator's ssh login shell on m1 resolves `python3` to
+`/usr/bin/python3` 3.9.6, which has no tomllib. With no 3.11+ interpreter found,
+they stop and say `set TARTCI_PYTHON`.
+
 > **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under
 > Prism, but the cross-build toolchain story there (MSVC x64 cross + x64 deps) is
 > heavier and not yet wired — `--target-arch` is Linux/Rosetta today. Tracked
