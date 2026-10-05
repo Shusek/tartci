@@ -169,7 +169,12 @@ class FakeSystem(su.System):
             if "merge-base" in a:
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
-                return ok(self.log_lines)
+                # Honour `base..main` the way git does: commits newer than base.
+                base = next((x.split("..")[0] for x in a if ".." in x), None)
+                lines = self.log_lines.splitlines(keepends=True)
+                cut = next((i for i, line in enumerate(lines) if base and line.startswith(base)),
+                           len(lines))
+                return ok("".join(lines[:cut]))
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
@@ -480,6 +485,41 @@ class SkewTests(Base):
         self.assertIn("1 commits behind main", su.render_skew(skew))
         self.assertIn("STALE", su.render_skew(skew))
         self.assertIn("UNKNOWN", su.render_skew(None))
+
+
+class SkewAfterApplyTests(Base):
+    """A verified apply records skew for the generation it installed.
+
+    m3, 2026-09-28: skew.json was measured at 05:30:43Z, the update to the
+    newest commit was verified at 05:39Z, and status went on reading "1 commits
+    behind main" because skew.json is otherwise written only before the run.
+    """
+
+    def skew(self) -> dict:
+        return json.loads((self.cfg.state_dir / "skew.json").read_text())
+
+    def test_a_verified_apply_rewrites_skew_for_the_installed_target(self) -> None:
+        self.assertUpdated(self.apply())
+        skew = self.skew()
+        self.assertEqual((skew["installed"], skew["recorded_by"]), (T_OLD, "verified_apply"))
+        # Only the still-soaking commit is ahead now, not the one just installed.
+        self.assertEqual(skew["behind"], 1)
+        steps = [step["step"] for step in json.loads(
+            Path(self.last()["receipt"]).read_text())["steps"]]
+        self.assertIn("skew", steps)
+
+    def test_a_failed_skew_record_never_fails_the_update(self) -> None:
+        real, calls = su.measure_skew, []
+
+        def second_call_fails(*args, **kwargs):
+            calls.append(args)
+            if len(calls) > 1:
+                raise OSError("disk")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(su, "measure_skew", side_effect=second_call_fails):
+            self.assertUpdated(self.apply())
+        self.assertEqual(len(calls), 2)
 
 
 class HappyPathTests(Base):
@@ -1253,7 +1293,7 @@ class SurfaceTests(Base):
         import macos_fleet_lanes as fleet
         su._write_json(self.cfg.state_dir / "skew.json", {
             "state": "behind", "behind": 3, "oldest_undeployed": "2026-09-23T06:51:41Z",
-            "stale": False, "measured_at": "now"})
+            "stale": False, "measured_at": su._iso(time.time())})
         self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
                          "self_update_current")
         self.assertEqual(fleet_doctor.check_self_update(None).code, "self_update_unmeasured")
