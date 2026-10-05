@@ -64,6 +64,10 @@ CODES: tuple[str, ...] = (
     "effective_generation_mismatch",
     "fleet_not_ready",
     "fleet_ready",
+    "gate_reserve_fits",
+    "gate_reserve_not_applicable",
+    "gate_reserve_overcommitted",
+    "gate_reserve_unknown",
     "generation_path_exec",
     "hold_receipt_malformed",
     "hold_receipt_present",
@@ -91,10 +95,6 @@ CODES: tuple[str, ...] = (
     "power_ok",
     "power_sleeps",
     "power_unknown",
-    "signing_prompts_not_applicable",
-    "signing_prompts_ok",
-    "signing_prompts_risk",
-    "signing_prompts_unknown",
     "profile_drift",
     "profile_drift_unknown",
     "profile_in_sync",
@@ -121,14 +121,18 @@ CODES: tuple[str, ...] = (
     "self_update_current",
     "self_update_problem",
     "self_update_unmeasured",
+    "signing_prompts_not_applicable",
+    "signing_prompts_ok",
+    "signing_prompts_risk",
+    "signing_prompts_unknown",
+    "supply_match",
+    "supply_mismatch",
+    "supply_unknown",
     "support_agents_drift",
     "support_agents_never",
     "support_agents_ok",
     "support_agents_pending",
     "support_agents_unreadable",
-    "supply_match",
-    "supply_mismatch",
-    "supply_unknown",
     "tool_freshness_current",
     "tool_freshness_stale",
     "tool_freshness_unmeasured",
@@ -738,6 +742,24 @@ def check_self_update(summary: dict | None) -> Finding:
                    {"skew": summary.get("skew"), "last": summary.get("last")})
 
 
+def check_gate_reserve(value: dict | None, *, installed_present: bool) -> Finding:
+    """Each gate lane against this host's live gate reserve (gate_reserve_fit.py)."""
+    if not installed_present:
+        return Finding("gate_reserve", NOT_APPLICABLE, "gate_reserve_not_applicable",
+                       "no installed fleet profile")
+    value = value or {}
+    lines = value.get("lines") or []
+    if value.get("problem"):
+        return Finding("gate_reserve", PROBLEM, "gate_reserve_overcommitted",
+                       f"{value['problem']}; resizing is a profile decision with the host's "
+                       "owner and must not take agent cores", {"gate_reserve": value})
+    if not lines or "UNKNOWN" in lines[0]:
+        return Finding("gate_reserve", UNKNOWN, "gate_reserve_unknown",
+                       lines[0] if lines else "not computed", {"gate_reserve": value})
+    return Finding("gate_reserve", OK, "gate_reserve_fits", "; ".join(lines),
+                   {"gate_reserve": value})
+
+
 def check_tool_freshness(summary: dict | None) -> Finding:
     """Shipyard and the pulp CLI against their latest releases."""
     if not isinstance(summary, dict) or summary.get("state") is None:
@@ -1328,6 +1350,15 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception:  # noqa: BLE001 - reported as unmeasured
             self_update_summary = None
     findings.append(check_self_update(self_update_summary))
+    if config.is_file():
+        try:
+            import macos_fleet_lanes
+            reserve_value = macos_fleet_lanes.gate_reserve_summary(config)
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            reserve_value = {"lines": [f"gate reserve: UNKNOWN ({exc})"], "problem": None}
+    else:
+        reserve_value = None
+    findings.append(check_gate_reserve(reserve_value, installed_present=config.is_file()))
     if tool_freshness_summary is None:
         try:
             import tool_freshness

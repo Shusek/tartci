@@ -1711,6 +1711,25 @@ fleet`), and check GitHub's job history against it with
   `~/.tartci/state/self-update/attempts/*.json` shows which code orchestrated
   each step. A PR that changes orchestration should say "effective from the
   update after next".
+- **Gate-reserve ratchet.** Prepare runs `fleet-macos validate <profile>
+  --check-reserve`, which fits each gate lane (no explicit priority, or
+  `priority = "gate"`) into THIS host's gate reserve from its live
+  host-profile, per axis: `supervisors x vm_cores` (default `vm_pool_cores`)
+  against `reserved_gate_cores`, and `supervisors x` the derived VM memory
+  against `reserved_gate_mem_mb` (`scripts/gate_reserve_fit.py`). Every
+  overcommitted pair is printed as `gate_reserve_overcommitted lane=...
+  axis=... demand=... reserve=...` on every update, and `tartci pool status`
+  and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
+  the installed profile. The update is refused only when the target profile's
+  overcommit on some (lane, axis) is strictly greater than the installed
+  profile's, both against the same live reserve (`gate_reserve_worse`). This is
+  a ratchet because two hosts overcommit today (m1: 2 x 3 against 3; m5:
+  2 x 6 against 8), and refusing them would leave both unable to update; a
+  check that let the overcommit grow would be no check (m3, 2026-10-04: 2 x 12
+  against 14 lease-denied the second Pulp slot while jobs queued, #373).
+  Resizing is a profile decision with the host's owner and must not take
+  agent cores. The flag is passed by the orchestrating (installed)
+  generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.

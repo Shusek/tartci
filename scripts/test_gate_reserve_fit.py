@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Gate lanes against each host's own gate reserve: report always, refuse only worse.
+
+m3, 2026-10-04 (#373): two 12-core Pulp gate slots against a 14-core reserve;
+with agent builds holding the rest, the second slot was lease-denied 8 times
+and macos jobs queued. The fit is computed per host from its live
+host-profile. The host facts below were read with `tartci host-profile --json`
+on each host on 2026-10-05.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import fleet_doctor as fd  # noqa: E402
+import gate_reserve_fit as grf  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+HOSTS = {
+    "m3": {"role": "dedicated-builder", "reserved_gate_cores": 14, "vm_pool_cores": 14,
+           "reserved_gate_mem_mb": 44110, "per_compile_job_mem_mb": 1536},
+    "m5studio": {"role": "dev-overflow", "reserved_gate_cores": 20, "vm_pool_cores": 6,
+                 "reserved_gate_mem_mb": 192196, "per_compile_job_mem_mb": 1536},
+    "m1": {"role": "light", "reserved_gate_cores": 3, "vm_pool_cores": 3,
+           "reserved_gate_mem_mb": 27648, "per_compile_job_mem_mb": 1536},
+    "m5": {"role": "dev-overflow", "reserved_gate_cores": 8, "vm_pool_cores": 6,
+           "reserved_gate_mem_mb": 67876, "per_compile_job_mem_mb": 1536},
+}
+
+
+def profile(host: str) -> dict:
+    return tomllib.loads((ROOT / "profiles" / f"{host}-macos-fleet.toml").read_text())
+
+
+def pulp_gate(data: dict) -> dict:
+    return next(lane for lane in data["lane"] if lane["id"] == "pulp-gate")
+
+
+class FitTests(unittest.TestCase):
+    def test_m3_and_m5studio_fit_and_m1_and_m5_overcommit_cores(self) -> None:
+        expected = {"m3": [], "m5studio": [],
+                    "m1": ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=6 reserve=3"],
+                    "m5": ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=12 reserve=8"]}
+        for host, lines in expected.items():
+            with self.subTest(host=host):
+                self.assertEqual(grf.finding_lines(grf.fit(profile(host), HOSTS[host])), lines)
+
+    def test_an_explicit_vm_lane_is_not_a_gate_lane(self) -> None:
+        data = {"lane": [{"id": "a", "priority": "vm", "supervisors": 2},
+                         {"id": "b", "priority": "gate"}, {"id": "c"}]}
+        self.assertEqual([lane["id"] for lane in grf.gate_lanes(data)], ["b", "c"])
+
+    def test_vm_memory_matches_the_shell_derivation(self) -> None:
+        script = (f"TARTCI_ROOT={ROOT}; . {ROOT}/providers/common/vm-lease.lib.sh; "
+                  "tartci_profile_value(){ printf 1536; }; "
+                  "for c in 1 3 6 7 8 14; do tartci_vm_lease_derived_mem_mb $c; echo; done")
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                             timeout=30).stdout.split()
+        self.assertEqual([int(v) for v in out], [grf.vm_mem_mb(c) for c in (1, 3, 6, 7, 8, 14)])
+
+
+class RatchetTests(unittest.TestCase):
+    def test_the_373_sizing_is_refused_against_the_installed_profile(self) -> None:
+        installed, target = profile("m3"), profile("m3")
+        pulp_gate(target)["vm_cores"] = 12
+        rows, refusals = grf.ratchet(installed, target, HOSTS["m3"])
+        self.assertEqual(refusals, ["gate_reserve_worse lane=pulp-gate axis=cores "
+                                    "installed_over=0 target_over=10 reserve=14"])
+
+    def test_m1_and_m5_report_on_every_update_and_never_block(self) -> None:
+        for host in ("m1", "m5"):
+            with self.subTest(host=host):
+                rows, refusals = grf.ratchet(profile(host), profile(host), HOSTS[host])
+                self.assertEqual(refusals, [])
+                self.assertEqual(len(grf.finding_lines(rows)), 1)
+
+    def test_a_smaller_overcommit_passes_and_reports_smaller(self) -> None:
+        target = profile("m5")
+        pulp_gate(target)["vm_cores"] = 5
+        rows, refusals = grf.ratchet(profile("m5"), target, HOSTS["m5"])
+        self.assertEqual(refusals, [])
+        self.assertEqual(grf.finding_lines(rows),
+                         ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=10 reserve=8"])
+
+    def test_a_first_install_reports_and_refuses_nothing(self) -> None:
+        rows, refusals = grf.ratchet(None, profile("m1"), HOSTS["m1"])
+        self.assertEqual((len(grf.finding_lines(rows)), refusals), (1, []))
+
+
+class ValidateCliTests(unittest.TestCase):
+    def run_validate(self, host: str, target_text: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target.toml"
+            target.write_text(target_text)
+            facts = Path(td) / "host.json"
+            facts.write_text(json.dumps(HOSTS[host]))
+            return subprocess.run(
+                [sys.executable, "scripts/macos_fleet_lanes.py", "validate", str(target),
+                 "--check-reserve", "--installed", str(ROOT / "profiles" / f"{host}-macos-fleet.toml"),
+                 "--host-profile-json", str(facts)],
+                cwd=ROOT, capture_output=True, text=True, timeout=60)
+
+    def test_validate_refuses_the_worse_m3_profile(self) -> None:
+        text = (ROOT / "profiles" / "m3-macos-fleet.toml").read_text()
+        self.assertIn("vm_cores = 7", text)
+        res = self.run_validate("m3", text.replace("vm_cores = 7", "vm_cores = 12", 1))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("gate_reserve_worse lane=pulp-gate axis=cores", res.stderr)
+
+    def test_validate_reports_m1_and_passes(self) -> None:
+        res = self.run_validate("m1", (ROOT / "profiles" / "m1-macos-fleet.toml").read_text())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("gate_reserve_overcommitted lane=pulp-gate axis=cores demand=6 reserve=3",
+                      res.stdout)
+
+    def test_plain_validate_is_unchanged(self) -> None:
+        res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
+                              str(ROOT / "profiles" / "m1-macos-fleet.toml")],
+                             cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("gate_reserve", res.stdout)
+
+
+class DoctorTests(unittest.TestCase):
+    def test_overcommitted_fits_unknown_and_not_applicable(self) -> None:
+        bad = fd.check_gate_reserve({"lines": ["gate reserve: OVERCOMMITTED lane=pulp-gate ..."],
+                                     "problem": "lane=pulp-gate axis=cores demand=6 reserve=3"},
+                                    installed_present=True)
+        self.assertEqual((bad.state, bad.code), (fd.PROBLEM, "gate_reserve_overcommitted"))
+        self.assertIn("must not take agent cores", bad.detail)
+        good = fd.check_gate_reserve({"lines": ["gate reserve: every gate lane fits"],
+                                      "problem": None}, installed_present=True)
+        self.assertEqual(good.code, "gate_reserve_fits")
+        self.assertEqual(fd.check_gate_reserve({"lines": ["gate reserve: UNKNOWN (x)"]},
+                                               installed_present=True).code,
+                         "gate_reserve_unknown")
+        self.assertEqual(fd.check_gate_reserve(None, installed_present=False).state,
+                         fd.NOT_APPLICABLE)
+
+
+if __name__ == "__main__":
+    unittest.main()
