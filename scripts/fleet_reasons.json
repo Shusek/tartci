@@ -302,6 +302,39 @@
       "why": "An unparseable receipt is not evidence of a healthy reclaimer.",
       "remedy": "Inspect ~/.tartci/state/reclaim/last-run.json; the next pass rewrites it atomically."
     },
+    "reuse_canary_never": {
+      "summary": "The reuse canary is installed but has recorded no pass yet.",
+      "why": "It runs every 6 h and RunAtLoad is off, so a freshly installed agent is quiet for up to 6 h. Unknown rather than a problem until the 13 h stale bound.",
+      "remedy": "Wait for the first pass, or check `launchctl print gui/$(id -u)/com.danielraffel.tartci.reuse-canary` and ~/Library/Logs/tartci/reuse-canary.log."
+    },
+    "reuse_canary_no_bindable": {
+      "summary": "The reuse canary ran, but no pass in 36 h produced a bindable reuse record.",
+      "why": "Pull requests only bind mac validation to an earlier run when a bindable record exists; the canary is what keeps one. Passes that refuse, fail, time out, or produce non-bindable records leave every PR running the full mac lane.",
+      "remedy": "Read the newest receipt under ~/.tartci/state/reuse-canary/attempts/: its outcome, shipyard_rc, and reuse_records[].reason say which. A refusal names its gate; a failed run has its log in ~/Library/Logs/tartci/reuse-canary.log."
+    },
+    "reuse_canary_not_installed": {
+      "summary": "The fleet profile enables the reuse canary, but its LaunchAgent is not installed.",
+      "why": "The canary is installed only through its [support_agents] declaration, which installs nothing while bootstrap = false.",
+      "remedy": "Check `tartci fleet-macos support-agents plan`: reuse-canary should read missing there. It is installed once the host's [support_agents] bootstrap is turned on."
+    },
+    "reuse_canary_off": {
+      "summary": "The reuse canary is not enabled on this host.",
+      "why": "Only hosts whose Shipyard runs in shadow_compare mode enable [reuse_canary] in their fleet profile."
+    },
+    "reuse_canary_ok": {
+      "summary": "The reuse canary produced a bindable reuse record within 36 h.",
+      "why": "Its newest bindable receipt is younger than the 36 h bound and a pass ran within 13 h."
+    },
+    "reuse_canary_stale": {
+      "summary": "The reuse canary has recorded no pass for over 13 h.",
+      "why": "It runs every 6 h and the interval guard kicks an overdue one at 12 h, so silence past 13 h means the agent is not running at all, not that it had nothing to do (a pass with nothing due still writes a receipt).",
+      "remedy": "Check `launchctl print gui/$(id -u)/com.danielraffel.tartci.reuse-canary` (loaded, last exit code) and the interval guard's receipt."
+    },
+    "reuse_canary_unreadable": {
+      "summary": "The reuse canary's state or the fleet profile could not be read.",
+      "why": "An unreadable receipt or profile is not evidence the canary is healthy.",
+      "remedy": "Inspect ~/.tartci/state/reuse-canary/ and the [reuse_canary] table of ~/.config/tartci/macos-fleet-profile.toml."
+    },
     "sealed_launcher_bundle": {
       "summary": "This host execs a sealed launcher bundle, so a generation stage alone cannot change what it runs.",
       "why": "Agents exec a signed Developer ID app, and that app runs its own sealed copy of the support cohort from inside the bundle. Staging a newer generation beside it succeeds, writes a receipt and exits 0 while the bundle keeps executing the cohort it was sealed around. This is how a host silently misses every fix it appears to have received.",

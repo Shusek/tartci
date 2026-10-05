@@ -523,13 +523,14 @@ bootstrap = false
 ```
 
 `scripts/support_agents.py` holds the registry of declarable agents (today the
-disk reclaimer, the artifact-cache refresher, the keychain unlocker, and the
-schedule backstop). Each renders with exactly the `render_launchd_template.py`
+disk reclaimer, the artifact-cache refresher, the keychain unlocker, the
+schedule backstop, and the reuse canary). Each with an install script renders with exactly the `render_launchd_template.py`
 arguments its `install_*_agent.sh` uses, so a host those scripts installed
 reads byte-identical; `scripts/test_support_agents.py` proves that per agent.
 An agent's own settings stay where they are (`schedule_backstop`, `[reclaim]`);
 this table only says which agents the host carries. `schedule-backstop` must be
-declared exactly when `schedule_backstop` is `live` or `dry-run`.
+declared exactly when `schedule_backstop` is `live` or `dry-run`, and
+`reuse-canary` exactly when `[reuse_canary] enabled = true`.
 
 After self-update verifies the lanes it runs `tartci fleet-macos support-agents
 auto`. With `bootstrap = false` that is a plan: it compares each declared
@@ -552,6 +553,58 @@ and a `tartci doctor fleet` finding (`support_agents_pending`,
 refuses a target whose checkout cannot render a declared agent. The
 `install_*_agent.sh` scripts and their `tartci setup` calls remain until
 `bootstrap = true` is proven across the fleet.
+
+## Reuse canary for Shipyard's bindable mac records
+
+Shipyard binds a pull request's mac validation to an earlier run of the same
+tree only when a bindable record for that tree exists on a host whose Shipyard
+runs in `shadow_compare` mode. Pull requests run only the fast tier, so nothing
+else writes one.
+
+`com.danielraffel.tartci.reuse-canary.plist.template` runs
+`scripts/reuse_canary.py` every 6 h (`RunAtLoad` off: a pass builds Pulp for up
+to three hours, so loading the agent must not start one). Each pass:
+
+- does nothing when another pass holds its lock;
+- refuses, touching nothing, when pool participation is off or draining (which
+  covers a self-update in progress);
+- reads origin/main's head with `git ls-remote` and skips it when today's
+  ledger holds a completed (`ran`) pass for that SHA or two starts of it; a
+  failed, timed-out or unrecorded pass, or a half-run, may retry within that cap;
+- refuses unless `shipyard --json reuse records` reports
+  `changed_surface_execution_mode` = `shadow_compare`;
+- checks out a dedicated worktree, `<worktrees_root>/pulp-reuse-canary`, at the
+  SHA (lineage-marked active; never another disk when the root's volume is not
+  mounted);
+- runs `shipyard run --targets mac` there with `PULP_BUILD_CLASS=background`,
+  in its own process group, bounded at three hours, with a progress line in
+  `~/Library/Logs/tartci/reuse-canary.log` every two minutes;
+- records `shipyard --json reuse records` for the SHA verbatim. Only that
+  output says whether the pass is bindable; an empty list after a pass means
+  the store filed nothing;
+- writes a receipt under `~/.tartci/state/reuse-canary/attempts/` and one
+  terminal event in `events.jsonl` beside it.
+
+It is enabled per host by the fleet profile:
+
+```toml
+[reuse_canary]
+enabled = true
+repo = "/Volumes/Workshop/Code/pulp"
+worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+```
+
+Only the m3 and m1 profiles enable it, and declare `reuse-canary` in their
+`[support_agents]` table; it is installed through that declaration (there is no
+separate install script), so it reaches a host only once that host's
+`bootstrap` is on.
+
+The agent is in `UNINTERRUPTIBLE_AGENTS`: a `shipyard run` cut mid-way leaves a
+half-run no later pass can classify. The interval guard kicks it like any fleet
+timer when launchd stops starting timers, so a stalled host still runs it within
+12 h. `tartci doctor fleet` reports `reuse_canary_stale` when no pass has been
+recorded for 13 h and `reuse_canary_no_bindable` when no pass has produced a
+bindable record for 36 h. Tests: `scripts/test_reuse_canary.py`.
 
 ## Release CLI macOS launchd rule
 

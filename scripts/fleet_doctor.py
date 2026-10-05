@@ -110,6 +110,13 @@ CODES: tuple[str, ...] = (
     "reclaim_pass_degraded",
     "reclaim_stale",
     "reclaim_unreadable",
+    "reuse_canary_never",
+    "reuse_canary_no_bindable",
+    "reuse_canary_not_installed",
+    "reuse_canary_off",
+    "reuse_canary_ok",
+    "reuse_canary_stale",
+    "reuse_canary_unreadable",
     "sealed_launcher_bundle",
     "self_update_current",
     "self_update_problem",
@@ -972,6 +979,42 @@ def check_support_agents(value: dict | None) -> list[Finding]:
     return [found, extra]
 
 
+def check_reuse_canary(value: dict | None) -> Finding:
+    """Whether the reuse canary keeps a bindable record (scripts/reuse_canary.py)."""
+    value = value or {"state": "unreadable", "error": "no status"}
+    state = value.get("state")
+    facts = {"reuse_canary": value}
+
+    def hours(key: str) -> str:
+        at = value.get(key)
+        return "never" if not at else f"{(float(value.get('now') or 0) - float(at)) / 3600:.1f} h ago"
+
+    if state == "off":
+        return Finding("reuse_canary", OK, "reuse_canary_off",
+                       "reuse canary not enabled on this host", facts)
+    if state == "not_installed":
+        return Finding("reuse_canary", PROBLEM, "reuse_canary_not_installed",
+                       "the profile enables the reuse canary but its LaunchAgent is not installed",
+                       facts)
+    if state == "never":
+        return Finding("reuse_canary", UNKNOWN, "reuse_canary_never",
+                       "reuse canary installed; no pass recorded yet", facts)
+    if state == "stale":
+        return Finding("reuse_canary", PROBLEM, "reuse_canary_stale",
+                       f"no reuse canary pass for over 13 h (last {hours('newest_receipt_at')})",
+                       facts)
+    if state == "no_bindable":
+        return Finding("reuse_canary", PROBLEM, "reuse_canary_no_bindable",
+                       "no bindable reuse record for 36 h (last bindable "
+                       f"{hours('newest_bindable_at')}; newest pass "
+                       f"{value.get('newest_outcome')})", facts)
+    if state == "ok":
+        return Finding("reuse_canary", OK, "reuse_canary_ok",
+                       f"last bindable reuse record {hours('newest_bindable_at')}", facts)
+    return Finding("reuse_canary", UNKNOWN, "reuse_canary_unreadable",
+                   f"reuse canary status unreadable: {value.get('error')}", facts)
+
+
 def check_power(value: dict | None) -> Finding:
     """Whether the host stays awake on AC (scripts/power_status.py)."""
     import power_status
@@ -1228,6 +1271,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             reclaim_value: dict | None = None,
             launchd_timers_value: dict | None = None,
             support_agents_value: dict | None = None,
+            reuse_canary_value: dict | None = None,
             power_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
@@ -1337,6 +1381,16 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             support_agents_value = {"state": "unreadable", "error": str(exc)}
     findings.extend(check_support_agents(support_agents_value))
+    if reuse_canary_value is None:
+        try:
+            import reuse_canary
+            settings, _ = reuse_canary.load_settings(config_dir / "macos-fleet-profile.toml")
+            reuse_canary_value = reuse_canary.status(
+                home / ".tartci" / "state" / "reuse-canary", settings,
+                plist=agents_dir / f"{reuse_canary.LABEL}.plist")
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            reuse_canary_value = {"state": "unreadable", "error": str(exc)}
+    findings.append(check_reuse_canary(reuse_canary_value))
     if power_value is None:
         try:
             import power_status
