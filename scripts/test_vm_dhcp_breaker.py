@@ -24,6 +24,11 @@ import threading
 import unittest
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None  # type: ignore[assignment]
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -258,6 +263,7 @@ class Wiring(unittest.TestCase):
         body = RUNNER.read_text()
         self.assertIn('[ "${VM_DHCP_BACKOFF:-0}" = 1 ]', body)
 
+    @unittest.skipUnless(tomllib, "macos_fleet_lanes needs tomllib (Python 3.11+)")
     def test_the_profile_key_turns_it_off_and_nothing_else(self):
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         base = (ROOT / "profiles" / "m1-macos-fleet.toml").read_text()
