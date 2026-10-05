@@ -79,7 +79,7 @@ IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$NAME" 2>/dev/null || true)"; [ -
 [ -n "$IP" ] || die "no IP for $NAME"
 GUEST_TRANSPORT=""
 for _ in $(seq 1 90); do
-  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
   if tart exec "$NAME" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
   sleep 2
 done
@@ -88,6 +88,7 @@ note "vm up at $IP via $GUEST_TRANSPORT — provisioning deps + Skia in-guest"
 
 run_guest_script(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+    # ssh-stdin: the guest script is fed by `run_guest_script <<'GUEST'`
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
       "SRC_REPO='$SRC_REPO' PULP_SHA='$PULP_SHA' SKIA_PLATFORM='$SKIA_PLATFORM' ENABLE_ROSETTA='$ENABLE_ROSETTA' PARENT_IDENTITY='$BASE' bash -s"
   else

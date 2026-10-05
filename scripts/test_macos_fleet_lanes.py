@@ -1859,6 +1859,48 @@ class MacosFleetLaneTests(unittest.TestCase):
             ("m5studio-macos-fleet.toml", "m5studio-pulp-gate-slot2"),
         ])
 
+    def test_fleet_claim_peers_is_a_lane_boolean_wired_to_the_env(self) -> None:
+        key = "assignment_fleet_claim_peers"
+        base = CONFIG.read_text()
+        self.assertNotIn(key, base)
+        anchor = "assignment_feed_rescue = true"
+        self.assertEqual(base.count(anchor), 1)
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.toml"
+            bad.write_text(base.replace(anchor, f'{anchor}\n{key} = "yes"', 1))
+            result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                    text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn(key, result.stderr)
+            ok = Path(td) / "ok.toml"
+            ok.write_text(base.replace(anchor, f"{anchor}\n{key} = true", 1))
+            envs = [plistlib.loads(b)["EnvironmentVariables"]
+                    for b in fleet.rendered_plists(fleet.load(ok)).values()]
+            wired = [e["TARTCI_QUEUE_LANE_ID"] for e in envs if e.get("TARTCI_JOB_CLAIM_FLEET_PEERS") == "1"]
+            self.assertEqual(sorted(wired), ["m1-pulp-gate", "m1-pulp-gate-slot2"])
+
+    def test_no_shipped_lane_reads_peers_yet(self) -> None:
+        profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertGreaterEqual(len(profiles), 4)
+        for profile in profiles:
+            for body in fleet.rendered_plists(fleet.load(profile)).values():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env, profile.name)
+
+    def test_job_claim_max_age_is_bounded_and_m1_declares_the_ttl(self) -> None:
+        base = CONFIG.read_text()
+        self.assertIn("job_claim_max_age_seconds = 1800", base)
+        with tempfile.TemporaryDirectory() as td:
+            for value in ("59", "1801", '"900"', "true"):
+                with self.subTest(value=value):
+                    bad = Path(td) / "bad.toml"
+                    bad.write_text(base.replace("job_claim_max_age_seconds = 1800",
+                                                f"job_claim_max_age_seconds = {value}", 1))
+                    result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                            text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("job_claim_max_age_seconds", result.stderr)
+
     @staticmethod
     def _profile_without_idle_retarget() -> str:
         """The m1 profile with its canary knob removed, so fixtures can inject

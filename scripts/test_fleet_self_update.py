@@ -185,7 +185,12 @@ class FakeSystem(su.System):
                 self.checked_out = a[-1]
             return ok()
         if a[0] == "ssh":
-            peer = a[5]
+            # The target is the first argument that is neither an option nor
+            # an option's value, wherever the options end.
+            i = 1
+            while a[i].startswith("-"):
+                i += 2 if a[i] in ("-o", "-i", "-p") else 1
+            peer = a[i]
             if "pool status" in a[-1]:
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")

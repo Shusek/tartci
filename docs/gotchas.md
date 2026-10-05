@@ -70,17 +70,44 @@ not the exit code.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A `while read` loop ends early after a peer read over ssh (2026-10-04)
+
+*Symptom:* the supervisor observed only the first class with young demand;
+every later class in `while read ... done <<< "$classes"` went unobserved, with
+no error. *Cause:* an ssh client forwards its stdin to the remote command, so
+an ssh anywhere under the loop body drains the rest of the loop's input. In
+#371 the ssh was inside a Python helper (`gate_supply.py decide`), which
+inherits stdin. shellcheck's SC2095 (run by `scripts/lint.sh`) catches only an
+ssh written directly in the loop; it cannot see through a function or a
+subprocess. *Guard:* `scripts/ssh_stdin_check.py`, run by
+`scripts/test_ssh_stdin.py` in CI, requires every ssh invocation in the repo
+to state its stdin, wherever it is:
+
+- shell: `ssh -n`, an input redirect on the same command (`</dev/null`,
+  `<<EOF`, `< file`), or ssh as the right side of a pipe (`ssh -G` is exempt);
+- Python: an argv list or tuple starting with `"ssh"` (or a name `ssh`) must
+  contain `"-n"`.
+
+A wrapper whose callers pipe a script into it is the one legitimate exception;
+mark it `# ssh-stdin: <why>` on its line or the line above.
+
 ## A test passes in CI and fails on the hosts' Python (2026-10-05)
 
 *Symptom:* a change is green in CI, then its tests fail under
 `/usr/bin/python3` with `No module named 'tomllib'` (#379, #390, #383, #391 on
-one day). *Cause:* the hosts run launchd agents, the interval guard and every
-`tartci_toml_exec_or_python3` fallback under `/usr/bin/python3`, which is 3.9
-and has no tomllib, while CI ran the tests only on ubuntu's 3.12+
-(`python-floor` only compiles, under 3.11). On 2026-10-05 main itself failed
-203 of 2283 tests under 3.9. *Guard:* the `python-39-tests` CI job runs every
-test module under Python 3.9. A test that genuinely needs tomllib says so
-through `scripts/testing_support.py` and is skipped there:
+one day). *Cause:* `/usr/bin/python3` is 3.9.6 on all four hosts and has no
+tomllib. It runs the tartci shim's support-manifest check, the pinned launch
+interpreter, every explicit `/usr/bin/python3` call site, and each
+`tartci_toml_exec_or_python3` fallback on a host without a tomllib Python;
+interactive ssh shells on m1 also resolve `python3` to it. (Under launchd's
+PATH a bare `python3` is a Homebrew 3.11+ on all four hosts.) CI ran the tests
+only on ubuntu's 3.12+ (`python-floor` only compiles, under 3.11); on
+2026-10-05 main itself failed 203 of 2283 tests under 3.9. *Guard:* the
+`python-39-tests` CI job runs every test module on a hosted Mac's own
+`/usr/bin/python3`, asserted to be 3.9.6. A test that genuinely needs tomllib
+says so through `scripts/testing_support.py` and is skipped there, and every
+module that degrades without tomllib has a running test of that branch
+(`scripts/test_no_tomllib_fallbacks.py`):
 
 ```python
 import testing_support
