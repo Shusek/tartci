@@ -72,6 +72,8 @@ HOST_KEYS = {
     "current_job_lifecycle_budget_seconds",
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
+    "job_claim_max_age_seconds",
+    "home_volume_floor_mode",
     "vm_dhcp_breaker",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
@@ -96,7 +98,7 @@ LANE_KEYS = {
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
-    "assignment_pre_clone_demand_check",
+    "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -376,6 +378,13 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    # How long this host's published boot claims may count on other hosts
+    # (scripts/job_claim.py). Only a host whose lanes hold claims longer than
+    # the consumers' default, such as one that waits for a lease after
+    # claiming, declares it; it can never exceed the claim TTL.
+    max_age = host.get("job_claim_max_age_seconds")
+    if max_age is not None and (type(max_age) is not int or not 60 <= max_age <= 1800):
+        fail("host.job_claim_max_age_seconds must be an integer from 60 through 1800")
     # The host VM-DHCP breaker (scripts/vm_dhcp_breaker.py) is on by default;
     # only `false` is ever written, to turn it off on one host.
     dhcp_breaker = host.get("vm_dhcp_breaker")
@@ -384,6 +393,9 @@ def load(path: Path) -> dict:
     agent_floor_qos = host.get("agent_floor_qos")
     if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
         fail('host.agent_floor_qos must be "utility" or "background"')
+    floor_mode = host.get("home_volume_floor_mode")
+    if floor_mode is not None and floor_mode not in ("report", "refuse"):
+        fail('host.home_volume_floor_mode must be "report" or "refuse"')
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:
@@ -702,6 +714,9 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: assignment_pre_clone_demand_check must be a "
                 "boolean on an event-class-v2 lane"
             )
+        fleet_peers = lane.get("assignment_fleet_claim_peers")
+        if fleet_peers is not None and type(fleet_peers) is not bool:
+            fail(f"lane {lane_id}: assignment_fleet_claim_peers must be a boolean")
         idle_retarget = lane.get("assignment_idle_retarget_seconds")
         if idle_retarget is not None and (
                 assignment_mode != "event-class-v2"
@@ -2351,6 +2366,8 @@ def lane_plist(
         env["TARTCI_VM_DHCP_BREAKER"] = "0"
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
+    if "home_volume_floor_mode" in host:
+        env["TARTCI_HOME_VOLUME_FLOOR_MODE"] = host["home_volume_floor_mode"]
     if "current_job_attempt_timeout_seconds" in host:
         env["TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"] = str(
             host["current_job_attempt_timeout_seconds"]
@@ -2409,6 +2426,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
     if lane.get("assignment_pre_clone_demand_check"):
         env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "1"
+    if lane.get("assignment_fleet_claim_peers"):
+        env["TARTCI_JOB_CLAIM_FLEET_PEERS"] = "1"
     if lane.get("assignment_idle_retarget_seconds"):
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]

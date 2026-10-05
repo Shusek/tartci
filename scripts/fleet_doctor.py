@@ -60,6 +60,8 @@ CODES: tuple[str, ...] = (
     "census_module_unavailable",
     "census_repo_unknown",
     "delivery_unknown",
+    "disk_axis_unread",
+    "disk_floor_refusing",
     "effective_generation_matches",
     "effective_generation_mismatch",
     "fleet_not_ready",
@@ -71,6 +73,8 @@ CODES: tuple[str, ...] = (
     "generation_path_exec",
     "hold_receipt_malformed",
     "hold_receipt_present",
+    "home_volume_floor_not_judged",
+    "home_volume_floor_ok",
     "host_agents_missing",
     "host_agents_not_applicable",
     "host_agents_ok",
@@ -763,6 +767,41 @@ def check_gate_reserve(value: dict | None, *, installed_present: bool) -> Findin
                    {"gate_reserve": value})
 
 
+def check_home_volume(value: dict | None, *, lanes: int, now: float | None = None,
+                      unread_after_s: float = 3600) -> Finding:
+    """The home-volume admission floor (scripts/home_volume_floor.py).
+
+    A floor that refuses everything looks exactly like a full disk from
+    outside, so a refusal streak as long as this host's lane count is its own
+    problem; so is an axis that has not been readable for a reclaim cadence,
+    because every admission in that time skipped it.
+    """
+    now = time.time() if now is None else now
+    if not value:
+        return Finding("home_volume", NOT_APPLICABLE, "home_volume_floor_not_judged",
+                       "no VM admission has judged the home volume (it is the Tart store's "
+                       "own volume, or no lease has been taken since this check existed)")
+    facts = {"home_volume": {k: v for k, v in value.items() if k != "samples"}}
+    since = value.get("unread_since")
+    if isinstance(since, (int, float)) and now - since >= unread_after_s:
+        return Finding("home_volume", PROBLEM, "disk_axis_unread",
+                       f"the home volume has not been readable for {(now - since) / 3600:.1f} h; "
+                       f"every VM admission in that time skipped it "
+                       f"({value.get('unread_reason')})", facts)
+    last = value.get("last") or {}
+    streak = int(value.get("consecutive_denials") or 0)
+    gib = 1024 ** 3
+    text = (f"free {last.get('free_bytes', 0) / gib:.0f} GiB, floor "
+            f"{last.get('floor_bytes', 0) / gib:.0f} GiB")
+    if streak >= max(1, lanes):
+        return Finding("home_volume", PROBLEM, "disk_floor_refusing",
+                       f"{streak} VM admissions in a row below the home-volume floor "
+                       f"({text}; refused, or would-refuse in report mode); reclaim the "
+                       f"volume, or the floor is wrong", facts)
+    return Finding("home_volume", OK, "home_volume_floor_ok",
+                   f"{text}; {streak} consecutive refusals", facts)
+
+
 def check_tool_freshness(summary: dict | None) -> Finding:
     """Shipyard and the pulp CLI against their latest releases."""
     if not isinstance(summary, dict) or summary.get("state") is None:
@@ -1394,6 +1433,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     else:
         fit_records, fit_missing, managed = [], [], False
     findings.append(check_lease_fit(fit_records, fit_missing, managed=managed))
+    try:
+        import home_volume_floor
+        import leases
+        home_value = home_volume_floor.status(leases.default_store_dir())
+    except Exception:  # noqa: BLE001 - an unreadable state reads as not judged
+        home_value = {}
+    findings.append(check_home_volume(home_value, lanes=len(fit_records)))
     try:
         import warm_vm_status
         warm_value = warm_vm_status.status(home / ".tartci/state/warm-vm")

@@ -49,6 +49,18 @@
       "remedy": "Inspect the named LaunchAgent's ProgramArguments before planning a deploy.",
       "do_not": "Do not start a deploy on the assumption that the unresolved agent behaves like its siblings."
     },
+    "disk_axis_unread": {
+      "summary": "The home volume could not be read for at least a reclaim cadence, so VM admissions skipped it.",
+      "why": "The axis fails open so a probe failure never becomes an outage, and must therefore never fail silently.",
+      "remedy": "Check the path in unread_reason and the volume's mount; disk_axis_unread events in the supervisor log show each skipped admission.",
+      "do_not": "Do not read an unread axis as a healthy volume."
+    },
+    "disk_floor_refusing": {
+      "summary": "VM admissions have been refused below the home-volume floor as many times in a row as this host has lanes.",
+      "why": "A floor that denies everything looks exactly like a full disk from outside, so a streak needs a person: either the volume is full or the computed floor is wrong.",
+      "remedy": "Read ~/.tartci/state/leases/home-volume.json (free, floor, fill rate); reclaim the volume (tartci reclaim, clean_build_cov.sh) or set TARTCI_HOME_VOLUME_FLOOR=0 on the lane while investigating.",
+      "do_not": "Do not raise the floor's cap or delete running jobs' files to clear it."
+    },
     "effective_generation_matches": {
       "summary": "Every managed agent executes the cohort the receipt records as installed.",
       "why": "Installed and effective are separate facts. They agree here, which is the only state in which a receipt can be read as a statement about what runs."
@@ -105,6 +117,18 @@
     "hold_receipt_present": {
       "summary": "Persistent listeners are covered by an exact held-idle receipt.",
       "why": "The receipt authorizes exactly one drain era and is invalidated when the pool reopens."
+    },
+    "home_volume_floor_not_judged": {
+      "summary": "No VM admission has judged the home volume.",
+      "why": "On a host whose Tart store is on the home volume, the store's own disk axis already judges it.",
+      "remedy": "Nothing to do unless the store is on another volume and leases have been taken.",
+      "do_not": "Do not read not-judged as ok on a host whose store is external."
+    },
+    "home_volume_floor_ok": {
+      "summary": "The home volume is judged at VM admission and is not refusing in a streak.",
+      "why": "The home volume holds supervisor temp files and build trees; a full one kills running supervisors (m5studio 2026-10-04).",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read one refusal as a problem; a refusal is the floor working."
     },
     "host_agents_missing": {
       "summary": "This managed fleet host is missing the launchd watchdog or the self-update agent.",

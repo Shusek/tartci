@@ -2369,6 +2369,33 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   loaded tartci LaunchAgent registered from a plist outside
   `~/Library/LaunchAgents` (a leaked test registration shadowing the real one).
 
+  **The home volume has its own floor.** The disk axis above judges the
+  volume holding the Tart store. When the store is on another volume
+  (m5studio's `/Volumes/Atelier`), a VM lease also judges the home volume,
+  which holds every supervisor's temp files and the build trees
+  (`scripts/home_volume_floor.py`). m5studio, 2026-10-04: the boot Data volume
+  reached 99% with coverage build dirs, ENOSPC killed a merge-group runner and
+  every lane supervisor, and leases kept being granted. The floor is computed
+  per host: `clamp(max(30 GiB, fill_rate x hours to the next reclaim pass),
+  30 GiB, 20% of the volume)`, with the fill rate measured over at least 6 h of
+  admission samples so a transient spike cannot inflate it. The profile's
+  `[host] home_volume_floor_mode` decides what happens below it, and every
+  shipped profile is `report`: the lease is admitted and the supervisor logs
+  `home_volume_would_refuse volume=home free=... floor=...`. In `refuse` mode a
+  NEW clone is denied instead (`lease_denied axis=disk
+  reason=home_volume_below_floor volume=home free=... floor=...`). Flip a host
+  to `refuse` only after a day of report data shows no would-refuse event that
+  was not a genuinely full volume, and with Daniel's OK. Either way, running
+  jobs and supervisors are never touched. An unreadable volume admits the lease and logs `disk_axis_unread`
+  on every such admission. `tartci doctor fleet` reports `disk_floor_refusing`
+  when the refusals run as long as the host's lane count (a floor that refuses
+  everything looks exactly like a full disk; would-refusals count in report
+  mode), and `disk_axis_unread` when the
+  volume has been unreadable for a reclaim cadence. State:
+  `~/.tartci/state/leases/home-volume.json`. `TARTCI_HOME_VOLUME_FLOOR=0` turns
+  it off for a lane; `TARTCI_HOME_VOLUME_FLOOR_HOURS` (default 1, the reclaim
+  agent's interval) sets the pass horizon.
+
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
   exceeds the approximately 19 GiB store growth observed during a Pulp full

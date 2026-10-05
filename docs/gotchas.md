@@ -70,6 +70,27 @@ not the exit code.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A `while read` loop ends early after a peer read over ssh (2026-10-04)
+
+*Symptom:* the supervisor observed only the first class with young demand;
+every later class in `while read ... done <<< "$classes"` went unobserved, with
+no error. *Cause:* an ssh client forwards its stdin to the remote command, so
+an ssh anywhere under the loop body drains the rest of the loop's input. In
+#371 the ssh was inside a Python helper (`gate_supply.py decide`), which
+inherits stdin. shellcheck's SC2095 (run by `scripts/lint.sh`) catches only an
+ssh written directly in the loop; it cannot see through a function or a
+subprocess. *Guard:* `scripts/ssh_stdin_check.py`, run by
+`scripts/test_ssh_stdin.py` in CI, requires every ssh invocation in the repo
+to state its stdin, wherever it is:
+
+- shell: `ssh -n`, an input redirect on the same command (`</dev/null`,
+  `<<EOF`, `< file`), or ssh as the right side of a pipe (`ssh -G` is exempt);
+- Python: an argv list or tuple starting with `"ssh"` (or a name `ssh`) must
+  contain `"-n"`.
+
+A wrapper whose callers pipe a script into it is the one legitimate exception;
+mark it `# ssh-stdin: <why>` on its line or the line above.
+
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
