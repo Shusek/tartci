@@ -16,9 +16,13 @@ every ssh invocation to state its stdin, wherever it is:
   shell   `ssh -n`, an input redirect on the same command (`</dev/null`,
           `<<EOF`, `<<<`, `< file`), or ssh as the right side of a pipe.
           `ssh -G` (print config, no connection) is exempt.
-  Python  a list or tuple whose first element is "ssh" (or a name called
-          `ssh`) must contain "-n". A literal is checked rather than the
-          subprocess call, because the argv is often built far from the call.
+  Python  a list or tuple whose first element is the ssh client must contain
+          "-n". A literal is checked rather than the subprocess call, because
+          the argv is often built far from the call. The first element is the
+          ssh client when it is the string "ssh" or a path ending in "/ssh";
+          a name or attribute called like one (`ssh`, `args.ssh`,
+          `self.ssh_bin`, `ssh_path`, `remote_ssh`); or a name, parameter or
+          argparse option given such a string as its value or default.
 
 A command that genuinely forwards its caller's stdin (a wrapper whose callers
 pipe a script into it) carries the comment `ssh-stdin: <reason>`, on its line
@@ -172,10 +176,60 @@ def shell_findings(path: Path, text: str) -> Iterator[str]:
                    f"caller's stdin (a `while read` loop ends early)")
 
 
-def _first_is_ssh(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant) and node.value == "ssh":
+# A name or attribute that by its name holds the ssh client.
+SSH_NAME = re.compile(r"(?i)^(ssh|ssh_?(bin|binary|path|cmd|command|exe|executable|program|"
+                      r"client)|\w+_ssh)$")
+
+
+def _is_ssh_value(node: ast.AST | None) -> bool:
+    return (isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and (node.value == "ssh" or node.value.endswith("/ssh")))
+
+
+def _ssh_bound_names(tree: ast.AST) -> set:
+    """Names, parameters and argparse options whose value or default is the ssh client."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and _is_ssh_value(node.value):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+                elif isinstance(target, ast.Attribute):
+                    names.add(target.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            positional = args.posonlyargs + args.args
+            for arg, default in zip(positional[len(positional) - len(args.defaults):],
+                                    args.defaults):
+                if _is_ssh_value(default):
+                    names.add(arg.arg)
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+                if _is_ssh_value(default):
+                    names.add(arg.arg)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "add_argument"
+              and any(k.arg == "default" and _is_ssh_value(k.value) for k in node.keywords)):
+            dest = next((k.value.value for k in node.keywords if k.arg == "dest"
+                         and isinstance(k.value, ast.Constant)), None)
+            flags = [a.value for a in node.args
+                     if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            if dest is None and flags:
+                longs = [f for f in flags if f.startswith("--")] or flags
+                dest = longs[0].lstrip("-").replace("-", "_")
+            if dest:
+                names.add(dest)
+    return names
+
+
+def _first_is_ssh(node: ast.AST, bound: set = frozenset()) -> bool:
+    if _is_ssh_value(node):
         return True
-    return isinstance(node, ast.Name) and node.id == "ssh"
+    if isinstance(node, ast.Name):
+        return bool(SSH_NAME.match(node.id)) or node.id in bound
+    if isinstance(node, ast.Attribute):
+        return bool(SSH_NAME.match(node.attr)) or node.attr in bound
+    return False
 
 
 def python_findings(path: Path, text: str) -> Iterator[str]:
@@ -184,10 +238,11 @@ def python_findings(path: Path, text: str) -> Iterator[str]:
     except SyntaxError:
         return
     lines = text.splitlines()
+    bound = _ssh_bound_names(tree)
     for node in ast.walk(tree):
         if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
             continue
-        if not _first_is_ssh(node.elts[0]):
+        if not _first_is_ssh(node.elts[0], bound):
             continue
         # An argv carries options; a bare tuple of program names does not.
         if not any(isinstance(e, ast.Constant) and isinstance(e.value, str)
@@ -195,8 +250,9 @@ def python_findings(path: Path, text: str) -> Iterator[str]:
             continue
         if any(isinstance(e, ast.Constant) and e.value in ("-n", "-G") for e in node.elts):
             continue
-        source = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
-        if EXEMPT in source:
+        here = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+        above = lines[node.lineno - 2] if node.lineno >= 2 else ""
+        if EXEMPT in here or (EXEMPT in above and above.lstrip().startswith("#")):
             continue
         yield (f"{path}:{node.lineno}: ssh argv without \"-n\"; a subprocess inherits the "
                f"caller's stdin and ssh forwards it (a `while read` loop ends early)")
