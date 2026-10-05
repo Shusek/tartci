@@ -1832,8 +1832,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", env)
                     self.assertEqual(pulp_slots, 2)
 
-    def test_pre_clone_check_is_on_every_pulp_gate_slot_and_nowhere_else(self) -> None:
-        """Every shipped host's two pulp-gate slots, and no other lane."""
+    def test_pre_clone_check_is_on_the_rolled_out_pulp_gate_slots_only(self) -> None:
+        """The two pulp-gate slots of m1, m3 and m5studio, and no other lane.
+        m5 joins after its ranked-lease canary read."""
         env_key = "TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertGreaterEqual(len(profiles), 4)
@@ -1852,8 +1853,6 @@ class MacosFleetLaneTests(unittest.TestCase):
             ("m1-macos-fleet.toml", "m1-pulp-gate-slot2"),
             ("m3-macos-fleet.toml", "studio-pulp-gate"),
             ("m3-macos-fleet.toml", "studio-pulp-gate-slot2"),
-            ("m5-macos-fleet.toml", "m5-pulp-gate"),
-            ("m5-macos-fleet.toml", "m5-pulp-gate-slot2"),
             ("m5studio-macos-fleet.toml", "m5studio-pulp-gate"),
             ("m5studio-macos-fleet.toml", "m5studio-pulp-gate-slot2"),
         ])
