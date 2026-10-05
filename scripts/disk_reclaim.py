@@ -76,6 +76,7 @@ import time
 from typing import Any, Iterable
 
 import pulp_reapers
+import gate_ccache_trim
 import scratch_dirs
 import tmp_checkouts
 
@@ -891,6 +892,10 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
         "deferred", "by_pattern")} if scratch else None)
     scratch_freed = (int(scratch.get("removed_bytes") or 0)
                      if receipt.get("mode") == "fix" else 0)
+    gate_ccache = receipt.get("gate_ccache_trim") or report.get("gate_ccache_trim") or {}
+    summary["gate_ccache_trim"] = ({key: gate_ccache.get(key) for key in (
+        "enabled", "status", "reason", "cache", "max_age_days", "interval_hours", "elapsed_s",
+        "before", "after", "counters_after", "last_completed_at")} if gate_ccache else None)
     summary["boot_volume"] = report.get("boot_volume")
     summary["scan_timeouts"] = report.get("scan_timeouts") or []
     summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
@@ -939,6 +944,22 @@ def scratch_detail(scratch: dict[str, Any] | None) -> str:
     return text
 
 
+def gate_ccache_detail(trim: dict[str, Any] | None) -> str:
+    """"; gate ccache evicted >14d: 506745 -> 149655 entries (14.3 -> 5.5 GB)"."""
+    if not trim or not trim.get("enabled") or trim.get("status") == "not_due":
+        return ""
+    if trim.get("status") != "evicted":
+        return f"; gate ccache {trim.get('status')}: {trim.get('reason') or '-'}"
+    before, after = trim.get("before") or {}, trim.get("after") or {}
+
+    def gb(side: dict[str, Any]) -> str:
+        return f"{side['bytes'] / 1e9:.1f}" if isinstance(side.get("bytes"), int) else "?"
+
+    return (f"; gate ccache evicted >{trim.get('max_age_days')}d: "
+            f"{before.get('entries', '?')} -> {after.get('entries', '?')} entries "
+            f"({gb(before)} -> {gb(after)} GB)")
+
+
 def boot_detail(boot: dict[str, Any] | None) -> str:
     if not boot or not boot.get("below_floor"):
         return ""
@@ -964,6 +985,7 @@ def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
                    f"(pulp {summary['pulp_reapers']['reclaimed_bytes'] / GIB:.1f} GiB)"
                    + tmp_checkout_detail(summary.get("tmp_checkouts"))
                    + scratch_detail(summary.get("scratch_dirs"))
+                   + gate_ccache_detail(summary.get("gate_ccache_trim"))
                    + boot_detail(summary.get("boot_volume"))),
         "fields": summary,
     }
@@ -1239,6 +1261,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     scratch = scratch_dirs.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
                                pressure=boot_pressure)
     receipt["scratch_dirs"] = scratch
+    # Gate ccache entries unused for N days (gate_ccache_trim.py for the
+    # gates): only with no VM running or leased, under the guard's lock.
+    progress.emit("gate ccache: checking the fleet profile", force=True)
+    gate_ccache = gate_ccache_trim.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
+                                       state_dir=state_dir(args))
+    receipt["gate_ccache_trim"] = gate_ccache
 
     remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed")
                      or scratch.get("removed"))
@@ -1291,6 +1319,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         "pulp_reapers": pulp,
         "tmp_checkouts": tmp,
         "scratch_dirs": scratch,
+        "gate_ccache_trim": gate_ccache,
         "boot_volume": boot,
         # Exit 3 means the pass ran and this volume is still below the floor;
         # status names it rather than calling the pass "failed".
