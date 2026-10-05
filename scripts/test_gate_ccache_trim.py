@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ccache_guard  # noqa: E402
+import disk_reclaim  # noqa: E402
 import gate_ccache_trim as trim  # noqa: E402
 import pulp_reapers  # noqa: E402
 
@@ -149,6 +150,21 @@ class Settings(unittest.TestCase):
                  "gate_ccache_max_age_days": 14, "gate_ccache_trim_interval_hours": 24}
         self.assertEqual(pulp_reapers.validate_table(table), [])
         self.assertTrue(pulp_reapers.validate_table({"gate_ccache_max_age_days": 1}))
+
+
+class ReclaimEvent(unittest.TestCase):
+    def test_the_pass_event_names_the_eviction_and_hides_a_pass_that_was_not_due(self):
+        receipt = {"mode": "fix", "report": {}, "pulp_reapers": {},
+                   "gate_ccache_trim": {"enabled": True, "status": "evicted", "max_age_days": 14,
+                                        "before": {"files_in_cache": 690},
+                                        "after": {"files_in_cache": 149655}}}
+        summary = disk_reclaim.pass_summary(receipt, 0)
+        self.assertEqual(summary["gate_ccache_trim"]["after"], {"files_in_cache": 149655})
+        self.assertEqual(disk_reclaim.gate_ccache_detail(summary["gate_ccache_trim"]),
+                         "; gate ccache evicted >14d: 690 -> 149655 files")
+        self.assertEqual(disk_reclaim.gate_ccache_detail({"enabled": True, "status": "not_due"}), "")
+        self.assertIn("Tart VM", disk_reclaim.gate_ccache_detail(
+            {"enabled": True, "status": "skipped", "reason": "a Tart VM is running on this host"}))
 
 
 @unittest.skipIf(trim.tomllib is None, "profile reading needs tomllib (Python 3.11+)")
