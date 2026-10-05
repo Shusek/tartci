@@ -81,6 +81,10 @@ CODES: tuple[str, ...] = (
     "host_agents_unreadable",
     "installed_generation_unknown",
     "lane_lease_never_fits",
+    "lane_python_no_tomllib",
+    "lane_python_not_applicable",
+    "lane_python_tomllib",
+    "lane_python_unknown",
     "lanes_exceed_lease_capacity",
     "launchd_registration_leaked",
     "launchd_registrations_ok",
@@ -1087,6 +1091,35 @@ def check_reuse_canary(value: dict | None) -> Finding:
                    f"reuse canary status unreadable: {value.get('error')}", facts)
 
 
+def check_lane_python(value: dict | None) -> Finding:
+    """`python3` on each lane's PATH imports tomllib (scripts/lane_python.py)."""
+    if value is None or value.get("error"):
+        return Finding("lane_python", UNKNOWN, "lane_python_unknown",
+                       f"lane python3 not probed: {(value or {}).get('error', 'no status')}",
+                       {"lane_python": value})
+    rows = value.get("rows") or []
+    facts = {"lane_python": value}
+    if not rows:
+        return Finding("lane_python", NOT_APPLICABLE, "lane_python_not_applicable",
+                       "no installed lane plist names a PATH", facts)
+    bad = [row for row in rows if row.get("tomllib") is False]
+    if bad:
+        parts = [(f"{row['python']} {row.get('version') or '(version unread)'}"
+                  if row.get("python") else "no python3")
+                 + f" for {', '.join(row.get('labels') or [])}" for row in bad]
+        return Finding("lane_python", PROBLEM, "lane_python_no_tomllib",
+                       "python3 on the lane PATH cannot import tomllib: " + "; ".join(parts)
+                       + ". Lanes run gate_supply decide, macos_fleet_lanes render and "
+                       "host_profile with it, and those die on import tomllib", facts)
+    unread = [row for row in rows if row.get("tomllib") is None]
+    if unread:
+        return Finding("lane_python", UNKNOWN, "lane_python_unknown",
+                       "; ".join(f"{row.get('python')}: {row.get('error')}" for row in unread),
+                       facts)
+    return Finding("lane_python", OK, "lane_python_tomllib",
+                   "; ".join(f"{row['python']} {row['version']}" for row in rows), facts)
+
+
 def check_vm_dhcp(value: dict | None) -> Finding:
     """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py)."""
     value = value or {"state": "unreadable", "error": "no status"}
@@ -1387,6 +1420,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             reclaim_value: dict | None = None,
             launchd_timers_value: dict | None = None,
             vm_dhcp_value: dict | None = None,
+            lane_python_value: dict | None = None,
             peer_reachability_value: dict | None = None,
             support_agents_value: dict | None = None,
             reuse_canary_value: dict | None = None,
@@ -1470,6 +1504,17 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     else:
         fit_records, fit_missing, managed = [], [], False
     findings.append(check_lease_fit(fit_records, fit_missing, managed=managed))
+    if lane_python_value is None:
+        if readable:
+            try:
+                import lane_python
+                lane_python_value = lane_python.status(
+                    agents_dir, host_profile.FLEET_LABEL_PREFIX)
+            except Exception as exc:  # noqa: BLE001 - reported as unprobed
+                lane_python_value = {"error": f"{type(exc).__name__}: {exc}"}
+        else:
+            lane_python_value = {"error": "agents directory unreadable"}
+    findings.append(check_lane_python(lane_python_value))
     try:
         import home_volume_floor
         import leases

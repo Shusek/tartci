@@ -165,6 +165,30 @@
       "remedy": "Shrink the lane's VM (TARTCI_MACOS_VM_CORES / vm_pool_cores) to fit the budget, or give the host a larger lease universe. The finding names the requested cores and the budget.",
       "do_not": "Do not disable the lease store or raise the gate reserve to make the lane boot; the budget exists to keep agent cores."
     },
+    "lane_python_no_tomllib": {
+      "summary": "python3 on a lane's PATH cannot import tomllib.",
+      "why": "Lanes run gate_supply decide (gate placement), macos_fleet_lanes render and host_profile with a bare python3. That works only while the lane PATH resolves python3 to a 3.11+ interpreter, normally Homebrew's. Here it resolves to one without tomllib, usually macOS's /usr/bin/python3 3.9, so those helpers die on import tomllib inside the lane.",
+      "remedy": "Install or repair a Python 3.11+ at a PATH entry ahead of /usr/bin in the lane plist (Homebrew's /opt/homebrew/bin/python3), then re-run the doctor. The finding names the interpreter and version it found.",
+      "do_not": "Do not edit the helpers to tolerate a missing tomllib: they read the fleet profile, and a guess in its place is a mis-placed gate."
+    },
+    "lane_python_not_applicable": {
+      "summary": "No installed lane plist names a PATH.",
+      "why": "There are no fleet lanes on this host (or none sets PATH), so no lane runs a bare python3 to check.",
+      "remedy": "Nothing, unless this host should run lanes; then install the fleet profile.",
+      "do_not": "Do not read this as the lane python being fine: nothing was probed."
+    },
+    "lane_python_tomllib": {
+      "summary": "python3 on every lane PATH imports tomllib.",
+      "why": "Each distinct lane PATH was resolved the way a shell would and its python3 run once; each reported a tomllib-capable version.",
+      "remedy": "Nothing.",
+      "do_not": "Do not take this as covering an interactive ssh shell: its PATH differs from the lane plist's."
+    },
+    "lane_python_unknown": {
+      "summary": "The lane python3 could not be probed.",
+      "why": "The LaunchAgents directory was unreadable, or a lane's python3 was found but failed to run the probe, so whether it imports tomllib is not known.",
+      "remedy": "Run the named interpreter by hand with the lane PATH and fix whatever the error says, then re-run the doctor.",
+      "do_not": "Do not read an unprobed interpreter as a working one."
+    },
     "lanes_exceed_lease_capacity": {
       "summary": "More identical lanes are installed than the lease budget can run at once.",
       "why": "A lane beyond the budget's capacity can only boot while a sibling is idle, and then the sibling would have served. It adds queue polling and admission calls but no concurrent capacity (m5: two 12-core gate lanes in a 14-core universe). While a sibling holds a VM the extra lane waits locally without scanning or asking Shipyard.",
