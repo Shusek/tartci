@@ -281,6 +281,23 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_installed_generation_refuses_itself_as_support_source(self) -> None:
+        # The installed `tartci` lives in a read-only generation, not a git
+        # checkout; defaulting the support source to it used to fail with a
+        # misleading "support member failed verification".
+        staged = support_manifest.stage_install(
+            self.support_source, self.support_manifest, self.root / "generations"
+        )
+        generation = Path(str(staged["root"]))
+        result = subprocess.run(
+            [str(generation / "tartci"), "fleet-macos", "install", str(self.config)],
+            text=True, capture_output=True, check=False, env=self.env,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("installed TartCI generation, not a git checkout", result.stderr)
+        self.assertIn("self-update", result.stderr)
+        self.assertNotIn("failed verification", result.stderr)
+
     def test_dry_run_does_not_install_or_retire(self) -> None:
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)

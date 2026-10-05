@@ -15,6 +15,58 @@ LaunchAgent, rather than diagnosing from `command -v` alone. Fleet preflight
 reports `daemon-can-reach-*` and `tartci-installed` separately so this PATH
 difference cannot masquerade as missing TartCI.
 
+So that agents running `ssh host tartci ...` find it, every fleet host puts
+`~/.local/bin` on PATH in `~/.zshenv`, the only startup file a non-interactive
+zsh reads. `~/.zshrc` and `~/.zprofile` do not count: m3 had it in both and
+`ssh m3 'command -v tartci'` still returned nothing (2026-10-05). Use the same
+guarded line on every host:
+
+```sh
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+```
+
+Check it from another host with `ssh HOST 'command -v tartci'`, and run the
+same check against a host known to work as the control.
+
+## `fleet-macos install` reports "installed support member failed verification"
+
+**Symptom:** `tartci fleet-macos install PROFILE` run through the installed
+`~/.local/bin/tartci` fails with
+`support-manifest: installed support member failed verification: fleet/README.md`,
+while the running supervisors are healthy.
+
+**Cause:** with no `--support-source`, the installer used its own root as the
+source. Through the installed entrypoint that root is a sealed generation under
+`~/.local/share/tartci-generations/`: its files are mode 0444 and it is not a
+git checkout, so it can never be a support source. The mode mismatch was the
+first thing to trip. Nothing on the host is broken.
+
+**Fix:** the installer now refuses this case with a message that says so. To
+update a host, run `tartci fleet-macos self-update`. To install a specific
+tree, pass `--support-source` with a clean tartci checkout.
+
+## Timer jobs stop running while the lanes look healthy (m3, 2026-10-04)
+
+**Symptom:** a host falls many commits behind main and its self-update log has
+not changed in hours, yet `launchctl print` shows the agent with `last exit
+code = 0` and the watchdog prints a checkmark for it. The lane supervisors keep
+serving jobs.
+
+**Cause:** launchd's gui domain stopped starting StartInterval jobs on its own.
+`launchctl print gui/$UID/<label>` shows `pended nondemand spawn = interval`
+and a `runs` counter that does not move. A clean last exit says nothing about
+whether the job still runs. On m3 the last update attempt had been correctly
+refused (a peer was draining), and launchd never started the retry, so the fix
+for this stall could not install itself.
+
+**Fix:** `scripts/launchd_interval_guard.py` runs inside the lane supervisors
+and kicks any timer agent whose run count has not moved for twice its interval.
+A host on a generation from before that guard needs one manual
+`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`; after that
+it heals on its own. To spot it, compare the age of the newest entry in
+`~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
+not the exit code.
+
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
