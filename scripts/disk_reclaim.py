@@ -824,6 +824,14 @@ def _atomic_write(path: pathlib.Path, body: str) -> None:
     os.replace(tmp, path)
 
 
+def _discovery_summary(value: Any) -> Any:
+    """The discovery block, with its unreadable list bounded for the receipt."""
+    if not isinstance(value, dict):
+        return value
+    unreadable = value.get("unreadable") or []
+    return dict(value, unreadable=unreadable[:10])
+
+
 def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
     """The small, stable shape the receipt, the event and status all share."""
     report = receipt.get("report") or {}
@@ -862,7 +870,11 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
             "runs": [{key: run.get(key) for key in (
                 "reaper", "mode", "exit_code", "reclaimed_bytes", "reported_gb",
                 "free_bytes_before", "free_bytes_after", "duration_s", "error",
-                "summary")} for run in pulp.get("runs") or []],
+                "summary", "reason", "worktrees_root")} for run in pulp.get("runs") or []],
+            # Which roots outside the profile were reaped, and how discovery
+            # judged them, including a readable "scanned N, matched 0".
+            "outside_profile_roots": pulp.get("outside_profile_roots"),
+            "discovery": _discovery_summary(pulp.get("discovery")),
         },
     }
     tmp = receipt.get("tmp_checkouts") or report.get("tmp_checkouts") or {}
