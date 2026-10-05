@@ -26,6 +26,7 @@
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
+#   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
 #   tartci fleet-macos support-agents <plan|apply|auto|status> [--json] # declared support LaunchAgents
 #   tartci support-manifest <write|verify|stage-install> # bind/install runtime cohort
 #   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
@@ -1407,6 +1408,7 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;

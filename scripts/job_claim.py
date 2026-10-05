@@ -20,9 +20,22 @@ standing against it. Two kinds of claim stand:
   names from one runner listing, and names that belong to a local claim are
   not counted twice.
 
-A booting lane on another host that has not minted yet is invisible here: no
-state tartci already publishes carries it, so cross-host races before the mint
-remain possible and fall through to the existing pre-mint recheck.
+* booting elsewhere: a live claim another HOST published (`status
+  --publish`, read over SSH by `gather-peers`) for the same key, younger than
+  the age that host declares for its claims (its `max_age_s`, at most the
+  TTL; a host that declares none gets DEFAULT_REMOTE_MAX_AGE_SECS). That is a
+  lane on another host that has claimed the job but not minted yet; without it
+  every host boots for the same job and all but the first discard at the
+  pre-mint recheck. A remote claim whose VM already shows in the fleet idle
+  listing is counted once (the runner name IS the VM name: the JIT config is
+  minted with `name=$vm`).
+
+Peers are read only when the lane opts in, and every peer fault (unreachable,
+slow past the read budget, a non-zero exit, unparsable output) counts no
+claims from that peer: the lane boots exactly as it would without peers. Only
+two hosts that both read before either writes can still boot for one job;
+because each host writes its claim only after reading, two lanes can never both
+refuse one job.
 
 The count a lane sees may be a lower bound (event-class V2 scans stop at the
 first matching job and report 1). A lower bound that does not exceed the
@@ -43,6 +56,8 @@ import hashlib
 import json
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 import time
 from typing import Any, Iterator
@@ -61,6 +76,12 @@ NEED_EXACT = 4
 ERROR = 1
 
 DEFAULT_TTL_SECS = 1800
+# How long another host's claim counts here when that host declares no age of
+# its own. A host whose lanes hold claims longer (m1 waits for a lease after
+# claiming) declares its own, up to the TTL.
+DEFAULT_REMOTE_MAX_AGE_SECS = 900
+PEER_CONNECT_TIMEOUT_SECS = 2
+DEFAULT_PEER_READ_SECS = 5.0
 
 
 def default_dir() -> pathlib.Path:
@@ -163,6 +184,51 @@ def fleet_idle_names(path: str | None, labels: str) -> list[str]:
     return sorted(names)
 
 
+def peer_claims(path: str | None, key: str, ttl: int) -> dict[str, Any]:
+    """Live claims other hosts published for `key`, from a gather-peers file.
+
+    Returns {"booting": [vm, ...], "read": [host, ...], "unread": [host, ...]}.
+    Each line is {"host", "ok", "status"} or {"host", "ok": false, "reason"}.
+    A claim counts while its age is within the age its own host declares
+    (`max_age_s`, clamped to the TTL), or DEFAULT_REMOTE_MAX_AGE_SECS when the
+    host declares none. Anything unparsable counts nothing: fail open.
+    """
+    out: dict[str, Any] = {"booting": [], "read": [], "unread": []}
+    if not path:
+        return out
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not isinstance(row.get("host"), str):
+            continue
+        status = row.get("status")
+        if row.get("ok") is not True or not isinstance(status, dict):
+            out["unread"].append(row["host"])
+            continue
+        out["read"].append(row["host"])
+        declared = status.get("max_age_s")
+        if isinstance(declared, bool) or not isinstance(declared, (int, float)) or declared <= 0:
+            limit = DEFAULT_REMOTE_MAX_AGE_SECS
+        else:
+            limit = min(float(declared), float(ttl))
+        for claim in status.get("claims") or []:
+            if not isinstance(claim, dict) or claim.get("key") != key:
+                continue
+            age = claim.get("age_s")
+            vm = claim.get("vm")
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or not isinstance(vm, str):
+                continue
+            if 0 <= age <= limit:
+                out["booting"].append(vm)
+    return out
+
+
 def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if args.queued < 0:
         raise ValueError("queued must be non-negative")
@@ -170,6 +236,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         raise ValueError("ttl must be positive")
     key = claim_key(args.repo, args.labels)
     fleet_idle = fleet_idle_names(args.fleet_runners_file, args.labels)
+    peers = peer_claims(getattr(args, "fleet_claims_file", None), key, args.ttl)
     now = time.time()
     with locked(pathlib.Path(args.dir), key) as path:
         rows = live(load(path), now)
@@ -179,7 +246,11 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             name for name in fleet_idle
             if name not in local_vms and name != args.vm
         ]
-        standing = len(others) + len(remote)
+        booting = sorted({
+            vm for vm in peers["booting"]
+            if vm not in local_vms and vm not in remote and vm != args.vm
+        })
+        standing = len(others) + len(remote) + len(booting)
         result: dict[str, Any] = {
             "key": key,
             "queued": args.queued,
@@ -188,6 +259,9 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 {"lane": row.get("lane"), "vm": row.get("vm")} for row in others
             ],
             "fleet_idle_runners": remote,
+            "fleet_booting": booting,
+            "peers_read": peers["read"],
+            "peers_unread": peers["unread"],
             "standing_claims": standing,
         }
         if args.queued > standing:
@@ -227,6 +301,7 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Live claims on this host. Read-only; what peers read with --publish."""
     directory = pathlib.Path(args.dir)
     now = time.time()
     claims: list[dict[str, Any]] = []
@@ -237,16 +312,134 @@ def status(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             except (OSError, ValueError):
                 continue
             for row in live(rows, now):
+                created = parse_iso(row.get("created_at"))
                 claims.append(
                     {
+                        "key": path.stem,
                         "lane": row.get("lane"),
                         "vm": row.get("vm"),
                         "repo": row.get("repo"),
                         "labels": row.get("labels"),
                         "created_at": row.get("created_at"),
+                        "age_s": None if created is None else round(now - created, 1),
                     }
                 )
-    return {"claims": claims}, 0
+    result: dict[str, Any] = {"claims": claims}
+    if getattr(args, "publish", False):
+        result["host"] = os.environ.get("TARTCI_RECEIPT_HOST_ID") or host_id_from_profile()
+        result["max_age_s"] = declared_max_age()
+    return result, 0
+
+
+def parse_iso(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def profile_path() -> pathlib.Path:
+    return pathlib.Path(os.environ.get(
+        "TARTCI_FLEET_PROFILE",
+        str(pathlib.Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"),
+    )).expanduser()
+
+
+def profile_host() -> dict[str, Any]:
+    try:
+        import tomllib  # type: ignore[import-not-found]
+        with profile_path().open("rb") as handle:
+            host = tomllib.load(handle).get("host")
+    except Exception:  # noqa: BLE001 - an unreadable profile declares nothing
+        return {}
+    return host if isinstance(host, dict) else {}
+
+
+def host_id_from_profile() -> str | None:
+    value = profile_host().get("id")
+    return value if isinstance(value, str) else None
+
+
+def declared_max_age() -> int | None:
+    """How long this host's claims may count elsewhere (`host.job_claim_max_age_seconds`)."""
+    value = profile_host().get("job_claim_max_age_seconds")
+    return value if type(value) is int and value > 0 else None
+
+
+def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Read every other published host's claims, in parallel, within a hard budget.
+
+    Writes one JSON line per peer to --out. A peer that fails to answer within
+    the budget is killed and recorded unread; nothing here can block a boot.
+    """
+    me = args.self_host
+    targets = peer_targets(pathlib.Path(args.supply), me)
+    procs: dict[str, subprocess.Popen] = {}
+    for host, target in targets.items():
+        argv = [args.ssh, "-o", "BatchMode=yes", "-o",
+                f"ConnectTimeout={PEER_CONNECT_TIMEOUT_SECS}", target,
+                "cd ~ && ~/.local/bin/tartci job-claim status --publish"]
+        try:
+            # Own process group: a straggler is killed with everything it
+            # started, so nothing can hold its pipe open past the budget.
+            procs[host] = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                           stderr=subprocess.DEVNULL, text=True,
+                                           start_new_session=True)
+        except OSError:
+            procs[host] = None  # type: ignore[assignment]
+    deadline = time.monotonic() + args.read_secs
+    rows: list[dict[str, Any]] = []
+    for host, proc in procs.items():
+        if proc is None:
+            rows.append({"host": host, "ok": False, "reason": "spawn_failed"})
+            continue
+        try:
+            out, _ = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=2)
+            if proc.stdout is not None:
+                proc.stdout.close()
+            rows.append({"host": host, "ok": False, "reason": "timeout"})
+            continue
+        if proc.returncode != 0:
+            rows.append({"host": host, "ok": False, "reason": f"exit_{proc.returncode}"})
+            continue
+        try:
+            value = json.loads(out)
+        except ValueError:
+            rows.append({"host": host, "ok": False, "reason": "unparsable"})
+            continue
+        if not isinstance(value, dict) or not isinstance(value.get("claims"), list):
+            rows.append({"host": host, "ok": False, "reason": "unparsable"})
+            continue
+        rows.append({"host": host, "ok": True, "status": value})
+    pathlib.Path(args.out).write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows),
+                                      encoding="utf-8")
+    return {"peers": sorted(targets), "unread": [r["host"] for r in rows if not r["ok"]]}, 0
+
+
+def peer_targets(supply: pathlib.Path, me: str) -> dict[str, str]:
+    """host_id -> SSH target for every published host except this one."""
+    try:
+        value = json.loads(supply.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    targets: dict[str, str] = {}
+    for row in (value.get("hosts") or []) if isinstance(value, dict) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("host_id"), str):
+            continue
+        host = row["host_id"]
+        if host == me:
+            continue
+        ssh = row.get("ssh")
+        targets[host] = ssh if isinstance(ssh, str) and ssh else f"tartci-{host}"
+    return targets
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -277,15 +470,28 @@ def build_parser() -> argparse.ArgumentParser:
     rel.add_argument("--labels", required=True)
     rel.add_argument("--claim-id", required=True)
 
+    acq.add_argument("--fleet-claims-file",
+                     help="gather-peers output: other hosts' published claims")
+
     st = sub.add_parser("status")
     common(st)
+    st.add_argument("--publish", action="store_true",
+                    help="add this host's id and declared claim max age (for peers)")
+
+    gp = sub.add_parser("gather-peers")
+    gp.add_argument("--out", required=True)
+    gp.add_argument("--self-host", required=True)
+    gp.add_argument("--supply", required=True)
+    gp.add_argument("--read-secs", type=float, default=DEFAULT_PEER_READ_SECS)
+    gp.add_argument("--ssh", default="ssh")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        handler = {"acquire": acquire, "release": release, "status": status}[args.command]
+        handler = {"acquire": acquire, "release": release, "status": status,
+                   "gather-peers": gather_peers}[args.command]
         result, rc = handler(args)
     except SystemExit:
         raise
