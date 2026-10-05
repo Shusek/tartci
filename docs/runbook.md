@@ -1742,6 +1742,11 @@ fleet`), and check GitHub's job history against it with
   hang an unattended run; the refusal says to run `pulp ship doctor`), then the
   launcher is built under the reseal runbook's immutability preconditions and
   verified.
+- **Skew after a verified apply.** The run re-measures skew for the generation
+  it just installed and verified, and rewrites `skew.json` (`recorded_by:
+  verified_apply`) before finishing, so status reads current at once instead
+  of the pre-update skew until the watchdog's next refresh. Checks are not
+  re-queried; a failure to record never fails the update.
 - **Which code runs which step (and why a change lands one update late).**
   The self-update agent runs `~/.local/bin/tartci`, so the **installed**
   generation orchestrates: the gates (one host at a time, capacity floor,
@@ -1935,6 +1940,17 @@ arrive, and a host that did not get it is loud:
   `sudo killall fseventsd`, which nothing here runs.
 - **When it refreshes.** Every watchdog pass, at most every 30 minutes;
   `tartci fleet-macos tool-freshness --refresh` measures now.
+- **Cached lines carry an age limit.** Every status line read from a cached
+  measurement is flagged once it is older than three of its refresher's
+  intervals (`scripts/state_age.py`, `STALE_FACTOR = 3`): tartci skew and tool
+  freshness against the watchdog's 30 minutes, fseventsd against the
+  host-vitals sensor's 60 s. The line then reads `STALE (measured N ago, older
+  than 3 x <interval>; is the <refresher> running?)`, the same text becomes the
+  surface's problem (doctor `self_update_problem` / `tool_freshness_stale`, the
+  watchdog WARN), and an unreadable time counts as stale. One missed run is
+  ordinary; three in a row mean the refresher is not running, which is how m3's
+  skew read "1 commits behind main" for two days while the watchdog's pass
+  never ran.
 - **Automatic apply.** Shipyard updates itself from here by default: once its
   newest release is 30 minutes old, `shipyard runner fleet-update --to <tag>
   --host-class <this host> --apply --json`, the governed rollout that stages

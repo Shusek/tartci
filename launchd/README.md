@@ -518,13 +518,20 @@ The fleet profile names the support LaunchAgents a host carries:
 
 ```toml
 [support_agents]
-declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
 bootstrap = false
 ```
 
 `scripts/support_agents.py` holds the registry of declarable agents (today the
 disk reclaimer, the artifact-cache refresher, the keychain unlocker, the
-schedule backstop, and the reuse canary). Each with an install script renders with exactly the `render_launchd_template.py`
+schedule backstop, the reuse canary, the launchd self-heal watchdog and the
+Tier-2 reaper). The watchdog and the reaper render with `TART_HOME` from the
+profile's `[host].tart_home`, so each host's agent reads its own Tart store;
+they used to be rendered by hand from this file, which is how m5studio was
+brought up serving gate VMs with no watchdog (no heal pass, no skew or tool
+freshness refresh). Every shipped profile declares both, so a host missing one
+reads `missing` in the plan receipt and `tartci doctor fleet` reports
+`host_agents_missing`. Each with an install script renders with exactly the `render_launchd_template.py`
 arguments its `install_*_agent.sh` uses, so a host those scripts installed
 reads byte-identical; `scripts/test_support_agents.py` proves that per agent.
 An agent's own settings stay where they are (`schedule_backstop`, `[reclaim]`);

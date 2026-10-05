@@ -115,8 +115,11 @@ class Isolated(unittest.TestCase):
         self.tmp = pathlib.Path(self._tmp.name).resolve()
         self.state = self.tmp / "state"
         self._env = {k: os.environ.get(k) for k in (
-            "PULP_BUILD_DIR_LOCK_ROOT", "TARTCI_FLEET_PROFILE", "TARTCI_HOME")}
+            "PULP_BUILD_DIR_LOCK_ROOT", "TARTCI_FLEET_PROFILE", "TARTCI_HOME",
+            "TARTCI_BOOT_USAGE")}
         os.environ["PULP_BUILD_DIR_LOCK_ROOT"] = str(self.tmp / "locks")
+        # A full reclaim pass would otherwise measure this host's real home.
+        os.environ["TARTCI_BOOT_USAGE"] = "0"
         os.environ["TARTCI_HOME"] = str(self.tmp / "tartci")
         os.environ["TARTCI_FLEET_PROFILE"] = str(self.tmp / "absent.toml")
         self.procs: list[subprocess.Popen] = []

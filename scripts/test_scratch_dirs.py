@@ -47,7 +47,8 @@ class Fixture(unittest.TestCase):
     def setUp(self) -> None:
         self.base = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(force_remove, self.base)
-        self.roots = {key: self.base / key for key in ("private_tmp", "user_tmp", "chrome_clone")}
+        self.roots = {key: self.base / key
+                      for key in ("private_tmp", "user_tmp", "chrome_clone", "derived_data")}
         for root in self.roots.values():
             root.mkdir()
 
@@ -88,6 +89,52 @@ class Selection(Fixture):
             self.assertFalse(path.exists(), path)
         self.assertGreater(report["removed_bytes"], 0)
         self.assertEqual(report["by_pattern"]["chrome-code-sign-clone"]["removed"], 1)
+
+    def test_any_generated_pulp_temp_dir_and_chrome_temp_is_removed_when_idle(self):
+        # Shapes seen in m3's temp dir: node/C mkdtemp, Python mkdtemp, a C++
+        # <pid>-<tick>-<n> counter, BSD mktemp -t, and Chrome's own scratch.
+        made = [self.make("user_tmp", name) for name in (
+            "pulp-materialized-atlas-YhX9tp",
+            "pulp-generated-bump-base-w8gw7p9n",
+            "pulp-swiftui-module-836053866706375",
+            "pulp-mcp-audio-probe-0633e21d0d58cd2a87cb8d5162a4f6bd",
+            "pulp-swiftui-gate-b3-widgets-123456789",
+            "pulp-arch-bad-19447-112967930892166-0",
+            "pulp-gates-script-inputs.CdrLdO",
+            "com.google.Chrome.Air0Z3",
+            "com.google.Chrome.chrome_chrome_url_fetcher_.3Ir9yE",
+        )]
+        report = self.scan()
+        self.assertEqual(report["removed"], len(made), report)
+        for path in made:
+            self.assertFalse(path.exists(), path)
+
+    def test_fixed_name_pulp_dirs_are_never_touched(self):
+        # A tool reuses these on purpose; pulp-control-<uid> is a live
+        # broker's directory. An all-lowercase suffix is indistinguishable
+        # from a word, so it is left too.
+        kept = [self.make("user_tmp", name) for name in (
+            "pulp-audio-doctor", "pulp-control-501", "pulp-locks-501", "pulp-cli-bake-1",
+            "pulp-child-process-working-dir", "pulp-materialized-atlas-ilwvao",
+        )]
+        kept.append(self.make("private_tmp", "pulp-materialized-atlas-YhX9tp"))
+        report = self.scan()
+        self.assertEqual(report["removed"], 0, report)
+        for path in kept:
+            self.assertTrue(path.exists(), path)
+
+    def test_derived_data_needs_two_weeks_idle_even_under_pressure(self):
+        fresh = self.make("derived_data", "cmux-begnpxtmcrbvxrcrqeplcypfldvl", hours=13 * 24)
+        stale = self.make("derived_data", "cmux-subrouter-goal-copy", hours=15 * 24)
+        report = self.scan(idle_hours=sd.PRESSURE_IDLE_HOURS)
+        self.assertTrue(fresh.exists())
+        self.assertFalse(stale.exists())
+        self.assertEqual(report["by_pattern"]["xcode-derived-data"]["removed"], 1, report)
+
+    def test_derived_data_an_open_build_keeps_its_folder(self):
+        stale = self.make("derived_data", "Pulp-agcvtsjdjopthyetczvivkmaozcb", hours=30 * 24)
+        self.scan(opened=[str(stale / "payload")])
+        self.assertTrue(stale.exists())
 
     def test_anything_not_named_is_never_touched(self):
         kept = [
