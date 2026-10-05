@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Stop cloning VMs on a host whose VM DHCP server has stopped answering.
+
+A booted VM gets its address from the host's macOS DHCP server (bootpd, a
+socket-activated system daemon that Internet Sharing manages). On m5 it
+stopped answering twice (2026-09-23 10:16-11:03Z, 13 VMs; 2026-10-04
+21:05-21:45Z, 10 VMs). Every lane kept cloning, waiting 120 s for an address
+(`boot_failed no_ip`) and discarding, while no boot could succeed: on 10-04
+bootpd ran nothing from 20:53Z until smd re-enabled it at 21:48:51Z. Recovery
+needs root, so tartci never attempts it; it stops spending VMs until an
+address comes back, and says so.
+
+One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
+
+* closed: lanes clone as usual. Each `no_ip` is recorded; K (2) of them
+  within N (15 min) with no address in between opens the breaker. A single
+  `no_ip` never has: both isolated ones on record cleared on the next boot.
+* open: no lane clones (`check` answers `backoff`, an idle pass). Once per
+  PROBE_SECS (300), or at once when bootpd's run counter has moved since the
+  breaker opened (an operator kicked it), exactly one lane is answered
+  `probe` and clones one VM. Every probe is recorded `vm_dhcp_probe
+  result=ip|no_ip`.
+* closed again: the first address any VM on the host gets, probe or not
+  (`record ip`), closes it and reports how long it was open, how many VMs it
+  spent, and the recovery latency. A breaker opened before the host last
+  booted is closed too (`reason=host_reboot`): a reboot resets bootpd.
+
+The trade is explicit: an outage now costs about one VM per PROBE_SECS
+instead of one per lane every 2-4 min, and recovery is noticed within
+PROBE_SECS plus a boot instead of within minutes.
+
+Fail open: an unreadable or corrupt breaker reads as closed, so a lane never
+refuses to boot over state it cannot read. Writes are atomic (tmp + rename)
+under an exclusive lock, so a reader never sees a partial file.
+
+Usage: vm_dhcp_breaker.py check --lane L | record --outcome ip|no_ip --lane L
+[--vm V] | status --json. `check` and `record` print {"action", "events"}; the
+caller emits the events.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - tartci hosts are POSIX.
+    fcntl = None  # type: ignore[assignment]
+
+K = 2
+WINDOW_S = 15 * 60
+PROBE_SECS = 300
+MAX_STREAK = 50
+
+
+def breaker_dir() -> pathlib.Path:
+    return pathlib.Path(os.environ.get(
+        "TARTCI_VM_DHCP_DIR", str(pathlib.Path.home() / ".tartci" / "state" / "vm-dhcp")))
+
+
+def setting(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+@contextlib.contextmanager
+def locked(directory: pathlib.Path) -> Iterator[pathlib.Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        raise OSError("breaker requires fcntl")
+    with (directory / "breaker.lock").open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield directory / "breaker.json"
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def load(path: pathlib.Path) -> dict[str, Any]:
+    """The breaker, or a closed one when it is absent or unreadable."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"state": "closed", "streak": []}
+    if not isinstance(value, dict) or value.get("state") not in ("open", "closed"):
+        return {"state": "closed", "streak": []}
+    if not isinstance(value.get("streak"), list):
+        value["streak"] = []
+    return value
+
+
+def save(path: pathlib.Path, value: dict[str, Any]) -> None:
+    tmp = path.with_name(f".breaker.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def boot_time() -> float | None:
+    """The host's last boot, epoch seconds (`sysctl kern.boottime`)."""
+    override = os.environ.get("TARTCI_VM_DHCP_BOOT_TIME")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            return None
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                             text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"sec\s*=\s*(\d+)", out)
+    return float(match.group(1)) if match else None
+
+
+def bootpd_readout() -> dict[str, Any]:
+    """bootpd's launchd state, readable without root; {} when unreadable."""
+    launchctl = os.environ.get("TARTCI_VM_DHCP_LAUNCHCTL", "launchctl")
+    try:
+        proc = subprocess.run([launchctl, "print", "system/com.apple.bootpd"],
+                              capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, Any] = {}
+    for line in proc.stdout.splitlines():
+        key, sep, value = line.strip().partition(" = ")
+        if not sep:
+            continue
+        if key == "state" and "state" not in out:
+            out["state"] = value.strip()
+        elif key == "runs":
+            try:
+                out["runs"] = int(value.strip())
+            except ValueError:
+                pass
+        elif key == "last exit code":
+            out["last_exit"] = value.strip()
+    return out
+
+
+def fmt(fields: dict[str, Any]) -> str:
+    return " ".join(f"{k}={v}" for k, v in fields.items() if v is not None and v != "")
+
+
+def iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def close(value: dict[str, Any], now: float, reason: str) -> list[list[str]]:
+    opened = float(value.get("opened_at") or now)
+    possible = max(float(value.get("last_probe_at") or opened),
+                   float(value.get("bootpd_moved_at") or 0))
+    event = ["vm_dhcp_recovered", fmt({
+        "reason": reason, "open_s": int(now - opened),
+        "vms_spent": int(value.get("vms_spent") or 0),
+        "probes": int(value.get("probes") or 0),
+        "latency_s": int(now - possible) if reason != "host_reboot" else None,
+    })]
+    value.clear()
+    value.update({"state": "closed", "streak": [], "last_ip_at": now})
+    return [event]
+
+
+def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    probe_secs = setting("TARTCI_VM_DHCP_PROBE_SECS", PROBE_SECS)
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        events: list[list[str]] = []
+        if value["state"] != "open":
+            return {"action": "clone", "events": events}
+        booted = boot_time()
+        if booted is not None and float(value.get("opened_at") or now) < booted:
+            events += close(value, now, "host_reboot")
+            save(path, value)
+            return {"action": "clone", "events": events}
+        last = value.get("last_probe_at")
+        if last is None:
+            last = value.get("opened_at")
+        due = now - float(now if last is None else last) >= probe_secs
+        readout = bootpd_readout()
+        runs = readout.get("runs")
+        moved = (runs is not None and value.get("bootpd_runs") is not None
+                 and runs != value.get("bootpd_runs"))
+        if moved:
+            value["bootpd_moved_at"] = now
+            value["bootpd_runs"] = runs
+        if not (due or moved):
+            return {"action": "backoff", "events": events}
+        value["last_probe_at"] = now
+        value["probe_lane"] = args.lane
+        value["probes"] = int(value.get("probes") or 0) + 1
+        save(path, value)
+        events.append(["vm_dhcp_probe_start", fmt({
+            "lane": args.lane, "trigger": "bootpd_runs_moved" if moved else "cadence",
+            "probe": value["probes"]})])
+        return {"action": "probe", "events": events}
+
+
+def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    k = setting("TARTCI_VM_DHCP_K", K)
+    window = setting("TARTCI_VM_DHCP_WINDOW_SECS", WINDOW_S)
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        events: list[list[str]] = []
+        probe = value.get("state") == "open" and value.get("probe_lane") == args.lane
+        if probe:
+            events.append(["vm_dhcp_probe", fmt({"lane": args.lane, "vm": args.vm,
+                                                 "result": args.outcome})])
+            value["probe_lane"] = None
+        if args.outcome == "ip":
+            if value.get("state") == "open":
+                events += close(value, now, "probe" if probe else "boot_ok")
+            else:
+                value["streak"] = []
+                value["last_ip_at"] = now
+            save(path, value)
+            return {"action": "recorded", "events": events}
+        # no_ip
+        if value.get("state") == "open":
+            value["vms_spent"] = int(value.get("vms_spent") or 0) + 1
+            save(path, value)
+            return {"action": "recorded", "events": events}
+        streak = [row for row in value.get("streak") or []
+                  if isinstance(row, dict) and now - float(row.get("ts") or 0) <= window]
+        streak.append({"ts": now, "lane": args.lane, "vm": args.vm})
+        value["streak"] = streak[-MAX_STREAK:]
+        if len(streak) >= k:
+            readout = bootpd_readout()
+            value.update({"state": "open", "opened_at": now, "vms_spent": len(streak),
+                          "probes": 0, "last_probe_at": now,
+                          "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None})
+            events.append(["vm_dhcp_unanswered", fmt({
+                "streak": len(streak), "window_s": int(now - float(streak[0]["ts"])),
+                "lanes": ",".join(sorted({str(r.get("lane")) for r in streak})),
+                "last_no_ip": ",".join(iso(float(r["ts"])) for r in streak),
+                "bootpd_state": readout.get("state", "unreadable"),
+                "bootpd_runs": readout.get("runs"),
+                "bootpd_last_exit": readout.get("last_exit"),
+            })])
+        save(path, value)
+        return {"action": "recorded", "events": events}
+
+
+def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
+    """For `tartci doctor fleet`: never a write, never a lock."""
+    path = (directory or breaker_dir()) / "breaker.json"
+    if not path.exists():
+        return {"state": "closed", "source": "absent"}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"state": "unreadable", "error": str(exc)}
+    if not isinstance(value, dict) or value.get("state") not in ("open", "closed"):
+        return {"state": "unreadable", "error": "unexpected breaker shape"}
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("--lane", required=True)
+    r = sub.add_parser("record")
+    r.add_argument("--outcome", choices=["ip", "no_ip"], required=True)
+    r.add_argument("--lane", required=True)
+    r.add_argument("--vm", default="")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "status":
+            print(json.dumps(status(), sort_keys=True))
+            return 0
+        result = check(args) if args.command == "check" else record(args)
+    except Exception as exc:  # noqa: BLE001 - the caller fails open
+        print(json.dumps({"action": "error", "error": str(exc), "events": []}))
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

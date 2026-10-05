@@ -12,6 +12,7 @@
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
+#   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
@@ -1407,6 +1408,7 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;

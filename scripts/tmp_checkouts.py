@@ -40,6 +40,13 @@ created in the two days after 09-27, while the Workshop volume went from 70% to
   * a branch Pulp's worktree lineage marks `active` is kept (`lineage_active`):
     its owner decides.
 
+A host whose agents also leave worktrees in a directory that holds real clones
+(m5s's internal ~/Code: 229 worktrees of an old primary checkout, 923 GiB,
+after its worktree root moved to /Volumes/Atelier) names it in
+`extra_worktree_roots`. There only linked worktrees are eligible, under every
+gate above; a plain clone is always kept (`clone_in_shared_root`), because in
+a developer's Code directory a clone is someone's checkout, not scratch.
+
 Keep-verdicts that only a change to the checkout can reverse are cached
 (`~/.tartci/state/reclaim/checkout-verdicts.json`) while the checkout's newest
 mtime is unchanged, for at most a day, so hundreds of idle checkouts are not
@@ -51,6 +58,7 @@ Opt-in per host through the installed fleet profile:
     tmp_checkouts = true              # /private/tmp
     worktree_root_checkouts = true    # reclaim.worktrees_root
     tmp_checkout_idle_hours = 48      # optional, 24..720
+    extra_worktree_roots = ["/Users/me/Code"]   # optional; worktrees only
 """
 
 from __future__ import annotations
@@ -101,6 +109,12 @@ def validate(table: dict[str, Any]) -> list[str]:
         problems.append("reclaim.worktree_root_checkouts must be a boolean")
     elif root and not isinstance(table.get("worktrees_root"), str):
         problems.append("reclaim.worktree_root_checkouts needs reclaim.worktrees_root")
+    extra = table.get("extra_worktree_roots", [])
+    if not isinstance(extra, list) or not all(
+            isinstance(r, str) and r.startswith("/") and r.rstrip("/")
+            and ".." not in r.split("/") for r in extra):
+        problems.append("reclaim.extra_worktree_roots must be a list of absolute paths "
+                        "other than /")
     return problems
 
 
@@ -117,9 +131,10 @@ def load_settings(profile: pathlib.Path) -> tuple[dict[str, Any] | None, str]:
         return None, f"fleet profile unreadable: {exc}"
     table = data.get("reclaim")
     if not isinstance(table, dict) or (table.get("tmp_checkouts") is not True
-                                       and table.get("worktree_root_checkouts") is not True):
+                                       and table.get("worktree_root_checkouts") is not True
+                                       and not table.get("extra_worktree_roots")):
         return None, (f"neither [reclaim] tmp_checkouts nor worktree_root_checkouts "
-                      f"is true in {profile}")
+                      f"is true, and no extra_worktree_roots, in {profile}")
     problems = validate(table)
     if problems:
         return None, "; ".join(problems)
@@ -128,8 +143,9 @@ def load_settings(profile: pathlib.Path) -> tuple[dict[str, Any] | None, str]:
         roots.append(os.environ.get("TARTCI_TMP_CHECKOUT_ROOT", DEFAULT_ROOT))
     if table.get("worktree_root_checkouts") is True:
         roots.append(table["worktrees_root"])
+    extra = [r for r in table.get("extra_worktree_roots", []) if r not in roots]
     return {"idle_hours": table.get("tmp_checkout_idle_hours", DEFAULT_IDLE_HOURS),
-            "roots": roots}, "enabled"
+            "roots": roots + extra, "worktrees_only": extra}, "enabled"
 
 
 def process_cwds(runner: Runner = subprocess.run) -> list[str] | None:
@@ -329,8 +345,11 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
          runner: Runner = subprocess.run, now: float | None = None,
          budget_s: float = PASS_BUDGET_S, cwds: list[str] | None | bool = True,
          cache: dict | None = None, next_cache: dict | None = None,
+         worktrees_only: bool = False,
          ) -> dict[str, Any]:
     """One pass over the git checkouts directly under `root`.
+
+    `worktrees_only` keeps every plain clone (an extra_worktree_roots root).
 
     `in_use` is the caller's live-build test (None when the process table
     could not be read, which removes nothing). `cwds` defaults to lsof.
@@ -382,6 +401,9 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
             continue
         if kind == "unreadable" or gitdir is None:
             keep("not_git")
+            continue
+        if worktrees_only and kind == "clone":
+            keep("clone_in_shared_root")
             continue
         if blind:
             keep("process_scan_unavailable")
@@ -489,7 +511,8 @@ def run(*, fix: bool, profile: pathlib.Path,
         for one in roots:
             reports.append(scan(one, fix=fix, idle_hours=settings["idle_hours"],
                                 in_use=in_use, runner=runner, cwds=cwds,
-                                cache=cache, next_cache=next_cache))
+                                cache=cache, next_cache=next_cache,
+                                worktrees_only=str(one) in settings.get("worktrees_only", [])))
     except Exception as exc:  # noqa: BLE001 - a janitor must not take the pass down
         return {"enabled": True, "error": f"checkout scan failed: {exc}"}
     try:
