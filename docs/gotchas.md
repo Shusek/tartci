@@ -103,8 +103,9 @@ interactive ssh shells on m1 also resolve `python3` to it. (Under launchd's
 PATH a bare `python3` is a Homebrew 3.11+ on all four hosts.) CI ran the tests
 only on ubuntu's 3.12+ (`python-floor` only compiles, under 3.11); on
 2026-10-05 main itself failed 203 of 2283 tests under 3.9. *Guard:* the
-`python-39-tests` CI job runs every test module on a hosted Mac's own
-`/usr/bin/python3`, asserted to be 3.9.6. A test that genuinely needs tomllib
+`python-39-tests` CI job runs every test module under Python 3.9 (the newest
+3.9 setup-python offers; 3.9.6 itself is not built for current ubuntu
+images), asserted to be 3.9 with no tomllib and first on PATH. A test that genuinely needs tomllib
 says so through `scripts/testing_support.py` and is skipped there, and every
 module that degrades without tomllib has a running test of that branch
 (`scripts/test_no_tomllib_fallbacks.py`):

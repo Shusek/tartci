@@ -62,31 +62,27 @@ jobs:
     # The fleet's system interpreter is /usr/bin/python3 3.9.6 on all four
     # hosts (m1, m3, m5, m5studio): the tartci shim's support-manifest check,
     # the pinned launch interpreter, explicit /usr/bin/python3 call sites and
-    # every tartci_toml_exec_or_python3 fallback run on it, without tomllib.
-    # python-floor only compiles under 3.11 and the lint job runs the tests
-    # on ubuntu's 3.12+, so a 3.9-only failure reached a PR four times on
-    # 2026-10-05. setup-python has no 3.9.6 build for current ubuntu images,
-    # so this runs on a hosted Mac with the OS's own /usr/bin/python3, the
-    # same binary the hosts run, and puts it first on PATH so subprocesses
+    # every tartci_toml_exec_or_python3 fallback on a host without a tomllib
+    # Python run on it. python-floor only compiles under 3.11 and the lint job
+    # runs the tests on ubuntu's 3.12+, so a 3.9-only failure reached a PR four
+    # times on 2026-10-05. setup-python has no 3.9.6 for current ubuntu images,
+    # so this runs the newest 3.9 (same language, same stdlib surface, no
+    # tomllib) on the lint job's OS, and puts it first on PATH so subprocesses
     # that call `python3` get it too. A test that genuinely needs tomllib says
     # so (scripts/testing_support.py) and is skipped rather than failing.
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Use the OS Python 3.9.6 the fleet hosts run
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Refuse anything but a 3.9 interpreter on PATH
         run: |
           set -euo pipefail
-          version="$(/usr/bin/python3 -c 'import platform; print(platform.python_version())')"
-          echo "/usr/bin/python3 is $version"
-          [ "$version" = "3.9.6" ] || { echo "::error::expected the fleet's 3.9.6, got $version"; exit 1; }
-          mkdir -p "$RUNNER_TEMP/fleet-python"
-          ln -sf /usr/bin/python3 "$RUNNER_TEMP/fleet-python/python3"
-          ln -sf /usr/bin/python3 "$RUNNER_TEMP/fleet-python/python"
-          echo "$RUNNER_TEMP/fleet-python" >> "$GITHUB_PATH"
-      - name: Run the unit tests under Python 3.9.6 (the hosts' /usr/bin/python3)
-        run: |
-          python3 --version
-          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -c 'import sys; v = sys.version_info[:2]; print(sys.version); raise SystemExit(0 if v == (3, 9) else 1)'
+          ! python3 -c 'import tomllib' 2>/dev/null
+      - name: Run the unit tests under Python 3.9 (the hosts' /usr/bin/python3)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
   python-floor:
     # Fleet hosts run these scripts under their own Homebrew python3, and the
