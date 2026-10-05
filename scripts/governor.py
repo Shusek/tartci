@@ -255,7 +255,7 @@ def cmd_fleet(hosts: list[str], as_json: bool) -> int:
     for host in hosts:
         try:
             proc = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
                  "PATH=$HOME/.local/bin:/opt/homebrew/bin:$PATH tartci governor show --json"],
                 text=True, capture_output=True, timeout=45, check=False,
             )

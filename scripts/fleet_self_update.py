@@ -689,7 +689,7 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     """
     out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
                            "off": False}
-    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
+    ssh = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
         value = json.loads(status.out)
@@ -917,7 +917,7 @@ def on_demand_supply(cfg: Config, sys_: System, me: str,
     def healthy(host_id: str) -> str | None:
         if host_id not in health:
             target = peers.get(host_id) or SSH_ALIAS_CONVENTION.format(host_id=host_id)
-            status = sys_.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+            status = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
                                "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
             try:
                 value = json.loads(status.out)

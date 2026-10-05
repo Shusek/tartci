@@ -365,7 +365,7 @@ tartci_warm_handoff(){
     tartci_warm_discard vm_died
     return 1
   fi
-  if ! ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$WARM_IP" true 2>/dev/null; then
+  if ! ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$WARM_IP" true 2>/dev/null; then
     tartci_warm_discard vm_unreachable
     return 1
   fi

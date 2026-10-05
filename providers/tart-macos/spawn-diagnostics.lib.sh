@@ -25,7 +25,7 @@ tartci_spawn_diag_guest(){
   local ip="$1" timeout="$2" operation="$3" script="$4"
   python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
     --timeout "$timeout" --operation "$operation" -- \
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" "$script"
+    ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" "$script"
 }
 
 # Capture diagnostics when the guest's runner logs record a failed tool start.
