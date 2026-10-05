@@ -286,6 +286,7 @@ class MultiRootTests(Fixture):
         settings, _ = tc.load_settings(self.profile("[reclaim]\ntmp_checkouts = true\n"))
         self.assertEqual(len(settings["roots"]), 1)
 
+    @testing_support.requires_tomllib
     def test_an_extra_root_reaps_worktrees_and_keeps_every_clone(self) -> None:
         # m5s's internal ~/Code: agents' worktrees of an old primary checkout
         # sit beside that checkout and other real clones.
