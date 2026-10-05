@@ -1296,6 +1296,19 @@ class LeaseDiskAxisTests(LeaseCliTestCase):
                 time.sleep(0.05)
             else:
                 self.fail("guarded writer identity was not committed before timeout")
+            # The guard commits the writer's identity before it releases the
+            # writer to exec; a guard killed in between leaves a writer that
+            # exits without running, whose lease is rightly reaped. Wait for
+            # the exec so the guard dies with the writer already running.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                comm = subprocess.run(["ps", "-p", str(writer_pid), "-o", "comm="],
+                                      capture_output=True, text=True).stdout.strip()
+                if Path(comm).name == "sleep":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"guarded writer {writer_pid} never exec'd its command")
 
             supervisor.terminate()
             supervisor.wait(timeout=5)
