@@ -99,6 +99,8 @@ def status(state_dir: pathlib.Path | None = None, *, now: float | None = None,
         if isinstance(receipt.get("boot_volume"), dict) else None,
         scratch_removed_bytes=(receipt.get("scratch_dirs") or {}).get("removed_bytes")
         if isinstance(receipt.get("scratch_dirs"), dict) else None,
+        boot_usage=receipt.get("boot_usage")
+        if isinstance(receipt.get("boot_usage"), dict) else None,
     )
     if age > stale_after_s:
         out["state"] = "stale"
@@ -176,6 +178,11 @@ def degraded(value: dict[str, Any]) -> list[str]:
     vitals = value.get("vitals_refresh") or {}
     if vitals.get("state") == "refresh_failed":
         out.append(f"host-vitals sensor: REFRESH FAILED ({vitals.get('detail')})")
+    # CI and agent data piling up on the boot volume, by path (boot_usage.py).
+    usage = value.get("boot_usage") or {}
+    out.extend(w for w in usage.get("warnings") or [] if isinstance(w, str))
+    if usage.get("error"):
+        out.append(f"boot usage: NOT MEASURED ({usage['error']})")
     return out
 
 
