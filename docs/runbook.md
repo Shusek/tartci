@@ -2278,13 +2278,19 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   every lane supervisor, and leases kept being granted. The floor is computed
   per host: `clamp(max(30 GiB, fill_rate x hours to the next reclaim pass),
   30 GiB, 20% of the volume)`, with the fill rate measured over at least 6 h of
-  admission samples so a transient spike cannot inflate it. Below it a NEW
-  clone is refused (`lease_denied axis=disk reason=home_volume_below_floor
-  volume=home free=... floor=...`); running jobs and supervisors are never
-  touched. An unreadable volume admits the lease and logs `disk_axis_unread`
+  admission samples so a transient spike cannot inflate it. The profile's
+  `[host] home_volume_floor_mode` decides what happens below it, and every
+  shipped profile is `report`: the lease is admitted and the supervisor logs
+  `home_volume_would_refuse volume=home free=... floor=...`. In `refuse` mode a
+  NEW clone is denied instead (`lease_denied axis=disk
+  reason=home_volume_below_floor volume=home free=... floor=...`). Flip a host
+  to `refuse` only after a day of report data shows no would-refuse event that
+  was not a genuinely full volume, and with Daniel's OK. Either way, running
+  jobs and supervisors are never touched. An unreadable volume admits the lease and logs `disk_axis_unread`
   on every such admission. `tartci doctor fleet` reports `disk_floor_refusing`
   when the refusals run as long as the host's lane count (a floor that refuses
-  everything looks exactly like a full disk), and `disk_axis_unread` when the
+  everything looks exactly like a full disk; would-refusals count in report
+  mode), and `disk_axis_unread` when the
   volume has been unreadable for a reclaim cadence. State:
   `~/.tartci/state/leases/home-volume.json`. `TARTCI_HOME_VOLUME_FLOOR=0` turns
   it off for a lane; `TARTCI_HOME_VOLUME_FLOOR_HOURS` (default 1, the reclaim

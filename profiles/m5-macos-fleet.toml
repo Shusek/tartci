@@ -29,6 +29,11 @@ persistent_runner_labels = []
 
 # launchd does not inherit the interactive shell's GitHub App configuration.
 # Preserve references only; key and token contents remain private host files.
+# Home-volume admission floor (scripts/home_volume_floor.py): `report` admits
+# every VM lease and logs `home_volume_would_refuse` when the home volume is
+# below its computed floor. `refuse` denies the new clone instead; flip it only
+# after a day of report data shows no false refusals, and with Daniel's OK.
+home_volume_floor_mode = "report"
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"

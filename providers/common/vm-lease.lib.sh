@@ -499,22 +499,29 @@ print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_b
   event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
 }
 
-# A grant that skipped the home-volume floor because the volume could not be
-# read: the axis fails open, so the event is what keeps it from failing silent.
+# Events for a grant the home-volume floor did not refuse: `disk_axis_unread`
+# when the volume could not be read (the axis fails open, so the event keeps it
+# from failing silent), and `home_volume_would_refuse` when report mode admitted
+# a lease that refuse mode would have denied (the data that decides the flip).
 tartci_vm_lease_home_unread_event(){
-  local out="$1" home_unread
+  local out="$1" line name fields
   declare -F event >/dev/null 2>&1 || return 0
-  home_unread="$(printf '%s' "$out" | python3 -c 'import json,sys
+  line="$(printf '%s' "$out" | python3 -c 'import json,sys
 try:
     h = json.load(sys.stdin).get("home_volume") or {}
 except ValueError:
     h = {}
-if isinstance(h, dict) and h.get("state") == "unread":
-    print("volume=home reason=" + str(h.get("reason") or "unknown").replace(" ", "_"))' 2>/dev/null || true)"
-  [ -n "$home_unread" ] || return 0
-  local unread_fields=()
-  read -r -a unread_fields <<< "$home_unread"
-  event disk_axis_unread "$home_unread" ${unread_fields[@]+"${unread_fields[@]}"}
+if not isinstance(h, dict):
+    h = {}
+if h.get("state") == "unread":
+    print("disk_axis_unread volume=home reason=" + str(h.get("reason") or "unknown").replace(" ", "_"))
+elif h.get("would_refuse"):
+    print("home_volume_would_refuse volume=home free=%s floor=%s" % (h.get("free_bytes"), h.get("floor_bytes")))' 2>/dev/null || true)"
+  [ -n "$line" ] || return 0
+  name="${line%% *}"
+  fields=()
+  read -r -a fields <<< "${line#* }"
+  event "$name" "${line#* }" ${fields[@]+"${fields[@]}"}
 }
 
 # The cores a VM lease of $1 at priority $2 is granted: a non-gate lane is
@@ -712,9 +719,12 @@ tartci_acquire_vm_lease(){
     [ -z "$disk_expected_device_id" ] || disk_args+=(--disk-expected-device-id "$disk_expected_device_id")
     # The home volume holds the supervisors' temp files and the build trees; a
     # VM lease also refuses a new clone while it is below its per-host floor
-    # (scripts/home_volume_floor.py). TARTCI_HOME_VOLUME_FLOOR=0 turns it off.
+    # (scripts/home_volume_floor.py). The host profile's home_volume_floor_mode
+    # (TARTCI_HOME_VOLUME_FLOOR_MODE) is `report` until a day of would-refuse
+    # data shows no false refusals; TARTCI_HOME_VOLUME_FLOOR=0 turns it off.
     if [ "${TARTCI_HOME_VOLUME_FLOOR:-1}" = 1 ] && [ -n "${HOME:-}" ]; then
-      disk_args+=(--home-floor-path "$HOME" --home-floor-hours "${TARTCI_HOME_VOLUME_FLOOR_HOURS:-1}")
+      disk_args+=(--home-floor-path "$HOME" --home-floor-hours "${TARTCI_HOME_VOLUME_FLOOR_HOURS:-1}"
+                  --home-floor-mode "${TARTCI_HOME_VOLUME_FLOOR_MODE:-report}")
     fi
     [ -z "$disk_expected_mount_path" ] || disk_args+=(--disk-expected-mount-path "$disk_expected_mount_path")
   fi

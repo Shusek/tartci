@@ -110,12 +110,13 @@ class AdmissionTests(unittest.TestCase):
         self.vms = self.dir / "vms"
         self.vms.mkdir()
 
-    def acquire(self, free_gib: float, home_device: str = "home") -> tuple:
+    def acquire(self, free_gib: float, home_device: str = "home",
+                mode: str = "refuse") -> tuple:
         args = leases.parse_args([
             "acquire", "--store-dir", str(self.store), "--id", "vm-1", "--cores", "4",
             "--capacity", "16", "--capacity-mem-mb", "0", "--priority", "gate",
             "--pid", str(os.getpid()), "--kind", "macos-vm", "--disk-path", str(self.vms),
-            "--home-floor-path", "/Users/x", "--json"])
+            "--home-floor-path", "/Users/x", "--home-floor-mode", mode, "--json"])
         real_device = str(os.stat(self.vms).st_dev)
         device = real_device if home_device == "store" else home_device
 
@@ -135,6 +136,19 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(result["exceeded_axis"]["disk"], True)
         self.assertEqual(result["home_volume"]["free_bytes"], 21 * GIB)
         self.assertEqual(result["home_volume"]["floor_bytes"], 30 * GIB)
+
+    def test_report_mode_never_refuses_and_says_what_refuse_would_do(self) -> None:
+        # The shipped default: the m5studio replay is admitted, marked would_refuse.
+        result, rc = self.acquire(21, mode="report")
+        self.assertEqual((result["ok"], rc), (True, 0))
+        self.assertEqual((result["home_volume"]["state"], result["home_volume"]["mode"],
+                          result["home_volume"]["would_refuse"]), ("below", "report", True))
+        # The streak still counts, so the day of report data is readable.
+        self.assertEqual(hvf.status(self.store)["consecutive_denials"], 1)
+
+    def test_the_cli_default_is_report(self) -> None:
+        args = leases.parse_args(["acquire", "--id", "x", "--cores", "1"])
+        self.assertEqual(args.home_floor_mode, "report")
 
     def test_a_home_volume_with_room_is_admitted(self) -> None:
         result, rc = self.acquire(300)
@@ -184,6 +198,30 @@ class DenialEventTests(unittest.TestCase):
         self.assertIn(f"volume=home free={21 * GIB} floor={30 * GIB}", out)
 
 
+class ProfileModeTests(unittest.TestCase):
+    def test_every_shipped_profile_ships_report_and_renders_it(self) -> None:
+        import tomllib
+        import macos_fleet_lanes as lanes
+        for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
+            with self.subTest(profile=path.name):
+                data = tomllib.loads(path.read_text())
+                self.assertEqual(data["host"].get("home_volume_floor_mode"), "report")
+                res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
+                                      str(path)], cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        source = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.toml"
+            bad.write_text(source.replace('home_volume_floor_mode = "report"',
+                                          'home_volume_floor_mode = "enforce"'))
+            res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
+                                  str(bad)], cwd=ROOT, capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("home_volume_floor_mode", res.stderr)
+
+
 class UnreadEventTests(unittest.TestCase):
     def run_lib(self, payload: dict) -> str:
         script = (f'event(){{ printf "%s\\n" "$*"; }}; TARTCI_ROOT={ROOT}; '
@@ -197,6 +235,43 @@ class UnreadEventTests(unittest.TestCase):
                                                         "reason": "OSError: EPERM"}})
         self.assertIn("disk_axis_unread volume=home reason=OSError:_EPERM", out)
         self.assertEqual(self.run_lib({"ok": True, "home_volume": {"state": "ok"}}), "")
+
+    def test_a_report_mode_grant_below_the_floor_logs_would_refuse(self) -> None:
+        out = self.run_lib({"ok": True, "home_volume": {
+            "state": "below", "mode": "report", "would_refuse": True,
+            "free_bytes": 21 * GIB, "floor_bytes": 30 * GIB}})
+        self.assertIn(f"home_volume_would_refuse volume=home free={21 * GIB} "
+                      f"floor={30 * GIB}", out)
+
+    def test_the_acquire_path_emits_it_on_a_grant(self) -> None:
+        # End to end through tartci_acquire_vm_lease: a granted lease whose
+        # home volume could not be read must reach the event log.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            (root / "scripts").mkdir(parents=True)
+            (root / "scripts" / "leases.py").write_text(
+                "import json\nprint(json.dumps({'ok': True, 'disk': {'free_bytes': 1, "
+                "'reserved_bytes': 0, 'requested_bytes': 0, 'required_bytes': 0, "
+                "'device_id': '1'}, 'home_volume': {'state': 'unread', "
+                "'reason': 'OSError: EPERM'}}))\n")
+            vms = Path(td) / "vms"
+            vms.mkdir()
+            script = f"""
+                event(){{ printf 'EVENT %s\\n' "$*"; }}
+                TARTCI_ROOT={ROOT}; . {ROOT}/providers/common/vm-lease.lib.sh
+                TARTCI_ROOT={root}
+                tartci_vm_leases_enabled(){{ return 0; }}
+                tartci_vm_lease_granted_cores(){{ printf '%s' "$1"; }}
+                tartci_vm_lease_derived_mem_mb(){{ printf 4096; }}
+                tartci_observe_disk_admission(){{ :; }}
+                tartci_start_vm_lease_heartbeat(){{ :; }}
+                tartci_vm_lease_disk_expected_device_id(){{ :; }}
+                tartci_vm_lease_disk_expected_mount_path(){{ :; }}
+                tartci_acquire_vm_lease vm-1 4 macos-vm gate pulp 4096 {vms} tart-macos lane runner
+            """
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                 timeout=60).stdout
+        self.assertIn("EVENT disk_axis_unread volume=home reason=OSError:_EPERM", out)
 
 
 if __name__ == "__main__":

@@ -1579,7 +1579,12 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 args.home_floor_path, store_dir, time.time(),
                 store_device=str(disk.get("device_id")),
                 hours_to_next_pass=float(getattr(args, "home_floor_hours", 1.0) or 1.0))
-            if home_volume["state"] == "below":
+            home_volume["mode"] = getattr(args, "home_floor_mode", "report") or "report"
+            if home_volume["state"] == "below" and home_volume["mode"] == "report":
+                # Report mode: the floor is being proven on real data before it
+                # may refuse anything. Admit, and say what refuse would have done.
+                home_volume["would_refuse"] = True
+            elif home_volume["state"] == "below":
                 # Only a NEW clone is refused here; nothing running is touched.
                 write_records(store_dir, active)
                 settle_waiter(

@@ -191,6 +191,12 @@ def parse_args(
              "device; a NEW VM lease below it is refused (home_volume_floor.py)",
     )
     acquire_parser.add_argument(
+        "--home-floor-mode",
+        choices=("report", "refuse"),
+        default="report",
+        help="report (default): admit and mark the grant would_refuse; refuse: deny it",
+    )
+    acquire_parser.add_argument(
         "--home-floor-hours",
         type=float,
         default=1.0,

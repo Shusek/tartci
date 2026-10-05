@@ -770,8 +770,9 @@ def check_home_volume(value: dict | None, *, lanes: int, now: float | None = Non
             f"{last.get('floor_bytes', 0) / gib:.0f} GiB")
     if streak >= max(1, lanes):
         return Finding("home_volume", PROBLEM, "disk_floor_refusing",
-                       f"{streak} VM admissions in a row refused below the home-volume floor "
-                       f"({text}); reclaim the volume, or the floor is wrong", facts)
+                       f"{streak} VM admissions in a row below the home-volume floor "
+                       f"({text}; refused, or would-refuse in report mode); reclaim the "
+                       f"volume, or the floor is wrong", facts)
     return Finding("home_volume", OK, "home_volume_floor_ok",
                    f"{text}; {streak} consecutive refusals", facts)
 
