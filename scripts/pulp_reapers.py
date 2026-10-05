@@ -384,8 +384,11 @@ def normalize_origin(url: str) -> str:
     for prefix in ("https://", "http://", "ssh://", "git://"):
         if text.lower().startswith(prefix):
             text = text[len(prefix):]
-            if "@" in text.split("/", 1)[0]:
-                text = text.split("@", 1)[1]
+            host, _, rest = text.partition("/")
+            host = host.split("@", 1)[-1]
+            if prefix == "ssh://":
+                host = host.split(":", 1)[0]        # ssh://git@host:22/o/r
+            text = f"{host}/{rest}"
             break
     else:
         head = text.split("/", 1)[0]
@@ -407,8 +410,8 @@ def origin_of(path: pathlib.Path, runner: Runner) -> str | None:
 
 
 def same_origin_worktrees(root: pathlib.Path, origin: str, runner: Runner = subprocess.run
-                          ) -> tuple[list[str], int, list[str]]:
-    """(matching, children_seen, unreadable) over the direct children of `root`.
+                          ) -> tuple[list[str], int, list[str], set[str]]:
+    """(matching, children_seen, unreadable, clone_roots) over the children of `root`.
 
     A child counts when its `.git` is a gitdir file (a worktree) and its
     repository's origin URL, read through to the common config, equals
@@ -418,11 +421,12 @@ def same_origin_worktrees(root: pathlib.Path, origin: str, runner: Runner = subp
     """
     matching: list[str] = []
     unreadable: list[str] = []
+    clones: set[str] = set()
     seen = 0
     try:
         children = sorted(root.iterdir())
     except OSError:
-        return matching, seen, unreadable
+        return matching, seen, unreadable, clones
     for child in children:
         if not (child / ".git").is_file():
             continue
@@ -432,7 +436,10 @@ def same_origin_worktrees(root: pathlib.Path, origin: str, runner: Runner = subp
             unreadable.append(str(child))
         elif url == origin:
             matching.append(str(child))
-    return matching, seen, unreadable
+            common = _common_dir(child, runner)
+            if common and os.path.basename(common) == ".git":
+                clones.add(os.path.dirname(common))
+    return matching, seen, unreadable, clones
 
 
 def run(*, fix: bool, profile: pathlib.Path | None = None,
@@ -454,7 +461,8 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         # Present from the start, so "discovery did not run" reads differently
         # from "discovery ran and matched nothing".
         "discovery": {"reason": "not_reached", "roots": [], "children_seen": 0,
-                      "configured_origin": None, "unreadable": []},
+                      "configured_origin": None, "unreadable": [],
+                      "unreadable_children": 0},
     }
     report["worktrees_in_tmp"] = tmp_worktrees(pathlib.Path(settings["repo"]), runner=runner)
     checkout_path = (state_dir or default_state_dir()) / "pulp-reapers"
@@ -512,6 +520,7 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
     origin = origin_of(pathlib.Path(settings["repo"]), runner)
     discovery = report["discovery"]
     discovery.update(reason=None, configured_origin=origin)
+    clones: set[str] = set()
     if origin is None:
         # Fail closed and say so: no identity, no pass outside the profile root.
         discovery["reason"] = "configured_origin_unreadable"
@@ -520,11 +529,13 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         resolved = os.path.realpath(extra)
         if resolved == configured:
             continue
-        worktrees, seen, unreadable = same_origin_worktrees(pathlib.Path(resolved), origin,
-                                                            runner)
+        worktrees, seen, unreadable, found = same_origin_worktrees(pathlib.Path(resolved),
+                                                                   origin, runner)
         discovery["roots"].append(resolved)
         discovery["children_seen"] += seen
         discovery["unreadable"] += unreadable
+        discovery["unreadable_children"] += len(unreadable)
+        clones |= found
         if not worktrees:
             continue
         warning = f"worktrees_outside_profile_root root={resolved} count={len(worktrees)}"
@@ -536,6 +547,25 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
                         timeout_s=REAPER_TIMEOUT_S[BUILD_COV],
                         idle_hours=settings["worktree_build_idle_hours"], stream=stream)
         record["reason"] = "discovered_pulp_root"
+        report["runs"].append(record)
+        report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
+    # A clone's in-repo agent worktrees (.claude/worktrees) are under none of
+    # the roots above: the reaper's own repo root is the materialized checkout,
+    # not any clone. One more run of the same path-based script covers each,
+    # the configured clone's included, where the directory exists.
+    agent_dirs = [(str(pathlib.Path(settings["repo"]) / ".claude" / "worktrees"),
+                   "configured_clone_agent_worktrees")]
+    configured_repo = os.path.realpath(settings["repo"])
+    agent_dirs += [(os.path.join(clone, ".claude", "worktrees"), "discovered_clone_agent_worktrees")
+                   for clone in sorted(clones) if os.path.realpath(clone) != configured_repo]
+    for agent_dir, reason in agent_dirs:
+        if not os.path.isdir(agent_dir):
+            continue
+        record = reaper(checkout / "tools" / "scripts" / f"{BUILD_COV}.sh", fix=fix,
+                        worktrees_root=agent_dir, measure_path=pathlib.Path(agent_dir),
+                        timeout_s=REAPER_TIMEOUT_S[BUILD_COV],
+                        idle_hours=settings["worktree_build_idle_hours"], stream=stream)
+        record["reason"] = reason
         report["runs"].append(record)
         report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
     failed = [r["reaper"] for r in report["runs"] if r.get("exit_code") != 0]

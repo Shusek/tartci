@@ -486,6 +486,13 @@ class DiscoveredPulpRoots(Isolated):
         calls, out, _ = self.run_with(repo, [boot_code])
         self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
         self.assertEqual(out["discovery"]["unreadable"], [str(broken)])
+        self.assertEqual(out["discovery"]["unreadable_children"], 1)
+        no_origin = self.second_clone_worktree(repo, boot_code, "no-origin")
+        git(self.tmp / "clone-no-origin", "remote", "remove", "origin")
+        calls, out, _ = self.run_with(repo, [boot_code])
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(sorted(out["discovery"]["unreadable"]), sorted([str(broken), str(no_origin)]))
+        self.assertEqual(out["discovery"]["unreadable_children"], 2)
 
     def test_an_unreadable_configured_origin_runs_nothing_outside_and_says_so(self):
         repo = PulpRepo(self.tmp)
@@ -516,6 +523,7 @@ class DiscoveredPulpRoots(Isolated):
 
     def test_origin_urls_normalize_across_forms(self):
         same = ["git@github.com:Generous-Corp/pulp.git", "ssh://git@github.com/Generous-Corp/pulp",
+                "ssh://git@github.com:22/Generous-Corp/pulp.git/",
                 "https://github.com/Generous-Corp/pulp.git", "https://GitHub.com/generous-corp/pulp/",
                 "http://github.com/Generous-Corp/pulp"]
         self.assertEqual({pr.normalize_origin(u) for u in same}, {"github.com/generous-corp/pulp"})
@@ -523,23 +531,43 @@ class DiscoveredPulpRoots(Isolated):
                             pr.normalize_origin(same[0]))
 
     def test_the_receipt_carries_every_field_a_control_reads(self):
-        # Structural: whatever run() reports for a discovered root must survive
-        # the receipt projection. The landed control reads last-run.json, and
-        # a projection that dropped these made it unpassable.
+        # Structural, not a second literal list: every key the REAL reaper puts
+        # in a run record, and the discovery evidence, must survive the
+        # projection into last-run.json. A key run() adds without being
+        # projected fails here.
         repo = PulpRepo(self.tmp)
         boot_code = self.tmp / "boot-code"
         self.second_clone_worktree(repo, boot_code, "wt")
-        _, out, _ = self.run_with(repo, [boot_code])
-        summary = dr.pass_summary({"pulp_reapers": out, "mode": "fix", "report": {}}, 0)
+        profile = repo.profile(self.tmp / "p.toml")
+        out, _ = self.quiet(pr.run, fix=False, profile=profile, state_dir=self.state,
+                            discovered_roots=[boot_code])
+        self.assertTrue([r for r in out["runs"] if r.get("reason") == "discovered_pulp_root"])
+        summary = dr.pass_summary({"pulp_reapers": out, "mode": "dry-run", "report": {}}, 0)
         projected = summary["pulp_reapers"]
-        self.assertEqual(projected["outside_profile_roots"], out["outside_profile_roots"])
-        for key in ("reason", "roots", "children_seen", "configured_origin"):
-            self.assertEqual(projected["discovery"][key], out["discovery"][key], key)
         self.assertEqual(len(projected["runs"]), len(out["runs"]))
         for record, shown in zip(out["runs"], projected["runs"]):
-            for key in ("reaper", "reason", "worktrees_root", "exit_code", "reclaimed_bytes"):
-                self.assertEqual(shown.get(key), record.get(key), key)
-        self.assertTrue([r for r in projected["runs"] if r.get("reason") == "discovered_pulp_root"])
+            self.assertLessEqual(set(record), set(shown), record)
+        self.assertEqual(projected["outside_profile_roots"], out["outside_profile_roots"])
+        self.assertLessEqual(set(out["discovery"]), set(projected["discovery"]))
+
+    def test_each_clones_agent_worktrees_get_one_run_when_present(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt")
+        calls, out, _ = self.run_with(repo, [boot_code])
+        self.assertFalse([r for r in out["runs"] if "agent_worktrees" in str(r.get("reason"))],
+                         "absent .claude/worktrees: nothing recorded")
+        configured = repo.primary / ".claude" / "worktrees"
+        second = self.tmp / "clone-wt" / ".claude" / "worktrees"
+        configured.mkdir(parents=True)
+        second.mkdir(parents=True)
+        calls, out, _ = self.run_with(repo, [boot_code])
+        reasons = {(r["reason"], r["worktrees_root"]) for r in out["runs"] if r.get("reason")}
+        self.assertIn(("configured_clone_agent_worktrees", str(configured)), reasons)
+        self.assertIn(("discovered_clone_agent_worktrees", str(second)), reasons)
+        heavy = [c for c in calls if c[0] == "clean_worktree_builds"
+                 and c[1] in (str(configured), str(second))]
+        self.assertEqual(heavy, [], "the heavier reaper never follows these")
 
     def test_two_discovered_roots_get_one_run_each(self):
         repo = PulpRepo(self.tmp)

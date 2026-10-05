@@ -829,7 +829,7 @@ def _discovery_summary(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
     unreadable = value.get("unreadable") or []
-    return dict(value, unreadable=unreadable[:10], unreadable_count=len(unreadable))
+    return dict(value, unreadable=unreadable[:10])
 
 
 def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:

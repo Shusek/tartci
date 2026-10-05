@@ -934,7 +934,11 @@ is scanned and the receipt says `configured_origin_unreadable`; a child whose
 origin cannot be read is never counted. The receipt's `pulp_reapers.discovery`
 records the roots scanned and the children seen, so "scanned N, matched 0" reads
 differently from "did not run", and `outside_profile_roots` plus each run's
-`reason` and `worktrees_root` are kept in `last-run.json`. The heavier reaper never
+`reason` and `worktrees_root` are kept in `last-run.json`. A clone's in-repo
+agent worktrees (`<clone>/.claude/worktrees`) lie under none of those roots, the
+configured clone's included (the reaper's own repo root is the materialized
+checkout), so where that directory exists the same script runs once more over
+it (`configured_clone_agent_worktrees` / `discovered_clone_agent_worktrees`). The heavier reaper never
 follows a discovered root. The root-level check is not a per-child filter:
 `clean_build_cov.sh` removes `build-cov*` under any direct child of a root it
 runs over, as it always has for `worktrees_root`.
