@@ -306,6 +306,84 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(rc, guard.EXIT_BUDGET)
         self.assertEqual(report["status"], "budget_exhausted")
 
+    def fake_clock(self) -> None:
+        """Advance the budget clock by one per check: a budget of N admits N entries."""
+        ticks = iter(range(10**6))
+        guard.CLOCK = lambda: float(next(ticks))
+        self.addCleanup(setattr, guard, "CLOCK", time.monotonic)
+
+    def tail_fixture(self) -> Path:
+        """Filler entries in every fan-out ahead of a poisoned manifest in `f`."""
+        for top in "0123456789abcde":
+            for n in range(3):
+                path = self.fx.cache / top / "0" / f"filler{n}"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"not a manifest")
+        return self.fx.manifest("f3" + "9" * 38, [], [R_HEADERS])
+
+    def test_exhausted_run_then_resume_covers_the_tail(self) -> None:
+        late = self.tail_fixture()
+        self.fake_clock()
+        rc, first = self.fx.run("quarantine", "--budget", "30")
+        self.assertEqual(rc, guard.EXIT_BUDGET)
+        self.assertTrue(late.exists(), "the first run must stop before the tail")
+        self.assertIsNotNone(first["cursor"])
+        self.assertNotIn("resumed_from", first)
+        rc, second = self.fx.run("quarantine", "--budget", "30")
+        self.assertEqual(second["resumed_from"], first["cursor"])
+        self.assertFalse(late.exists(), "the resumed run must reach the tail")
+        self.assertIn(self.rel(late), self.quarantined(second))
+
+    def test_without_the_cursor_every_exhausted_run_stops_at_the_head(self) -> None:
+        # Control for the test above: the same budget, cursor removed between
+        # runs, never reaches the tail.
+        late = self.tail_fixture()
+        self.fake_clock()
+        for _ in range(3):
+            rc, _report = self.fx.run("quarantine", "--budget", "30")
+            self.assertEqual(rc, guard.EXIT_BUDGET)
+            (self.fx.qroot / guard.CURSOR_FILE).unlink()
+        self.assertTrue(late.exists())
+
+    def test_resumed_run_wraps_to_the_head_and_a_complete_run_clears_the_cursor(self) -> None:
+        late = self.tail_fixture()
+        self.fake_clock()
+        self.fx.run("quarantine", "--budget", "30")
+        total = sum(1 for _ in guard.iter_all_entries(self.fx.cache))
+        rc, report = self.fx.run("quarantine", "--budget", "100000")
+        self.assertEqual(rc, guard.EXIT_OK)
+        self.assertIsNone(report["cursor"])
+        self.assertFalse((self.fx.qroot / guard.CURSOR_FILE).exists())
+        self.assertFalse(late.exists())
+        # The wrapped part reached every unit, so the run counted every entry.
+        self.assertEqual(report["counts"]["entries"], total)
+        self.assertFalse(self.poison.exists())
+
+    def test_cursor_for_a_vanished_unit_starts_at_the_next_one(self) -> None:
+        self.tail_fixture()
+        guard.save_cursor(self.fx.qroot, [".", "e", "zz"])
+        units = [key for key, _root, _entry in guard.iter_from(self.fx.cache, [".", "e", "zz"])]
+        self.assertEqual(units[0][:2], [".", "f"])
+        # Every entry is still visited exactly once.
+        self.assertEqual(len(units), sum(1 for _ in guard.iter_all_entries(self.fx.cache)))
+
+    def test_unreadable_or_unknown_cursor_starts_at_the_beginning(self) -> None:
+        self.fx.qroot.mkdir(parents=True)
+        (self.fx.qroot / guard.CURSOR_FILE).write_text("{not json")
+        self.assertIsNone(guard.load_cursor(self.fx.qroot))
+        plain = [str(e) for _r, e in guard.iter_all_entries(self.fx.cache)]
+        unknown = [str(e) for _k, _r, e in guard.iter_from(self.fx.cache, ["elsewhere", "1", ""])]
+        self.assertEqual(plain, unknown)
+
+    def test_scan_neither_reads_nor_moves_the_cursor(self) -> None:
+        self.tail_fixture()
+        guard.save_cursor(self.fx.qroot, [".", "f", "3"])
+        before = (self.fx.qroot / guard.CURSOR_FILE).read_text()
+        rc, report = self.fx.run("scan")
+        self.assertEqual(rc, guard.EXIT_OK)
+        self.assertNotIn("resumed_from", report)
+        self.assertEqual((self.fx.qroot / guard.CURSOR_FILE).read_text(), before)
+
     def test_reset_refuses_while_busy(self) -> None:
         guard.BUSY_PROBE = lambda: "a Tart VM is running on this host"
         rc, report = self.fx.run("reset", "--reset")
