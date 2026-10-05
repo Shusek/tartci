@@ -11,6 +11,8 @@ Run:  python3 scripts/test_tartci_launchd_watchdog.py
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import os
 import plistlib
 import sys

@@ -16,6 +16,7 @@ The two that matter most are a matched pair, and they must BOTH hold:
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import plistlib
 import sys
 import unittest
@@ -89,6 +90,7 @@ class TestLabelExtraction(unittest.TestCase):
 
 
 class TestLaneFromPlist(unittest.TestCase):
+    @testing_support.requires_tomllib
     def test_state_dir_and_identity_come_from_the_plist(self) -> None:
         label = PREFIX + "studio.pulp-gate"
         plist = installed_plist(label)
@@ -99,6 +101,7 @@ class TestLaneFromPlist(unittest.TestCase):
         self.assertEqual(lane.state_dir, Path("/tmp/x/macos-fleet/pulp-gate"))
         self.assertEqual(lane.runner_name, "studio-pulp-gate-01")
 
+    @testing_support.requires_tomllib
     def test_every_discovered_lane_carries_the_supervisors_runner_name(self) -> None:
         for label, name in (("studio.pulp-gate", "studio-pulp-gate-01"),
                             ("studio.pulp-gate.slot2", "studio-pulp-gate-slot2-02")):
@@ -155,6 +158,7 @@ class TestDiscovery(unittest.TestCase):
         self.agents = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
 
+    @testing_support.requires_tomllib
     def test_discovers_every_loaded_lane_with_its_own_state_dir(self) -> None:
         for label, ident in (
             ("studio.pulp-gate", "pulp-gate"),
@@ -182,6 +186,7 @@ class TestDiscovery(unittest.TestCase):
         self.assertTrue(any("launchctl_unreadable" in p for p in problems))
         self.assertEqual(fld.lane_state_dirs(lanes), [])
 
+    @testing_support.requires_tomllib
     def test_lane_without_state_dir_is_reported_not_guessed(self) -> None:
         write_plist(self.agents, PREFIX + "studio.pulp-gate", None)
         listing = "PID\tStatus\tLabel\n1\t0\t" + PREFIX + "studio.pulp-gate\n"
@@ -247,6 +252,7 @@ class TestInstalledPlistContract(unittest.TestCase):
                 for slot in range(1, lane.get("supervisors", 1) + 1):
                     yield profile.name, installer.lane_plist(data, lane, slot=slot), os
 
+    @testing_support.requires_tomllib
     def test_discovery_names_every_rendered_lane_as_its_supervisor_does(self) -> None:
         import subprocess
         runner = self.ROOT / "providers" / "tart-macos" / "runner.sh"

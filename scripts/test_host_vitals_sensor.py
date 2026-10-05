@@ -7,6 +7,8 @@ reading) and m5studio had none; `pool status` read `fseventsd: UNKNOWN`.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import os
 import pathlib
 import shutil

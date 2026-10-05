@@ -12,6 +12,8 @@ Run:  python3 -m unittest scripts.test_pulp_reapers
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import io
 import json
 import re

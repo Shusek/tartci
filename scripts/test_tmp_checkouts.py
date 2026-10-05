@@ -7,6 +7,7 @@ Every fixture is a real git repository under a temp dir standing in for
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import pathlib
@@ -258,6 +259,7 @@ class MultiRootTests(Fixture):
         path.write_text(body)
         return path
 
+    @testing_support.requires_tomllib
     def test_both_roots_are_swept_and_reported_per_root(self) -> None:
         worktrees = self.base / "agent-worktrees"
         worktrees.mkdir()
@@ -276,6 +278,7 @@ class MultiRootTests(Fixture):
         self.assertEqual(sorted(report["by_root"]), sorted([str(self.tmp), str(worktrees)]))
         self.assertEqual(report["by_root"][str(worktrees)]["removed"], 1)
 
+    @testing_support.requires_tomllib
     def test_worktree_root_is_opt_in_and_needs_a_root(self) -> None:
         self.assertTrue(pr.validate_table({"worktree_root_checkouts": True}))
         self.assertEqual(pr.validate_table({"worktree_root_checkouts": True,

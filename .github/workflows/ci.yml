@@ -58,6 +58,25 @@ jobs:
             bash "$test_script" || { rc=$?; echo "::error::$test_script exited $rc"; exit 1; }
           done
 
+  python-39-tests:
+    # The hosts run launchd agents, the interval guard and every
+    # tartci_toml_exec_or_python3 fallback under /usr/bin/python3, which is
+    # 3.9 and has no tomllib. python-floor only compiles under 3.11 and the
+    # lint job runs the tests on ubuntu's 3.12+, so a test or code path that
+    # breaks on 3.9 reached main four times on 2026-10-05. Every test module
+    # runs here under 3.9; one that genuinely needs tomllib says so
+    # (scripts/testing_support.py) and is skipped rather than failing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Run the unit tests under Python 3.9 (the hosts' /usr/bin/python3)
+        run: |
+          python --version
+          python -m unittest discover -s scripts -p 'test_*.py'
+
   python-floor:
     # Fleet hosts run these scripts under their own Homebrew python3, and the
     # oldest one in service is 3.11 (the tomllib floor). The lint job's

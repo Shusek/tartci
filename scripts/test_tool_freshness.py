@@ -8,6 +8,7 @@ fault present and absent, so a check that can only pass would fail here.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import hashlib
 import json
 import os
@@ -584,6 +585,7 @@ class StatusSurfaceTests(unittest.TestCase):
         path.write_text(json.dumps(reading))
         return path
 
+    @testing_support.requires_tomllib
     def test_fseventsd_over_its_limit_is_a_problem_and_under_is_not(self) -> None:
         import macos_fleet_lanes as lanes
         big = lanes.host_vitals_summary(self.vitals(
@@ -595,6 +597,7 @@ class StatusSurfaceTests(unittest.TestCase):
         self.assertIsNone(small["problem"])
         self.assertTrue(small["lines"][0].startswith("fseventsd: 20 MB RSS, 1.0% CPU"))
 
+    @testing_support.requires_tomllib
     def test_fseventsd_absent_or_unpublished_reads_unknown_never_ok(self) -> None:
         import macos_fleet_lanes as lanes
         self.assertIn("UNKNOWN (host-vitals reading has no fseventsd field",
@@ -602,6 +605,7 @@ class StatusSurfaceTests(unittest.TestCase):
         self.assertIn("UNKNOWN (no host-vitals reading",
                       lanes.host_vitals_summary(self.dir / "absent.json")["lines"][0])
 
+    @testing_support.requires_tomllib
     def test_status_lines_and_watchdog_warning_carry_both(self) -> None:
         import macos_fleet_lanes as lanes
         import tartci_launchd_watchdog as wd

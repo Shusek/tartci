@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import datetime as dt
 import json
 import subprocess
@@ -79,6 +80,7 @@ class RecordedFixtureTests(unittest.TestCase):
         self.assertEqual(m1["served_by"], {"studio/pulp-gate": 1})
         self.assertEqual(result["undeclared"], [])
 
+    @testing_support.requires_tomllib
     def test_cli_on_fixture(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "supply_observed.py"), "--repo", REPO,

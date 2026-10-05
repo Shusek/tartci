@@ -70,6 +70,30 @@ not the exit code.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A test passes in CI and fails on the hosts' Python (2026-10-05)
+
+*Symptom:* a change is green in CI, then its tests fail under
+`/usr/bin/python3` with `No module named 'tomllib'` (#379, #390, #383, #391 on
+one day). *Cause:* the hosts run launchd agents, the interval guard and every
+`tartci_toml_exec_or_python3` fallback under `/usr/bin/python3`, which is 3.9
+and has no tomllib, while CI ran the tests only on ubuntu's 3.12+
+(`python-floor` only compiles, under 3.11). On 2026-10-05 main itself failed
+203 of 2283 tests under 3.9. *Guard:* the `python-39-tests` CI job runs every
+test module under Python 3.9. A test that genuinely needs tomllib says so
+through `scripts/testing_support.py` and is skipped there:
+
+```python
+import testing_support
+testing_support.skip_module_without_tomllib()   # whole module, before its imports
+
+@testing_support.requires_tomllib                # one test or class
+def test_reads_the_profile(self): ...
+```
+
+Import a tomllib-only module (`macos_fleet_lanes`, `fleet_self_update`, ...)
+inside the test that needs it, not at module level, so the module's other
+tests still run on the hosts' Python.
+
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
