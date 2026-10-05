@@ -100,6 +100,17 @@ class MemoryAxisTests(unittest.TestCase):
         self.assertEqual(same, [])
 
 
+class NoReserveTests(unittest.TestCase):
+    def test_a_host_with_no_gate_reserve_reports_nothing(self) -> None:
+        # A CI runner or a small host: host-profile gives reserved_gate_cores 0
+        # and the watchdog must not WARN that every gate lane overcommits it.
+        host = {"reserved_gate_cores": 0, "vm_pool_cores": 1, "reserved_gate_mem_mb": 0}
+        data = {"lane": [{"id": "pulp-gate", "supervisors": 2, "vm_cores": 7}]}
+        self.assertEqual(grf.fit(data, host), [])
+        rows, refusals = grf.ratchet(data, data, host)
+        self.assertEqual((rows, refusals), ([], []))
+
+
 class RatchetTests(unittest.TestCase):
     @requires_tomllib
     def test_the_373_sizing_is_refused_against_the_installed_profile(self) -> None:

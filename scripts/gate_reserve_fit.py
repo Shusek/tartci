@@ -66,8 +66,11 @@ def fit(profile: Dict[str, Any], host: Dict[str, Any]) -> List[Dict[str, Any]]:
         reserve = {"cores": int(host["reserved_gate_cores"]),
                    "memory": int(host.get("reserved_gate_mem_mb") or 0)}
         for axis in AXES:
-            if axis == "memory" and reserve[axis] <= 0:
-                continue  # memory axis off on this host
+            if reserve[axis] <= 0:
+                # No gate reserve on this axis (memory unread, or a host whose
+                # role reserves nothing for gates): there is no reserve for the
+                # slots to fit inside, so there is nothing to measure.
+                continue
             rows.append({"lane": str(lane.get("id")), "axis": axis,
                          "demand": demand[axis], "reserve": reserve[axis],
                          "over": max(0, demand[axis] - reserve[axis])})
