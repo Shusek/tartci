@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Dispatch a repository's frequent safety-net workflows at their real cadence.
+"""Dispatch a repository's frequent safety-net and daily workflows at their real cadence.
 
 Why this exists
 ---------------
 GitHub delays ``schedule`` events under load and drops the ones that pile up.
 On Generous-Corp/pulp every hourly-or-faster cron fires about once every five
 hours (2026-10-01..02: 7-8 runs per ``*/15``/``*/30`` workflow in 41 h, 82-164
-expected), while daily crons still fire daily, five to seven hours late. The
-merge-stall, runner-health, release-reconcile, and similar watchdogs therefore
-run a fraction as often as their crons promise.
+expected), while daily crons fire five to seven hours late and sometimes not at
+all (read-audit-nightly.yml, 2026-10-05). The merge-stall, runner-health,
+release-reconcile, and similar watchdogs therefore run a fraction as often as
+their crons promise, and a daily check counting consecutive days can lose one.
+A daily workflow is listed with ``cadence_minutes`` 1440.
 
 This agent closes the gap from outside GitHub's scheduler. Each tick it reads
 the repository's ``.github/schedule-backstop.json`` manifest (which the
@@ -58,6 +60,10 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 SCHEMA_VERSION = 1
+# A daily workflow (one cron firing a day) is listed with this cadence: the
+# agent then dispatches it only when no run on the ref is a day old, so a daily
+# check that counts consecutive days cannot lose one to a dropped cron.
+DAILY_MINUTES = 1440
 MANIFEST_PATH = ".github/schedule-backstop.json"
 MANIFEST_REFRESH_SECS = 3600
 ACTIVE_STATUSES = {"queued", "in_progress", "waiting", "requested", "pending"}
@@ -111,8 +117,8 @@ def validate_manifest(value: object) -> Dict[str, Any]:
             or name in seen
         ):
             raise BackstopError(f"manifest workflow {name!r} is not a unique bare workflow file")
-        if type(cadence) is not int or not 1 <= cadence <= 60:
-            raise BackstopError(f"{name}: cadence_minutes must be an integer in 1..60")
+        if type(cadence) is not int or not (1 <= cadence <= 60 or cadence == DAILY_MINUTES):
+            raise BackstopError(f"{name}: cadence_minutes must be an integer in 1..60, or {DAILY_MINUTES}")
         seen.add(name)
         workflows.append({"file": name, "cadence_minutes": cadence})
     return {"ref": ref, "workflows": workflows}

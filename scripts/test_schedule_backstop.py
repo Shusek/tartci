@@ -169,9 +169,21 @@ class ManifestTests(unittest.TestCase):
                 sb.validate_manifest(manifest((name, 30)))
 
     def test_rejects_out_of_range_cadence(self):
-        for cadence in (0, 61, "30", True):
+        for cadence in (0, 61, 1439, 1441, 2880, "30", True):
             with self.assertRaises(sb.BackstopError, msg=repr(cadence)):
                 sb.validate_manifest(manifest(("a.yml", cadence)))
+
+    def test_a_daily_workflow_is_dispatched_only_after_a_day_without_a_run(self):
+        self.assertEqual(sb.validate_manifest(manifest(("nightly.yml", 1440)))["workflows"],
+                         [{"file": "nightly.yml", "cadence_minutes": 1440}])
+        day = 1440 * 60
+        now = 1_800_000_000.0
+        run = {"created_at": sb.iso(now - day + 600), "status": "completed"}
+        self.assertEqual(sb.decide(run, day, None, now)["action"], "skip")      # 23h50m old
+        run = {"created_at": sb.iso(now - day - 600), "status": "completed"}
+        self.assertEqual(sb.decide(run, day, None, now)["action"], "dispatch")  # dropped cron
+        # Its own dispatch is paced by the day, not by the tick.
+        self.assertEqual(sb.decide(run, day, now - 3600, now)["action"], "skip")
 
 
 class CommandLineTests(unittest.TestCase):

@@ -509,6 +509,13 @@ rm "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
 then set `schedule_backstop = "off"` (or remove the key) in that host's profile
 so the next `tartci setup` does not reinstall it.
 
+A daily workflow is listed with `cadence_minutes` 1440 (the only value
+allowed above 60): it is dispatched only when no run on the ref is a day old,
+so a check that counts consecutive days, such as the read audit's Stage 0
+streak, cannot lose a day to a dropped cron. Its late cron can still fire
+right after such a dispatch; the workflow's concurrency group keeps that to
+one run.
+
 Judge it by runs per listed workflow per day against `1440 / cadence_minutes`,
 with total Actions runs and minutes as the control.
 
