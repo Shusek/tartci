@@ -38,6 +38,11 @@ agent_floor_cores = 6
 # runs this fleet's other fleet-wide views. The launchd watchdog runs it at most
 # every 15 minutes and only logs; it never resets a cache or changes
 # scheduling. Remove this table to turn it off.
+# Home-volume admission floor (scripts/home_volume_floor.py): `report` admits
+# every VM lease and logs `home_volume_would_refuse` when the home volume is
+# below its computed floor. `refuse` denies the new clone instead; flip it only
+# after a day of report data shows no false refusals, and with Daniel's OK.
+home_volume_floor_mode = "report"
 [build_disagreement]
 enabled = true
 
