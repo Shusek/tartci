@@ -236,5 +236,5 @@ replaces_launchd_labels = []
 # Self-update renders and compares them after every update; with bootstrap =
 # false it only reports, and installs or changes nothing.
 [support_agents]
-declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
 bootstrap = false
