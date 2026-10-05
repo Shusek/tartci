@@ -279,6 +279,43 @@ Rollback: delete `assignment_pre_clone_demand_check` from
 `profiles/m3-macos-fleet.toml`, re-render, and reload the pulp-gate slots at an
 idle boundary.
 
+## Fleet-wide boot claims (opt-in, not enabled)
+
+A lane claims a queued job of its class before it clones (`scripts/job_claim.py`),
+but until now a claim was visible only on its own host and, fleet-wide, only
+once a runner had minted. A lane on another host that is cloning or booting was
+invisible, so every free lane on every host could boot for one queued job, and
+all but the first discarded at the pre-mint check. Measured 2026-10-01T09:19Z to
+10-04T17:18Z: pre-mint `own_class_empty` per served job was 0.27 (m1), 0.26
+(m3), 0.65 (m5) and 0.20 (m5s), and for 23/26, 61/63, 77/93 and 34/52 of those
+another host minted the same class inside the discarded VM's claim-to-denial
+window (control, the same windows shifted 1-2 h: 19/52, 20/126, 38/190, 18/104).
+
+Every host publishes its live claims, read-only:
+`tartci job-claim status --publish` (key, VM, age; the host's id; and the age
+it declares for its claims, `host.job_claim_max_age_seconds`, at most the
+1800 s claim TTL). A lane with `assignment_fleet_claim_peers = true` (env
+`TARTCI_JOB_CLAIM_FLEET_PEERS=1`) reads every other host in the published
+supply over SSH before it claims (`job_claim.py gather-peers`: parallel,
+`ConnectTimeout=2`, a hard `TARTCI_JOB_CLAIM_FLEET_READ_SECS` budget, default 5,
+after which stragglers are killed with their process group). A peer's claim for
+the same class stands like a local one while its age is within the age that host
+declares, or 900 s when it declares none; a claim whose VM already shows as an
+idle runner counts once (the runner name is the VM name).
+
+Fail open: an unreachable, slow, failing or unparsable peer counts no claims,
+and the lane boots exactly as without peers. The per-attempt count rides on
+every `job_claim` / `job_claim_contended` event (`fleet_booting=`,
+`peers_unread=`); `job_claim_peer_unread` is logged once per peer per hour. A
+host writes its claim only after reading its peers, so two lanes can never both
+refuse one job; two hosts that both read before either writes can still both
+boot (a window of seconds), and the pre-mint check catches the loser.
+
+m1 declares 1800 s: its lanes wait for a VM lease after claiming, so its claims
+live about 26 min on average against 4-5 min elsewhere. The key is off on every
+lane. Canary: m1, once it has had the pre-clone check for 72 h, with m3, m5 and
+m5studio as same-window controls; m5 joins after its ranked-lease canary read.
+
 ## Per-slot class preference (opt-in, PR-first canary on m3)
 
 Every slot consults the classes in configured tier order, merge-group first.

@@ -18,6 +18,12 @@ github_api_timeout_seconds = 30
 
 # launchd does not inherit the interactive shell's GitHub App configuration.
 # Preserve references only; key and token contents remain private host files.
+# m1's lanes wait for a VM lease after claiming a job, so its boot claims
+# live about 26 min on average (claim to pre-mint denial, 2026-10-01..04)
+# against 4-5 min on the other hosts. Peers count its claims for up to
+# the claim TTL rather than their 15 min default (scripts/job_claim.py).
+job_claim_max_age_seconds = 1800
+
 # Home-volume admission floor (scripts/home_volume_floor.py): `report` admits
 # every VM lease and logs `home_volume_would_refuse` when the home volume is
 # below its computed floor. `refuse` denies the new clone instead; flip it only

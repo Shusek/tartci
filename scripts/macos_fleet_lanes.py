@@ -72,6 +72,7 @@ HOST_KEYS = {
     "current_job_lifecycle_budget_seconds",
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
+    "job_claim_max_age_seconds",
     "home_volume_floor_mode",
     "vm_dhcp_breaker",
 }
@@ -97,7 +98,7 @@ LANE_KEYS = {
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
-    "assignment_pre_clone_demand_check",
+    "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -377,6 +378,13 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    # How long this host's published boot claims may count on other hosts
+    # (scripts/job_claim.py). Only a host whose lanes hold claims longer than
+    # the consumers' default, such as one that waits for a lease after
+    # claiming, declares it; it can never exceed the claim TTL.
+    max_age = host.get("job_claim_max_age_seconds")
+    if max_age is not None and (type(max_age) is not int or not 60 <= max_age <= 1800):
+        fail("host.job_claim_max_age_seconds must be an integer from 60 through 1800")
     # The host VM-DHCP breaker (scripts/vm_dhcp_breaker.py) is on by default;
     # only `false` is ever written, to turn it off on one host.
     dhcp_breaker = host.get("vm_dhcp_breaker")
@@ -706,6 +714,9 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: assignment_pre_clone_demand_check must be a "
                 "boolean on an event-class-v2 lane"
             )
+        fleet_peers = lane.get("assignment_fleet_claim_peers")
+        if fleet_peers is not None and type(fleet_peers) is not bool:
+            fail(f"lane {lane_id}: assignment_fleet_claim_peers must be a boolean")
         idle_retarget = lane.get("assignment_idle_retarget_seconds")
         if idle_retarget is not None and (
                 assignment_mode != "event-class-v2"
@@ -2415,6 +2426,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
     if lane.get("assignment_pre_clone_demand_check"):
         env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "1"
+    if lane.get("assignment_fleet_claim_peers"):
+        env["TARTCI_JOB_CLAIM_FLEET_PEERS"] = "1"
     if lane.get("assignment_idle_retarget_seconds"):
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]
