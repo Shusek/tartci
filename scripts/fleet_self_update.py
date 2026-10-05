@@ -107,6 +107,24 @@ ANNOUNCE_TIE_SECONDS = 10
 WAITING_TICKET_TTL = 2 * 3600
 # Deferred this long without a turn is starvation: loud, and exit 3.
 STARVED_AFTER_SECONDS = 6 * 3600
+# The self-update agent's launchd StartInterval: one survey of every peer per
+# attempt (launchd/com.danielraffel.tartci.self-update.plist.template).
+SELF_UPDATE_INTERVAL_SECONDS = 1800
+# A peer whose pool status has been unreadable this long stops holding the
+# update turn (it still serves nothing for the capacity floor). A peer that is
+# READ holding an update marker this old already counts as not updating, so a
+# dark peer, even one still mid-install, gets no more trust than a seen one
+# with a stale marker. The bound also outlasts the longest a peer can
+# legitimately be mid-update. Unreadable means unreachable; a readable peer
+# that is draining, off or updating never accrues dark time.
+PEER_UNREACHABLE_EXCLUDE_SECONDS = ACTIVE_MARKER_TTL
+# ...and at least this many consecutive unreadable reads inside that time, so
+# two reads either side of a long sleep cannot meet it alone.
+PEER_UNREACHABLE_MIN_READS = 4
+# A peer corroborates "X is dark" only from its own read of X this recent,
+# measured on its own clock.
+PEER_UNREACHABLE_FRESH_SECONDS = 3600
+PEER_UNREADABLE_NAME = "peer-unreadable.json"
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
@@ -364,6 +382,25 @@ def skew_stale_note(skew: dict | None, now: float | None = None) -> str | None:
     import state_age
     return state_age.stale_note(skew.get("measured_at"), SKEW_REFRESH_S,
                                 "launchd watchdog (tartci launchd heal)", now)
+
+
+def peer_reachability(home: Path | None = None) -> dict:
+    """This host's record of unreachable peers, for status surfaces. Never raises.
+
+    {"state": "ok" | "dark" | "unreadable", "peers": {peer: streak}}. A host
+    that has never surveyed (or last found every peer readable) has no record.
+    """
+    path = state_dir_for(home or Path.home()) / PEER_UNREADABLE_NAME
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"state": "ok", "peers": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"state": "unreadable", "error": str(exc)[:200], "peers": {}}
+    if not isinstance(value, dict):
+        return {"state": "unreadable", "error": "not an object", "peers": {}}
+    peers = {peer: row for peer, row in value.items() if isinstance(row, dict)}
+    return {"state": "dark" if peers else "ok", "peers": peers}
 
 
 def summary(home: Path | None = None) -> dict:
@@ -681,19 +718,26 @@ def self_host_id(cfg: Config) -> str:
 # Printed by the peer: its own clock, then its marker. Ages are computed on
 # the peer's clock so host clock skew cannot make a live marker look stale.
 WAITING_SEPARATOR = "--- waiting ---"
+UNREADABLE_SEPARATOR = "--- unreadable ---"
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
-                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true')
+                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
+                'echo; echo "' + UNREADABLE_SEPARATOR + '"; '
+                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/' + PEER_UNREADABLE_NAME
+                + '" 2>/dev/null || true')
 
 
 def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str, Any]:
     """One peer's pool state, update marker and waiting ticket.
 
     {"busy": bool, "evidence": str, "active_age": seconds | None,
-     "since": epoch | None, "off": bool}. Marker ages are computed on the
+     "since": epoch | None, "off": bool, "readable": bool, "clock": epoch | None,
+     "unreadable": {host: streak} | None}. Marker ages are computed on the
     PEER's clock, so host clock skew cannot make a live marker look stale.
     `since` is when the peer's live waiting ticket joined the queue. Unreachable
-    or unreadable peers are busy: fail closed.
+    or unreadable peers are busy: fail closed. `readable` is whether its pool
+    status parsed; `unreadable` is the peer's own record of which hosts it
+    could not read, for corroboration.
 
     A peer that is OFF with no live update marker is not busy: it is out of
     service on purpose (m5studio, off for a store move on 2026-10-01, blocked
@@ -703,7 +747,7 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     refuse.
     """
     out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
-                           "off": False}
+                           "off": False, "readable": False, "clock": None, "unreadable": None}
     ssh = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
@@ -712,10 +756,19 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
         out["evidence"] = (f"peer {host_id} ({target}) pool status unreadable (exit {status.rc}): "
                            f"{status.text[:160]}")
         return out
+    out["readable"] = True
     marker = sys_.run([*ssh, _PEER_MARKER], timeout=60)
     first, _, rest = marker.out.partition("\n")
     clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
+    out["clock"] = clock
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
+    waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
+    if clock is not None and unreadable_text.strip():
+        try:
+            report = json.loads(unreadable_text)
+        except json.JSONDecodeError:
+            report = None
+        out["unreadable"] = report if isinstance(report, dict) else None
     if clock is not None and waiting_text.strip():
         try:
             ticket = json.loads(waiting_text)
@@ -758,25 +811,105 @@ def peer_state(cfg: Config, sys_: System, host_id: str, target: str) -> tuple[bo
 
 
 def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
-    return survey_peers(cfg, sys_, me)[0]
+    return survey_peers(cfg, sys_, me).busy
 
 
-def survey_peers(cfg: Config, sys_: System,
-                 me: str) -> tuple[list[str], dict[str, float], list[str]]:
-    """(why each busy peer is busy, {peer: when its ticket joined the queue},
-    off peers).
+@dataclasses.dataclass
+class Survey:
+    busy: list[str]                 # why each blocking peer blocks
+    waiting: dict[str, float]       # peer -> when its ticket joined the queue
+    off: list[str]                  # off and not updating: left to the capacity floor
+    excluded: list[str]             # unreachable long enough to stop holding the turn
+    notes: list[str]                # why each excluded peer is excluded
+
+
+def peer_streaks(cfg: Config) -> dict[str, dict]:
+    """This host's record of peers whose pool status it could not read."""
+    value = _read_json(cfg.state_dir / PEER_UNREADABLE_NAME) or {}
+    return {peer: row for peer, row in value.items() if isinstance(row, dict)
+            and isinstance(row.get("since"), (int, float)) and isinstance(row.get("reads"), int)}
+
+
+def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) -> Survey:
+    """Read every other published host once.
 
     An off peer neither blocks nor holds a place in the queue: it cannot take
     a turn while it is off, and yielding to it would stall the fleet the same
     way refusing on it did.
+
+    An unreachable peer blocks, except that one dark long enough stops holding
+    the turn (`excluded`), when all of these hold, so two hosts never go out
+    at once:
+    - this host's own streak: PEER_UNREACHABLE_MIN_READS consecutive
+      unreadable reads over at least PEER_UNREACHABLE_EXCLUDE_SECONDS; any
+      readable read, whatever it shows, ends the streak;
+    - quorum: this host reads more than half the published fleet, counting
+      itself, so a host cut off from the rest excludes nobody and the two
+      halves of an even split cannot both proceed;
+    - unanimity: at least one peer is readable, and every readable peer's own
+      read of X in the last PEER_UNREACHABLE_FRESH_SECONDS failed too. One
+      peer that can still reach X means X is alive and may be updating.
+    A host that flaps readable/unreadable never qualifies and keeps blocking;
+    STARVED_AFTER_SECONDS reports that. `record` persists the streaks and
+    emits the transition events; a plan reads them without writing.
     """
+    import host_off  # noqa: PLC0415 - sibling module; owns the event log format
+    now = sys_.now()
+    infos = {peer: read_peer(cfg, sys_, peer, target)
+             for peer, target in published_peers(cfg, sys_).items() if peer != me}
+    prior = peer_streaks(cfg)
+    streaks: dict[str, dict] = {}
+    for peer, info in infos.items():
+        was = prior.get(peer)
+        if info["readable"]:
+            if record and was and was.get("excluded"):
+                host_off.event(cfg.state_dir, "peer_unreachable_rejoined",
+                               f"peer {peer} is readable again after {int(now - was['since'])}s dark",
+                               {"peer": peer, "dark_for_s": int(now - was["since"])}, now=now)
+            continue
+        streaks[peer] = {"since": was["since"] if was else now,
+                         "reads": (was["reads"] if was else 0) + 1, "last": now,
+                         "excluded": bool(was and was.get("excluded"))}
+    readable = sorted(peer for peer, info in infos.items() if info["readable"])
+    fleet = len(infos) + 1
+    quorum = 1 + len(readable) > fleet / 2
+    excluded: list[str] = []
+    notes: list[str] = []
+    for peer, streak in sorted(streaks.items()):
+        dark = now - streak["since"]
+        corroborated_by = []
+        for other in readable:
+            report = (infos[other]["unreadable"] or {}).get(peer)
+            clock = infos[other]["clock"]
+            last = report.get("last") if isinstance(report, dict) else None
+            if (clock is not None and isinstance(last, (int, float))
+                    and 0 <= clock - last <= PEER_UNREACHABLE_FRESH_SECONDS):
+                corroborated_by.append(other)
+        unanimous = bool(readable) and corroborated_by == readable
+        qualifies = (streak["reads"] >= PEER_UNREACHABLE_MIN_READS
+                     and dark >= PEER_UNREACHABLE_EXCLUDE_SECONDS)
+        if not (qualifies and quorum and unanimous):
+            streak["excluded"] = False
+            continue
+        excluded.append(peer)
+        note = (f"{peer} unreadable since {_iso(streak['since'])} ({streak['reads']} reads; "
+                f"also dark to {', '.join(corroborated_by)}; {1 + len(readable)}/{fleet} read)")
+        notes.append(note)
+        if record and not streak["excluded"]:
+            host_off.event(cfg.state_dir, "peer_unreachable_excluded",
+                           f"peer {note}: it no longer holds the update turn",
+                           {"peer": peer, "since": _iso(streak["since"]), "reads": streak["reads"],
+                            "corroborated_by": corroborated_by,
+                            "readable": 1 + len(readable), "fleet": fleet}, now=now)
+        streak["excluded"] = True
+    if record:
+        _write_json(cfg.state_dir / PEER_UNREADABLE_NAME, streaks)
     busy: list[str] = []
     waiting: dict[str, float] = {}
     off: list[str] = []
-    for peer, target in published_peers(cfg, sys_).items():
-        if peer == me:
+    for peer, info in infos.items():
+        if peer in excluded:
             continue
-        info = read_peer(cfg, sys_, peer, target)
         if info["busy"]:
             busy.append(info["evidence"])
         elif info.get("off"):
@@ -784,7 +917,7 @@ def survey_peers(cfg: Config, sys_: System,
             continue
         if info["since"] is not None:
             waiting[peer] = info["since"]
-    return busy, waiting, off
+    return Survey(busy, waiting, off, excluded, notes)
 
 
 def queue_ahead(me: str, my_since: float, waiting: dict[str, float]) -> list[str]:
@@ -1576,7 +1709,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy, waiting, off = survey_peers(cfg, sys_, me)
+        survey = survey_peers(cfg, sys_, me, record=apply)
+        busy, waiting, off = survey.busy, survey.waiting, survey.off
         ticket = waiting_ticket(cfg)
         my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
                     else sys_.now())
@@ -1597,7 +1731,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         else:
             receipt.step("peers", "every other published host is on and not updating"
                          + (f"; off and not updating, so counted as serving nothing by the "
-                            f"capacity floor: {', '.join(off)}" if off else ""))
+                            f"capacity floor: {', '.join(off)}" if off else "")
+                         + (f"; unreachable, so no longer holding the turn and counted as "
+                            f"serving nothing by the capacity floor: {'; '.join(survey.notes)}"
+                            if survey.excluded else ""))
         allow = False
         try:
             allow, rule = floor_decision(cfg, sys_, me)
@@ -1630,7 +1767,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_OK
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
-                  helper=helper, approval=approval)
+                  helper=helper, approval=approval, excluded=survey.excluded)
         return run.execute()
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)
@@ -1685,8 +1822,10 @@ class Run:
 
     def __init__(self, cfg: Config, sys_: System, receipt: Receipt, *, me: str, target: str,
                  previous: str, profile: Path, install_args: list[str], allow: bool,
-                 helper: dict | None, approval: Path | None) -> None:
+                 helper: dict | None, approval: Path | None,
+                 excluded: list[str] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
+        self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
@@ -1721,7 +1860,7 @@ class Run:
         import signal
         previous_handler = signal.signal(signal.SIGTERM, _raise_terminated)
         try:
-            _announce(self.cfg, self.sys, self.me, self.target)
+            _announce(self.cfg, self.sys, self.me, self.target, self.excluded)
             self.receipt.step("announce", str(self.cfg.state_dir / "active.json"))
             # This host has its turn: whatever the update's outcome, it no
             # longer holds a place in the queue.
@@ -2144,7 +2283,8 @@ class Run:
         return EXIT_FAILED
 
 
-def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
+def _announce(cfg: Config, sys_: System, me: str, target: str,
+              excluded: list[str] | None = None) -> None:
     marker = cfg.state_dir / "active.json"
     announced = sys_.now()
     _write_json(marker, {"host_id": me, "target": target, "ts": announced,
@@ -2161,6 +2301,10 @@ def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
             continue
         info = read_peer(cfg, sys_, peer, ssh_target)
         if not info["busy"]:
+            continue
+        # Only a peer this run's survey excluded, and only while it is still
+        # unreadable: one that answers now goes through the protocol below.
+        if peer in (excluded or ()) and not info["readable"]:
             continue
         theirs = info["active_age"]
         if theirs is None:

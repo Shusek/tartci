@@ -1795,6 +1795,33 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A peer that stays unreachable stops holding the turn.** An unreadable
+  peer counts as busy, because it may be mid-update. Each survey records the
+  peers it could not read in `~/.tartci/state/self-update/peer-unreadable.json`
+  (`since`, `reads`, `last`); any readable read, whether the peer is on, off,
+  draining or updating, drops its row. A peer is excluded from turn-taking,
+  and only from turn-taking, when all of these hold:
+  - this host has read it unreadable at least 4 times in a row over at least
+    3 h. That is `ACTIVE_MARKER_TTL`, the age at which a peer's own update
+    marker already counts as stale, so a dark peer gets no more trust than a
+    seen one. It also outlasts the longest legitimate update;
+  - this host reads more than half the published fleet, counting itself. A
+    host cut off from the rest excludes nobody, and neither half of an even
+    split can proceed;
+  - at least one peer is readable, and every readable peer's own record shows
+    the same host unreadable at its last read, within the last hour on that
+    peer's clock. One peer that can still reach it means it is alive.
+
+  An excluded peer still serves nothing for the capacity floor, so a drain
+  that would leave a required label unserved still refuses. At the
+  post-announce re-read it is skipped only while it stays unreadable; if it
+  answers, the normal protocol applies. Events: `peer_unreachable_excluded`
+  once per episode, and `peer_unreachable_rejoined` on its first readable
+  read. Doctor: `peer_unreachable` (dark, still holding the turn) and
+  `peer_unreachable_excluded`. A host that flaps between readable and
+  unreadable never qualifies and keeps blocking; `self_update_starved`
+  reports that after 6 h. Recovery of the dark host itself is manual: it
+  needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only
   takes effect after some host updates. If the queue itself is wedged, unwedge
