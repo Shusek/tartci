@@ -35,8 +35,9 @@ class CiLaneTests(unittest.TestCase):
     def test_ci_runs_every_test_module_under_python_3_9(self) -> None:
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         job = text.split("  python-39-tests:", 1)[1].split("\n  python-floor:", 1)[0]
-        self.assertIn('python-version: "3.9"', job)
-        self.assertIn("python -m unittest discover -s scripts -p 'test_*.py'", job)
+        self.assertIn('[ "$version" = "3.9.6" ]', job)
+        self.assertIn('ln -sf /usr/bin/python3 "$RUNNER_TEMP/fleet-python/python3"', job)
+        self.assertIn("python3 -m unittest discover -s scripts -p 'test_*.py'", job)
 
 
 if __name__ == "__main__":
