@@ -222,6 +222,28 @@ class TartciSupportManifestTests(unittest.TestCase):
                     (installed / "added-after-seal").write_text("x")
             thaw_directories(generations)
 
+    def test_install_succeeds_where_a_sealed_directory_cannot_be_renamed(self) -> None:
+        # macOS 15's rule, on any host: renaming a directory without its own
+        # write bit fails with EACCES.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source, manifest = self.staged_source(root)
+            generations = root / "generations"
+            real_rename = os.rename
+
+            def rename(src, dst):
+                if os.path.isdir(src) and not os.lstat(src).st_mode & stat.S_IWUSR:
+                    raise PermissionError(13, "Permission denied", str(src))
+                return real_rename(src, dst)
+
+            with mock.patch.object(support_manifest.os, "rename", side_effect=rename):
+                result = support_manifest.stage_install(source, manifest, generations)
+            self.assertTrue(result["created"])
+            installed = Path(str(result["root"]))
+            support_manifest.verify(installed, installed / support_manifest.MANIFEST_NAME,
+                                    immutable=True)
+            thaw_directories(generations)
+
     def test_a_generation_that_fails_its_seal_is_not_left_under_its_name(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
