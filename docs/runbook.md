@@ -1700,6 +1700,22 @@ fleet`), and check GitHub's job history against it with
   verified_apply`) before finishing, so status reads current at once instead
   of the pre-update skew until the watchdog's next refresh. Checks are not
   re-queried; a failure to record never fails the update.
+- **Which code runs which step (and why a change lands one update late).**
+  The self-update agent runs `~/.local/bin/tartci`, so the **installed**
+  generation orchestrates: the gates (one host at a time, capacity floor,
+  rate limit), drain, the mid-job wait, pool off/on, verify, rollback and the
+  decision to converge support agents are the code already on the host. The
+  **target's** code runs only through the update checkout: `support-manifest
+  write`, `fleet-macos validate`, `fleet-macos install` and the support-agent
+  template check. A change to orchestration therefore takes effect from the
+  update after the one that installs it; a change to validate or install takes
+  effect in the update that carries it. This is deliberate: rollback authority
+  stays with the known-good generation, and the update never re-executes into
+  code that has not yet run on this host. Each attempt receipt records
+  `orchestrator_generation` (the commit whose code ran it) beside `target`, so
+  `~/.tartci/state/self-update/attempts/*.json` shows which code orchestrated
+  each step. A PR that changes orchestration should say "effective from the
+  update after next".
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
@@ -2252,6 +2268,20 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `reclaim_boot_low`. Look in `/private/tmp` and the per-user temp dir: the
   pass's `scratch_dirs` field shows what the scratch reaper removed and why it
   kept the rest.
+
+  With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
+  default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs
+  `ccache -d $TARTCI_CI_CACHE/ccache --evict-older-than <N>d` on the gate ccache
+  (the cache the runners mount; without the variable, the profile's
+  `[host].cache_root`),
+  at most once per interval and only while no Tart VM runs or holds a VM lease
+  and the pre-boot guard's lock is free (`scripts/gate_ccache_trim.py`). ccache
+  recounts its files and size counters during the eviction, which the gate
+  cache needs: its counters drift about 100x low, so ccache's own cleanup never
+  starts. The event's `gate_ccache_trim` field shows the entries and bytes on
+  disk before and after. Never run a bare `ccache -c` on that cache from the host: the host's
+  `ccache` has no `ccache.conf` there and treats its 5 GiB default as the cap,
+  not the guests' 40G; once the counters are recounted that evicts by size.
 
   The same origin/main checkout carries Pulp's host-vitals sensor. Its
   installer copies `host_vitals.sh` and `host_vitals_sensor.sh` into
