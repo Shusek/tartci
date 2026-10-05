@@ -62,6 +62,13 @@ tmp_checkouts = true
 # and Chrome's code-sign clones (12 h idle, nothing open, no live process
 # naming it; 4 h while the boot volume is below its floor). scripts/scratch_dirs.py
 scratch_dirs = true
+# Canary: evict gate ccache entries unused for 14 days, once a day, only while
+# no VM is running or leased (scripts/gate_ccache_trim.py). m5's gate cache held
+# 506k entries, 70% unused for 14 days, and the pre-boot guard that stats every
+# entry took 87-185 s per boot. The gate's per-job hit rate is 99.5% on every
+# host, m5s included from a 25k-entry cache, so the window keeps about five
+# days of working set. Rollback: delete this key.
+gate_ccache_trim = true
 
 # Canary: rank waiting VM lanes by the lease priority they already carry
 # (scripts/leases.py). Six VM lanes share this host's one free 6-core VM slot
