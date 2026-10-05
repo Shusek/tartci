@@ -17,7 +17,16 @@ remove what they made:
   * $TMPDIR/pulp-* and shipyard-test-* prefixes named in PATTERNS below.
   * .../X/com.google.Chrome.code_sign_clone/code_sign_clone.*: the copy of
     Google Chrome.app Chrome makes at launch and removes only on an orderly
-    exit; every killed headless Chrome leaves one (168 on m3).
+    exit; every killed headless Chrome leaves one (168 on m3). Chrome's own
+    $TMPDIR/com.google.Chrome.* scratch is left the same way (932 on m3).
+  * $TMPDIR/pulp-<words>-<mkdtemp suffix>: any Pulp test or tool scratch.
+    1,505 had built up on m3 in ten days, from 30-odd tests that were killed
+    or never cleaned up. A suffix must hold a digit, capital or underscore,
+    so a fixed-name directory a tool reuses on purpose never matches.
+  * ~/Library/Developer/Xcode/DerivedData/*: Xcode's build products, which an
+    agent's xcodebuild leaves at 3 to 8 GiB a project (39 GiB on m3). They
+    are rebuilt on the next build, and are removed only after
+    DERIVED_DATA_IDLE_HOURS (14 days) with nothing inside modified.
 
 /private/tmp and the per-user temp dir are outside every other reclaim root
 (build dirs and checkouts), so nothing removed them.
@@ -77,6 +86,9 @@ DU_TIMEOUT_S = 120
 WALK_MAXDEPTH = 4
 WALK_MAX_ENTRIES = 50_000
 PASS_BUDGET_S = 900
+# DerivedData is a cache a developer may come back to; two weeks untouched
+# means nobody is building that project here.
+DERIVED_DATA_IDLE_HOURS = 14 * 24
 LIST_LIMIT = 20
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -85,20 +97,36 @@ Runner = Callable[..., subprocess.CompletedProcess]
 @dataclass(frozen=True)
 class Pattern:
     name: str
-    root: str          # key into the roots mapping: private_tmp | user_tmp | chrome_clone
+    root: str          # key into the roots mapping: private_tmp | user_tmp | chrome_clone | derived_data
     regex: str         # full match against the entry's basename
     only_child: str | None = None  # the entry must contain exactly this one name
+    min_idle_hours: float = 0      # an idle gate this pattern never goes below
+
+
+# pulp-<words>-<suffix> or pulp-<words>.<suffix> (BSD mktemp -t), the shape of
+# a Pulp temp dir: a random suffix holding a digit, capital or underscore, or a
+# -<pid>-<tick>-<n> counter. Fixed names such as pulp-audio-doctor, or
+# pulp-control-501 (one per uid), never match.
+PULP_MKDTEMP = (r"pulp-[a-z0-9]+(?:-[a-z0-9]+)*"
+                r"(?:[-.](?=[A-Za-z0-9_]*[0-9A-Z_])[A-Za-z0-9_]{6,}|-[0-9]+(?:-[0-9]+){2,})")
 
 
 PATTERNS: tuple[Pattern, ...] = (
     Pattern("shipyard-validation", "private_tmp", r"shipyard-validation-[A-Za-z0-9]{6}"),
     Pattern("older-clean-clone", "user_tmp", r"tmp[a-z0-9_]{8}", only_child="older-clean-clone"),
-    *(Pattern(f"pulp-test:{root}", root,
-              r"(?:pulp-version-bump-proof-|pulp-generated-bump-test-)[a-z0-9_]{8}"
-              r"|pulp-(?:authority-cold|fetch-install|fetch-src|fetch-fallback)-[0-9-]+")
-      for root in ("user_tmp", "private_tmp")),
+    Pattern("pulp-test:user_tmp", "user_tmp",
+            r"(?:pulp-version-bump-proof-|pulp-generated-bump-test-)[a-z0-9_]{8}"
+            r"|pulp-(?:authority-cold|fetch-install|fetch-src|fetch-fallback)-[0-9-]+"
+            r"|" + PULP_MKDTEMP),
+    Pattern("pulp-test:private_tmp", "private_tmp",
+            r"(?:pulp-version-bump-proof-|pulp-generated-bump-test-)[a-z0-9_]{8}"
+            r"|pulp-(?:authority-cold|fetch-install|fetch-src|fetch-fallback)-[0-9-]+"),
     Pattern("shipyard-test-codex", "user_tmp", r"shipyard-test-codex-[A-Za-z0-9]{6}"),
     Pattern("chrome-code-sign-clone", "chrome_clone", r"code_sign_clone\.[A-Za-z0-9]{6}"),
+    Pattern("chrome-temp", "user_tmp",
+            r"com\.google\.Chrome\.(?:[A-Za-z_]+\.)?[A-Za-z0-9]{6}"),
+    Pattern("xcode-derived-data", "derived_data", r"[A-Za-z0-9][A-Za-z0-9_.+-]*",
+            min_idle_hours=DERIVED_DATA_IDLE_HOURS),
 )
 
 
@@ -158,6 +186,7 @@ def default_roots(runner: Runner = subprocess.run) -> dict[str, pathlib.Path]:
         # Chrome clones itself into the per-user temp dir's sibling X/.
         roots["chrome_clone"] = (user_tmp.resolve().parent / "X"
                                  / "com.google.Chrome.code_sign_clone")
+    roots["derived_data"] = pathlib.Path.home() / "Library/Developer/Xcode/DerivedData"
     return roots
 
 
@@ -343,6 +372,7 @@ def scan(roots: dict[str, pathlib.Path], *, fix: bool, idle_hours: float,
             continue
         tally = report["by_pattern"].setdefault(
             pattern.name, {"candidates": 0, "removed": 0, "removed_bytes": 0})
+        gate_hours = max(idle_hours, pattern.min_idle_hours)
         for entry in entries:
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                 continue
@@ -377,7 +407,7 @@ def scan(roots: dict[str, pathlib.Path], *, fix: bool, idle_hours: float,
             if newest is None:
                 keep("unmeasurable")
                 continue
-            if now - newest < idle_hours * 3600:
+            if now - newest < gate_hours * 3600:
                 keep("recent")
                 continue
             size = size_bytes(path, runner)
@@ -385,7 +415,7 @@ def scan(roots: dict[str, pathlib.Path], *, fix: bool, idle_hours: float,
                 # The listings and the walk were taken before this; re-read the
                 # age immediately before the irreversible act.
                 recheck = newest_mtime(path)
-                if recheck is None or time.time() - recheck < idle_hours * 3600:
+                if recheck is None or time.time() - recheck < gate_hours * 3600:
                     keep("touched_during_pass")
                     continue
                 error = remover(path, uid)

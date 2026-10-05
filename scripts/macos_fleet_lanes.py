@@ -2899,6 +2899,8 @@ def tool_freshness_summary() -> dict:
 
 
 FSEVENTSD_WARN_MB = 1024
+# The host-vitals sensor publishes every 60 s (Pulp com.pulp.host-vitals).
+HOST_VITALS_INTERVAL_S = 60
 
 
 def host_vitals_summary(path: Path | None = None) -> dict:
@@ -2933,14 +2935,20 @@ def _fseventsd_summary(path: Path | None = None) -> dict:
     except (OSError, json.JSONDecodeError):
         return {"lines": [f"fseventsd: UNKNOWN (no host-vitals reading at {path})"],
                 "problem": None}
+    import state_age
+
     sampled = reading.get("sampled_at") if isinstance(reading, dict) else None
     age = f", sampled {int(time.time() - sampled)}s ago" if isinstance(sampled, int) else ""
+    aged = state_age.stale_note(sampled, HOST_VITALS_INTERVAL_S, "host-vitals sensor")
     fsev = reading.get("fseventsd") if isinstance(reading, dict) else None
     if not isinstance(fsev, dict) or not isinstance(fsev.get("rss_mb"), int):
         return {"lines": [f"fseventsd: UNKNOWN (host-vitals reading has no fseventsd field{age}; "
                           "reinstall the sensor)"], "problem": None}
     limit = fsev.get("warn_mb") if isinstance(fsev.get("warn_mb"), int) else FSEVENTSD_WARN_MB
     text = f"fseventsd: {fsev['rss_mb']} MB RSS, {fsev.get('cpu_pct')}% CPU{age}"
+    if aged:
+        # A reading the sensor stopped refreshing says nothing about now.
+        return {"lines": [f"{text} {aged}"], "problem": f"host vitals {aged}", "fseventsd": fsev}
     if fsev["rss_mb"] > limit:
         problem = f"fseventsd {fsev['rss_mb']} MB RSS > {limit} MB"
         return {"lines": [f"{text} WARN (> {limit} MB; restart with sudo killall fseventsd)"],
