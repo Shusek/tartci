@@ -52,6 +52,43 @@ class PythonTests(unittest.TestCase):
         self.assertEqual(python('run(["ssh", "-n", "-o", "BatchMode=yes", host, "true"])'), [])
         self.assertEqual(python('if head in ("ssh", "autossh"): pass'), [])
 
+    def test_an_attribute_argv0_is_the_ssh_client(self) -> None:
+        # gather_peers: the ssh path came from argparse, so argv[0] was an
+        # attribute, and the literal-or-`ssh` rule never looked at it.
+        self.assertEqual(len(python('cmd = [args.ssh, "-o", "BatchMode=yes", target, "true"]')), 1)
+        self.assertEqual(python('cmd = [args.ssh, "-n", "-o", "BatchMode=yes", target, "true"]'),
+                         [])
+        for first in ("self.ssh_bin", "config.ssh_path", "remote_ssh", "SSH", '"/usr/bin/ssh"'):
+            with self.subTest(first=first):
+                self.assertEqual(len(python(f'c = [{first}, "-o", "BatchMode=yes", h, "true"]')),
+                                 1)
+
+    def test_a_name_whose_value_is_ssh_is_the_ssh_client(self) -> None:
+        cases = {
+            "assigned": 'client = "/usr/bin/ssh"\nc = [client, "-o", "BatchMode=yes", h]\n',
+            "parameter": 'def peer(h, client="ssh"):\n    return [client, "-o", "X=1", h]\n',
+            "kw-only": 'def peer(h, *, prog="ssh"):\n    return [prog, "-o", "X=1", h]\n',
+            "argparse": ('p.add_argument("--remote-shell", default="ssh")\n'
+                         'c = [args.remote_shell, "-o", "X=1", h]\n'),
+            "argparse dest": ('p.add_argument("-r", dest="via", default="/usr/bin/ssh")\n'
+                              'c = [opts.via, "-o", "X=1", h]\n'),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertEqual(len(python(text)), 1)
+                self.assertEqual(python(text.replace('"-o", "', '"-n", "-o", "', 1)), [])
+
+    def test_other_argv0_names_are_not_ssh(self) -> None:
+        self.assertEqual(python('c = [args.rsync, "-a", src, dst]'), [])
+        self.assertEqual(python('c = [ssh_host, "-o", "x"]'), [])
+        self.assertEqual(python('client = "scp"\nc = [client, "-o", "X=1", h]\n'), [])
+
+    def test_an_exemption_on_the_line_above_an_argv_is_honoured(self) -> None:
+        self.assertEqual(python('# ssh-stdin: the script is piped in\nc = [args.ssh, "-o", "X", h]'),
+                         [])
+        self.assertEqual(len(python('x = 1  # ssh-stdin: other line\nc = [args.ssh, "-o", "X", h]')),
+                         1)
+
     def test_an_exempted_argv_is_skipped(self) -> None:
         self.assertEqual(python('a = ["ssh", "-T", h]  # ssh-stdin: pipes a script in'), [])
 
