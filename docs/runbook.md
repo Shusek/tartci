@@ -1763,6 +1763,29 @@ fleet`), and check GitHub's job history against it with
   `~/.tartci/state/self-update/attempts/*.json` shows which code orchestrated
   each step. A PR that changes orchestration should say "effective from the
   update after next".
+- **Gate-reserve ratchet.** Prepare runs `fleet-macos validate <profile>
+  --check-reserve`, which fits each gate lane (no explicit priority, or
+  `priority = "gate"`) into THIS host's gate reserve from its live
+  host-profile, per axis: `supervisors x vm_cores` (default `vm_pool_cores`)
+  against `reserved_gate_cores`, and `supervisors x` the derived VM memory
+  against `reserved_gate_mem_mb` (`scripts/gate_reserve_fit.py`). Every
+  overcommitted pair is printed as `gate_reserve_overcommitted lane=...
+  axis=... demand=... reserve=...` on every update, and `tartci pool status`
+  and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
+  the installed profile. The update is refused only when the target profile's
+  overcommit on some (lane, axis) is strictly greater than the installed
+  profile's, both against the same live reserve (`gate_reserve_worse`). This is
+  a ratchet because two hosts overcommit today (m1: 2 x 3 against 3; m5:
+  2 x 6 against 8), and refusing them would leave both unable to update; a
+  check that let the overcommit grow would be no check (m3, 2026-10-04: 2 x 12
+  against 14 lease-denied the second Pulp slot while jobs queued, #373).
+  Resizing is a profile decision with the host's owner and must not take
+  agent cores. A host that reserves no gate cores (a CI runner, or a role
+  that keeps none for gates) has no reserve to fit lanes into, so the check
+  reads `gate reserve: n/a (this host reserves no gate cores)` and the doctor
+  `gate_reserve_not_applicable`, never "fits"; a missing memory reserve beside
+  a cores reserve adds a `memory axis n/a` line. The flag is passed by the orchestrating (installed)
+  generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
@@ -1772,6 +1795,33 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A peer that stays unreachable stops holding the turn.** An unreadable
+  peer counts as busy, because it may be mid-update. Each survey records the
+  peers it could not read in `~/.tartci/state/self-update/peer-unreadable.json`
+  (`since`, `reads`, `last`); any readable read, whether the peer is on, off,
+  draining or updating, drops its row. A peer is excluded from turn-taking,
+  and only from turn-taking, when all of these hold:
+  - this host has read it unreadable at least 4 times in a row over at least
+    3 h. That is `ACTIVE_MARKER_TTL`, the age at which a peer's own update
+    marker already counts as stale, so a dark peer gets no more trust than a
+    seen one. It also outlasts the longest legitimate update;
+  - this host reads more than half the published fleet, counting itself. A
+    host cut off from the rest excludes nobody, and neither half of an even
+    split can proceed;
+  - at least one peer is readable, and every readable peer's own record shows
+    the same host unreadable at its last read, within the last hour on that
+    peer's clock. One peer that can still reach it means it is alive.
+
+  An excluded peer still serves nothing for the capacity floor, so a drain
+  that would leave a required label unserved still refuses. At the
+  post-announce re-read it is skipped only while it stays unreadable; if it
+  answers, the normal protocol applies. Events: `peer_unreachable_excluded`
+  once per episode, and `peer_unreachable_rejoined` on its first readable
+  read. Doctor: `peer_unreachable` (dark, still holding the turn) and
+  `peer_unreachable_excluded`. A host that flaps between readable and
+  unreadable never qualifies and keeps blocking; `self_update_starved`
+  reports that after 6 h. Recovery of the dark host itself is manual: it
+  needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only
   takes effect after some host updates. If the queue itself is wedged, unwedge

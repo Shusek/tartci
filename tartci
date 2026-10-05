@@ -1357,7 +1357,7 @@ if fleet["managed"]:
         print(line)
     # Shipyard and the pulp CLI against their latest releases, and fseventsd
     # from the host-vitals sensor. Reported, never folded into `fleet ready`.
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = config.get(key) if isinstance(config.get(key), dict) else {}
         for line in row.get("lines") or [f"{key}: UNKNOWN (not checked from here)"]:
             print(line)

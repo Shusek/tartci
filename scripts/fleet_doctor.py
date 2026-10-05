@@ -66,6 +66,10 @@ CODES: tuple[str, ...] = (
     "effective_generation_mismatch",
     "fleet_not_ready",
     "fleet_ready",
+    "gate_reserve_fits",
+    "gate_reserve_not_applicable",
+    "gate_reserve_overcommitted",
+    "gate_reserve_unknown",
     "generation_path_exec",
     "hold_receipt_malformed",
     "hold_receipt_present",
@@ -91,6 +95,10 @@ CODES: tuple[str, ...] = (
     "no_installed_profile",
     "no_managed_launchagents",
     "no_persistent_runners",
+    "peer_reachability_ok",
+    "peer_reachability_unreadable",
+    "peer_unreachable",
+    "peer_unreachable_excluded",
     "persistent_runners_without_hold_receipt",
     "power_ok",
     "power_sleeps",
@@ -745,6 +753,28 @@ def check_self_update(summary: dict | None) -> Finding:
                    {"skew": summary.get("skew"), "last": summary.get("last")})
 
 
+def check_gate_reserve(value: dict | None, *, installed_present: bool) -> Finding:
+    """Each gate lane against this host's live gate reserve (gate_reserve_fit.py)."""
+    if not installed_present:
+        return Finding("gate_reserve", NOT_APPLICABLE, "gate_reserve_not_applicable",
+                       "no installed fleet profile")
+    value = value or {}
+    lines = value.get("lines") or []
+    if value.get("problem"):
+        return Finding("gate_reserve", PROBLEM, "gate_reserve_overcommitted",
+                       f"{value['problem']}; resizing is a profile decision with the host's "
+                       "owner and must not take agent cores", {"gate_reserve": value})
+    if not lines or "UNKNOWN" in lines[0]:
+        return Finding("gate_reserve", UNKNOWN, "gate_reserve_unknown",
+                       lines[0] if lines else "not computed", {"gate_reserve": value})
+    if lines[0].startswith("gate reserve: n/a"):
+        # Gate lanes with no reserve to fit them in: unmeasurable, not a fit.
+        return Finding("gate_reserve", NOT_APPLICABLE, "gate_reserve_not_applicable",
+                       lines[0], {"gate_reserve": value})
+    return Finding("gate_reserve", OK, "gate_reserve_fits", "; ".join(lines),
+                   {"gate_reserve": value})
+
+
 def check_home_volume(value: dict | None, *, lanes: int, now: float | None = None,
                       unread_after_s: float = 3600) -> Finding:
     """The home-volume admission floor (scripts/home_volume_floor.py).
@@ -1073,6 +1103,34 @@ def check_vm_dhcp(value: dict | None) -> Finding:
                    f"VM DHCP breaker unreadable: {value.get('error')}", facts)
 
 
+def check_peer_reachability(value: dict | None) -> Finding:
+    """Peers this host could not read at its last self-update survey."""
+    value = value or {"state": "unreadable", "error": "no status", "peers": {}}
+    facts = {"peer_reachability": value}
+    if value.get("state") == "unreadable":
+        return Finding("peer_reachability", UNKNOWN, "peer_reachability_unreadable",
+                       f"the unreachable-peer record is unreadable: {value.get('error')}", facts)
+    peers = value.get("peers") or {}
+    if not peers:
+        return Finding("peer_reachability", OK, "peer_reachability_ok",
+                       "every peer was readable at the last self-update survey", facts)
+
+    def since(row: dict) -> str:
+        ts = row.get("since")
+        return (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+                if isinstance(ts, (int, float)) else "?")
+
+    excluded = sorted(p for p, row in peers.items() if row.get("excluded"))
+    rows = "; ".join(f"{p} since {since(row)} ({row.get('reads')} reads"
+                     + (", excluded from update turns)" if row.get("excluded") else ")")
+                     for p, row in sorted(peers.items()))
+    if excluded:
+        return Finding("peer_reachability", PROBLEM, "peer_unreachable_excluded",
+                       f"unreachable peers no longer hold the update turn: {rows}", facts)
+    return Finding("peer_reachability", PROBLEM, "peer_unreachable",
+                   f"unreachable peers still hold the update turn: {rows}", facts)
+
+
 def check_power(value: dict | None) -> Finding:
     """Whether the host stays awake on AC (scripts/power_status.py)."""
     import power_status
@@ -1329,6 +1387,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             reclaim_value: dict | None = None,
             launchd_timers_value: dict | None = None,
             vm_dhcp_value: dict | None = None,
+            peer_reachability_value: dict | None = None,
             support_agents_value: dict | None = None,
             reuse_canary_value: dict | None = None,
             power_value: dict | None = None,
@@ -1387,6 +1446,15 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception:  # noqa: BLE001 - reported as unmeasured
             self_update_summary = None
     findings.append(check_self_update(self_update_summary))
+    if config.is_file():
+        try:
+            import macos_fleet_lanes
+            reserve_value = macos_fleet_lanes.gate_reserve_summary(config)
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            reserve_value = {"lines": [f"gate reserve: UNKNOWN ({exc})"], "problem": None}
+    else:
+        reserve_value = None
+    findings.append(check_gate_reserve(reserve_value, installed_present=config.is_file()))
     if tool_freshness_summary is None:
         try:
             import tool_freshness
@@ -1446,6 +1514,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             vm_dhcp_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_vm_dhcp(vm_dhcp_value))
+    if peer_reachability_value is None:
+        try:
+            import fleet_self_update
+            peer_reachability_value = fleet_self_update.peer_reachability(home)
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            peer_reachability_value = {"state": "unreadable", "error": str(exc), "peers": {}}
+    findings.append(check_peer_reachability(peer_reachability_value))
     if support_agents_value is None:
         try:
             import support_agents

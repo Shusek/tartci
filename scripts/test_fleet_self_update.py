@@ -566,6 +566,14 @@ class OrchestratorGenerationTests(Base):
         self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
 
 
+class ReserveCheckTests(Base):
+    def test_the_target_is_validated_with_the_gate_reserve_ratchet(self) -> None:
+        self.assertUpdated(self.apply())
+        validates = [a for a, _ in self.sys.calls if a[:3] == ["./tartci", "fleet-macos", "validate"]]
+        self.assertTrue(validates)
+        self.assertTrue(all("--check-reserve" in a for a in validates), validates)
+
+
 class HappyPathTests(Base):
     def test_apply_runs_the_procedure_in_order_and_verifies(self) -> None:
         self.assertEqual(self.apply(), su.EXIT_OK, self.sys.calls[-5:])
