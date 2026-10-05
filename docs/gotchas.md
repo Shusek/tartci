@@ -45,6 +45,19 @@ first thing to trip. Nothing on the host is broken.
 update a host, run `tartci fleet-macos self-update`. To install a specific
 tree, pass `--support-source` with a clean tartci checkout.
 
+## A support generation will not install on macOS 15 (2026-10-05)
+
+*Symptom:* `stage_install` (the self-update install step) fails with
+`PermissionError: [Errno 13]` renaming the staged generation into place.
+*Cause:* macOS 15 refuses to rename a directory whose own mode is 0555, even
+within the same parent; macOS 27 allows it. The installer used to seal the
+staged root to 0555 before the rename. Found on hosted macos-15 (15.7.9); every
+fleet host runs 27. *Guard:* the root is renamed while 0755, then chmodded 0555,
+fsynced and verified immutable under its final name; a generation that fails
+that check is removed rather than left where the next install would refuse it.
+`test_tartci_support_manifest` records the mode at the rename, so the order is
+checked on every host.
+
 ## Timer jobs stop running while the lanes look healthy (m3, 2026-10-04)
 
 **Symptom:** a host falls many commits behind main and its self-update log has

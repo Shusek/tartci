@@ -419,20 +419,33 @@ def stage_install(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        staged.chmod(0o555)
         descriptor = os.open(staged, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        verify(staged, installed_manifest, immutable=True)
         launch_record(launch, destination)
+        # The generation root is sealed only after it has its final name:
+        # macOS 15 refuses to rename a directory whose own mode is 0555
+        # (EACCES, even within one parent), while macOS 27 allows it.
         os.rename(staged, destination)
-        descriptor = os.open(generations_root, os.O_RDONLY)
         try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            destination.chmod(0o555)
+            for directory in (destination, generations_root):
+                descriptor = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            verify(destination, destination / MANIFEST_NAME, immutable=True)
+        except BaseException:
+            # A generation that failed its seal must not stay under its final
+            # name, where the next install would find it and refuse.
+            for directory in [destination, *destination.rglob("*")]:
+                if directory.is_dir() and not directory.is_symlink():
+                    directory.chmod(0o755)
+            shutil.rmtree(destination)
+            raise
     finally:
         if staged.exists():
             for directory in [staged, *staged.rglob("*")]:
