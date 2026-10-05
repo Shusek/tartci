@@ -51,6 +51,11 @@ bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
 and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
 needs no tartci update to be read.
 
+The support LaunchAgents a host carries (reclaimer, artifact-cache refresher,
+keychain unlocker, schedule backstop, reuse canary, launchd watchdog, reaper)
+are declared in its fleet profile's `[support_agents]` table and compared after
+every self-update; see [`launchd/README.md`](launchd/README.md#declared-support-agents).
+
 Both `drain` and `off` run a **capacity floor** first
 (`scripts/capacity_floor.py`): they refuse when no host other than this one
 serves a required gate label, because that mutation takes the label to zero
