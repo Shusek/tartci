@@ -482,6 +482,30 @@ class SkewTests(Base):
         self.assertIn("UNKNOWN", su.render_skew(None))
 
 
+class OrchestratorGenerationTests(Base):
+    """Which code ran an update is recorded beside what it installed.
+
+    The installed generation orchestrates; the target's code runs only for
+    support-manifest, validate, install and the template check. So a change to
+    orchestration takes effect one update late, and the receipt must show it.
+    """
+
+    def test_a_receipt_names_the_orchestrating_generation_beside_the_target(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual((receipt["orchestrator_generation"], receipt["target"]),
+                         (INSTALLED, T_OLD))
+        self.assertNotEqual(receipt["orchestrator_generation"], receipt["target"])
+
+    def test_the_generation_is_read_from_the_running_code_path(self) -> None:
+        gen = Path(self.td.name) / ".local/share/tartci-generations" / \
+            f"{'c' * 40}-4757141035587a83" / "scripts"
+        gen.mkdir(parents=True)
+        self.assertEqual(su.orchestrator_generation(gen / "fleet_self_update.py"), "c" * 40)
+        self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
+
+
 class HappyPathTests(Base):
     def test_apply_runs_the_procedure_in_order_and_verifies(self) -> None:
         self.assertEqual(self.apply(), su.EXIT_OK, self.sys.calls[-5:])
