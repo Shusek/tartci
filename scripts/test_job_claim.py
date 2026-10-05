@@ -26,6 +26,11 @@ import time
 import unittest
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None  # type: ignore[assignment]
+
 ROOT = Path(__file__).resolve().parents[1]
 CLAIM = ROOT / "scripts/job_claim.py"
 LIB = ROOT / "providers/tart-macos/job-claim.lib.sh"
@@ -307,6 +312,7 @@ class PeerGatherTests(unittest.TestCase):
 
 
 class PublishTests(unittest.TestCase):
+    @unittest.skipUnless(tomllib, "the host profile is read with tomllib (Python 3.11+)")
     def test_status_publishes_live_claims_with_age_host_and_declared_max_age(self) -> None:
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, True)
