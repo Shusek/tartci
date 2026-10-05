@@ -327,7 +327,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   write_state booted
   local sshok=0
-  for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
+  for _ in $(seq 1 90); do ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     discard_current_linux_vm
@@ -409,7 +409,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # Write the JIT config and run the agent once. A JIT runner processes exactly
   # one job and deregisters. The host cache binding above is mandatory so a
   # mount regression cannot silently turn every ephemeral job cold.
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
      touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \
