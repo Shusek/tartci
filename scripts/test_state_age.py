@@ -20,8 +20,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_self_update as su  # noqa: E402
-import macos_fleet_lanes as lanes  # noqa: E402
 import state_age  # noqa: E402
+
+try:
+    import tomllib  # noqa: F401  (macos_fleet_lanes needs it; /usr/bin/python3 3.9 lacks it)
+    HAVE_TOMLLIB = True
+except ModuleNotFoundError:
+    HAVE_TOMLLIB = False
 import tool_freshness as tf  # noqa: E402
 
 NOW = 1_790_000_000.0
@@ -85,7 +90,9 @@ class SurfaceTests(unittest.TestCase):
                        {"measured_at": iso(NOW - 600), "tools": {"shipyard": row}})
         self.assertIsNone(tf.summary(self.home)["problem"])
 
+    @unittest.skipUnless(HAVE_TOMLLIB, "macos_fleet_lanes needs tomllib (Python 3.11+)")
     def test_host_vitals_the_sensor_stopped_refreshing_reads_stale(self) -> None:
+        import macos_fleet_lanes as lanes
         path = self.home / "host_vitals.json"
         fsev = {"rss_mb": 20, "cpu_pct": 1.0, "warn": False, "warn_mb": 1024}
         path.write_text(json.dumps({"sampled_at": int(NOW - 3600), "fseventsd": fsev}))

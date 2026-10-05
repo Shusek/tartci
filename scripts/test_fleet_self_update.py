@@ -508,6 +508,19 @@ class SkewAfterApplyTests(Base):
             Path(self.last()["receipt"]).read_text())["steps"]]
         self.assertIn("skew", steps)
 
+    def test_the_record_does_not_requery_checks(self) -> None:
+        # Verification already proved this generation runs; the record must not
+        # depend on check runs, which can be slow, rate-limited or red later.
+        real, kwargs_seen = su.measure_skew, []
+
+        def spy(*args, **kwargs):
+            kwargs_seen.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(su, "measure_skew", side_effect=spy):
+            self.assertUpdated(self.apply())
+        self.assertEqual(kwargs_seen[-1].get("verify_checks"), False)
+
     def test_a_failed_skew_record_never_fails_the_update(self) -> None:
         real, calls = su.measure_skew, []
 
