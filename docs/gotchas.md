@@ -85,8 +85,13 @@ to state its stdin, wherever it is:
 
 - shell: `ssh -n`, an input redirect on the same command (`</dev/null`,
   `<<EOF`, `< file`), or ssh as the right side of a pipe (`ssh -G` is exempt);
-- Python: an argv list or tuple starting with `"ssh"` (or a name `ssh`) must
-  contain `"-n"`.
+- Python: an argv list or tuple whose first element is the ssh client must
+  contain `"-n"`. That is the string `"ssh"` or a path ending in `/ssh`; a
+  name or attribute named like the client (`ssh`, `args.ssh`, `self.ssh_bin`,
+  `ssh_path`, `remote_ssh`); or a name, parameter or argparse option whose
+  value or default is such a string. The rule first matched only `"ssh"` and
+  a bare name `ssh`, so `[args.ssh, "-o", ...]` in `job_claim.gather_peers`
+  passed it without `-n`.
 
 A wrapper whose callers pipe a script into it is the one legitimate exception;
 mark it `# ssh-stdin: <why>` on its line or the line above.

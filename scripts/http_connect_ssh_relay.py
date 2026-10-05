@@ -191,7 +191,7 @@ def attempt_bridge(
     stderr_sink = tempfile.TemporaryFile()
     try:
         bridge = subprocess.Popen(
-            [
+            [  # ssh-stdin: stdin is the bridge socket, forwarded on purpose
                 config.ssh,
                 "-o", "BatchMode=yes",
                 "-o", f"ConnectTimeout={config.connect_timeout}",
