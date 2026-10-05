@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import pathlib
@@ -113,6 +114,7 @@ class Evaluate(unittest.TestCase):
 
 
 class Run(Base):
+    @testing_support.requires_tomllib
     def test_samples_at_most_once_a_day_and_keeps_history(self):
         first = self.run_pass(1000, {"a": GIB, "b": GIB})
         self.assertTrue(first["sampled"])
@@ -126,6 +128,7 @@ class Run(Base):
         lines = (self.tmp / "state" / "boot-usage" / "history.jsonl").read_text().splitlines()
         self.assertEqual([json.loads(line)["ts"] for line in lines], [1000, 1000 + DAY])
 
+    @testing_support.requires_tomllib
     def test_profile_thresholds_apply(self):
         self.profile.write_text("[reclaim]\nboot_usage_warn_gb = 1\n")
         report = self.run_pass(1000, {"a": 2 * GIB, "b": 0})

@@ -9,6 +9,7 @@ operator to reach for the override by reflex.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import subprocess
@@ -531,6 +532,7 @@ class CliTests(unittest.TestCase):
                 capture_output=True, text=True, env=env, timeout=60,
             )
 
+    @testing_support.requires_tomllib
     def test_last_serving_host_exits_three(self) -> None:
         proc = self.run_guard({REPO_ENDPOINT: {"runners": [runner(1, "studio-pulp-gate-01-612-7")]}})
 
@@ -540,6 +542,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["reason"], capacity_floor.REASON_LAST_SERVING_HOST)
         self.assertIn(GATE, payload["message"])
 
+    @testing_support.requires_tomllib
     def test_idle_fleet_with_a_live_declaring_peer_exits_zero(self) -> None:
         proc = self.run_guard(
             {}, supply=published("m5", "m1"),
@@ -556,6 +559,7 @@ class CliTests(unittest.TestCase):
         verdicts = {peer["host"]: peer["counted"] for peer in payload["findings"][0]["peers"]}
         self.assertEqual(verdicts, {"m1": False, "m5": True})
 
+    @testing_support.requires_tomllib
     def test_idle_fleet_whose_declaring_peers_are_unproven_exits_three(self) -> None:
         proc = self.run_guard(
             {}, supply=published("m5", "m1"),
@@ -568,6 +572,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("m1 not counted (pool status unreadable via ssh-m1 (exit 255)",
                       payload["message"])
 
+    @testing_support.requires_tomllib
     def test_an_unreadable_published_supply_counts_no_peer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = str(Path(tmp) / "absent.json")
@@ -577,6 +582,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_LAST_SERVING_HOST, proc.stderr)
         self.assertIn("is unreadable, so no peer can be judged", json.loads(proc.stdout)["message"])
 
+    @testing_support.requires_tomllib
     def test_peer_serving_the_label_exits_zero(self) -> None:
         proc = self.run_guard(
             {
@@ -589,6 +595,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_OK, proc.stderr)
         self.assertTrue(json.loads(proc.stdout)["allowed"])
 
+    @testing_support.requires_tomllib
     def test_peer_only_on_the_organization_exits_zero(self) -> None:
         proc = self.run_guard(
             {
@@ -601,6 +608,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["findings"][0]["remaining"], ["pulp-intel-macmini"])
 
+    @testing_support.requires_tomllib
     def test_unreachable_organization_scope_exits_four(self) -> None:
         proc = self.run_guard(
             {
@@ -612,6 +620,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_INDETERMINATE, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["reason"], capacity_floor.REASON_CAPACITY_UNKNOWN)
 
+    @testing_support.requires_tomllib
     def test_override_exits_zero_and_records_the_override(self) -> None:
         proc = self.run_guard(
             {REPO_ENDPOINT: {"runners": [runner(1, "studio-pulp-gate-01-612-7")]}},
@@ -623,6 +632,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["allowed"])
         self.assertTrue(payload["overridden"])
 
+    @testing_support.requires_tomllib
     def test_a_profile_declaring_no_gate_label_exits_zero(self) -> None:
         profile = textwrap.dedent(
             """\
@@ -642,6 +652,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_OK, proc.stderr)
         self.assertTrue(json.loads(proc.stdout)["allowed"])
 
+    @testing_support.requires_tomllib
     def test_an_unnameable_persistent_service_exits_four(self) -> None:
         profile = PROFILE.replace(
             'home = "/Users/ci"',

@@ -33,6 +33,9 @@ Fail open: an unreadable or corrupt breaker reads as closed, so a lane never
 refuses to boot over state it cannot read. Writes are atomic (tmp + rename)
 under an exclusive lock, so a reader never sees a partial file.
 
+Python 3.9-safe: every lane calls it with a bare `python3`, and a host whose
+lane PATH falls through to /usr/bin/python3 must still stop cloning.
+
 Usage: vm_dhcp_breaker.py check --lane L | record --outcome ip|no_ip --lane L
 [--vm V] | status --json. `check` and `record` print {"action", "events"}; the
 caller emits the events.
