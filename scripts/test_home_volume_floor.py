@@ -27,6 +27,12 @@ import fleet_doctor as fd  # noqa: E402
 import home_volume_floor as hvf  # noqa: E402
 import leases  # noqa: E402
 
+try:
+    import tomllib  # noqa: F401  (macos_fleet_lanes needs it; /usr/bin/python3 3.9 lacks it)
+    HAVE_TOMLLIB = True
+except ModuleNotFoundError:
+    HAVE_TOMLLIB = False
+
 ROOT = Path(__file__).resolve().parents[1]
 GIB = hvf.GIB
 NOW = 1_790_000_000.0
@@ -198,6 +204,7 @@ class DenialEventTests(unittest.TestCase):
         self.assertIn(f"volume=home free={21 * GIB} floor={30 * GIB}", out)
 
 
+@unittest.skipUnless(HAVE_TOMLLIB, "validates profiles through macos_fleet_lanes (tomllib)")
 class ProfileModeTests(unittest.TestCase):
     def test_every_shipped_profile_ships_report_and_renders_it(self) -> None:
         import tomllib
@@ -242,6 +249,39 @@ class UnreadEventTests(unittest.TestCase):
             "free_bytes": 21 * GIB, "floor_bytes": 30 * GIB}})
         self.assertIn(f"home_volume_would_refuse volume=home free={21 * GIB} "
                       f"floor={30 * GIB}", out)
+
+    def test_an_unset_mode_env_passes_report(self) -> None:
+        # The shell default must be report: a lane rendered before the profile
+        # key existed has no TARTCI_HOME_VOLUME_FLOOR_MODE in its environment.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            (root / "scripts").mkdir(parents=True)
+            argv_file = Path(td) / "argv.json"
+            (root / "scripts" / "leases.py").write_text(
+                "import json, sys\n"
+                f"open({str(argv_file)!r}, 'w').write(json.dumps(sys.argv))\n"
+                "print(json.dumps({'ok': True, 'disk': {'free_bytes': 1, 'reserved_bytes': 0, "
+                "'requested_bytes': 0, 'required_bytes': 0, 'device_id': '1'}}))\n")
+            vms = Path(td) / "vms"
+            vms.mkdir()
+            script = f"""
+                unset TARTCI_HOME_VOLUME_FLOOR_MODE
+                TARTCI_ROOT={ROOT}; . {ROOT}/providers/common/vm-lease.lib.sh
+                TARTCI_ROOT={root}
+                tartci_vm_leases_enabled(){{ return 0; }}
+                tartci_vm_lease_granted_cores(){{ printf '%s' "$1"; }}
+                tartci_vm_lease_derived_mem_mb(){{ printf 4096; }}
+                tartci_observe_disk_admission(){{ :; }}
+                tartci_start_vm_lease_heartbeat(){{ :; }}
+                tartci_vm_lease_disk_expected_device_id(){{ :; }}
+                tartci_vm_lease_disk_expected_mount_path(){{ :; }}
+                tartci_acquire_vm_lease vm-1 4 macos-vm gate pulp 4096 {vms} tart-macos lane runner
+            """
+            subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                           env={k: v for k, v in os.environ.items()
+                                if k != "TARTCI_HOME_VOLUME_FLOOR_MODE"})
+            argv = json.loads(argv_file.read_text())
+        self.assertEqual(argv[argv.index("--home-floor-mode") + 1], "report")
 
     def test_the_acquire_path_emits_it_on_a_grant(self) -> None:
         # End to end through tartci_acquire_vm_lease: a granted lease whose
