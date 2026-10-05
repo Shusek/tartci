@@ -73,6 +73,7 @@ HOST_KEYS = {
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
     "job_claim_max_age_seconds",
+    "home_volume_floor_mode",
     "vm_dhcp_breaker",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
@@ -392,6 +393,9 @@ def load(path: Path) -> dict:
     agent_floor_qos = host.get("agent_floor_qos")
     if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
         fail('host.agent_floor_qos must be "utility" or "background"')
+    floor_mode = host.get("home_volume_floor_mode")
+    if floor_mode is not None and floor_mode not in ("report", "refuse"):
+        fail('host.home_volume_floor_mode must be "report" or "refuse"')
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:
@@ -2362,6 +2366,8 @@ def lane_plist(
         env["TARTCI_VM_DHCP_BREAKER"] = "0"
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
+    if "home_volume_floor_mode" in host:
+        env["TARTCI_HOME_VOLUME_FLOOR_MODE"] = host["home_volume_floor_mode"]
     if "current_job_attempt_timeout_seconds" in host:
         env["TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"] = str(
             host["current_job_attempt_timeout_seconds"]

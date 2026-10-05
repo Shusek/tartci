@@ -41,6 +41,11 @@ agent_floor_qos = "utility"
 # the TCC responsible process (Full Disk Access / Removable Volumes for
 # /Volumes/Atelier); public/home-backed profiles do not inherit it. The
 # approval digest is this host's own, written by scripts/build_macos_launcher.sh.
+# Home-volume admission floor (scripts/home_volume_floor.py): `report` admits
+# every VM lease and logs `home_volume_would_refuse` when the home volume is
+# below its computed floor. `refuse` denies the new clone instead; flip it only
+# after a day of report data shows no false refusals, and with Daniel's OK.
+home_volume_floor_mode = "report"
 [launch_helper]
 path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
 approval_sha256_path = "/Users/danielraffel/.config/tartci/m5studio-launcher-approved.sha256"
