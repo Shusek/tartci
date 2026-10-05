@@ -247,7 +247,10 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   `tartci ccache reset --reset` moves the whole cache aside; it refuses while
   a VM runs or holds a lease unless `--force`. The macOS runner runs the
   quarantine before every VM boot (fail-open, `TARTCI_CCACHE_GUARD=0` disables;
-  events `ccache_guard` in the lane's event log).
+  events `ccache_guard` in the lane's event log). A budget-exhausted run
+  records where it stopped in `cursor.json` and the next run resumes there;
+  without that, a cache too large for the budget had its late fan-outs
+  checked only by the runs that happened to finish.
 
 - **Link error: undefined `icu_74::Locale::...` on Ubuntu.**
   → *Cause:* Pulp opts into direct `icu::Locale`/BreakIterator calls when

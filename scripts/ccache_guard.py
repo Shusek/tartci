@@ -55,6 +55,17 @@ never moved: a result is a real object for SOME source, and the fault is the
 manifest that points at it. Batches older than --retain-days (default 30) are
 pruned; guard.log is kept.
 
+Budget and resume
+-----------------
+The runner gives the pre-boot quarantine a time budget. A run the budget cuts
+short records the unit it stopped in (<quarantine-root>/cursor.json; a unit is
+one fan-out directory's own files or one of its subdirectories), and the next
+quarantine run starts there, walks to the end and wraps to the beginning. So
+on a cache too large to walk inside one budget, successive boots still check
+every directory in turn instead of rechecking the same head every time. A run
+that covers the whole cache removes the cursor. `scan` and `reset` always walk
+the whole cache from the start and neither read nor move the cursor.
+
 Default-safe
 ------------
 The guard reads entries through the host's own `ccache --inspect` and
@@ -93,6 +104,7 @@ Exit codes: 0 done (or nothing to do), 1 setup error, 3 refused busy,
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import errno
 import json
@@ -117,6 +129,8 @@ FANOUT = set("0123456789abcdef")
 # Per-job write isolation keeps its layers here, beside the fan-out.
 LAYER_DIR = "tartci-layers-v1"
 VERDICT_CACHE = "verdicts.json"
+# Where a budget-exhausted quarantine run stopped (see iter_from).
+CURSOR_FILE = "cursor.json"
 INSPECT_TIMEOUT = 20
 # Dependency-file inputs that are not includes (see result_verdict).
 IMPLICIT_DEP_SUFFIXES = (".json", ".modulemap")
@@ -124,6 +138,8 @@ DEFAULT_RETAIN_DAYS = 30
 STAMP_RE = re.compile(r"^\d{8}T\d{6}Z(-\d+)?$")
 
 EXIT_OK, EXIT_SETUP, EXIT_BUSY, EXIT_SKIPPED, EXIT_BUDGET = 0, 1, 3, 4, 5
+# The budget's clock. Tests replace it to exhaust a run at an exact entry.
+CLOCK = time.monotonic
 DEFAULT_LOCK_WAIT_S = 120.0
 MAX_LOCK_WAIT_S = 3600.0
 
@@ -144,11 +160,15 @@ def resolve_ccache(explicit: str | None = None) -> str | None:
     return None
 
 
-def iter_entries(cache: Path):
-    """Every cache entry file under ONE ccache root's fan-out directories.
+def iter_units(cache: Path):
+    """The scan units of ONE ccache root, in walk order: (top, sub) pairs.
 
     Only the single-hex-digit fan-out directories hold entries, so anything
     else at the top (tmp, lock, and the per-job layer tree) is never walked.
+    A unit is either the files directly in a fan-out directory (sub "") or
+    one of its subdirectories walked recursively. With ccache's two-level
+    layout that is about 272 units per root, small enough that one always
+    fits a guard budget, which is what lets a cursor resume between them.
     """
     try:
         tops = sorted(os.scandir(cache), key=lambda e: e.name)
@@ -157,12 +177,42 @@ def iter_entries(cache: Path):
     for top in tops:
         if top.name not in FANOUT or not top.is_dir(follow_symlinks=False):
             continue
-        for dirpath, dirnames, filenames in os.walk(top.path):
-            dirnames[:] = sorted(d for d in dirnames if d != "tmp")
-            for name in sorted(filenames):
-                if name.startswith(".") or name in ("stats", "CACHEDIR.TAG"):
-                    continue
+        yield top.name, ""
+        try:
+            subs = sorted(e.name for e in os.scandir(top.path)
+                          if e.name != "tmp" and e.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+        for sub in subs:
+            yield top.name, sub
+
+
+def iter_unit_entries(root: Path, top: str, sub: str):
+    """Every cache entry file in one unit (see iter_units), in walk order."""
+    def wanted(name: str) -> bool:
+        return not name.startswith(".") and name not in ("stats", "CACHEDIR.TAG")
+
+    if not sub:
+        try:
+            names = sorted(e.name for e in os.scandir(root / top)
+                           if e.is_file(follow_symlinks=False))
+        except OSError:
+            return
+        for name in names:
+            if wanted(name):
+                yield root / top / name
+        return
+    for dirpath, dirnames, filenames in os.walk(root / top / sub):
+        dirnames[:] = sorted(d for d in dirnames if d != "tmp")
+        for name in sorted(filenames):
+            if wanted(name):
                 yield Path(dirpath) / name
+
+
+def iter_entries(cache: Path):
+    """Every cache entry file under ONE ccache root's fan-out directories."""
+    for top, sub in iter_units(cache):
+        yield from iter_unit_entries(cache, top, sub)
 
 
 def cache_roots(cache: Path) -> list[Path]:
@@ -185,6 +235,59 @@ def iter_all_entries(cache: Path):
     for root in cache_roots(cache):
         for entry in iter_entries(root):
             yield root, entry
+
+
+def unit_key(cache: Path, root: Path, top: str, sub: str) -> list[str]:
+    """A unit's cursor form: [root relative to the cache, top, sub]."""
+    rel = os.path.relpath(root, cache)
+    return [rel, top, sub]
+
+
+def iter_from(cache: Path, start: list[str] | None):
+    """(unit key, root, entry) over every root, starting at the `start` unit.
+
+    Units from `start` to the end come first, then the units before it, so a
+    walk that resumes a cursor still covers the whole cache once. A cursor
+    naming a unit that no longer exists starts at the next unit after it in
+    walk order; one naming an unknown root starts at the beginning.
+    """
+    roots = cache_roots(cache)
+    units = [(index, root, top, sub) for index, root in enumerate(roots)
+             for top, sub in iter_units(root)]
+    first = 0
+    if start is not None:
+        rels = [os.path.relpath(root, cache) for root in roots]
+        if start[0] in rels:
+            target = (rels.index(start[0]), start[1], start[2])
+            first = next((i for i, (index, _r, top, sub) in enumerate(units)
+                          if (index, top, sub) >= target), len(units))
+    for index, root, top, sub in units[first:] + units[:first]:
+        key = unit_key(cache, root, top, sub)
+        for entry in iter_unit_entries(root, top, sub):
+            yield key, root, entry
+
+
+def load_cursor(qroot: Path) -> list[str] | None:
+    try:
+        value = json.loads((qroot / CURSOR_FILE).read_text()).get("unit")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(value, list) and len(value) == 3 and all(isinstance(v, str) for v in value):
+        return value
+    return None
+
+
+def save_cursor(qroot: Path, unit: list[str] | None) -> None:
+    """Record where an exhausted run stopped; a complete run removes it."""
+    path = qroot / CURSOR_FILE
+    if unit is None:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    qroot.mkdir(parents=True, exist_ok=True)
+    tmp = qroot / (CURSOR_FILE + ".tmp")
+    tmp.write_text(json.dumps({"unit": unit, "ts": utc_stamp()}, sort_keys=True))
+    os.replace(tmp, path)
 
 
 def is_manifest_header(path: Path) -> bool:
@@ -341,13 +444,17 @@ def save_verdicts(qroot: Path, verdicts: dict) -> None:
 
 def run_scan(cache: Path, ccache: str, *, all_zero: bool, size_cap: int,
              quarantine_dir: Path | None, deadline: float | None,
-             verdicts: dict | None = None) -> dict:
+             verdicts: dict | None = None, start: list[str] | None = None) -> dict:
     """Walk every readable root; quarantine what classify() flags.
 
     `verdicts` (relative path -> [size, mtime_ns]) remembers manifests already
     proven consistent, so a legitimate include-less TU's manifest is checked
     once, not on every boot. An entry is re-checked whenever its size or
     mtime changes. The dict is updated in place with what this run saw.
+
+    `start` is a cursor unit to begin at (iter_from). A run the deadline cuts
+    short reports the unit it was in as `cursor`, so the next run checks the
+    rest of the cache first instead of rescanning the same head every time.
     """
     counts = {"entries": 0, "manifests_checked": 0, "zero_include": 0,
               "zero_include_consistent": 0, "zero_include_suspect": 0,
@@ -356,9 +463,11 @@ def run_scan(cache: Path, ccache: str, *, all_zero: bool, size_cap: int,
     flagged: list[dict] = []
     budget_exhausted = False
     seen: dict = {}
-    for root, entry in iter_all_entries(cache):
-        if deadline is not None and time.monotonic() > deadline:
+    cursor = None
+    for unit, root, entry in iter_from(cache, start):
+        if deadline is not None and CLOCK() > deadline:
             budget_exhausted = True
+            cursor = unit
             break
         counts["entries"] += 1
         try:
@@ -405,7 +514,8 @@ def run_scan(cache: Path, ccache: str, *, all_zero: bool, size_cap: int,
         verdicts.update(seen)
     elif verdicts is not None:
         verdicts.update(seen)
-    return {"counts": counts, "flagged": flagged, "budget_exhausted": budget_exhausted}
+    return {"counts": counts, "flagged": flagged, "budget_exhausted": budget_exhausted,
+            "cursor": cursor}
 
 
 def append_log(qroot: Path, record: dict) -> None:
@@ -570,15 +680,24 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_SKIPPED
     try:
         qdir = None if plan else new_batch_dir(qroot)
-        deadline = time.monotonic() + args.budget if args.budget > 0 else None
+        deadline = CLOCK() + args.budget if args.budget > 0 else None
         all_zero = args.all_zero_include or args.command == "reset"
         result["mode"] = "all-zero-include" if all_zero else "suspect-only"
         if args.command == "reset":
             result["before"] = sum(1 for _ in iter_all_entries(cache))
         verdicts = load_verdicts(qroot)
+        # Only the budgeted pre-boot quarantine resumes; scan and reset always
+        # walk the whole cache from the start.
+        resumes = args.command == "quarantine" and not plan
+        start = load_cursor(qroot) if resumes else None
+        if start is not None:
+            result["resumed_from"] = start
         scan = run_scan(cache, ccache, all_zero=all_zero, size_cap=args.size_cap,
-                        quarantine_dir=qdir, deadline=deadline, verdicts=verdicts)
+                        quarantine_dir=qdir, deadline=deadline, verdicts=verdicts,
+                        start=start)
         result.update(scan)
+        if resumes:
+            save_cursor(qroot, scan["cursor"])
         if args.command == "reset" and args.reset:
             moved = errors = 0
             for _root, entry in list(iter_all_entries(cache)):
