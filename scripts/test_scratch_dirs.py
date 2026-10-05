@@ -8,6 +8,7 @@ injected so every gate is exercised without depending on this host's state.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import contextlib
 import io
 import os
@@ -279,6 +280,7 @@ class Settings(unittest.TestCase):
         report = sd.run(fix=True, profile=self.profile("[reclaim]\ntmp_checkouts = true\n"))
         self.assertFalse(report["enabled"])
 
+    @testing_support.requires_tomllib
     def test_idle_hours_are_bounded(self):
         for value in ("1", "721", "\"12\"", "12.5"):
             report = sd.run(fix=True, profile=self.profile(
@@ -290,6 +292,7 @@ class Settings(unittest.TestCase):
         table = {"pulp_worktree_builds": False, "scratch_dirs": True, "scratch_idle_hours": 12}
         self.assertEqual(pr.validate_table(table), [])
 
+    @testing_support.requires_tomllib
     def test_pressure_selects_the_shorter_gate(self):
         base = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(force_remove, base)

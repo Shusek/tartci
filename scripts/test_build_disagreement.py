@@ -10,6 +10,7 @@ Run:  python3 scripts/test_build_disagreement.py
 """
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import datetime as dt
 import io
 import json
@@ -278,6 +279,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out)["state"], "disabled")
 
+    @testing_support.requires_tomllib
     def test_only_the_m3_canary_profile_enables_it(self):
         # The watch reads GitHub fleet-wide, so one host is enough; m3 is the canary.
         enabled = sorted(path.stem for path in (HERE.parent / "profiles").glob("*.toml")

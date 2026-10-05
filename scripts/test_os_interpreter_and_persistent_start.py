@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import json
 import os
 import plistlib

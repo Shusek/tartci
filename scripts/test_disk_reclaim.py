@@ -11,6 +11,7 @@ Run:  python3 -m unittest scripts.test_disk_reclaim   (or via discover)
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import errno
 import io
 import json
@@ -1141,6 +1142,7 @@ class LeaseVolumeFloorTests(TwoRootHarness):
         self.assertEqual(code_ctl, 3)
         self.assertEqual(report_ctl["floor_scope"], "scan_volumes")
 
+    @testing_support.requires_tomllib
     def test_the_fleet_profile_names_the_lease_volume(self):
         profile = self.a / "profile.toml"
         profile.write_text(f'[host]\ntart_home = "{self.vms}"\n')
@@ -1196,6 +1198,7 @@ class RootDiscoveryTests(unittest.TestCase):
                 dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
             self.assertEqual(dr.parse_roots(None), [])
 
+    @testing_support.requires_tomllib
     def test_profile_reclaim_paths_add_the_external_volume_root(self):
         """A host whose external volume is not named Workshop is still scanned.
 

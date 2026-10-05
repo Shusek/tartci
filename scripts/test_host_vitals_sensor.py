@@ -7,6 +7,7 @@ reading) and m5studio had none; `pool status` read `fseventsd: UNKNOWN`.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import os
 import pathlib
 import shutil
@@ -17,7 +18,6 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import host_vitals_sensor as hvs  # noqa: E402
-import macos_fleet_lanes as lanes  # noqa: E402
 import pulp_reapers as pr  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -72,7 +72,9 @@ class DriftTests(Fixture):
         self.assertEqual(absent["state"], "not_applicable")
         self.assertIsNone(hvs.status_line(absent))
 
+    @testing_support.requires_tomllib
     def test_pool_status_line_only_when_it_is_not_origin_main(self) -> None:
+        import macos_fleet_lanes as lanes
         self.install_old()
         self.assertIn("host-vitals sensor: DRIFT", hvs.status_line(self.drift()))
         self.assertIn("NOT INSTALLED", hvs.status_line({"state": "not_installed"}))
@@ -113,6 +115,7 @@ class RefreshTests(Fixture):
 
 
 class ReclaimWiringTests(Fixture):
+    @testing_support.requires_tomllib
     def test_the_reclaim_pass_refreshes_even_without_a_worktree_root(self) -> None:
         # m5studio: worktrees_root did not exist yet, so the pass returned
         # before it ever materialized origin/main.
@@ -134,6 +137,7 @@ class ReclaimWiringTests(Fixture):
         self.assertEqual(seen, [(checkout / "tools" / "scripts", True)])
         self.assertEqual(report["host_vitals_sensor"]["state"], "refreshed")
 
+    @testing_support.requires_tomllib
     def test_every_fleet_host_runs_the_pass_that_refreshes_it(self) -> None:
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertEqual([p.name for p in profiles],

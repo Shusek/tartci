@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import argparse
 import contextlib
 import json
@@ -413,6 +414,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
     def _held(self) -> list[str]:
         return sorted(row["id"] for row in json.loads(self.run_cli("status").stdout)["leases"])
 
+    @testing_support.requires_tomllib
     def test_tagged_release_admits_exactly_like_merge_group(self) -> None:
         """120 vs 110 is indistinguishable to admission on every occupancy a
         two-slot host can be in: the higher number buys status order only."""
@@ -430,6 +432,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
                 self.assertEqual(verdicts["tagged"], verdicts["merge"])
         self.store = base
 
+    @testing_support.requires_tomllib
     def test_booting_release_on_slot2_leaves_slot1_its_gate_guest(self) -> None:
         for gate in ("merge", "pr"):
             with self.subTest(slot1=gate):
@@ -439,6 +442,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
                 self.assertTrue(body["ok"])
                 self.assertEqual(body["capacity"]["used_cores"], self.CAPACITY)
 
+    @testing_support.requires_tomllib
     def test_release_never_preempts_running_gate_guests(self) -> None:
         """Both slots busy with gate work: a waiting release is refused and
         both gate leases are untouched. Nothing a release does can take capacity
@@ -450,6 +454,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
         self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
         self.assertEqual(self._held(), ["slot1-gate", "slot2-gate"])
 
+    @testing_support.requires_tomllib
     def test_release_pr_gate_admits_exactly_like_pr_head(self) -> None:
         """Every occupancy a two-slot host can be in gives the release PR gate
         PR-head's verdict, so a slot that boots it holds what a gate guest on
@@ -468,6 +473,7 @@ class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
                 self.assertEqual(verdicts["pr_gate"], verdicts["pr"])
         self.store = base
 
+    @testing_support.requires_tomllib
     def test_release_pr_gate_is_admitted_while_an_ordinary_build_holds_the_non_gate_budget(self) -> None:
         """m5 as measured on 2026-09-27: 14 leasable cores, 8 reserved for the
         gate, 6-core guests, and a governed agent build holding the whole

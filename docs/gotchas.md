@@ -96,6 +96,45 @@ to state its stdin, wherever it is:
 A wrapper whose callers pipe a script into it is the one legitimate exception;
 mark it `# ssh-stdin: <why>` on its line or the line above.
 
+## A test passes in CI and fails on the hosts' Python (2026-10-05)
+
+*Symptom:* a change is green in CI, then its tests fail under
+`/usr/bin/python3` with `No module named 'tomllib'` (#379, #390, #383, #391 on
+one day). *Cause:* `/usr/bin/python3` is 3.9.6 on all four hosts and has no
+tomllib. It runs the tartci shim's support-manifest check, the pinned launch
+interpreter, every explicit `/usr/bin/python3` call site, and each
+`tartci_toml_exec_or_python3` fallback on a host without a tomllib Python;
+interactive ssh shells on m1 also resolve `python3` to it. (Under launchd's
+PATH a bare `python3` is a Homebrew 3.11+ on all four hosts.) CI ran the tests
+only on ubuntu's 3.12+ (`python-floor` only compiles, under 3.11); on
+2026-10-05 main itself failed 203 of 2283 tests under 3.9. *Guard:* the
+`python-39-tests` CI job runs every test module under Python 3.9 (the newest
+3.9 setup-python offers; 3.9.6 itself is not built for current ubuntu
+images), asserted to be 3.9 with no tomllib and first on PATH. A test that genuinely needs tomllib
+says so through `scripts/testing_support.py` and is skipped there, and every
+module that degrades without tomllib has a running test of that branch
+(`scripts/test_no_tomllib_fallbacks.py`):
+
+```python
+import testing_support
+testing_support.skip_module_without_tomllib()   # whole module, before its imports
+
+@testing_support.requires_tomllib                # one test or class
+def test_reads_the_profile(self): ...
+```
+
+Import a tomllib-only module (`macos_fleet_lanes`, `fleet_self_update`, ...)
+inside the test that needs it, not at module level, so the module's other
+tests still run on the hosts' Python.
+
+That skip is not available everywhere. For a module a 3.9 interpreter runs
+(reachable by import from an explicit `/usr/bin/python3` site, or declaring
+itself "3.9-safe"), a skip on 3.9 removes exactly the coverage the job exists
+for, so `scripts/test_system_python_tests_run.py` fails on any
+tomllib-conditional skip in that module's tests unless it is listed in
+`ALLOWED` with the 3.11-only behaviour it guards. Make the test run on 3.9
+first; list it only when what it asserts really needs tomllib.
+
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
