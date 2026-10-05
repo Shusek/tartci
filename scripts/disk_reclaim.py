@@ -75,6 +75,7 @@ import threading
 import time
 from typing import Any, Iterable
 
+import boot_usage
 import pulp_reapers
 import gate_ccache_trim
 import scratch_dirs
@@ -1267,6 +1268,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     gate_ccache = gate_ccache_trim.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
                                        state_dir=state_dir(args))
     receipt["gate_ccache_trim"] = gate_ccache
+    # Which CI and agent paths hold the boot volume, sampled once a day after
+    # the reapers above (boot_usage.py). Read-only.
+    progress.emit("boot usage: sampling CI and agent paths on the boot volume", force=True)
+    receipt["boot_usage"] = boot_usage.run(
+        state_dir=state_dir(args), profile=pulp_reapers.default_profile_path(),
+        boot_volume=boot_path, user_tmp=scratch_dirs.user_temp_dir())
 
     remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed")
                      or scratch.get("removed"))
