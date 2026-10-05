@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +25,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import state_age  # noqa: E402
 import tool_freshness as tf  # noqa: E402
 
 HOUR = 3600.0
@@ -126,6 +128,10 @@ class ToolFreshnessTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.state = tf.state_dir_for(self.home)
+        # Status reads ages against this clock: just after the fixed NOW.
+        clock = mock.patch.object(state_age, "clock", lambda: NOW + 60)
+        clock.start()
+        self.addCleanup(clock.stop)
         self.feeds = {
             "danielraffel/Shipyard": feed(("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 20 * HOUR)),
             "Generous-Corp/pulp": feed(("v0.877.1", NOW - 3 * HOUR), ("v0.877.2", NOW - 1 * HOUR)),
@@ -579,7 +585,7 @@ class StatusSurfaceTests(unittest.TestCase):
 
     def vitals(self, fsev: object) -> Path:
         path = self.dir / "host_vitals.json"
-        reading = {"level": "green", "sampled_at": 1}
+        reading = {"level": "green", "sampled_at": int(time.time())}
         if fsev is not None:
             reading["fseventsd"] = fsev
         path.write_text(json.dumps(reading))
