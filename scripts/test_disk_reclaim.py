@@ -503,8 +503,17 @@ class ClassifyTests(unittest.TestCase):
         """`pgrep` exits 1 with no output when nothing matches."""
         result = dr.active_command_lines("zzz-no-process-matches-this-zzz")
         self.assertEqual(result, "")
-        # Control: a pattern that must match this very test process.
-        self.assertNotEqual(dr.active_command_lines("python"), "")
+        # Control: a process this test starts, with a marker only it carries.
+        # Matching "python" instead depends on the host: macOS's own python
+        # runs as ".../Python.app/Contents/MacOS/Python", which pgrep -f's
+        # case-sensitive match misses, so a clean runner had nothing to find.
+        marker = f"tartci-pgrep-control-{os.getpid()}-{time.monotonic_ns()}"
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", marker])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        # Non-empty, not "contains the marker": Linux's pgrep -l prints the
+        # process name without its arguments.
+        self.assertNotEqual(dr.active_command_lines(marker), "")
 
     def test_an_unreadable_build_tree_is_never_reclaimable(self):
         """An age we could not measure must not be spent as an old age."""
