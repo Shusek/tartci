@@ -67,14 +67,29 @@ def fit(profile: Dict[str, Any], host: Dict[str, Any]) -> List[Dict[str, Any]]:
                    "memory": int(host.get("reserved_gate_mem_mb") or 0)}
         for axis in AXES:
             if reserve[axis] <= 0:
-                # No gate reserve on this axis (memory unread, or a host whose
-                # role reserves nothing for gates): there is no reserve for the
-                # slots to fit inside, so there is nothing to measure.
+                # No gate reserve on this axis: nothing to fit inside. The
+                # caller says so with not_applicable_lines(), never "fits".
                 continue
             rows.append({"lane": str(lane.get("id")), "axis": axis,
                          "demand": demand[axis], "reserve": reserve[axis],
                          "over": max(0, demand[axis] - reserve[axis])})
     return rows
+
+
+def not_applicable_lines(profile: Dict[str, Any], host: Dict[str, Any]) -> List[str]:
+    """Axes with gate lanes declared but no gate reserve to measure them against.
+
+    A reserve of 0 is not a fit: the measurement cannot be made. A host whose
+    role reserves no gate cores reads n/a for the whole check; a cores reserve
+    with an unread memory reserve reads n/a for the memory axis alone.
+    """
+    if not gate_lanes(profile):
+        return []
+    if int(host.get("reserved_gate_cores") or 0) <= 0:
+        return ["gate reserve: n/a (this host reserves no gate cores)"]
+    if int(host.get("reserved_gate_mem_mb") or 0) <= 0:
+        return ["gate reserve: memory axis n/a (this host reports no gate memory reserve)"]
+    return []
 
 
 def finding_lines(rows: List[Dict[str, Any]]) -> List[str]:

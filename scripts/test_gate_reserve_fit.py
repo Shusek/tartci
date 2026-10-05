@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -101,14 +102,59 @@ class MemoryAxisTests(unittest.TestCase):
 
 
 class NoReserveTests(unittest.TestCase):
-    def test_a_host_with_no_gate_reserve_reports_nothing(self) -> None:
-        # A CI runner or a small host: host-profile gives reserved_gate_cores 0
-        # and the watchdog must not WARN that every gate lane overcommits it.
-        host = {"reserved_gate_cores": 0, "vm_pool_cores": 1, "reserved_gate_mem_mb": 0}
-        data = {"lane": [{"id": "pulp-gate", "supervisors": 2, "vm_cores": 7}]}
-        self.assertEqual(grf.fit(data, host), [])
-        rows, refusals = grf.ratchet(data, data, host)
-        self.assertEqual((rows, refusals), ([], []))
+    """A host that reserves no gate cores cannot be measured: it reads n/a, never fits.
+
+    A CI runner or a small host: host-profile gives reserved_gate_cores 0. The
+    fit has no reserve to put the slots in, so neither "every gate lane fits"
+    nor "OVERCOMMITTED" is true.
+    """
+    HOST = {"reserved_gate_cores": 0, "vm_pool_cores": 1, "reserved_gate_mem_mb": 0}
+    LANES = {"lane": [{"id": "pulp-gate", "supervisors": 2, "vm_cores": 7}]}
+    PROFILE = '[[lane]]\nid = "pulp-gate"\nsupervisors = 2\nvm_cores = 7\n'
+
+    def test_no_reserve_is_named_not_applicable(self) -> None:
+        self.assertEqual(grf.fit(self.LANES, self.HOST), [])
+        self.assertEqual(grf.not_applicable_lines(self.LANES, self.HOST),
+                         ["gate reserve: n/a (this host reserves no gate cores)"])
+        self.assertEqual(grf.ratchet(self.LANES, self.LANES, self.HOST), ([], []))
+
+    def test_no_gate_lanes_has_nothing_to_call_not_applicable(self) -> None:
+        self.assertEqual(grf.not_applicable_lines({"lane": []}, self.HOST), [])
+
+    def test_an_unread_memory_reserve_names_the_memory_axis(self) -> None:
+        host = {"reserved_gate_cores": 14, "vm_pool_cores": 14, "reserved_gate_mem_mb": 0}
+        self.assertEqual(grf.not_applicable_lines(self.LANES, host),
+                         ["gate reserve: memory axis n/a (this host reports no gate "
+                          "memory reserve)"])
+        self.assertEqual([r["axis"] for r in grf.fit(self.LANES, host)], ["cores"])
+
+    def summary(self, host: dict) -> dict:
+        import macos_fleet_lanes
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(macos_fleet_lanes, "live_host_profile", return_value=host):
+            config = Path(td) / "profile.toml"
+            config.write_text(self.PROFILE)
+            return macos_fleet_lanes.gate_reserve_summary(config)
+
+    @requires_tomllib
+    def test_summary_and_doctor_say_not_applicable_not_fits(self) -> None:
+        value = self.summary(self.HOST)
+        self.assertEqual(value, {"lines": ["gate reserve: n/a (this host reserves no gate "
+                                           "cores)"], "problem": None})
+        finding = fd.check_gate_reserve(value, installed_present=True)
+        self.assertEqual((finding.state, finding.code),
+                         (fd.NOT_APPLICABLE, "gate_reserve_not_applicable"))
+        self.assertIn("reserves no gate cores", finding.detail)
+
+    @requires_tomllib
+    def test_summary_carries_the_memory_n_a_beside_the_cores_fit(self) -> None:
+        value = self.summary({"reserved_gate_cores": 14, "vm_pool_cores": 14,
+                              "reserved_gate_mem_mb": 0})
+        self.assertEqual(value["lines"], [
+            "gate reserve: every gate lane fits",
+            "gate reserve: memory axis n/a (this host reports no gate memory reserve)"])
+        self.assertEqual(fd.check_gate_reserve(value, installed_present=True).code,
+                         "gate_reserve_fits")
 
 
 class RatchetTests(unittest.TestCase):

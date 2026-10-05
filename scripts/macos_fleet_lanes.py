@@ -2993,6 +2993,8 @@ def check_reserve(target: dict, installed_path: Path, host_json: Path | None,
         with installed_path.open("rb") as fh:
             installed = tomllib.load(fh)
     rows, refusals = gate_reserve_fit.ratchet(installed, target, host)
+    for line in gate_reserve_fit.not_applicable_lines(target, host):
+        print(line)
     for line in gate_reserve_fit.finding_lines(rows):
         print(line)
     for line in refusals:
@@ -3011,14 +3013,19 @@ def gate_reserve_summary(config: Path) -> dict:
         import gate_reserve_fit
         with config.open("rb") as fh:
             profile = tomllib.load(fh)
-        lines = gate_reserve_fit.finding_lines(
-            gate_reserve_fit.fit(profile, live_host_profile(config)))
+        host = live_host_profile(config)
+        lines = gate_reserve_fit.finding_lines(gate_reserve_fit.fit(profile, host))
+        not_applicable = gate_reserve_fit.not_applicable_lines(profile, host)
     except Exception as exc:  # noqa: BLE001 - a status line must not break status
         return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
                 "problem": None}
+    if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
+        return {"lines": not_applicable, "problem": None}
     if not lines:
-        return {"lines": ["gate reserve: every gate lane fits"], "problem": None}
-    return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines],
+        return {"lines": ["gate reserve: every gate lane fits", *not_applicable],
+                "problem": None}
+    return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines]
+            + not_applicable,
             "problem": "; ".join(line.split(" ", 1)[1] for line in lines)}
 
 

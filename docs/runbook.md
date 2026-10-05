@@ -1780,7 +1780,11 @@ fleet`), and check GitHub's job history against it with
   check that let the overcommit grow would be no check (m3, 2026-10-04: 2 x 12
   against 14 lease-denied the second Pulp slot while jobs queued, #373).
   Resizing is a profile decision with the host's owner and must not take
-  agent cores. The flag is passed by the orchestrating (installed)
+  agent cores. A host that reserves no gate cores (a CI runner, or a role
+  that keeps none for gates) has no reserve to fit lanes into, so the check
+  reads `gate reserve: n/a (this host reserves no gate cores)` and the doctor
+  `gate_reserve_not_applicable`, never "fits"; a missing memory reserve beside
+  a cores reserve adds a `memory axis n/a` line. The flag is passed by the orchestrating (installed)
   generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over

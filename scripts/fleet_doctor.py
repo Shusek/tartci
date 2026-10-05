@@ -763,6 +763,10 @@ def check_gate_reserve(value: dict | None, *, installed_present: bool) -> Findin
     if not lines or "UNKNOWN" in lines[0]:
         return Finding("gate_reserve", UNKNOWN, "gate_reserve_unknown",
                        lines[0] if lines else "not computed", {"gate_reserve": value})
+    if lines[0].startswith("gate reserve: n/a"):
+        # Gate lanes with no reserve to fit them in: unmeasurable, not a fit.
+        return Finding("gate_reserve", NOT_APPLICABLE, "gate_reserve_not_applicable",
+                       lines[0], {"gate_reserve": value})
     return Finding("gate_reserve", OK, "gate_reserve_fits", "; ".join(lines),
                    {"gate_reserve": value})
 
