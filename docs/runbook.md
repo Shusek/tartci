@@ -1658,11 +1658,14 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **While open,** no lane clones. Each pass is idle, not blocked, and takes no
   job claim: the breaker is the first pre-boot check, before the job claim and
   the pre-clone demand check. One lane probes with a single VM every 300 s, or
-  at once when bootpd's run count moves (`vm_dhcp_probe result=ip|no_ip`).
+  at once when the VM-network chain changes (bootpd loaded or its run count,
+  `/etc/bootpd.plist`'s mtime, or InternetSharing's pid, all readable without
+  root), or at once after `tartci vm-dhcp probe-now`
+  (`vm_dhcp_probe result=ip|no_ip cause=…`).
 - **Closes** on the first address any VM on the host gets, or when the host
   rebooted after the breaker opened. `vm_dhcp_recovered` reports `reason`,
   `open_s`, `vms_spent`, `probes`, and `latency_s` (time since the last probe,
-  or since bootpd's run count moved).
+  or since the chain last changed).
 - **The trade:** an outage costs about one VM per 300 s instead of one per lane
   every 2 to 4 min. Recovery is noticed within 300 s plus a boot instead of
   within minutes. `latency_s` above 300 s plus boot p99 means the cadence is
@@ -1672,37 +1675,49 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
   it for one host.
 
-Recovery needs root, and tartci never runs it. First tell which failure it is.
-`launchctl print system/com.apple.bootpd` needs no root: exit 0 means the job
-is loaded, and exit 113 ("Could not find service") means launchd has no bootpd
-job at all. `tartci doctor fleet` reads the same thing and reports the open
-breaker as `vm_dhcp_unanswered` (loaded but silent) or
-`vm_dhcp_bootpd_not_loaded`.
+Recovery needs root, and tartci never runs it. Each `no_ip` records which
+layer failed (`cause`), read while that VM is still up, and `tartci doctor
+fleet` names the most fundamental one. Fix the layers in this order; a lower
+one cannot help until the one above it works.
 
-**Loaded but silent** (`vm_dhcp_unanswered`):
+**Never kickstart the `com.apple.NetworkSharing` job.** System Integrity
+Protection refuses it ("150: Operation not permitted while System Integrity
+Protection is engaged", m5, 2026-10-07).
 
-1. `sudo launchctl print system/com.apple.bootpd` and
-   `/usr/bin/log show --last 30m --predicate 'process == "bootpd"'` (expect
-   silence).
-2. `sudo launchctl kickstart -k system/com.apple.bootpd`.
-3. If no address arrives within 2 min, run
-   `sudo launchctl disable system/com.apple.bootpd && sudo launchctl enable system/com.apple.bootpd`,
-   then if needed `sudo launchctl kickstart -k system/com.apple.NetworkSharing`.
-   A reboot also clears it.
+**Never move `/etc/bootpd.plist` or
+`/Library/Preferences/SystemConfiguration/com.apple.vmnet.plist` aside.**
+`dhcp_enabled = false` there is the normal state while no VM runs: an idle
+healthy host (m3) reads exactly that, and InternetSharing rewrites the file
+with `dhcp_enabled = [bridge100]` and a `Subnets` entry when a VM's network
+comes up. It is not stale configuration.
 
-**Not loaded** (`vm_dhcp_bootpd_not_loaded`): bootpd's plist
-(`/System/Library/LaunchDaemons/bootps.plist`) ships Disabled, and only
-Internet Sharing (`com.apple.NetworkSharing`) loads it. A bootpd kickstart fails
-with "Could not find service", and disable/enable only changes the override
-without loading anything (m5, 2026-10-07).
+1. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
+   existed while a VM ran. Tart's NAT network is vmnet shared mode, which
+   InternetSharing creates per VM; on m5 on 2026-10-07 it had run since boot
+   without answering any VM's request, so bootpd had nothing to serve.
+   `sudo killall InternetSharing` (launchd starts it again on the next VM's
+   request; SIP blocks the launchctl kickstart, not a signal), or turn
+   Internet Sharing off and on in System Settings > General > Sharing, or
+   reboot.
+2. **bootpd not loaded** (`vm_dhcp_bootpd_not_loaded`): `launchctl print
+   system/com.apple.bootpd` exits 113 ("Could not find service"; no root
+   needed to check). bootpd's plist ships Disabled and Internet Sharing
+   normally loads it. `sudo launchctl bootstrap system
+   /System/Library/LaunchDaemons/bootps.plist` (proven on m5 with SIP on). A
+   bootpd kickstart, or disable/enable, cannot load a job launchd does not
+   have.
+3. **DHCP not enabled on the VM network** (`vm_dhcp_config_disabled`):
+   `bridge100` exists but `/etc/bootpd.plist` does not list it in
+   `dhcp_enabled`. InternetSharing did not finish configuring it: same fix as
+   layer 1.
+4. **bootpd loaded but silent** (`vm_dhcp_unanswered`):
+   `sudo launchctl kickstart -k system/com.apple.bootpd`; if no address within
+   2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl
+   enable system/com.apple.bootpd`; a reboot also clears it.
 
-1. `sudo launchctl kickstart -k system/com.apple.NetworkSharing`, which reloads
-   bootpd with Internet Sharing.
-2. If `launchctl print system/com.apple.bootpd` still exits 113,
-   `sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist`.
-3. Confirm it now prints a state and a run count.
-
-The probe fires at once when a step moves bootpd's run count.
+After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
+instead of waiting out the 300 s cadence; a fix that changes the chain usually
+triggers it on its own.
 
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 

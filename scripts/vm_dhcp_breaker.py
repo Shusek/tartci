@@ -16,10 +16,11 @@ One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
   within N (15 min) with no address in between opens the breaker. A single
   `no_ip` never has: both isolated ones on record cleared on the next boot.
 * open: no lane clones (`check` answers `backoff`, an idle pass). Once per
-  PROBE_SECS (300), or at once when bootpd's run counter has moved since the
-  breaker opened (an operator kicked it), exactly one lane is answered
-  `probe` and clones one VM. Every probe is recorded `vm_dhcp_probe
-  result=ip|no_ip`.
+  PROBE_SECS (300), at once when the VM-network chain has changed since the
+  last look (bootpd loaded or its run count, /etc/bootpd.plist's mtime, or
+  InternetSharing's pid: an operator acted), or at once after `probe-now`,
+  exactly one lane is answered `probe` and clones one VM. Every probe is
+  recorded `vm_dhcp_probe result=ip|no_ip`.
 * closed again: the first address any VM on the host gets, probe or not
   (`record ip`), closes it and reports how long it was open, how many VMs it
   spent, and the recovery latency. A breaker opened before the host last
@@ -36,8 +37,21 @@ under an exclusive lock, so a reader never sees a partial file.
 Python 3.9-safe: every lane calls it with a bare `python3`, and a host whose
 lane PATH falls through to /usr/bin/python3 must still stop cloning.
 
+Every `no_ip`, read while that VM is still up, also records which layer
+failed (`cause`), most fundamental first:
+  vm_network_missing  no bridge100 exists: InternetSharing (vmnet shared
+                      mode) never created the VM network, so bootpd has
+                      nothing to serve (m5, 2026-10-07)
+  bootpd_not_loaded   launchd has no bootpd job (`launchctl print` exit 113)
+  dhcp_config_disabled  the network exists but /etc/bootpd.plist does not
+                      enable DHCP on it
+  dhcp_silent         everything is in place and bootpd still answers nothing
+/etc/bootpd.plist saying dhcp_enabled=false is the NORMAL idle state: Internet
+Sharing rewrites it when it creates bridge100, so it only means something
+while a VM is up.
+
 Usage: vm_dhcp_breaker.py check --lane L | record --outcome ip|no_ip --lane L
-[--vm V] | status --json. `check` and `record` print {"action", "events"}; the
+[--vm V] | probe-now | status --json. `check` and `record` print {"action", "events"}; the
 caller emits the events.
 """
 from __future__ import annotations
@@ -168,6 +182,86 @@ def bootpd_readout() -> dict[str, Any]:
     return out
 
 
+def vm_network_readout() -> dict[str, Any]:
+    """The host's vmnet shared-mode interfaces (bridge1NN), readable without
+    root; {} when unreadable."""
+    ifconfig = os.environ.get("TARTCI_VM_DHCP_IFCONFIG", "ifconfig")
+    try:
+        proc = subprocess.run([ifconfig, "-l"], capture_output=True, text=True, timeout=5,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    names = proc.stdout.split()
+    return {"bridges": sorted(n for n in names if re.fullmatch(r"bridge1\d\d", n)),
+            "vmenet": sum(1 for n in names if n.startswith("vmenet"))}
+
+
+def bootpd_config_readout() -> dict[str, Any]:
+    """/etc/bootpd.plist (world-readable): which interfaces get DHCP, and its
+    mtime. {"present": False} when absent; {} when unreadable."""
+    import plistlib
+    path = pathlib.Path(os.environ.get("TARTCI_VM_DHCP_BOOTPD_PLIST", "/etc/bootpd.plist"))
+    try:
+        raw = path.read_bytes()
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        return {"present": False}
+    except OSError:
+        return {}
+    try:
+        value = plistlib.loads(raw)
+    except Exception:  # noqa: BLE001 - any malformed plist is unreadable
+        return {}
+    enabled = value.get("dhcp_enabled") if isinstance(value, dict) else None
+    return {"present": True, "mtime": mtime,
+            "dhcp_enabled": [str(x) for x in enabled] if isinstance(enabled, list) else []}
+
+
+def sharing_pid() -> int | None:
+    """InternetSharing's pid (com.apple.NetworkSharing), readable without root."""
+    launchctl = os.environ.get("TARTCI_VM_DHCP_LAUNCHCTL", "launchctl")
+    try:
+        proc = subprocess.run([launchctl, "print", "system/com.apple.NetworkSharing"],
+                              capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+        key, sep, value = line.strip().partition(" = ")
+        if sep and key == "pid":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def diagnose(net: dict[str, Any], bootpd: dict[str, Any],
+             config: dict[str, Any]) -> str:
+    """Which layer failed, read while a VM that got no address is still up."""
+    if not net:
+        return "unknown"
+    bridges = net.get("bridges") or []
+    if not bridges:
+        return "vm_network_missing"
+    if bootpd.get("loaded") is False:
+        return "bootpd_not_loaded"
+    if config.get("present") is False or (
+            config.get("present") and not set(bridges) & set(config.get("dhcp_enabled") or [])):
+        return "dhcp_config_disabled"
+    return "dhcp_silent"
+
+
+def chain() -> dict[str, Any]:
+    """What an operator's fix changes: compared between looks, a difference
+    triggers a probe at once. Every part is readable without root."""
+    bootpd = bootpd_readout()
+    config = bootpd_config_readout()
+    return {"bootpd_loaded": bootpd.get("loaded"), "bootpd_runs": bootpd.get("runs"),
+            "config_mtime": config.get("mtime"), "sharing_pid": sharing_pid()}
+
+
 def fmt(fields: dict[str, Any]) -> str:
     return " ".join(f"{k}={v}" for k, v in fields.items() if v is not None and v != "")
 
@@ -208,21 +302,25 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if last is None:
             last = value.get("opened_at")
         due = now - float(now if last is None else last) >= probe_secs
-        readout = bootpd_readout()
-        runs = readout.get("runs")
-        moved = (runs is not None and value.get("bootpd_runs") is not None
-                 and runs != value.get("bootpd_runs"))
+        current = chain()
+        seen = value.get("chain")
+        moved = isinstance(seen, dict) and current != seen
+        value["chain"] = current
         if moved:
             value["bootpd_moved_at"] = now
-            value["bootpd_runs"] = runs
-        if not (due or moved):
+        requested = value.get("probe_requested_at")
+        asked = requested is not None and float(requested) > float(last or 0)
+        if not (due or moved or asked):
+            if not isinstance(seen, dict) or moved:
+                save(path, value)
             return {"action": "backoff", "events": events}
         value["last_probe_at"] = now
         value["probe_lane"] = args.lane
         value["probes"] = int(value.get("probes") or 0) + 1
         save(path, value)
         events.append(["vm_dhcp_probe_start", fmt({
-            "lane": args.lane, "trigger": "bootpd_runs_moved" if moved else "cadence",
+            "lane": args.lane,
+            "trigger": "operator" if asked else "chain_changed" if moved else "cadence",
             "probe": value["probes"]})])
         return {"action": "probe", "events": events}
 
@@ -247,7 +345,12 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
                 value["last_ip_at"] = now
             save(path, value)
             return {"action": "recorded", "events": events}
-        # no_ip
+        # no_ip: read which layer failed while this VM is still up.
+        readout = bootpd_readout()
+        cause = diagnose(vm_network_readout(), readout, bootpd_config_readout())
+        value["cause"], value["cause_at"] = cause, now
+        if probe:
+            events[-1][1] += f" cause={cause}"
         if value.get("state") == "open":
             value["vms_spent"] = int(value.get("vms_spent") or 0) + 1
             save(path, value)
@@ -257,10 +360,10 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         streak.append({"ts": now, "lane": args.lane, "vm": args.vm})
         value["streak"] = streak[-MAX_STREAK:]
         if len(streak) >= k:
-            readout = bootpd_readout()
             value.update({"state": "open", "opened_at": now, "vms_spent": len(streak),
-                          "probes": 0, "last_probe_at": now,
-                          "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None})
+                          "probes": 0, "last_probe_at": now, "chain": chain(),
+                          "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None,
+                          "probe_requested_at": None})
             events.append(["vm_dhcp_unanswered", fmt({
                 "streak": len(streak), "window_s": int(now - float(streak[0]["ts"])),
                 "lanes": ",".join(sorted({str(r.get("lane")) for r in streak})),
@@ -268,9 +371,25 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
                 "bootpd_state": readout.get("state", "unreadable"),
                 "bootpd_runs": readout.get("runs"),
                 "bootpd_last_exit": readout.get("last_exit"),
+                "cause": cause,
             })])
         save(path, value)
         return {"action": "recorded", "events": events}
+
+
+def probe_now(now: float | None = None) -> dict[str, Any]:
+    """After a human fix: the next `check` probes at once instead of waiting
+    out PROBE_SECS. A no-op on a closed breaker."""
+    now = time.time() if now is None else now
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        if value.get("state") != "open":
+            return {"action": "closed", "events": []}
+        value["probe_requested_at"] = now
+        save(path, value)
+        return {"action": "requested", "events": [["vm_dhcp_probe_requested", fmt({
+            "open_s": int(now - float(value.get("opened_at") or now)),
+            "cause": value.get("cause")})]]}
 
 
 def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
@@ -303,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--outcome", choices=["ip", "no_ip"], required=True)
     r.add_argument("--lane", required=True)
     r.add_argument("--vm", default="")
+    sub.add_parser("probe-now")
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -310,7 +430,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             print(json.dumps(status(), sort_keys=True))
             return 0
-        result = check(args) if args.command == "check" else record(args)
+        if args.command == "probe-now":
+            result = probe_now()
+        else:
+            result = check(args) if args.command == "check" else record(args)
     except Exception as exc:  # noqa: BLE001 - the caller fails open
         print(json.dumps({"action": "error", "error": str(exc), "events": []}))
         return 1

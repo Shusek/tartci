@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,17 +49,39 @@ class Case(unittest.TestCase):
         self.runs = self.tmp / "bootpd-runs"
         self.runs.write_text("3")
         launchctl = self.tmp / "launchctl"
+        self.sharing = self.tmp / "sharing-pid"
+        self.sharing.write_text("14504")
         launchctl.write_text(
             "#!/bin/bash\n"
+            "case \"$2\" in *NetworkSharing)\n"
+            f"  printf '\\tstate = running\\n\\tpid = %s\\n' \"$(cat {str(self.sharing)!r})\"; exit 0 ;;\n"
+            "esac\n"
             "printf '\\tstate = not running\\n\\truns = %s\\n\\tlast exit code = 0\\n' "
             f"\"$(cat {str(self.runs)!r})\"\n")
         launchctl.chmod(0o755)
+        # The VM network as `ifconfig -l` lists it, and /etc/bootpd.plist:
+        # by default a healthy chain, so a no_ip reads as bootpd silent.
+        self.ifaces = self.tmp / "ifaces"
+        self.ifaces.write_text("lo0 en0 bridge0 bridge100 vmenet0")
+        ifconfig = self.tmp / "ifconfig"
+        ifconfig.write_text(f"#!/bin/bash\ncat {str(self.ifaces)!r}\n")
+        ifconfig.chmod(0o755)
+        self.plist = self.tmp / "bootpd.plist"
+        self.write_plist(["bridge100"])
         self.env = {"TARTCI_VM_DHCP_DIR": str(self.tmp / "vm-dhcp"),
+                    "TARTCI_VM_DHCP_IFCONFIG": str(ifconfig),
+                    "TARTCI_VM_DHCP_BOOTPD_PLIST": str(self.plist),
                     "TARTCI_VM_DHCP_LAUNCHCTL": str(launchctl),
                     "TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400)}
         self.saved = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
         self.addCleanup(self._restore)
+
+    def write_plist(self, enabled) -> None:
+        import plistlib
+        self.plist.write_bytes(plistlib.dumps({"bootp_enabled": False,
+                                               "detect_other_dhcp_server": False,
+                                               "dhcp_enabled": enabled}))
 
     def _restore(self) -> None:
         for key, value in self.saved.items():
@@ -141,13 +164,14 @@ class Open(Case):
         self.runs.write_text("4")
         result = self.check(T0 + 70)
         self.assertEqual(result["action"], "probe")
-        self.assertIn("trigger=bootpd_runs_moved", result["events"][0][1])
+        self.assertIn("trigger=chain_changed", result["events"][0][1])
 
     def test_a_failed_probe_is_recorded_and_spent(self):
         self.open()
         self.check(T0 + 400, lane="a")
         result = self.record("no_ip", T0 + 600, lane="a")
-        self.assertEqual(result["events"], [["vm_dhcp_probe", "lane=a vm=vm result=no_ip"]])
+        self.assertEqual(result["events"],
+                         [["vm_dhcp_probe", "lane=a vm=vm result=no_ip cause=dhcp_silent"]])
         self.assertEqual(self.state()["vms_spent"], 3)
         self.assertEqual(self.state()["state"], "open")
 
@@ -339,6 +363,136 @@ class BootpdNotLoaded(Case):
         self.assertNotIn("bootpd", closed)
 
 
+class Layers(Case):
+    """Each no_ip names the layer that failed, read while its VM is still up."""
+
+    def open_with(self, at: float = T0) -> dict:
+        self.record("no_ip", at)
+        return self.record("no_ip", at + 300)
+
+    def test_the_diagnosis_matrix(self):
+        up = {"bridges": ["bridge100"], "vmenet": 1}
+        loaded = {"loaded": True}
+        on = {"present": True, "dhcp_enabled": ["bridge100"]}
+        for net, bootpd, config, cause in (
+                ({}, loaded, on, "unknown"),
+                ({"bridges": [], "vmenet": 0}, {"loaded": False}, {"present": False},
+                 "vm_network_missing"),
+                (up, {"loaded": False}, on, "bootpd_not_loaded"),
+                (up, loaded, {"present": True, "dhcp_enabled": []}, "dhcp_config_disabled"),
+                (up, loaded, {"present": False}, "dhcp_config_disabled"),
+                (up, loaded, on, "dhcp_silent")):
+            with self.subTest(cause=cause):
+                self.assertEqual(vb.diagnose(net, bootpd, config), cause)
+
+    def test_m5_on_2026_10_07_reads_as_the_vm_network_missing(self):
+        # InternetSharing never answered: no bridge100 while the VM ran, and
+        # the idle bootpd.plist says dhcp_enabled=false.
+        self.ifaces.write_text("lo0 en0 bridge0 utun0")
+        self.write_plist(False)
+        result = self.open_with()
+        self.assertIn("cause=vm_network_missing", result["events"][0][1])
+        finding = fleet_doctor.check_vm_dhcp(self.state())
+        self.assertEqual(finding.code, "vm_dhcp_vm_network_missing")
+
+    def test_the_network_layer_outranks_bootpd_not_loaded(self):
+        self.ifaces.write_text("lo0 en0")
+        self.launchctl_missing_bootpd()
+        self.open_with()
+        self.assertEqual(fleet_doctor.check_vm_dhcp(self.state()).code,
+                         "vm_dhcp_vm_network_missing")
+
+    def test_a_running_vm_bridge_missing_from_the_config(self):
+        self.write_plist(False)
+        self.open_with()
+        self.assertEqual(self.state()["cause"], "dhcp_config_disabled")
+        self.assertEqual(fleet_doctor.check_vm_dhcp(self.state()).code, "vm_dhcp_config_disabled")
+
+    def test_everything_in_place_stays_unanswered(self):
+        self.open_with()
+        self.assertEqual(self.state()["cause"], "dhcp_silent")
+        self.assertEqual(fleet_doctor.check_vm_dhcp(self.state()).code, "vm_dhcp_unanswered")
+
+    def launchctl_missing_bootpd(self) -> None:
+        path = self.tmp / "launchctl"
+        path.write_text("#!/bin/bash\n"
+                        "case \"$2\" in *NetworkSharing) printf '\\tpid = 1\\n'; exit 0 ;; esac\n"
+                        "echo 'Could not find service' >&2\nexit 113\n")
+        path.chmod(0o755)
+
+
+class ProbeTriggers(Case):
+    """Probe at once when an operator's fix changes the chain, or on request."""
+
+    def open(self) -> None:
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+
+    def test_an_unchanged_chain_waits_for_the_cadence(self):
+        self.open()
+        self.assertEqual(self.check(T0 + 120)["action"], "backoff")
+
+    def test_bootpd_loading_after_it_opened_probes_at_once(self):
+        # m5: bootpd was not loaded when the breaker opened, so its run count
+        # was None and a run-count comparison could never fire.
+        self.launchctl_missing_bootpd()
+        self.open()
+        self.assertIsNone(self.state()["bootpd_runs"])
+        self.restore_launchctl()
+        result = self.check(T0 + 120)
+        self.assertEqual(result["action"], "probe")
+        self.assertIn("trigger=chain_changed", result["events"][0][1])
+
+    def test_the_config_file_changing_probes_at_once(self):
+        self.open()
+        self.check(T0 + 90)
+        os.utime(self.plist, (T0 + 100, T0 + 100))
+        self.assertEqual(self.check(T0 + 120)["action"], "probe")
+
+    def test_internetsharing_restarting_probes_at_once(self):
+        self.open()
+        self.sharing.write_text("99999")
+        self.assertEqual(self.check(T0 + 120)["action"], "probe")
+
+    def test_probe_now_probes_once_then_waits(self):
+        self.open()
+        requested = vb.probe_now(now=T0 + 100)
+        self.assertEqual(requested["action"], "requested")
+        self.assertEqual(requested["events"][0][0], "vm_dhcp_probe_requested")
+        result = self.check(T0 + 110)
+        self.assertEqual(result["action"], "probe")
+        self.assertIn("trigger=operator", result["events"][0][1])
+        self.record("no_ip", T0 + 200, lane="m5-pulp-gate")
+        self.assertEqual(self.check(T0 + 220)["action"], "backoff")
+
+    def test_probe_now_on_a_closed_breaker_does_nothing(self):
+        self.assertEqual(vb.probe_now(now=T0)["action"], "closed")
+        self.assertEqual(self.state()["state"], "closed")
+
+    def test_the_tartci_verb_reaches_probe_now(self):
+        self.open()
+        out = subprocess.run([str(ROOT / "tartci"), "vm-dhcp", "probe-now"],
+                             capture_output=True, text=True, check=True, env=dict(os.environ))
+        self.assertEqual(json.loads(out.stdout)["action"], "requested")
+        self.assertIsNotNone(self.state()["probe_requested_at"])
+
+    def launchctl_missing_bootpd(self) -> None:
+        Layers.launchctl_missing_bootpd(self)
+
+    def restore_launchctl(self) -> None:
+        self.setUp_launchctl()
+
+    def setUp_launchctl(self) -> None:
+        path = self.tmp / "launchctl"
+        path.write_text(
+            "#!/bin/bash\n"
+            "case \"$2\" in *NetworkSharing)\n"
+            f"  printf '\\tpid = %s\\n' \"$(cat {str(self.sharing)!r})\"; exit 0 ;;\n"
+            "esac\n"
+            "printf '\\tstate = running\\n\\truns = 4\\n\\tlast exit code = 0\\n'\n")
+        path.chmod(0o755)
+
+
 class Doctor(unittest.TestCase):
     def test_codes_and_the_root_remedy(self):
         reasons = fleet_doctor.load_reasons()
@@ -353,13 +507,25 @@ class Doctor(unittest.TestCase):
         remedy = reasons["vm_dhcp_unanswered"]["remedy"]
         self.assertIn("sudo launchctl kickstart -k system/com.apple.bootpd", remedy)
         self.assertIn("tartci never runs it", remedy)
+        self.assertIn("sudo killall InternetSharing",
+                      reasons["vm_dhcp_vm_network_missing"]["remedy"])
+        self.assertIn("sudo killall InternetSharing", reasons["vm_dhcp_config_disabled"]["remedy"])
+        for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled"):
+            self.assertIn(code, fleet_doctor.CODES)
         not_loaded = reasons["vm_dhcp_bootpd_not_loaded"]
-        self.assertIn(fleet_doctor.check_vm_dhcp(
-            {"state": "open", "bootpd": {"loaded": False}}).code, fleet_doctor.CODES)
-        for step in ("sudo launchctl kickstart -k system/com.apple.NetworkSharing",
-                     "sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist"):
-            self.assertIn(step, not_loaded["remedy"])
-        self.assertIn("Could not find service", remedy)
+        self.assertEqual(fleet_doctor.check_vm_dhcp(
+            {"state": "open", "bootpd": {"loaded": False}}).code, "vm_dhcp_bootpd_not_loaded")
+        self.assertIn("sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist",
+                      not_loaded["remedy"])
+        self.assertIn("Could not find service", not_loaded["why"])
+
+    def test_no_remedy_ever_suggests_the_sip_blocked_kickstart(self):
+        # m5, 2026-10-07: "150: Operation not permitted while System Integrity
+        # Protection is engaged".
+        blocked = re.compile(r"kickstart\s+(-k\s+)?system/com\.apple\.NetworkSharing")
+        for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md",
+                     ROOT / "scripts" / "fleet_doctor.py", ROOT / "scripts" / "vm_dhcp_breaker.py"):
+            self.assertIsNone(blocked.search(path.read_text()), path.name)
 
 
 if __name__ == "__main__":
