@@ -805,6 +805,13 @@ providers/proxmox-linux/bake-pulp-golden.sh \
   --guest-host <candidate-ip>
 ```
 
+The bake, `tart-linux/provision.sh` and `tart-macos/provision.sh pulp-readiness`
+read their TOML manifests through `tartci_toml_python`
+(`providers/common/toml-python.lib.sh`, the resolver the `tartci` shim sources),
+not a bare `python3`: an operator's ssh login shell on m1 resolves `python3` to
+`/usr/bin/python3` 3.9.6, which has no tomllib. With no 3.11+ interpreter found,
+they stop and say `set TARTCI_PYTHON`.
+
 > **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under
 > Prism, but the cross-build toolchain story there (MSVC x64 cross + x64 deps) is
 > heavier and not yet wired — `--target-arch` is Linux/Rosetta today. Tracked
@@ -970,9 +977,10 @@ Install the toolchain over SSH:
 # Git bash: fetch deps only
 ssh pulp-win 'C:\path\to\bash setup.sh --ci --deps-only'
 
-# Configure under the MSVC env, GPU off (no Windows Skia yet)
+# Configure under the MSVC env. Use GPU=ON for the published Windows Skia
+# slice; use GPU=OFF only for a deliberately CPU-only smoke.
 ssh pulp-win 'vcvarsall arm64 && cmake -S pulp -B pulp\build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=OFF'
+  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=ON'
 
 ssh pulp-win 'cmake --build pulp\build'
 ssh pulp-win 'ctest --test-dir pulp\build'   # apply the CI exclude set (gpu/visual labels)
@@ -1528,7 +1536,8 @@ ordered exclusive workflow classes), `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`
 `TARTCI_RUNNER_SHA256` (required with a non-default runner version),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
-`TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
+`TARTCI_WIN_GPU` (`on`/`off`, default `off` for the on-demand lane),
+`TARTCI_WIN_CTEST_JOBS`, `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
 `TARTCI_WIN_LOGS`. Defaults target `Generous-Corp/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
@@ -1620,6 +1629,168 @@ the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
 
+### Lane python3 cannot import tomllib (`lane_python_no_tomllib`)
+
+Lanes run `gate_supply.py decide` (gate placement), `macos_fleet_lanes.py
+render` and `host_profile.py` with a bare `python3`. That is correct only while
+the lane plist's PATH puts a 3.11+ python3 (Homebrew's `/opt/homebrew/bin`)
+ahead of `/usr/bin`, because macOS's `/usr/bin/python3` is 3.9 and has no
+tomllib. `tartci doctor fleet` takes the PATH from each installed lane plist,
+resolves `python3` on it the way a shell would, runs it once, and reports
+`lane_python_no_tomllib` with the interpreter path, its version and the lanes
+that use it when it cannot import tomllib (`scripts/lane_python.py`). Fix the
+interpreter (reinstall Homebrew's python3), not the helpers: they read the
+fleet profile, and a guess in its place is a mis-placed gate. An interactive
+ssh shell has a different PATH and is not what this checks.
+
+### VM DHCP not answering (`vm_dhcp_unanswered`)
+
+A booted VM gets its address from the host's DHCP server: bootpd, a
+socket-activated system daemon that macOS Internet Sharing manages. When bootpd
+stops answering, every boot waits 120 s for an address (`boot_failed no_ip`) and
+is discarded. On m5 this happened on 2026-09-23 (13 VMs in 47 min) and
+2026-10-04 (10 VMs in 40 min). On 10-04, bootpd ran nothing from 20:53Z until
+macOS itself disabled and re-enabled it at 21:48:51Z.
+
+Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
+`~/.tartci/state/vm-dhcp/breaker.json`):
+
+- **Opens** on two `no_ip` in a row within 15 min, with no address in between.
+  A single `no_ip` has never been an outage. `vm_dhcp_unanswered` records
+  bootpd's state, run count and last exit at that moment, and the `no_ip`
+  times.
+- **While open,** no lane clones. Each pass is idle, not blocked, and takes no
+  job claim: the breaker is the first pre-boot check, before the job claim and
+  the pre-clone demand check. One lane probes with a single VM every 300 s, or
+  at once when the VM-network chain changes (bootpd loaded or its run count,
+  `/etc/bootpd.plist`'s mtime, or InternetSharing's pid, all readable without
+  root), or at once after `tartci vm-dhcp probe-now`
+  (`vm_dhcp_probe result=ip|no_ip cause=…`).
+- **Closes** on the first address any VM on the host gets.
+  `vm_dhcp_recovered` reports `reason`,
+  `open_s`, `vms_spent`, `probes`, and `latency_s` (time since the last probe,
+  or since the chain last changed).
+- **The trade:** an outage costs about one VM per 300 s instead of one per lane
+  every 2 to 4 min. Recovery is noticed within 300 s plus a boot instead of
+  within minutes. `latency_s` above 300 s plus boot p99 means the cadence is
+  wrong.
+- **Verifies after a boot** (`verifying`, doctor `vm_dhcp_verifying`): when
+  kern.boottime differs from the one recorded, when no boot time is recorded
+  (first run, or a breaker file from before this state), and after a
+  self-update's `pool on` (receipt step `vm-dhcp-verify`, which runs
+  `tartci vm-dhcp verify --reason self_update`), exactly one lane probes and
+  the others idle. Its address closes the breaker (`vm_dhcp_verified`); its
+  `no_ip` opens it at once with the failing layer
+  (`streak=1 trigger=post_boot alert=now`). A probe that reports nothing within
+  960 s opens it with `cause=probe_unreported` and frees the slot; a later
+  address still closes it. A reboot used to close the breaker outright, and on
+  m5 on 2026-10-07 every lane cloned again into a broken VM network (about 56
+  VMs). The cost is one serialised boot, about 3 min, per reboot or
+  self-update. **On first deploy every host verifies once** (no boot time is
+  recorded yet). The self-update trigger runs from the installed
+  orchestrator, so it takes effect one update after deploy.
+- **The 960 s bound** is twice the slowest probe report on current lane code
+  (clone_start to `boot_failed no_ip`, which ends the 120 s address wait),
+  rounded up to the minute. `TARTCI_VM_DHCP_VERIFY_SECS` overrides it. Measured
+  2026-10-07 from every lane's `events.jsonl`:
+
+  | Host | n | p50 | p90 | p99 | max (s) |
+  |---|---|---|---|---|---|
+  | m3 | 6 | 197 | 200 | 200 | 200 |
+  | m1 | 298 | 199 | 353 | 392 | 1129 (one 2026-07-09 event in the retired pre-fleet `macos` lane; next 400) |
+  | m5 | 303 | 205 | 220 | 316 | 464 |
+  | m5s | 0 | — | — | — | — (1032 clones, never a `no_ip`) |
+
+  The success report comes earlier. `boot_ip clone_to_ip_s=` (logged at the
+  address since this change) gives clone_start to address directly; before
+  it, clone_start to `boot_ok`, which also counts SSH and the JIT mint,
+  passed 960 s in 5 of 5215 boots over 30 days. **Re-derive the 960 s default
+  once 30 days of `boot_ip` exist**: on each host,
+  `tartci vm-dhcp boot-times --days 30` reads every lane log (at any depth:
+  m5studio nests them under `macos-fleet/<lane>/`) and prints both report
+  distributions and `suggested_verify_secs`; take the fleet-wide maximum.
+- **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
+  `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
+  the same once-per-episode path as a host left OFF, closed when a VM gets an
+  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
+  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
+  fleet_reasons, so it is usable from a phone notification. It is raised when
+  the breaker is open and:
+  - a post-boot probe got no address (`alert=now`): within one pass, at most
+    300 s;
+  - it has been open 300 s and a probe failed since, or no lane has probed at
+    all (an idle host would otherwise stay silent): about 14 min after it
+    opens;
+  - two consecutive probes never reported, whatever opened it. A probe is
+    unreported once the next is granted before it reported, so this holds at
+    the third grant: about 10 to 15 min after the breaker opens. One unreported
+    probe is a slow boot and raises nothing; neither does a closed or
+    `verifying` breaker.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
+  breaker's `events.jsonl`. A close that fails (a new outage replacing one
+  whose issue is still open, or recovery) is kept as `stale_issues` in the
+  alert state and retried every pass, so no issue is left open.
+  `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
+  opens no issue.
+- **Fails open:** an unreadable breaker reads as closed and never verifies.
+  Writes are atomic under a lock.
+- **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
+  it for one host, including the post-boot verification.
+
+Recovery needs root, and tartci never runs it. Each `no_ip` records which
+layer failed (`cause`), read while that VM is still up, and `tartci doctor
+fleet` names the most fundamental one. Fix the layers in this order; a lower
+one cannot help until the one above it works.
+
+**Never kickstart the `com.apple.NetworkSharing` job.** System Integrity
+Protection refuses it ("150: Operation not permitted while System Integrity
+Protection is engaged", m5, 2026-10-07).
+
+**Never move `/etc/bootpd.plist` or
+`/Library/Preferences/SystemConfiguration/com.apple.vmnet.plist` aside.**
+`dhcp_enabled = false` there is the normal state while no VM runs: an idle
+healthy host (m3) reads exactly that, and InternetSharing rewrites the file
+with `dhcp_enabled = [bridge100]` and a `Subnets` entry when a VM's network
+comes up. It is not stale configuration.
+
+1. **pfd crash-looping** (`vm_dhcp_pfd_crash_loop`): no `bridge100`, and
+   `launchctl print system/com.apple.pfd` (no root) shows it not running with a
+   non-zero last exit and a climbing run count. InternetSharing waits on pfd
+   before it creates the VM network. On m5 on 2026-10-07 pfd exited 3 every
+   10 s from boot, logging only "no pf starter references held"; a healthy
+   pfd stays up and never logs that line. No verified remedy yet: compare
+   `sudo pfctl -s info` and `sudo pfctl -s References` with a healthy host,
+   record what brings pfd to `running`, and run `tartci vm-dhcp probe-now`
+   after any change. Never `pfctl -d`: it drops every holder's references.
+2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
+   existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
+   shared mode, which InternetSharing creates per VM. Restarting the
+   InternetSharing process did not bring it back on m5. No verified remedy
+   yet: run `tartci vm-dhcp probe-now` after any change and capture
+   `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the
+   InternetSharing pid. The Internet Sharing toggle in System Settings and a
+   reboot are the known resets.
+3. **bootpd not loaded** (`vm_dhcp_bootpd_not_loaded`): `launchctl print
+   system/com.apple.bootpd` exits 113 ("Could not find service"; no root
+   needed to check). bootpd's plist ships Disabled and Internet Sharing
+   normally loads it. `sudo launchctl bootstrap system
+   /System/Library/LaunchDaemons/bootps.plist` (proven on m5 with SIP on). A
+   bootpd kickstart, or disable/enable, cannot load a job launchd does not
+   have.
+4. **DHCP not enabled on the VM network** (`vm_dhcp_config_disabled`):
+   `bridge100` exists but `/etc/bootpd.plist` does not list it in
+   `dhcp_enabled`. InternetSharing did not finish configuring it: same capture
+   as layer 2, no verified remedy yet.
+5. **bootpd loaded but silent** (`vm_dhcp_unanswered`):
+   `sudo launchctl kickstart -k system/com.apple.bootpd`; if no address within
+   2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl
+   enable system/com.apple.bootpd`; a reboot also clears it.
+
+After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
+instead of waiting out the 300 s cadence; a fix that changes the chain usually
+triggers it on its own.
+
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
 launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
@@ -1697,6 +1868,50 @@ fleet`), and check GitHub's job history against it with
   hang an unattended run; the refusal says to run `pulp ship doctor`), then the
   launcher is built under the reseal runbook's immutability preconditions and
   verified.
+- **Skew after a verified apply.** The run re-measures skew for the generation
+  it just installed and verified, and rewrites `skew.json` (`recorded_by:
+  verified_apply`) before finishing, so status reads current at once instead
+  of the pre-update skew until the watchdog's next refresh. Checks are not
+  re-queried; a failure to record never fails the update.
+- **Which code runs which step (and why a change lands one update late).**
+  The self-update agent runs `~/.local/bin/tartci`, so the **installed**
+  generation orchestrates: the gates (one host at a time, capacity floor,
+  rate limit), drain, the mid-job wait, pool off/on, verify, rollback and the
+  decision to converge support agents are the code already on the host. The
+  **target's** code runs only through the update checkout: `support-manifest
+  write`, `fleet-macos validate`, `fleet-macos install` and the support-agent
+  template check. A change to orchestration therefore takes effect from the
+  update after the one that installs it; a change to validate or install takes
+  effect in the update that carries it. This is deliberate: rollback authority
+  stays with the known-good generation, and the update never re-executes into
+  code that has not yet run on this host. Each attempt receipt records
+  `orchestrator_generation` (the commit whose code ran it) beside `target`, so
+  `~/.tartci/state/self-update/attempts/*.json` shows which code orchestrated
+  each step. A PR that changes orchestration should say "effective from the
+  update after next".
+- **Gate-reserve ratchet.** Prepare runs `fleet-macos validate <profile>
+  --check-reserve`, which fits each gate lane (no explicit priority, or
+  `priority = "gate"`) into THIS host's gate reserve from its live
+  host-profile, per axis: `supervisors x vm_cores` (default `vm_pool_cores`)
+  against `reserved_gate_cores`, and `supervisors x` the derived VM memory
+  against `reserved_gate_mem_mb` (`scripts/gate_reserve_fit.py`). Every
+  overcommitted pair is printed as `gate_reserve_overcommitted lane=...
+  axis=... demand=... reserve=...` on every update, and `tartci pool status`
+  and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
+  the installed profile. The update is refused only when the target profile's
+  overcommit on some (lane, axis) is strictly greater than the installed
+  profile's, both against the same live reserve (`gate_reserve_worse`). This is
+  a ratchet because two hosts overcommit today (m1: 2 x 3 against 3; m5:
+  2 x 6 against 8), and refusing them would leave both unable to update; a
+  check that let the overcommit grow would be no check (m3, 2026-10-04: 2 x 12
+  against 14 lease-denied the second Pulp slot while jobs queued, #373).
+  Resizing is a profile decision with the host's owner and must not take
+  agent cores. A host that reserves no gate cores (a CI runner, or a role
+  that keeps none for gates) has no reserve to fit lanes into, so the check
+  reads `gate reserve: n/a (this host reserves no gate cores)` and the doctor
+  `gate_reserve_not_applicable`, never "fits"; a missing memory reserve beside
+  a cores reserve adds a `memory axis n/a` line. The flag is passed by the orchestrating (installed)
+  generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
@@ -1706,6 +1921,33 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A peer that stays unreachable stops holding the turn.** An unreadable
+  peer counts as busy, because it may be mid-update. Each survey records the
+  peers it could not read in `~/.tartci/state/self-update/peer-unreadable.json`
+  (`since`, `reads`, `last`); any readable read, whether the peer is on, off,
+  draining or updating, drops its row. A peer is excluded from turn-taking,
+  and only from turn-taking, when all of these hold:
+  - this host has read it unreadable at least 4 times in a row over at least
+    3 h. That is `ACTIVE_MARKER_TTL`, the age at which a peer's own update
+    marker already counts as stale, so a dark peer gets no more trust than a
+    seen one. It also outlasts the longest legitimate update;
+  - this host reads more than half the published fleet, counting itself. A
+    host cut off from the rest excludes nobody, and neither half of an even
+    split can proceed;
+  - at least one peer is readable, and every readable peer's own record shows
+    the same host unreadable at its last read, within the last hour on that
+    peer's clock. One peer that can still reach it means it is alive.
+
+  An excluded peer still serves nothing for the capacity floor, so a drain
+  that would leave a required label unserved still refuses. At the
+  post-announce re-read it is skipped only while it stays unreadable; if it
+  answers, the normal protocol applies. Events: `peer_unreachable_excluded`
+  once per episode, and `peer_unreachable_rejoined` on its first readable
+  read. Doctor: `peer_unreachable` (dark, still holding the turn) and
+  `peer_unreachable_excluded`. A host that flaps between readable and
+  unreadable never qualifies and keeps blocking; `self_update_starved`
+  reports that after 6 h. Recovery of the dark host itself is manual: it
+  needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only
   takes effect after some host updates. If the queue itself is wedged, unwedge
@@ -1874,6 +2116,17 @@ arrive, and a host that did not get it is loud:
   `sudo killall fseventsd`, which nothing here runs.
 - **When it refreshes.** Every watchdog pass, at most every 30 minutes;
   `tartci fleet-macos tool-freshness --refresh` measures now.
+- **Cached lines carry an age limit.** Every status line read from a cached
+  measurement is flagged once it is older than three of its refresher's
+  intervals (`scripts/state_age.py`, `STALE_FACTOR = 3`): tartci skew and tool
+  freshness against the watchdog's 30 minutes, fseventsd against the
+  host-vitals sensor's 60 s. The line then reads `STALE (measured N ago, older
+  than 3 x <interval>; is the <refresher> running?)`, the same text becomes the
+  surface's problem (doctor `self_update_problem` / `tool_freshness_stale`, the
+  watchdog WARN), and an unreadable time counts as stale. One missed run is
+  ordinary; three in a row mean the refresher is not running, which is how m3's
+  skew read "1 commits behind main" for two days while the watchdog's pass
+  never ran.
 - **Automatic apply.** Shipyard updates itself from here by default: once its
   newest release is 30 minutes old, `shipyard runner fleet-update --to <tag>
   --host-class <this host> --apply --json`, the governed rollout that stages
@@ -2009,8 +2262,9 @@ authoritative gate.
 
 - **Linux:** done — green build + 99% ctest + 99.93% warm ccache, golden tagged.
 - **Windows:** 24H2-ARM golden boots headless + auto-boots; toolchain installs;
-  non-GPU build/test is the MVP target. GPU/Skia lane is a tracked follow-up
-  (needs Windows skia-builder slices + the Windows GPU-host product work).
+  the published ARM64 and x64 Skia slices now support a GPU-linked build. A
+  headless compile and scan prove the binary path; headed UTM plus a DAW is
+  still required for UI/audio acceptance.
 - **macOS:** the proven lane this toolkit generalizes from.
 - **Pool serving:** `tartci serve macos|linux|windows` wired (ported from Pulp's
   proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent
@@ -2239,6 +2493,20 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   pass's `scratch_dirs` field shows what the scratch reaper removed and why it
   kept the rest.
 
+  With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
+  default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs
+  `ccache -d $TARTCI_CI_CACHE/ccache --evict-older-than <N>d` on the gate ccache
+  (the cache the runners mount; without the variable, the profile's
+  `[host].cache_root`),
+  at most once per interval and only while no Tart VM runs or holds a VM lease
+  and the pre-boot guard's lock is free (`scripts/gate_ccache_trim.py`). ccache
+  recounts its files and size counters during the eviction, which the gate
+  cache needs: its counters drift about 100x low, so ccache's own cleanup never
+  starts. The event's `gate_ccache_trim` field shows the entries and bytes on
+  disk before and after. Never run a bare `ccache -c` on that cache from the host: the host's
+  `ccache` has no `ccache.conf` there and treats its 5 GiB default as the cap,
+  not the guests' 40G; once the counters are recounted that evicts by size.
+
   The same origin/main checkout carries Pulp's host-vitals sensor. Its
   installer copies `host_vitals.sh` and `host_vitals_sensor.sh` into
   `~/.local/bin`, so a change to them never reached a host: on 2026-09-29 m1,
@@ -2258,6 +2526,33 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   STALE rather than "installed and loaded"; `doctor fleet` also flags any
   loaded tartci LaunchAgent registered from a plist outside
   `~/Library/LaunchAgents` (a leaked test registration shadowing the real one).
+
+  **The home volume has its own floor.** The disk axis above judges the
+  volume holding the Tart store. When the store is on another volume
+  (m5studio's `/Volumes/Atelier`), a VM lease also judges the home volume,
+  which holds every supervisor's temp files and the build trees
+  (`scripts/home_volume_floor.py`). m5studio, 2026-10-04: the boot Data volume
+  reached 99% with coverage build dirs, ENOSPC killed a merge-group runner and
+  every lane supervisor, and leases kept being granted. The floor is computed
+  per host: `clamp(max(30 GiB, fill_rate x hours to the next reclaim pass),
+  30 GiB, 20% of the volume)`, with the fill rate measured over at least 6 h of
+  admission samples so a transient spike cannot inflate it. The profile's
+  `[host] home_volume_floor_mode` decides what happens below it, and every
+  shipped profile is `report`: the lease is admitted and the supervisor logs
+  `home_volume_would_refuse volume=home free=... floor=...`. In `refuse` mode a
+  NEW clone is denied instead (`lease_denied axis=disk
+  reason=home_volume_below_floor volume=home free=... floor=...`). Flip a host
+  to `refuse` only after a day of report data shows no would-refuse event that
+  was not a genuinely full volume, and with Daniel's OK. Either way, running
+  jobs and supervisors are never touched. An unreadable volume admits the lease and logs `disk_axis_unread`
+  on every such admission. `tartci doctor fleet` reports `disk_floor_refusing`
+  when the refusals run as long as the host's lane count (a floor that refuses
+  everything looks exactly like a full disk; would-refusals count in report
+  mode), and `disk_axis_unread` when the
+  volume has been unreadable for a reclaim cadence. State:
+  `~/.tartci/state/leases/home-volume.json`. `TARTCI_HOME_VOLUME_FLOOR=0` turns
+  it off for a lane; `TARTCI_HOME_VOLUME_FLOOR_HOURS` (default 1, the reclaim
+  agent's interval) sets the pass horizon.
 
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
@@ -2394,6 +2689,11 @@ installing prereqs + creating stores, it now:
    budget (`PULP_BUILD_JOBS`) and the lease store answers. If either fails,
    `tartci setup` reports the host is not fully onboarded instead of exiting
    clean, so a half-provisioned host is visible.
+3. **Installs the host agents**: the disk reclaimer, the artifact-cache
+   refresher, the keychain unlocker, and the schedule backstop where the fleet
+   profile says `schedule_backstop = "live"` or `"dry-run"` (only m3 is live;
+   see `launchd/README.md`, "Schedule backstop"). Each installer is idempotent
+   and non-fatal.
 
 After `tartci setup`, deploy the clean receipt-bound support generation through
 `tartci fleet-macos install` as described above and — for a CI host — register

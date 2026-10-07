@@ -8,6 +8,8 @@ or acts on it: that would turn a configuration difference into an outage.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import json
 import os
 import re
@@ -115,6 +117,14 @@ class PoolOnReportsDriftTests(unittest.TestCase):
             self.assertNotIn("does not refuse on this", clean.stdout)
 
 
+# m3's host facts (read with `tartci host-profile --json`, 2026-10-05): 14 gate
+# cores, 44110 MB gate memory. The watchdog computes the gate-reserve fit from
+# the host it runs on, so without these a CI runner's own size would decide
+# whether a clean profile warns.
+M3_HOST = {"TARTCI_HOST_CORES": "28", "TARTCI_HOST_MEM_MB": "98304",
+           "TARTCI_ROLE": "dedicated-builder", "TARTCI_HOST_MODEL": "Mac15,14"}
+
+
 class WatchdogWarnTests(unittest.TestCase):
     def _run(self, td: Path, profile: str, *extra: str) -> subprocess.CompletedProcess[str]:
         config = td / "profile.toml"
@@ -130,8 +140,10 @@ class WatchdogWarnTests(unittest.TestCase):
         # this machine's real install or update checkout.
         home = td / "home"
         home.mkdir(exist_ok=True)
-        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(home),
-               "TARTCI_HOME": str(td / "tartci-home"), "TARTCI_TART_CLI": "/nonexistent"}
+        env = {**{k: v for k, v in os.environ.items() if not k.startswith("TARTCI_GOV_")},
+               "PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(home),
+               "TARTCI_HOME": str(td / "tartci-home"), "TARTCI_TART_CLI": "/nonexistent",
+               **M3_HOST}
         return subprocess.run(
             [sys.executable, str(WATCHDOG), "--launch-agents-dir", str(agents),
              "--fleet-config", str(config), "--fleet-receipt", str(td / "none.json"), *extra],

@@ -1,5 +1,11 @@
 schema = 1
 name = "m3-macos-fleet"
+# The ONE host that dispatches the schedule backstop (scripts/schedule_backstop.py),
+# installed by `tartci setup` (scripts/install_schedule_backstop_agent.sh).
+# Canary 2026-10-03: the ten covered Pulp workflows ran 48 to 50 times a day
+# against 48 expected (4 to 5 before), with no double dispatch. Every other
+# profile leaves this unset (off). Fail-open: with it off the crons carry on.
+schedule_backstop = "live"
 
 # Shipyard's durable host tag for M3 is `studio`. The profile name remains M3
 # operator vocabulary, but install authority is bound to that exact live tag.
@@ -32,6 +38,11 @@ agent_floor_cores = 6
 # runs this fleet's other fleet-wide views. The launchd watchdog runs it at most
 # every 15 minutes and only logs; it never resets a cache or changes
 # scheduling. Remove this table to turn it off.
+# Home-volume admission floor (scripts/home_volume_floor.py): `report` admits
+# every VM lease and logs `home_volume_would_refuse` when the home volume is
+# below its computed floor. `refuse` denies the new clone instead; flip it only
+# after a day of report data shows no false refusals, and with Daniel's OK.
+home_volume_floor_mode = "report"
 [build_disagreement]
 enabled = true
 
@@ -100,7 +111,13 @@ repo = "Generous-Corp/pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
-vm_cores = 12
+# 7, not 12: this dedicated-builder host reserves 14 of its 26 lease cores for
+# gates, so a second 12-core gate VM fit only while non-gate builds held at most
+# 2 cores. Agent builds routinely held the other 12 and a gate slot was refused
+# its lease (capacity_exceeded) while jobs queued. 2 x 7 = the 14-core gate
+# reserve, as m5studio sizes 2 x 8 to its 16. Memory: 7 cores derive a 12288 MB
+# lease, and 2 x 12288 fits inside the 44110 MB gate memory reserve.
+vm_cores = 7
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]
@@ -205,3 +222,18 @@ min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
 replaces_launchd_labels = []
+
+# The support LaunchAgents this host carries (scripts/support_agents.py).
+# Self-update renders and compares them after every update; with bootstrap =
+# false it only reports, and installs or changes nothing.
+[support_agents]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
+bootstrap = false
+
+# The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
+# shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse
+# record. The agent is declared by this table.
+[reuse_canary]
+enabled = true
+repo = "/Volumes/Workshop/Code/pulp"
+worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"

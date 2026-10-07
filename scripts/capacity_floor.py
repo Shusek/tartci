@@ -637,7 +637,7 @@ def peer_resolver(
     def read(peer: str, target: str) -> PeerEvidence:
         from bounded_subprocess import ObservationError, run_bounded
 
-        argv = [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        argv = [ssh, "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none",
                 target, PEER_STATUS_COMMAND]
         try:

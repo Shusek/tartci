@@ -116,6 +116,9 @@ UNINTERRUPTIBLE_AGENTS: frozenset[str] = frozenset({
     # Quiet for up to 90 minutes while it waits for lanes to go idle, and
     # mid-install after that: a bootout there strands the host drained.
     "com.danielraffel.tartci.self-update",
+    # Up to three hours inside `shipyard run`: a run cut mid-way leaves a
+    # half-run no later pass can classify.
+    "com.danielraffel.tartci.reuse-canary",
 })
 APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
     "com.danielraffel.tartci.reclaim": {
@@ -129,6 +132,12 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
             "deferred in the update queue past the starvation bound; host untouched"),
         4: "an update failed and the host was restored to the previous generation",
         5: "tartci skew could not be measured",
+    },
+    "com.danielraffel.tartci.reuse-canary": {
+        3: "a gate refused (pool off or draining, Shipyard not in shadow_compare); host untouched",
+        4: "shipyard run failed or exceeded its bound",
+        5: "shipyard reuse records unreadable, or the [reuse_canary] profile table is invalid",
+        6: "origin/main's head or the canary worktree could not be prepared",
     },
 }
 # Rate limit: at most this many heals per label inside the window.
@@ -202,6 +211,30 @@ def parse_launchctl_exit_timeout(text: str) -> float | None:
     return None
 
 
+def owes_exit75_respawn(
+    state: str | None,
+    last_exit_code: int | None,
+    age_s: float | None,
+    expected_loaded: bool,
+    restart_grace_s: int,
+) -> bool:
+    """Whether launchd owes this agent the respawn its exit 75 asked for. Pure.
+
+    A lane supervisor exits 75 (EX_TEMPFAIL) only after its fail-closed
+    restart contract has run, expecting KeepAlive to start it again. Past the
+    grace, an agent still not running has been owed that respawn, whatever
+    launchd's reason. The watchdog's wedged verdict and the interval guard's
+    lane kick (`launchd_interval_guard.py`) share this one definition.
+    """
+    return (
+        expected_loaded
+        and last_exit_code == 75
+        and state in {"not running", "spawn scheduled"}
+        and age_s is not None
+        and age_s > restart_grace_s
+    )
+
+
 def classify(
     state: str | None,
     last_exit_code: int | None,
@@ -242,13 +275,7 @@ def classify(
     resembles."""
     if state is None and expected_loaded:
         return "wedged", "not loaded while pool participation is enabled"
-    if (
-        expected_loaded
-        and last_exit_code == 75
-        and state in {"not running", "spawn scheduled"}
-        and log_age_s is not None
-        and log_age_s > restart_grace_s
-    ):
+    if owes_exit75_respawn(state, last_exit_code, log_age_s, expected_loaded, restart_grace_s):
         return (
             "wedged",
             f"EX_TEMPFAIL self-restart did not respawn within {restart_grace_s}s "
@@ -1093,6 +1120,11 @@ def template_agent_pass(label: str, keep_prefix: str, name: str, home: str | Non
             capture_output=True, text=True, timeout=30)
         boot = run(["launchctl", "bootstrap", domain, plist_path],
                    capture_output=True, text=True, timeout=30)
+        if boot.returncode == 0:
+            # A RunAtLoad launch is speculative and launchd can defer it
+            # indefinitely on a busy host; kickstart makes it on-demand.
+            run(["launchctl", "kickstart", f"{domain}/{label}"],
+                capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"{_iso(utcnow())} launchd-watchdog: WARN {name} re-render FAILED ({exc})"
     if boot.returncode != 0:
@@ -1153,7 +1185,7 @@ def config_problem(value: dict) -> str | None:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     if self_update.get("problem"):
         parts.append(f"self_update={self_update['problem']}")
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         if row.get("problem"):
             parts.append(f"{key}={row['problem']}")
@@ -1218,6 +1250,32 @@ def _pool_on() -> tuple[int, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, str(exc)
     return proc.returncode, (proc.stderr or proc.stdout).strip()
+
+
+def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | None:
+    """Tell someone, once per outage, that this host cannot boot VMs.
+
+    The VM-DHCP breaker stops the lanes cloning; this raises a GitHub issue
+    naming the host, the doctor command and the remedy, and closes it when a
+    VM gets an address (scripts/vm_boot_alert.py). Prints a WARN
+    every pass while the outage is due. Never raises.
+    """
+    try:
+        import vm_boot_alert  # noqa: PLC0415 - sibling module
+        import vm_dhcp_breaker  # noqa: PLC0415 - sibling module
+        now = utcnow() if now is None else now
+        if status_only:
+            due, why = vm_dhcp_breaker.alert_due(vm_dhcp_breaker.status(), now)
+        else:
+            out = vm_boot_alert.alert_pass(now=now)
+            due, why = out["due"], out["why"]
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN vm-boot check FAILED "
+                f"({type(exc).__name__}: {exc}); no alert was raised for a host that "
+                "cannot boot VMs")
+    if due:
+        return f"{_iso(now)} launchd-watchdog: WARN vm-boot: this host cannot boot VMs ({why})"
+    return None
 
 
 def host_off_pass(status_only: bool = False, now: float | None = None) -> str | None:
@@ -1344,6 +1402,9 @@ def main(argv: list[str] | None = None) -> int:
     host_off_line = host_off_pass(status_only=args.status or args.dry_run)
     if host_off_line:
         print(host_off_line)
+    vm_boot_line = vm_boot_pass(status_only=args.status or args.dry_run)
+    if vm_boot_line:
+        print(vm_boot_line)
 
     agents = discover_agents(args.launch_agents_dir)
     # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and

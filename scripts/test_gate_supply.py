@@ -11,6 +11,7 @@ Three layers, each with its control beside it:
 """
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import argparse
 import datetime as dt
 import json
@@ -298,7 +299,7 @@ class FallbackSupervisorTests(RunnerFixture, unittest.TestCase):
         self.peers.mkdir()
         _write_exec(self.root / "ssh", (
             "#!/usr/bin/env bash\n"
-            "for a in \"$@\"; do case \"$a\" in -o) ;; *=*) ;; *) target=\"$a\"; break;; esac; done\n"
+            "for a in \"$@\"; do case \"$a\" in -o) ;; -*) ;; *=*) ;; *) target=\"$a\"; break;; esac; done\n"
             f"f=\"{self.peers}/$target.json\"\n"
             "[ -f \"$f\" ] || { echo \"ssh: connect to host $target: Connection refused\" >&2; exit 255; }\n"
             "cat \"$f\"\n"))
@@ -432,6 +433,7 @@ class ProfileRenderTests(unittest.TestCase):
                                    "validate", str(path), *args],
                                   text=True, capture_output=True, check=False)
 
+    @testing_support.requires_tomllib
     def test_the_knob_renders_resolved_ssh_targets(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         data = fleet.tomllib.loads(self._profile('fallback_preferred_hosts = ["studio", "m5"]\n'))
@@ -442,6 +444,7 @@ class ProfileRenderTests(unittest.TestCase):
         lane = next(row for row in control["lane"] if row["id"] == "pulp-gate")
         self.assertNotIn("TARTCI_FALLBACK_PEERS", fleet.lane_plist(control, lane)["EnvironmentVariables"])
 
+    @testing_support.requires_tomllib
     def test_validation_rejects_self_and_min_age_zero(self) -> None:
         self.assertEqual(self._run(self._profile('fallback_preferred_hosts = ["studio"]\n')).returncode, 0)
         bad_self = self._run(self._profile('fallback_preferred_hosts = ["m1"]\n'))
@@ -451,6 +454,7 @@ class ProfileRenderTests(unittest.TestCase):
             "min_queued_age_seconds = 600", "min_queued_age_seconds = 0", 1)
         self.assertNotEqual(self._run(zero_age).returncode, 0)
 
+    @testing_support.requires_tomllib
     def test_only_m1_pulp_gate_falls_back_and_only_to_m3(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         enabled = []

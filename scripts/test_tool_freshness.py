@@ -8,6 +8,7 @@ fault present and absent, so a check that can only pass would fail here.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,6 +25,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import state_age  # noqa: E402
 import tool_freshness as tf  # noqa: E402
 
 HOUR = 3600.0
@@ -125,6 +128,10 @@ class ToolFreshnessTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.state = tf.state_dir_for(self.home)
+        # Status reads ages against this clock: just after the fixed NOW.
+        clock = mock.patch.object(state_age, "clock", lambda: NOW + 60)
+        clock.start()
+        self.addCleanup(clock.stop)
         self.feeds = {
             "danielraffel/Shipyard": feed(("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 20 * HOUR)),
             "Generous-Corp/pulp": feed(("v0.877.1", NOW - 3 * HOUR), ("v0.877.2", NOW - 1 * HOUR)),
@@ -578,12 +585,13 @@ class StatusSurfaceTests(unittest.TestCase):
 
     def vitals(self, fsev: object) -> Path:
         path = self.dir / "host_vitals.json"
-        reading = {"level": "green", "sampled_at": 1}
+        reading = {"level": "green", "sampled_at": int(time.time())}
         if fsev is not None:
             reading["fseventsd"] = fsev
         path.write_text(json.dumps(reading))
         return path
 
+    @testing_support.requires_tomllib
     def test_fseventsd_over_its_limit_is_a_problem_and_under_is_not(self) -> None:
         import macos_fleet_lanes as lanes
         big = lanes.host_vitals_summary(self.vitals(
@@ -595,6 +603,7 @@ class StatusSurfaceTests(unittest.TestCase):
         self.assertIsNone(small["problem"])
         self.assertTrue(small["lines"][0].startswith("fseventsd: 20 MB RSS, 1.0% CPU"))
 
+    @testing_support.requires_tomllib
     def test_fseventsd_absent_or_unpublished_reads_unknown_never_ok(self) -> None:
         import macos_fleet_lanes as lanes
         self.assertIn("UNKNOWN (host-vitals reading has no fseventsd field",
@@ -602,6 +611,7 @@ class StatusSurfaceTests(unittest.TestCase):
         self.assertIn("UNKNOWN (no host-vitals reading",
                       lanes.host_vitals_summary(self.dir / "absent.json")["lines"][0])
 
+    @testing_support.requires_tomllib
     def test_status_lines_and_watchdog_warning_carry_both(self) -> None:
         import macos_fleet_lanes as lanes
         import tartci_launchd_watchdog as wd
@@ -810,6 +820,10 @@ class HealPassTests(unittest.TestCase):
         root = tmp / "tartci-root"
         (root / "scripts").mkdir(parents=True)
         shutil.copy(HERE.parent / "tartci", root / "tartci")
+        # The shim sources its Python resolver from this lib.
+        (root / "providers" / "common").mkdir(parents=True)
+        shutil.copy(HERE.parent / "providers" / "common" / "toml-python.lib.sh",
+                    root / "providers" / "common" / "toml-python.lib.sh")
         marker = tmp / "watchdog-ran"
         (root / "scripts" / "network_profile.py").write_text(textwrap.dedent(f"""\
             import sys

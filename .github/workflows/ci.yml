@@ -59,6 +59,35 @@ jobs:
             bash "$test_script" || { rc=$?; echo "::error::$test_script exited $rc"; exit 1; }
           done
 
+  python-39-tests:
+    # The fleet's system interpreter is /usr/bin/python3 3.9.6 on all four
+    # hosts (m1, m3, m5, m5studio): the tartci shim's support-manifest check,
+    # the pinned launch interpreter, explicit /usr/bin/python3 call sites and
+    # every tartci_toml_exec_or_python3 fallback on a host without a tomllib
+    # Python run on it. python-floor only compiles under 3.11 and the lint job
+    # runs the tests on ubuntu's 3.12+, so a 3.9-only failure reached a PR four
+    # times on 2026-10-05. setup-python has no 3.9.6 for current ubuntu images,
+    # so this runs the newest 3.9 (same language, same stdlib surface, no
+    # tomllib) on the lint job's OS, and puts it first on PATH so subprocesses
+    # that call `python3` get it too. A test that genuinely needs tomllib says
+    # so (scripts/testing_support.py) and is skipped rather than failing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Refuse anything but a 3.9 interpreter on PATH
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; v = sys.version_info[:2]; print(sys.version); raise SystemExit(0 if v == (3, 9) else 1)'
+          if python3 -c 'import tomllib' 2>/dev/null; then
+            echo "python3 imports tomllib; this job must run a tomllib-less 3.9" >&2
+            exit 1
+          fi
+      - name: Run the unit tests under Python 3.9 (the hosts' /usr/bin/python3)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
   python-floor:
     # Fleet hosts run these scripts under their own Homebrew python3, and the
     # oldest one in service is 3.11 (the tomllib floor). The lint job's

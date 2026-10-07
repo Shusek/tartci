@@ -12,6 +12,7 @@
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
+#   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
@@ -26,6 +27,9 @@
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
+#   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
+#   tartci vm-dhcp <status|probe-now>    # VM DHCP breaker; probe at once after a fix
+#   tartci fleet-macos support-agents <plan|apply|auto|status> [--json] # declared support LaunchAgents
 #   tartci support-manifest <write|verify|stage-install> # bind/install runtime cohort
 #   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
 #   tartci tart-image-sync ... # resumable, checksum-verified Tart golden transfer
@@ -68,57 +72,10 @@ c_ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 c_miss() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
 c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
 
-# macOS still ships Python 3.9, but fleet profile/readiness helpers use the
-# stdlib tomllib module added in Python 3.11. Resolve a supported interpreter
-# explicitly so launchd cannot turn a real readiness result into the generic
-# readiness_probe_failed fallback. TARTCI_PYTHON may name an absolute path or
-# a PATH command; otherwise prefer common Homebrew 3.11/3.12 installations.
-tartci_toml_python_path() {
-  local candidate configured="${TARTCI_PYTHON:-}"
-  if [ -n "$configured" ]; then
-    candidate="$(command -v "$configured" 2>/dev/null || true)"
-    [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1 || {
-      echo "tartci: TARTCI_PYTHON must name a Python 3.11+ interpreter with tomllib: $configured" >&2
-      return 127
-    }
-    printf '%s\n' "$candidate"
-    return 0
-  fi
-
-  for candidate in python3.12 python3.11; do
-    candidate="$(command -v "$candidate" 2>/dev/null || true)"
-    if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  candidate="$(command -v python3 2>/dev/null || true)"
-  if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-    printf '%s\n' "$candidate"
-    return 0
-  fi
-
-  for candidate in \
-    /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
-    /opt/homebrew/bin/python3 \
-    /usr/local/bin/python3.12 /usr/local/bin/python3.11 \
-    /usr/local/bin/python3; do
-    if [ -x "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  echo "tartci: no Python 3.11+ interpreter with tomllib is available; set TARTCI_PYTHON" >&2
-  return 127
-}
-
-tartci_toml_python() {
-  local python
-  python="$(tartci_toml_python_path)" || return 127
-  "$python" "$@"
-}
+# macOS still ships Python 3.9 (no tomllib); tartci_toml_python_path and
+# tartci_toml_python resolve a 3.11+ interpreter (providers/common/toml-python.lib.sh).
+# shellcheck source=providers/common/toml-python.lib.sh
+. "$HERE/providers/common/toml-python.lib.sh"
 
 # Replace this process with a TOML-reading helper. A bare `python3` under ssh or
 # launchd is /usr/bin/python3 (3.9, no tomllib): the helper then cannot read the
@@ -276,7 +233,10 @@ cmd_fleet_macos() {
     tool-freshness)
       tartci_toml_python "$HERE/scripts/tool_freshness.py" "$@"
       ;;
-    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update|tool-freshness> ..."; return 2 ;;
+    support-agents)
+      tartci_toml_python "$HERE/scripts/support_agents.py" "$@"
+      ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update|tool-freshness|support-agents> ..."; return 2 ;;
   esac
 }
 
@@ -361,6 +321,10 @@ cmd_setup() {
   # Keeps any artifact-cache git mirror current; a no-op on a host that has none.
   "$HERE/scripts/install_artifact_cache_refresh_agent.sh" --install ||
     echo "setup: could not install the artifact-cache refresher" >&2
+  # The schedule backstop, live only where the fleet profile says so (m3);
+  # installs nothing on a host whose profile leaves it off.
+  "$HERE/scripts/install_schedule_backstop_agent.sh" --install ||
+    echo "setup: could not install the schedule backstop" >&2
   # Keeps the dedicated signing keychain unlocked in the GUI session, where a
   # locked one raises password dialogs; a no-op without keychain.env.
   "$HERE/scripts/install_keychain_unlock_agent.sh" --install ||
@@ -405,6 +369,7 @@ cmd_pre_mint_outcomes() { tartci_toml_exec_or_python3 "$HERE/scripts/pre_mint_ou
 # installed generation; a copied script path is never refreshed by self-update.
 cmd_network_relay() { tartci_toml_exec_or_python3 "$HERE/scripts/http_connect_ssh_relay.py" "$@"; }
 cmd_schedule_backstop() { tartci_toml_exec_or_python3 "$HERE/scripts/schedule_backstop.py" "$@"; }
+cmd_reuse_canary() { tartci_toml_exec_or_python3 "$HERE/scripts/reuse_canary.py" "$@"; }
 # The tick takes no arguments and runs on any invocation, so --help must be
 # answered here rather than reaching it: a help request once ran a real tick.
 cmd_queue_tick() {
@@ -1218,13 +1183,19 @@ EOF
       power_json="$(python3 "$HERE/scripts/power_status.py" --json 2>/dev/null)" \
         || power_json='{"state":"unknown"}'
       [ -n "$power_json" ] || power_json='{"state":"unknown"}'
+      # Whether launchd still starts this host's timer jobs, from the receipt
+      # the lane supervisors' interval guard writes every minute.
+      local launchd_timers_json
+      launchd_timers_json="$(python3 "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
+        || launchd_timers_json='{"state":"unreadable"}'
+      [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
       if [ "$status_json" = 1 ]; then
         local lease_fit_json
         lease_fit_json="$(python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
           || lease_fit_json='{"managed":null}'
         [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
-        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json"
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json" "$launchd_timers_json"
         local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -1243,6 +1214,8 @@ EOF
         python3 "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
         python3 "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
         python3 "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
+        python3 "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
+          || echo "launchd timers: UNREADABLE"
         python3 "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
           || echo "signing prompts: UNREADABLE"
         # The readiness payload is already computed above; JSON formatting does
@@ -1338,7 +1311,7 @@ if fleet["managed"]:
         print(line)
     # Shipyard and the pulp CLI against their latest releases, and fseventsd
     # from the host-vitals sensor. Reported, never folded into `fleet ready`.
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = config.get(key) if isinstance(config.get(key), dict) else {}
         for line in row.get("lines") or [f"{key}: UNKNOWN (not checked from here)"]:
             print(line)
@@ -1390,11 +1363,15 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
+  image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
+  vm-dhcp) shift; exec python3 "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;
   network-relay) shift; cmd_network_relay "$@" ;;
   schedule-backstop) shift; cmd_schedule_backstop "$@" ;;
+  reuse-canary) shift; cmd_reuse_canary "$@" ;;
   queue-tick) shift; cmd_queue_tick "$@" ;;
   steward-scheduler) shift; cmd_steward_scheduler "$@" ;;
   queue-saturation) shift; cmd_queue_saturation "$@" ;;

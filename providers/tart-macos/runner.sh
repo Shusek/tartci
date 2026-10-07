@@ -438,10 +438,14 @@ source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
 # shellcheck source=providers/tart-macos/job-claim.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
+# shellcheck source=providers/tart-macos/vm-dhcp.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/vm-dhcp.lib.sh"
 # shellcheck source=providers/tart-macos/lease-fit.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/lease-fit.lib.sh"
 # shellcheck source=providers/tart-macos/heartbeat-keepalive.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/heartbeat-keepalive.lib.sh"
+# shellcheck source=providers/tart-macos/interval-guard.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/interval-guard.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
@@ -458,6 +462,8 @@ tartci_guest_isolation_configure || die "invalid guest isolation configuration"
 # A read-only share has nowhere to put a job's write layer.
 [ "$TARTCI_HOST_CACHE_ACCESS_MODE" = rw ] || [ "$CCACHE_LAYER_ENABLED" = 0 ] \
   || die "TARTCI_HOST_CACHE_ACCESS=ro cannot be combined with TARTCI_CCACHE_WRITE_ISOLATION=1"
+# shellcheck source=providers/tart-macos/spawn-diagnostics.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/spawn-diagnostics.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -1124,7 +1130,7 @@ stop_current_aqua_runner(){
   fi
   if [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ]; then
     bounded_teardown_command aqua-stop \
-      ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
+      ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
       "\$HOME/.tartci/bin/guest-aqua-runner.sh stop '$CURRENT_AQUA_LABEL'" \
       >/dev/null 2>&1 || true
   fi
@@ -1168,10 +1174,11 @@ discard_current_vm(){
   fi
   CURRENT_RPID=""
   bounded_teardown_command tart-stop tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
-  if ! bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1 \
+  if ! tartci_tart_delete "$CURRENT_VM" \
     && ! tart_vm_proved_absent "$CURRENT_VM"; then
     note "teardown incomplete — guardian is terminal but VM deletion was not proved"
     event teardown_incomplete "vm=$CURRENT_VM reason=delete_unproved"
+    event delete_unproved "vm=$CURRENT_VM site=teardown $TARTCI_DELETE_EVIDENCE"
     # The guardian is terminal, so the guest is not running; only its disk
     # remains unproved. The loop may keep that VM as pending-delete instead of
     # restarting the supervisor (see reconcile_pending_delete).
@@ -1181,6 +1188,27 @@ discard_current_vm(){
   CURRENT_VM=""
   CURRENT_IP=""
   CURRENT_AQUA_LABEL=""
+}
+
+# One bounded `tart delete`. Its output used to go to /dev/null, so an
+# unproved delete could not say whether the bound fired or tart refused. On
+# failure TARTCI_DELETE_EVIDENCE holds rc, elapsed_ms, bounded, load1 and the
+# last stderr lines (scripts/delete_evidence.py) for the delete_unproved event.
+TARTCI_DELETE_EVIDENCE=""
+tartci_tart_delete(){
+  local vm="$1" status err rc=0
+  TARTCI_DELETE_EVIDENCE=""
+  status="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-status.XXXXXX")" || return 1
+  err="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-stderr.XXXXXX")" || { rm -f "$status"; return 1; }
+  python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
+    --timeout "$TEARDOWN_STEP_TIMEOUT" --operation tart-delete --status-file "$status" -- \
+    tart delete "$vm" >/dev/null 2>"$err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    TARTCI_DELETE_EVIDENCE="$(python3 "$TARTCI_ROOT/scripts/delete_evidence.py" \
+      --status "$status" --stderr "$err" 2>/dev/null)" || TARTCI_DELETE_EVIDENCE="evidence=unavailable"
+  fi
+  rm -f "$status" "$err"
+  return "$rc"
 }
 
 # A timed-out `tart delete` is killed with its process group, so it is no
@@ -1202,7 +1230,7 @@ tart_vm_proved_absent(){
 reconcile_pending_delete(){
   [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ] || return 2
   PENDING_DELETE_ATTEMPTS=$((PENDING_DELETE_ATTEMPTS + 1))
-  if bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1 \
+  if tartci_tart_delete "$CURRENT_VM" \
     || tart_vm_proved_absent "$CURRENT_VM"; then
     note "pending-delete VM $CURRENT_VM proved gone (attempt $PENDING_DELETE_ATTEMPTS) — releasing its capacity"
     event teardown_reconciled "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS"
@@ -1216,6 +1244,7 @@ reconcile_pending_delete(){
     CURRENT_RESV=""
     return 0
   fi
+  event delete_unproved "vm=$CURRENT_VM site=pending_delete attempt=$PENDING_DELETE_ATTEMPTS $TARTCI_DELETE_EVIDENCE"
   if [ "$PENDING_DELETE_ATTEMPTS" -ge "$PENDING_DELETE_MAX_ATTEMPTS" ]; then
     note "pending-delete VM $CURRENT_VM still unproved after $PENDING_DELETE_ATTEMPTS attempts — falling back to a fail-closed restart"
     return 2
@@ -1226,6 +1255,7 @@ reconcile_pending_delete(){
 
 cleanup(){
   tartci_heartbeat_keepalive_stop
+  tartci_interval_guard_stop
   tartci_pool_lock_release
   tartci_boundary_proof_abandon
   tartci_job_claim_release
@@ -1772,7 +1802,7 @@ install_and_preflight_aqua_runner(){
     note "[$vm] failed to install Aqua runner launcher"
     return 1
   fi
-  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "\$HOME/.tartci/bin/guest-aqua-runner.sh preflight '$aqua_label'"; then
     note "[$vm] console Aqua session preflight failed — refusing to mint JIT config"
     return 1
@@ -1814,6 +1844,7 @@ boot_vm_to_ssh(){
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   fi
   event clone_start "golden=$GOLDEN"
+  CLONE_STARTED_AT="$(date +%s)"
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.
   CURRENT_VM="$vm"
@@ -1901,15 +1932,21 @@ boot_vm_to_ssh(){
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
     rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" no_ip "$vm"
     discard_current_vm
     tartci_release_vm_lease
     return 1
   fi
   CURRENT_IP="$ip"
+  # The moment the VM network answered: clone_start -> boot_ip is the time a
+  # VM-DHCP probe takes to report success.
+  local clone_to_ip_s=$(( $(date +%s) - ${CLONE_STARTED_AT:-$(date +%s)} ))
+  event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
+  tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
   rm -f "$boot_log"
   local sshok=0
   for _ in $(seq 1 90); do
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
+    ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
       && { sshok=1; break; }
     sleep 2
   done
@@ -1998,6 +2035,7 @@ run_one(){
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
   PRE_CLONE_DEMAND_GONE=0
+  VM_DHCP_BACKOFF=0
   LAST_RUN_LEASE_DENIED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l ip="" rc=0
@@ -2015,6 +2053,16 @@ run_one(){
   fi
   if ! tartci_pool_lock_absent; then
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
+    return 75
+  fi
+  # The host's VM DHCP breaker comes first: while the host's DHCP server is
+  # not answering no boot can succeed, so nothing else is worth doing, and a
+  # lane that backs off here has taken no job claim. Order of the pre-boot
+  # checks: this breaker, then the job claim, then (after the admission
+  # precheck) the pre-clone demand check. See vm-dhcp.lib.sh.
+  if ! tartci_vm_dhcp_check "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}"; then
+    heartbeat vm-dhcp-breaker-open
+    note "[$i] VM DHCP on this host is not answering (breaker open) — not cloning; one probe every ${TARTCI_VM_DHCP_PROBE_SECS:-300}s"
     return 75
   fi
   # One booting VM per queued job: a lane whose class's queued jobs are all
@@ -2358,6 +2406,9 @@ run_one(){
 
   run_runner_until_done "$vm" "$ip" "$jit" "$selected_tier" || rc=$?
   tartci_pool_lock_release
+  # The guest is the only witness to a tool the runner could not start; read
+  # it before the VM is discarded. Bounded, and silent when there is nothing.
+  tartci_capture_guest_spawn_errors "$vm" "$ip"
   t_runner_done="$(now_epoch)"
   if [ "$rc" -eq "$IDLE_RETARGET_RC" ]; then
     # The cached selection is what booted this class; a fresh live selection
@@ -2474,6 +2525,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 tartci_boundary_proof_validate \
   || die "invalid parallel boundary-proof configuration"
 tartci_job_claim_validate || die "invalid job-claim configuration"
+tartci_vm_dhcp_validate || die "invalid VM DHCP breaker configuration"
 tartci_lease_fit_validate || die "invalid lease-fit configuration"
 tartci_heartbeat_keepalive_validate || die "invalid heartbeat keepalive configuration"
 
@@ -2499,6 +2551,8 @@ if [ "$LOOP" = 1 ]; then
   BLIND_RESTART_MAX="${TARTCI_SCAN_BLIND_RESTART_MAX:-3}"
   BLIND_RESTART_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-restarts"
   BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
+  # Starts launchd timer jobs if launchd stops starting them (interval-guard.lib.sh).
+  tartci_interval_guard_start
   heartbeat loop
   while true; do
     if [ -n "$CURRENT_VM" ]; then
@@ -2648,6 +2702,7 @@ if [ "$LOOP" = 1 ]; then
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
       if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
+         || [ "${VM_DHCP_BACKOFF:-0}" = 1 ] \
          || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0

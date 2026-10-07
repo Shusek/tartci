@@ -31,6 +31,9 @@ import macos_launcher_probe
 import host_profile
 import network_profile
 import pulp_reapers
+import schedule_backstop_mode
+import support_agents
+import reuse_canary
 import power_status
 
 
@@ -46,7 +49,8 @@ DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
-    "reclaim", "leases", "guest_network",
+    "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
+    "reuse_canary",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -68,6 +72,9 @@ HOST_KEYS = {
     "current_job_lifecycle_budget_seconds",
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
+    "job_claim_max_age_seconds",
+    "home_volume_floor_mode",
+    "vm_dhcp_breaker",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -91,7 +98,7 @@ LANE_KEYS = {
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
-    "assignment_pre_clone_demand_check",
+    "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -371,9 +378,24 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    # How long this host's published boot claims may count on other hosts
+    # (scripts/job_claim.py). Only a host whose lanes hold claims longer than
+    # the consumers' default, such as one that waits for a lease after
+    # claiming, declares it; it can never exceed the claim TTL.
+    max_age = host.get("job_claim_max_age_seconds")
+    if max_age is not None and (type(max_age) is not int or not 60 <= max_age <= 1800):
+        fail("host.job_claim_max_age_seconds must be an integer from 60 through 1800")
+    # The host VM-DHCP breaker (scripts/vm_dhcp_breaker.py) is on by default;
+    # only `false` is ever written, to turn it off on one host.
+    dhcp_breaker = host.get("vm_dhcp_breaker")
+    if dhcp_breaker is not None and type(dhcp_breaker) is not bool:
+        fail("host.vm_dhcp_breaker must be a boolean")
     agent_floor_qos = host.get("agent_floor_qos")
     if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
         fail('host.agent_floor_qos must be "utility" or "background"')
+    floor_mode = host.get("home_volume_floor_mode")
+    if floor_mode is not None and floor_mode not in ("report", "refuse"):
+        fail('host.home_volume_floor_mode must be "report" or "refuse"')
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:
@@ -459,6 +481,24 @@ def load(path: Path) -> dict:
         problems = pulp_reapers.validate_table(reclaim)
         if problems:
             fail("; ".join(problems))
+    # Which host dispatches the schedule backstop (live), rehearses it
+    # (dry-run), or carries none (off, the default). Same reader as the
+    # installer, so a profile that installs is a profile it acts on.
+    problems = schedule_backstop_mode.validate(data.get(schedule_backstop_mode.KEY))
+    if problems:
+        fail("; ".join(problems))
+    # Which hosts run the reuse canary. Same validator as the runtime reader.
+    canary = data.get(reuse_canary.TABLE)
+    if canary is not None:
+        problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Which support LaunchAgents this host carries (checked after the agents'
+    # own tables, whose errors are more specific). Same validator as the
+    # runtime reader, so a profile that installs is a profile it acts on.
+    problems = support_agents.validate(data)
+    if problems:
+        fail("; ".join(problems))
     lease_policy = data.get("leases")
     if lease_policy is not None:
         if not isinstance(lease_policy, dict):
@@ -674,6 +714,9 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: assignment_pre_clone_demand_check must be a "
                 "boolean on an event-class-v2 lane"
             )
+        fleet_peers = lane.get("assignment_fleet_claim_peers")
+        if fleet_peers is not None and type(fleet_peers) is not bool:
+            fail(f"lane {lane_id}: assignment_fleet_claim_peers must be a boolean")
         idle_retarget = lane.get("assignment_idle_retarget_seconds")
         if idle_retarget is not None and (
                 assignment_mode != "event-class-v2"
@@ -2319,8 +2362,12 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
+    if host.get("vm_dhcp_breaker") is False:
+        env["TARTCI_VM_DHCP_BREAKER"] = "0"
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
+    if "home_volume_floor_mode" in host:
+        env["TARTCI_HOME_VOLUME_FLOOR_MODE"] = host["home_volume_floor_mode"]
     if "current_job_attempt_timeout_seconds" in host:
         env["TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"] = str(
             host["current_job_attempt_timeout_seconds"]
@@ -2379,6 +2426,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
     if lane.get("assignment_pre_clone_demand_check"):
         env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "1"
+    if lane.get("assignment_fleet_claim_peers"):
+        env["TARTCI_JOB_CLAIM_FLEET_PEERS"] = "1"
     if lane.get("assignment_idle_retarget_seconds"):
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]
@@ -2802,6 +2851,8 @@ def config_verdicts(config: Path, support_root: Path,
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
                 "self_update": self_update_summary(),
+                "gate_reserve": {"lines": ["gate reserve: n/a (no installed fleet profile)"],
+                                 "problem": None},
                 "tool_freshness": tool_freshness_summary(),
                 "host_vitals": host_vitals_summary()}
     value: dict = {}
@@ -2836,6 +2887,7 @@ def config_verdicts(config: Path, support_root: Path,
     except Exception as exc:  # noqa: BLE001
         value["supply"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
     value["self_update"] = self_update_summary()
+    value["gate_reserve"] = gate_reserve_summary(config)
     value["tool_freshness"] = tool_freshness_summary()
     value["host_vitals"] = host_vitals_summary()
     return value
@@ -2864,6 +2916,8 @@ def tool_freshness_summary() -> dict:
 
 
 FSEVENTSD_WARN_MB = 1024
+# The host-vitals sensor publishes every 60 s (Pulp com.pulp.host-vitals).
+HOST_VITALS_INTERVAL_S = 60
 
 
 def host_vitals_summary(path: Path | None = None) -> dict:
@@ -2898,19 +2952,81 @@ def _fseventsd_summary(path: Path | None = None) -> dict:
     except (OSError, json.JSONDecodeError):
         return {"lines": [f"fseventsd: UNKNOWN (no host-vitals reading at {path})"],
                 "problem": None}
+    import state_age
+
     sampled = reading.get("sampled_at") if isinstance(reading, dict) else None
     age = f", sampled {int(time.time() - sampled)}s ago" if isinstance(sampled, int) else ""
+    aged = state_age.stale_note(sampled, HOST_VITALS_INTERVAL_S, "host-vitals sensor")
     fsev = reading.get("fseventsd") if isinstance(reading, dict) else None
     if not isinstance(fsev, dict) or not isinstance(fsev.get("rss_mb"), int):
         return {"lines": [f"fseventsd: UNKNOWN (host-vitals reading has no fseventsd field{age}; "
                           "reinstall the sensor)"], "problem": None}
     limit = fsev.get("warn_mb") if isinstance(fsev.get("warn_mb"), int) else FSEVENTSD_WARN_MB
     text = f"fseventsd: {fsev['rss_mb']} MB RSS, {fsev.get('cpu_pct')}% CPU{age}"
+    if aged:
+        # A reading the sensor stopped refreshing says nothing about now.
+        return {"lines": [f"{text} {aged}"], "problem": f"host vitals {aged}", "fseventsd": fsev}
     if fsev["rss_mb"] > limit:
         problem = f"fseventsd {fsev['rss_mb']} MB RSS > {limit} MB"
         return {"lines": [f"{text} WARN (> {limit} MB; restart with sudo killall fseventsd)"],
                 "problem": problem, "fseventsd": fsev}
     return {"lines": [text], "problem": None, "fseventsd": fsev}
+
+
+DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
+
+
+def live_host_profile(config: Path, override: Path | None = None) -> dict:
+    if override is not None:
+        return json.loads(override.read_text())
+    import host_profile
+    return host_profile.build_profile(fleet_profile=str(config))
+
+
+def check_reserve(target: dict, installed_path: Path, host_json: Path | None,
+                  config: Path) -> int:
+    """`validate --check-reserve`: report every overcommit, refuse only a worse one."""
+    import gate_reserve_fit
+    host = live_host_profile(config, host_json)
+    installed = None
+    if installed_path.is_file():
+        with installed_path.open("rb") as fh:
+            installed = tomllib.load(fh)
+    rows, refusals = gate_reserve_fit.ratchet(installed, target, host)
+    for line in gate_reserve_fit.not_applicable_lines(target, host):
+        print(line)
+    for line in gate_reserve_fit.finding_lines(rows):
+        print(line)
+    for line in refusals:
+        print(line, file=sys.stderr)
+    if refusals:
+        print("refusing: this profile overcommits the gate reserve more than the installed "
+              "one; resizing gate lanes is a profile decision with the host's owner",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def gate_reserve_summary(config: Path) -> dict:
+    """The installed profile's fit against this host's live gate reserve."""
+    try:
+        import gate_reserve_fit
+        with config.open("rb") as fh:
+            profile = tomllib.load(fh)
+        host = live_host_profile(config)
+        lines = gate_reserve_fit.finding_lines(gate_reserve_fit.fit(profile, host))
+        not_applicable = gate_reserve_fit.not_applicable_lines(profile, host)
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
+                "problem": None}
+    if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
+        return {"lines": not_applicable, "problem": None}
+    if not lines:
+        return {"lines": ["gate reserve: every gate lane fits", *not_applicable],
+                "problem": None}
+    return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines]
+            + not_applicable,
+            "problem": "; ".join(line.split(" ", 1)[1] for line in lines)}
 
 
 def self_update_summary() -> dict:
@@ -2944,7 +3060,7 @@ def render_config_verdicts(value: dict | None) -> str:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     lines.extend(self_update.get("lines") or
                  ["tartci: skew UNKNOWN (not checked from here)"])
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         lines.extend(row.get("lines") or [f"{key}: UNKNOWN (not checked from here)"])
     supply = value.get("supply") if isinstance(value.get("supply"), dict) else {}
@@ -3127,6 +3243,16 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("config", type=Path)
         if name == "render":
             cmd.add_argument("--output", required=True, type=Path)
+        if name == "validate":
+            cmd.add_argument(
+                "--check-reserve", action="store_true",
+                help="also fit each gate lane into THIS host's gate reserve (live host "
+                     "profile): report every overcommit, refuse only one the config makes "
+                     "worse than the installed profile (scripts/gate_reserve_fit.py)")
+            cmd.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE,
+                             help="the installed profile the ratchet compares against")
+            cmd.add_argument("--host-profile-json", type=Path, default=None,
+                             help=argparse.SUPPRESS)
     receipt = sub.add_parser("write-receipt")
     receipt.add_argument("config", type=Path)
     receipt.add_argument("--agents-dir", required=True, type=Path)
@@ -3292,6 +3418,8 @@ def main(argv: list[str] | None = None) -> int:
         data = load(args.config)
         if args.command == "validate":
             print(f"valid: host={data['host']['id']} lanes={len(data['lane'])} activation=unchanged")
+            if args.check_reserve:
+                return check_reserve(data, args.installed, args.host_profile_json, args.config)
             return 0
         if args.command == "write-receipt":
             write_receipt(

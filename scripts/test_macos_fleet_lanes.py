@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import plistlib
 import json
 import datetime as dt
@@ -216,7 +218,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "launch_helper": helper,
             }), mock.patch.object(
                 macos_launcher_probe.subprocess, "run",
-                side_effect=[missing, ok, terminal, ok],
+                side_effect=[missing, ok, ok, terminal, ok],
             ) as run:
                 result = fleet.probe_launch_helper(
                     Path("receipt"), config, root / "agents", root / "support"
@@ -224,6 +226,10 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertEqual(result["path"], "/Volumes/Workshop/VMs")
             self.assertEqual(run.call_args_list[-1].args[0][1], "bootout")
+            # launchd can defer the probe's RunAtLoad launch indefinitely on a
+            # busy host, so it is kickstarted right after bootstrap.
+            verbs = [call.args[0][1] for call in run.call_args_list]
+            self.assertEqual(verbs[verbs.index("bootstrap") + 1], "kickstart")
 
             cleanup_failed = subprocess.CompletedProcess(
                 [], 5, "", "bootout failed\n"
@@ -232,7 +238,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "launch_helper": helper,
             }), mock.patch.object(
                 macos_launcher_probe.subprocess, "run",
-                side_effect=[missing, ok, terminal, cleanup_failed],
+                side_effect=[missing, ok, ok, terminal, cleanup_failed],
             ):
                 with self.assertRaisesRegex(ValueError, "could not remove"):
                     fleet.probe_launch_helper(
@@ -246,7 +252,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "launch_helper": helper,
             }), mock.patch.object(
                 macos_launcher_probe.subprocess, "run",
-                side_effect=[missing, ok, probe_failed, cleanup_failed],
+                side_effect=[missing, ok, ok, probe_failed, cleanup_failed],
             ):
                 with self.assertRaisesRegex(
                     ValueError, "exited 74; .*could not remove"
@@ -747,7 +753,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertNotIn("priority", pulp_lane)
                 self.assertEqual(
                     pulp_lane.get("vm_cores"),
-                    12 if host_id == "studio" else None,
+                    7 if host_id == "studio" else None,
                 )
                 self.assertEqual(
                     pulp_lane["supervisors"], 2
@@ -897,7 +903,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     for value in values:
                         env = value["EnvironmentVariables"]
                         expected_vm_cores = (
-                            "12"
+                            "7"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
                             else None
@@ -1791,7 +1797,9 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_pre_clone_check_is_a_v2_boolean(self) -> None:
         key = "assignment_pre_clone_demand_check"
-        base = CONFIG.read_text()
+        # The shipped m1 profile enables it; fixtures inject their own value.
+        base, count = re.subn(rf"^{key} = true\n", "", CONFIG.read_text(), flags=re.M)
+        self.assertEqual(count, 1)
         self.assertNotIn(key, base)
         anchor = "assignment_feed_rescue = true"
         self.assertEqual(base.count(anchor), 1)
@@ -1826,9 +1834,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", env)
                     self.assertEqual(pulp_slots, 2)
 
-    def test_pre_clone_check_canary_is_m3_pulp_gate_only(self) -> None:
-        """One canary host: m3's two pulp-gate slots, and no other shipped
-        host or lane."""
+    def test_pre_clone_check_is_on_the_rolled_out_pulp_gate_slots_only(self) -> None:
+        """The two pulp-gate slots of m1, m3 and m5studio, and no other lane.
+        m5 joins after its ranked-lease canary read."""
         env_key = "TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertGreaterEqual(len(profiles), 4)
@@ -1843,9 +1851,55 @@ class MacosFleetLaneTests(unittest.TestCase):
                         self.assertEqual(env[env_key], "1")
                         self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
         self.assertEqual(sorted(enabled), [
+            ("m1-macos-fleet.toml", "m1-pulp-gate"),
+            ("m1-macos-fleet.toml", "m1-pulp-gate-slot2"),
             ("m3-macos-fleet.toml", "studio-pulp-gate"),
             ("m3-macos-fleet.toml", "studio-pulp-gate-slot2"),
+            ("m5studio-macos-fleet.toml", "m5studio-pulp-gate"),
+            ("m5studio-macos-fleet.toml", "m5studio-pulp-gate-slot2"),
         ])
+
+    def test_fleet_claim_peers_is_a_lane_boolean_wired_to_the_env(self) -> None:
+        key = "assignment_fleet_claim_peers"
+        base = CONFIG.read_text()
+        self.assertNotIn(key, base)
+        anchor = "assignment_feed_rescue = true"
+        self.assertEqual(base.count(anchor), 1)
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.toml"
+            bad.write_text(base.replace(anchor, f'{anchor}\n{key} = "yes"', 1))
+            result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                    text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn(key, result.stderr)
+            ok = Path(td) / "ok.toml"
+            ok.write_text(base.replace(anchor, f"{anchor}\n{key} = true", 1))
+            envs = [plistlib.loads(b)["EnvironmentVariables"]
+                    for b in fleet.rendered_plists(fleet.load(ok)).values()]
+            wired = [e["TARTCI_QUEUE_LANE_ID"] for e in envs if e.get("TARTCI_JOB_CLAIM_FLEET_PEERS") == "1"]
+            self.assertEqual(sorted(wired), ["m1-pulp-gate", "m1-pulp-gate-slot2"])
+
+    def test_no_shipped_lane_reads_peers_yet(self) -> None:
+        profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertGreaterEqual(len(profiles), 4)
+        for profile in profiles:
+            for body in fleet.rendered_plists(fleet.load(profile)).values():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env, profile.name)
+
+    def test_job_claim_max_age_is_bounded_and_m1_declares_the_ttl(self) -> None:
+        base = CONFIG.read_text()
+        self.assertIn("job_claim_max_age_seconds = 1800", base)
+        with tempfile.TemporaryDirectory() as td:
+            for value in ("59", "1801", '"900"', "true"):
+                with self.subTest(value=value):
+                    bad = Path(td) / "bad.toml"
+                    bad.write_text(base.replace("job_claim_max_age_seconds = 1800",
+                                                f"job_claim_max_age_seconds = {value}", 1))
+                    result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                            text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("job_claim_max_age_seconds", result.stderr)
 
     @staticmethod
     def _profile_without_idle_retarget() -> str:

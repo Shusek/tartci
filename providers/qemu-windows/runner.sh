@@ -499,6 +499,7 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
   }
 
+  # ssh-stdin: callers pipe scripts and the JIT config into wsh
   wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
   # Wait for SSH, but bail the moment QEMU dies — that's how a free-port TOCTOU
   # (another process grabbed $port between the probe close and QEMU's bind)

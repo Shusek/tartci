@@ -2,6 +2,7 @@
 """Behavioral coverage for exclusive V2 macOS JIT assignment classes."""
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import contextlib
 import json
 import os
@@ -1273,6 +1274,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
+    @testing_support.requires_tomllib
     def test_release_pr_gate_is_minted_while_gate_work_waits(self) -> None:
         """The 2026-09-26 shape: merge-group and PR-head work queued without a
         gap for hours beside a `Release-path PR gate` job. m5's pulp-gate lane
@@ -1305,6 +1307,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(self._decide(1, "0", pr=True, release_pr=True),
                          ("1", "pulp-build-pr-head"))
 
+    @testing_support.requires_tomllib
     def test_idle_gate_runner_on_slot2_retargets_to_a_waiting_release_first(self) -> None:
         """A parked gate runner whose own class emptied retargets to the tagged
         release before the other gate class, and the slot then boots it. Slot 1,
@@ -1322,6 +1325,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
                 # Control: slot 1's gate-first order on the same queue.
                 self.assertEqual(self._decide(1, tier, **queue), ("1", slot1_dest))
 
+    @testing_support.requires_tomllib
     def test_idle_release_runner_on_slot2_serves_gate_work_when_no_release_waits(self) -> None:
         """The order is a preference, not a reservation: an idle release runner
         with no release queued goes back to gate work in the slot's own order."""
@@ -1336,6 +1340,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
                 self.assertEqual(self._decide(2, tier, **queue), ("1", dest))
                 self.assertEqual(self._selected_tier(2, **queue), selected)
 
+    @testing_support.requires_tomllib
     def test_idle_release_runner_is_held_while_its_release_waits(self) -> None:
         """A tagged-release runner is about to be assigned while a tagged
         release waits, whatever gate work is also queued."""
@@ -1384,6 +1389,7 @@ class ShippedFleetReleaseFirstSlotTests(RunnerFixture, unittest.TestCase):
             self.assertEqual(sorted(slots), [1, 2], profile)
             self.hosts[profile] = slots
 
+    @testing_support.requires_tomllib
     def test_each_host_serves_releases_first_on_exactly_one_slot(self) -> None:
         busy = {"merge": True, "pr": True}
         for profile, (_, release_slot) in self.HOSTS.items():

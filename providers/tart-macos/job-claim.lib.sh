@@ -17,6 +17,10 @@
 #
 # TARTCI_JOB_CLAIM=0 disables claims; TARTCI_JOB_CLAIM_FLEET=0 keeps them
 # host-local (no runner listing); TARTCI_JOB_CLAIM_TTL_SECS bounds a claim.
+# TARTCI_JOB_CLAIM_FLEET_PEERS=1 (profile `assignment_fleet_claim_peers`) also
+# reads every other published host's live claims over SSH before acquiring,
+# within TARTCI_JOB_CLAIM_FLEET_READ_SECS (default 5); an unread peer counts
+# nothing, so the lane boots as without peers.
 
 JOB_CLAIM_ID=""
 JOB_CLAIM_LABELS=""
@@ -35,6 +39,9 @@ tartci_job_claim_validate(){
   case "${TARTCI_JOB_CLAIM_FLEET:-1}" in 0|1) ;; *)
     printf 'invalid TARTCI_JOB_CLAIM_FLEET: expected 0 or 1\n' >&2; return 2 ;;
   esac
+  case "${TARTCI_JOB_CLAIM_FLEET_PEERS:-0}" in 0|1) ;; *)
+    printf 'invalid TARTCI_JOB_CLAIM_FLEET_PEERS: expected 0 or 1\n' >&2; return 2 ;;
+  esac
   case "${TARTCI_JOB_CLAIM_TTL_SECS:-1800}" in
     ''|*[!0-9]*|0) printf 'invalid TARTCI_JOB_CLAIM_TTL_SECS: expected a positive integer\n' >&2; return 2 ;;
   esac
@@ -51,6 +58,45 @@ tartci_job_claim_fleet_runners(){
     >"$out_file" 2>/dev/null || : >"$out_file"
 }
 
+# Other hosts' published claims, one JSON line per peer, into $1. Nothing at all
+# unless the lane opted in; any failure leaves the file empty or marks the peer
+# unread, and both count no claims (fail open).
+tartci_job_claim_fleet_peer_claims(){
+  local out_file="$1"
+  : >"$out_file"
+  [ "${TARTCI_JOB_CLAIM_FLEET_PEERS:-0}" = 1 ] || return 0
+  [ -n "${TARTCI_RECEIPT_HOST_ID:-}" ] || return 0
+  python3 "$TARTCI_ROOT/scripts/job_claim.py" gather-peers --out "$out_file" \
+    --self-host "$TARTCI_RECEIPT_HOST_ID" \
+    --supply "${TARTCI_JOB_CLAIM_SUPPLY:-$TARTCI_ROOT/fleet/advertised-labels.json}" \
+    --read-secs "${TARTCI_JOB_CLAIM_FLEET_READ_SECS:-5}" \
+    --ssh "${TARTCI_JOB_CLAIM_SSH:-ssh}" </dev/null >/dev/null 2>&1 || : >"$out_file"
+}
+# One job_claim_peer_unread event per peer per hour; the per-attempt count is
+# carried on every job_claim / job_claim_contended event (peers_unread=N).
+_tartci_job_claim_note_unread(){
+  local peers_file="$1" stamp_dir host now last
+  stamp_dir="${TARTCI_JOB_CLAIM_DIR:-$HOME/.tartci/state/job-claims}/peer-unread"
+  mkdir -p "$stamp_dir" 2>/dev/null || return 0
+  now="$(date +%s)"
+  while IFS=$'\t' read -r host reason; do
+    [ -n "$host" ] || continue
+    last="$(cat "$stamp_dir/$host" 2>/dev/null || echo 0)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $((now - last)) -ge 3600 ] || continue
+    printf '%s\n' "$now" >"$stamp_dir/$host" 2>/dev/null || true
+    event job_claim_peer_unread "peer=$host reason=$reason"
+  done < <(python3 -c '
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(row, dict) and row.get("ok") is not True and isinstance(row.get("host"), str):
+        print("%s\t%s" % (row["host"], row.get("reason") or "unknown"))
+' "$peers_file" 2>/dev/null)
+}
 # Exhaustive queued count for the selected class, or nothing. Only an
 # event-class-v2 lane reports a lower bound, so only it ever needs this.
 tartci_job_claim_exact_count(){
@@ -86,7 +132,7 @@ _tartci_job_claim_call(){
 # the class is already covered by another lane.
 tartci_job_claim_acquire(){
   local vm="$1" selected_labels="$2" selected_tier="$3" queued="$4" runner_api_root="$5"
-  local runners out="" rc=0 lower=() exact detail
+  local runners peers out="" rc=0 lower=() exact detail
   JOB_CLAIM_CONTENDED=0
   JOB_CLAIM_ID=""
   tartci_job_claim_enabled || return 0
@@ -95,10 +141,16 @@ tartci_job_claim_acquire(){
   [ "$ASSIGNMENT_MODE" != event-class-v2 ] || lower=(--lower-bound)
   runners="$(mktemp "${TMPDIR:-/tmp}/tartci-job-claim.XXXXXX")" || return 0
   tartci_job_claim_fleet_runners "$runner_api_root" "$runners"
+  peers="$(mktemp "${TMPDIR:-/tmp}/tartci-job-claim-peers.XXXXXX")" || peers=""
+  if [ -n "$peers" ]; then
+    tartci_job_claim_fleet_peer_claims "$peers"
+    _tartci_job_claim_note_unread "$peers"
+  fi
   local claim_id="$RUNNER_NAME-$SLOT-$vm"
   local base_args=(acquire --repo "$REPO" --labels "$selected_labels"
     --claim-id "$claim_id" --lane "$RUNNER_NAME" --vm "$vm" --pid "$$"
     --fleet-runners-file "$runners" --ttl "${TARTCI_JOB_CLAIM_TTL_SECS:-1800}")
+  [ -z "$peers" ] || base_args+=(--fleet-claims-file "$peers")
   _tartci_job_claim_call out "${base_args[@]}" --queued "$queued" ${lower[@]+"${lower[@]}"} || rc=$?
   if [ "$rc" -eq 4 ]; then
     # A sibling holds a claim and our count was only "at least one". Buy the
@@ -107,21 +159,22 @@ tartci_job_claim_acquire(){
       rc=0
       _tartci_job_claim_call out "${base_args[@]}" --queued "$exact" || rc=$?
     else
-      rm -f "$runners"
+      rm -f "$runners" ${peers:+"$peers"}
       event job_claim_unavailable "reason=exact_count_unavailable labels=$selected_labels"
       return 0
     fi
   fi
-  rm -f "$runners"
+  rm -f "$runners" ${peers:+"$peers"}
   detail="$(printf '%s' "$out" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except ValueError:
     print("detail=unreadable"); raise SystemExit
-print("queued=%s standing=%s local=%d fleet_idle=%d" % (
+print("queued=%s standing=%s local=%d fleet_idle=%d fleet_booting=%d peers_unread=%d" % (
     d.get("queued"), d.get("standing_claims"),
-    len(d.get("local_claims") or []), len(d.get("fleet_idle_runners") or [])))
+    len(d.get("local_claims") or []), len(d.get("fleet_idle_runners") or []),
+    len(d.get("fleet_booting") or []), len(d.get("peers_unread") or [])))
 ' 2>/dev/null)" || detail="detail=unreadable"
   # The same numbers as typed event fields (word-split on purpose: every
   # token is key=value with no spaces).

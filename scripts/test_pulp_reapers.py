@@ -12,6 +12,7 @@ Run:  python3 -m unittest scripts.test_pulp_reapers
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import io
 import json
 import re
@@ -23,13 +24,13 @@ import sys
 import tempfile
 import time
 import unittest
+from typing import Optional
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import disk_reclaim as dr  # noqa: E402
-import macos_fleet_lanes as fleet  # noqa: E402
 import pulp_reapers as pr  # noqa: E402
 
 FIXTURE = HERE.parent / "tests" / "fixtures" / "pulp-reapers"
@@ -114,8 +115,11 @@ class Isolated(unittest.TestCase):
         self.tmp = pathlib.Path(self._tmp.name).resolve()
         self.state = self.tmp / "state"
         self._env = {k: os.environ.get(k) for k in (
-            "PULP_BUILD_DIR_LOCK_ROOT", "TARTCI_FLEET_PROFILE", "TARTCI_HOME")}
+            "PULP_BUILD_DIR_LOCK_ROOT", "TARTCI_FLEET_PROFILE", "TARTCI_HOME",
+            "TARTCI_BOOT_USAGE")}
         os.environ["PULP_BUILD_DIR_LOCK_ROOT"] = str(self.tmp / "locks")
+        # A full reclaim pass would otherwise measure this host's real home.
+        os.environ["TARTCI_BOOT_USAGE"] = "0"
         os.environ["TARTCI_HOME"] = str(self.tmp / "tartci")
         os.environ["TARTCI_FLEET_PROFILE"] = str(self.tmp / "absent.toml")
         self.procs: list[subprocess.Popen] = []
@@ -154,6 +158,7 @@ class OffByDefault(Isolated):
             return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
         return calls, reaper
 
+    @testing_support.requires_tomllib
     def test_no_profile_runs_nothing(self):
         calls, reaper = self.recorder()
         out = pr.run(fix=True, profile=self.tmp / "absent.toml", state_dir=self.state,
@@ -162,6 +167,7 @@ class OffByDefault(Isolated):
         self.assertIn("no installed fleet profile", out["reason"])
         self.assertEqual(calls, [])
 
+    @testing_support.requires_tomllib
     def test_profile_without_the_table_or_with_it_false_runs_nothing(self):
         repo = PulpRepo(self.tmp)
         for body in ("schema = 1\n", repo.profile(self.tmp / "p.toml",
@@ -204,7 +210,9 @@ class Validation(unittest.TestCase):
         self.assertTrue(pr.validate_table({"pulp_worktree_builds": True}))
         self.assertTrue(pr.validate_table(self.good(pulp_worktree_builds="yes")))
 
+    @testing_support.requires_tomllib
     def test_fleet_profile_loader_uses_the_same_validator(self):
+        import macos_fleet_lanes as fleet
         base = (HERE.parent / "profiles" / "m3-macos-fleet.toml").read_text()
         # The checked-in profile may already carry the table; drop it so the
         # cases below decide what the loader sees.
@@ -243,6 +251,7 @@ class Materialize(Isolated):
         self.assertEqual(sha, newer, detail)
         self.assertEqual(git(checkout, "rev-parse", "HEAD"), newer)
 
+    @testing_support.requires_tomllib
     def test_origin_without_tools_ci_is_refused_and_nothing_runs(self):
         repo = PulpRepo(self.tmp, with_ci=False)
         profile = repo.profile(self.tmp / "p.toml")
@@ -260,6 +269,7 @@ class EndToEnd(Isolated):
         profile = repo.profile(self.tmp / "p.toml", **overrides)
         return self.quiet(pr.run, fix=True, profile=profile, state_dir=self.state)
 
+    @testing_support.requires_tomllib
     def test_two_day_old_build_cov_idle_goes_active_stays(self):
         # m3, 2026-09-27: a 40 GB build-cov two days old, on a volume with
         # 21 GiB free. tartci's 7-day pressure gate kept it; Pulp's reaper
@@ -275,6 +285,7 @@ class EndToEnd(Isolated):
         runs = {r["reaper"]: r for r in out["runs"]}
         self.assertEqual(runs["clean_build_cov"]["exit_code"], 0, log)
 
+    @testing_support.requires_tomllib
     def test_build_cov_runs_even_without_pressure_but_worktree_reaper_does_not(self):
         repo = PulpRepo(self.tmp)
         cov = fill(repo.worktrees / "wt" / "build-cov", days=2)
@@ -287,6 +298,7 @@ class EndToEnd(Isolated):
         self.assertIn("clean_worktree_builds", out["skipped"])
         self.assertFalse(cov.exists(), log)
 
+    @testing_support.requires_tomllib
     def test_merged_idle_worktree_build_goes_under_pressure_and_the_guarded_ones_stay(self):
         repo = PulpRepo(self.tmp)
         merged = repo.worktree("merged", "feat/merged")
@@ -362,6 +374,7 @@ class WorktreesInTmp(Isolated):
         self.assertIsNone(value["total_bytes"])
         self.assertIn("unknown", value["size"])
 
+    @testing_support.requires_tomllib
     def test_reclaim_pass_reports_it_as_an_event_field(self):
         repo = PulpRepo(self.tmp)
         in_tmp = pathlib.Path(self._slash_tmp) / "wt"
@@ -393,7 +406,296 @@ class WorktreesInTmp(Isolated):
             self.assertIn(code, reasons)
 
 
+class DiscoveredPulpRoots(Isolated):
+    """Coverage dirs are reaped in every Code root that holds this repo's worktrees."""
+
+    def recorder(self):
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append((script.stem, kwargs["worktrees_root"], kwargs.get("timeout_s")))
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0,
+                    "worktrees_root": kwargs["worktrees_root"]}
+        return calls, reaper
+
+    def other_root_worktree(self, repo: PulpRepo, root: pathlib.Path, name: str) -> pathlib.Path:
+        root.mkdir(exist_ok=True)
+        path = root / name
+        git(repo.primary, "worktree", "add", "-q", "-b", f"feat/{name}", str(path), repo.first)
+        return path
+
+    def run_with(self, repo: PulpRepo, roots, *, fix: bool = True, runner=subprocess.run,
+                 **overrides):
+        calls, reaper = self.recorder()
+        profile = repo.profile(self.tmp / "p.toml", **overrides)
+        (out, log) = self.quiet(pr.run, fix=fix, profile=profile, state_dir=self.state,
+                                reaper=reaper, discovered_roots=roots, runner=runner)
+        return calls, out, log
+
+    def extra_runs(self, calls, roots):
+        wanted = {str(os.path.realpath(r)) for r in roots}
+        return [c for c in calls if c[1] in wanted and c[0] == "clean_build_cov"]
+
+    @testing_support.requires_tomllib
+    def test_the_m5s_boot_volume_root_gets_its_own_coverage_run(self):
+        # m5s, 2026-10-04: worktrees in ~/Code on the boot volume, the profile's
+        # worktrees_root on another volume. The boot root was never reaped.
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "pulp-wave2e")
+        calls, out, log = self.run_with(repo, [boot_code])
+        extra = self.extra_runs(calls, [boot_code])
+        self.assertEqual(len(extra), 1, calls)
+        record = [r for r in out["runs"] if r.get("reason") == "discovered_pulp_root"]
+        self.assertEqual(len(record), 1, out)
+        self.assertEqual(out["outside_profile_roots"],
+                         [{"root": str(os.path.realpath(boot_code)), "count": 1}])
+        self.assertEqual(log.count("worktrees_outside_profile_root"), 1, log)
+        # The heavier reaper never follows a discovered root.
+        self.assertFalse([c for c in calls if c[0] == "clean_worktree_builds"
+                          and c[1] == str(os.path.realpath(boot_code))], calls)
+
+    def second_clone_worktree(self, repo: PulpRepo, root: pathlib.Path, name: str,
+                              *, url: Optional[str] = None) -> pathlib.Path:
+        """A worktree of a SECOND clone of the same origin, as in m5s's ~/Code."""
+        clone = self.tmp / f"clone-{name}"
+        subprocess.run(["git", "clone", "-q", str(repo.origin), str(clone)], check=True)
+        if url is not None:
+            git(clone, "remote", "set-url", "origin", url)
+        root.mkdir(exist_ok=True)
+        path = root / name
+        git(clone, "worktree", "add", "-q", "-b", f"feat/{name}", str(path), repo.first)
+        return path
+
+    @testing_support.requires_tomllib
+    def test_a_second_clone_of_the_same_origin_is_reaped(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt-a")
+        self.second_clone_worktree(repo, boot_code, "wt-b")
+        calls, out, log = self.run_with(repo, [boot_code])
+        resolved = str(os.path.realpath(boot_code))
+        self.assertEqual(len(self.extra_runs(calls, [boot_code])), 1, calls)
+        self.assertEqual(out["outside_profile_roots"], [{"root": resolved, "count": 2}])
+        self.assertEqual(out["discovery"]["children_seen"], 2)
+        self.assertIn(resolved, out["discovery"]["roots"])
+        self.assertEqual(log.count(f"worktrees_outside_profile_root root={resolved} count=2"), 1)
+
+    @testing_support.requires_tomllib
+    def test_a_clone_of_another_origin_is_not_counted(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt", url="git@github.com:Someone/else.git")
+        calls, out, log = self.run_with(repo, [boot_code])
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(out["outside_profile_roots"], [])
+        self.assertEqual(out["discovery"]["children_seen"], 1, "scanned, matched nothing")
+        self.assertNotIn("worktrees_outside_profile_root", log)
+
+    @testing_support.requires_tomllib
+    def test_a_child_whose_url_cannot_be_read_is_not_counted_and_is_recorded(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        broken = boot_code / "broken"
+        broken.mkdir(parents=True)
+        (broken / ".git").write_text("gitdir: /nonexistent/worktrees/broken\n")
+        calls, out, _ = self.run_with(repo, [boot_code])
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(out["discovery"]["unreadable"], [str(broken)])
+        self.assertEqual(out["discovery"]["unreadable_children"], 1)
+        no_origin = self.second_clone_worktree(repo, boot_code, "no-origin")
+        git(self.tmp / "clone-no-origin", "remote", "remove", "origin")
+        calls, out, _ = self.run_with(repo, [boot_code])
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(sorted(out["discovery"]["unreadable"]), sorted([str(broken), str(no_origin)]))
+        self.assertEqual(out["discovery"]["unreadable_children"], 2)
+
+    @testing_support.requires_tomllib
+    def test_an_unreadable_configured_origin_runs_nothing_outside_and_says_so(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt")
+        primary = str(repo.primary)
+
+        def runner(argv, **kwargs):
+            # The configured clone's origin cannot be read; everything else can.
+            if argv[:4] == ["git", "-C", primary, "config"]:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.run(argv, **kwargs)
+        calls, out, _ = self.run_with(repo, [boot_code], runner=runner)
+        self.assertEqual(self.extra_runs(calls, [boot_code]), [], calls)
+        self.assertEqual(out["discovery"]["reason"], "configured_origin_unreadable")
+        self.assertEqual((out["discovery"]["roots"], out["discovery"]["children_seen"]), ([], 0),
+                         "with no identity nothing outside the profile root is even scanned")
+        self.assertEqual(out["outside_profile_roots"], [])
+        self.assertTrue([c for c in calls if c[0] == "clean_build_cov"], "the profile root still runs")
+
+    @testing_support.requires_tomllib
+    def test_discovery_that_did_not_run_reads_differently_from_a_zero(self):
+        repo = PulpRepo(self.tmp)
+        calls, out, _ = self.run_with(repo, [], worktrees_root=str(self.tmp / "absent"))
+        self.assertEqual(out["discovery"]["reason"], "not_reached")
+        calls, out, _ = self.run_with(repo, [])
+        self.assertIsNone(out["discovery"]["reason"])
+        self.assertEqual(out["discovery"]["children_seen"], 0)
+
+    def test_origin_urls_normalize_across_forms(self):
+        same = ["git@github.com:Generous-Corp/pulp.git", "ssh://git@github.com/Generous-Corp/pulp",
+                "ssh://git@github.com:22/Generous-Corp/pulp.git/",
+                "https://github.com/Generous-Corp/pulp.git", "https://GitHub.com/generous-corp/pulp/",
+                "http://github.com/Generous-Corp/pulp"]
+        self.assertEqual({pr.normalize_origin(u) for u in same}, {"github.com/generous-corp/pulp"})
+        self.assertNotEqual(pr.normalize_origin("git@github.com:Generous-Corp/pulp-planning.git"),
+                            pr.normalize_origin(same[0]))
+
+    @testing_support.requires_tomllib
+    def test_the_receipt_carries_every_field_a_control_reads(self):
+        # Structural, not a second literal list: every key the REAL reaper puts
+        # in a run record, and the discovery evidence, must survive the
+        # projection into last-run.json. A key run() adds without being
+        # projected fails here.
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt")
+        profile = repo.profile(self.tmp / "p.toml")
+        out, _ = self.quiet(pr.run, fix=False, profile=profile, state_dir=self.state,
+                            discovered_roots=[boot_code])
+        self.assertTrue([r for r in out["runs"] if r.get("reason") == "discovered_pulp_root"])
+        summary = dr.pass_summary({"pulp_reapers": out, "mode": "dry-run", "report": {}}, 0)
+        projected = summary["pulp_reapers"]
+        self.assertEqual(len(projected["runs"]), len(out["runs"]))
+        for record, shown in zip(out["runs"], projected["runs"]):
+            self.assertLessEqual(set(record), set(shown), record)
+        self.assertEqual(projected["outside_profile_roots"], out["outside_profile_roots"])
+        self.assertLessEqual(set(out["discovery"]), set(projected["discovery"]))
+
+    @testing_support.requires_tomllib
+    def test_each_clones_agent_worktrees_get_one_run_when_present(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.second_clone_worktree(repo, boot_code, "wt")
+        calls, out, _ = self.run_with(repo, [boot_code])
+        self.assertFalse([r for r in out["runs"] if "agent_worktrees" in str(r.get("reason"))],
+                         "absent .claude/worktrees: nothing recorded")
+        configured = repo.primary / ".claude" / "worktrees"
+        second = self.tmp / "clone-wt" / ".claude" / "worktrees"
+        configured.mkdir(parents=True)
+        second.mkdir(parents=True)
+        calls, out, _ = self.run_with(repo, [boot_code])
+        reasons = {(r["reason"], r["worktrees_root"]) for r in out["runs"] if r.get("reason")}
+        self.assertIn(("configured_clone_agent_worktrees", str(configured)), reasons)
+        self.assertIn(("discovered_clone_agent_worktrees", str(second)), reasons)
+        heavy = [c for c in calls if c[0] == "clean_worktree_builds"
+                 and c[1] in (str(configured), str(second))]
+        self.assertEqual(heavy, [], "the heavier reaper never follows these")
+
+    @testing_support.requires_tomllib
+    def test_the_configured_clones_agent_worktrees_run_once_when_also_discovered(self):
+        # m3: every matching child of /Volumes/Workshop/Code is a worktree of
+        # the CONFIGURED clone, so discovery finds that clone too. Its
+        # .claude/worktrees must still be reaped exactly once, as configured.
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "wt")
+        agent = repo.primary / ".claude" / "worktrees"
+        agent.mkdir(parents=True)
+        calls, out, _ = self.run_with(repo, [boot_code])
+        runs = [r for r in out["runs"] if r.get("worktrees_root") == str(agent)]
+        self.assertEqual([r["reason"] for r in runs], ["configured_clone_agent_worktrees"], runs)
+        self.assertEqual(len([c for c in calls if c[1] == str(agent)]), 1, calls)
+
+    @testing_support.requires_tomllib
+    def test_two_discovered_roots_get_one_run_each(self):
+        repo = PulpRepo(self.tmp)
+        first, second = self.tmp / "code-a", self.tmp / "code-b"
+        self.other_root_worktree(repo, first, "wt-a")
+        self.other_root_worktree(repo, second, "wt-b")
+        calls, out, _ = self.run_with(repo, [first, second])
+        self.assertEqual(len(self.extra_runs(calls, [first])), 1, calls)
+        self.assertEqual(len(self.extra_runs(calls, [second])), 1, calls)
+
+    @testing_support.requires_tomllib
+    def test_the_profile_root_is_not_run_twice(self):
+        repo = PulpRepo(self.tmp)
+        repo.worktree("wt", "feat/wt")
+        calls, out, _ = self.run_with(repo, [repo.worktrees])
+        runs = [c for c in calls if c[0] == "clean_build_cov"]
+        self.assertEqual(len(runs), 1, calls)
+        self.assertEqual(out["outside_profile_roots"], [])
+
+    def test_a_root_holding_only_a_foreign_repo_is_left_alone(self):
+        repo = PulpRepo(self.tmp)
+        foreign_root = self.tmp / "foreign-code"
+        foreign_root.mkdir()
+        other = self.tmp / "other-repo"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+        (other / "f").write_text("x")
+        git(other, "add", "-A")
+        git(other, "commit", "-q", "-m", "o")
+        git(other, "worktree", "add", "-q", "-b", "x", str(foreign_root / "wt"))
+        calls, out, log = self.run_with(repo, [foreign_root])
+        self.assertEqual(self.extra_runs(calls, [foreign_root]), [], calls)
+        self.assertNotIn("worktrees_outside_profile_root", log)
+
+    def test_the_primary_checkout_is_not_a_worktree_outside_the_profile(self):
+        # m3 keeps its primary checkout in /Volumes/Workshop/Code beside
+        # agent-worktrees; that root holds the repository itself, not worktrees.
+        repo = PulpRepo(self.tmp)
+        calls, out, log = self.run_with(repo, [repo.root])
+        self.assertEqual(self.extra_runs(calls, [repo.root]), [], calls)
+        self.assertNotIn("worktrees_outside_profile_root", log)
+
+    def test_a_root_of_plain_dirs_is_left_alone(self):
+        repo = PulpRepo(self.tmp)
+        plain = self.tmp / "plain-code"
+        (plain / "project" / "build-cov").mkdir(parents=True)
+        calls, out, _ = self.run_with(repo, [plain])
+        self.assertEqual(self.extra_runs(calls, [plain]), [], calls)
+
+    def test_disabled_pulp_worktree_builds_runs_nothing_anywhere(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "wt")
+        calls, out, _ = self.run_with(repo, [boot_code], pulp_worktree_builds=False)
+        self.assertEqual(calls, [])
+        self.assertFalse(out["enabled"])
+
+    @testing_support.requires_tomllib
+    def test_the_discovered_root_run_follows_the_pass_mode(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        self.other_root_worktree(repo, boot_code, "wt")
+        modes = []
+
+        def reaper(script, **kwargs):
+            modes.append((kwargs["worktrees_root"], kwargs["fix"]))
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+        profile = repo.profile(self.tmp / "p.toml")
+        for fix in (False, True):
+            modes.clear()
+            self.quiet(pr.run, fix=fix, profile=profile, state_dir=self.state,
+                       reaper=reaper, discovered_roots=[boot_code])
+            extra = [m for m in modes if m[0] == str(os.path.realpath(boot_code))]
+            self.assertEqual(extra, [(str(os.path.realpath(boot_code)), fix)])
+
+    @testing_support.requires_tomllib
+    def test_the_real_reaper_clears_coverage_in_the_discovered_root(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        wt = self.other_root_worktree(repo, boot_code, "pulp-wave2f")
+        cov = fill(wt / "build-cov", days=2)
+        kept = fill(repo.worktrees / "wt" / "build-cov", days=2)
+        profile = repo.profile(self.tmp / "p.toml", pressure_free_gb=1)
+        (out, log) = self.quiet(pr.run, fix=True, profile=profile, state_dir=self.state,
+                                discovered_roots=[boot_code])
+        self.assertFalse(cov.exists(), log)
+        self.assertFalse(kept.exists(), log)
+        extra = [r for r in out["runs"] if r.get("reason") == "discovered_pulp_root"]
+        self.assertEqual(extra[0]["exit_code"], 0, log)
+
+
 class DiskReclaimIntegration(Isolated):
+    @testing_support.requires_tomllib
     def test_receipt_event_and_log_line_carry_the_pulp_result(self):
         repo = PulpRepo(self.tmp)
         cov = fill(repo.worktrees / "wt" / "build-cov", days=2)
@@ -424,6 +726,34 @@ class DiskReclaimIntegration(Isolated):
         self.assertEqual([e["fields"]["reaper"] for e in events[1:]],
                          ["clean_build_cov", "clean_worktree_builds"])
         self.assertIn('"event": "reclaim_pass"', err.getvalue())
+
+    @testing_support.requires_tomllib
+    def test_the_reclaim_pass_hands_its_scan_roots_to_the_reapers(self):
+        repo = PulpRepo(self.tmp)
+        boot_code = self.tmp / "boot-code"
+        boot_code.mkdir()
+        git(repo.primary, "worktree", "add", "-q", "-b", "feat/boot", str(boot_code / "wt"),
+            repo.first)
+        cov = fill(boot_code / "wt" / "build-cov", days=2)
+        os.environ["TARTCI_FLEET_PROFILE"] = str(repo.profile(self.tmp / "p.toml"))
+        state = self.tmp / "reclaim-state"
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()) as err:
+            code = dr.main(["--roots", str(boot_code), "--json", "--fix",
+                            "--state-dir", str(state), "--boot-floor-gb", "0"])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertFalse(cov.exists(), err.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["pulp_reapers"]["outside_profile_roots"],
+                         [{"root": str(os.path.realpath(boot_code)), "count": 1}])
+        # The landed control reads the receipt, not stdout.
+        receipt = json.loads((state / "last-run.json").read_text())["pulp_reapers"]
+        self.assertEqual(receipt["outside_profile_roots"],
+                         [{"root": str(os.path.realpath(boot_code)), "count": 1}])
+        self.assertEqual([(r["reason"], r["worktrees_root"]) for r in receipt["runs"]
+                          if r.get("reason")],
+                         [("discovered_pulp_root", str(os.path.realpath(boot_code)))])
+        self.assertGreaterEqual(receipt["discovery"]["children_seen"], 1)
 
     def test_a_failed_pass_still_leaves_a_receipt(self):
         state = self.tmp / "reclaim-state"
