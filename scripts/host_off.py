@@ -225,7 +225,8 @@ def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None
     """Once per episode: an event and a GitHub issue while `active`; the issue
     closes and the state goes once `resolved`.
 
-    A different `since` is a new episode. A failed issue open is kept as
+    A different `since` is a new episode, and the previous episode's issue is
+    closed rather than forgotten. A failed issue open is kept as
     `issue_error` in the state at `path` and retried on the next pass.
     `render()` builds the issue's (title, body) only when one is opened.
     `issue(title, body)` and `close(number)` default to ghapp.
@@ -234,6 +235,9 @@ def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None
     out = {"evented": False, "issue": state.get("issue")}
     if active:
         if state.get("since") != since:
+            # A new episode: the previous one's issue is closed, never orphaned.
+            if state.get("issue"):
+                (close or _close_issue)(str(state["issue"]))
             state = {"since": since}
         if not state.get("evented"):
             raise_event()

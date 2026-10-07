@@ -632,17 +632,18 @@ def alert_due(value: dict[str, Any], now: float,
           probe has been granted at all (an idle host: the two no_ips that
           opened it are the evidence, and silence would last forever); a
           probe still in flight is waited for; or
-      (c) it opened on an unreported probe and a second consecutive probe has
-          gone unreported. One unreported probe alone is a slow boot.
+      (c) two consecutive probes have gone unreported, whatever opened it:
+          a probe counts as unreported when the next one is granted before it
+          reported. One unreported probe alone is a slow boot.
     Closed and verifying never are.
     """
     if value.get("state") != "open":
         return False, ""
     if value.get("alert_now"):
         return True, "a post-boot probe got no address"
+    if int(value.get("consecutive_unreported") or 0) >= 2:
+        return True, "two consecutive probes never reported"
     if value.get("cause") == "probe_unreported":
-        if int(value.get("consecutive_unreported") or 0) >= 2:
-            return True, "two consecutive probes never reported"
         return False, ""
     if now - float(value.get("opened_at") or now) < probe_secs:
         return False, ""

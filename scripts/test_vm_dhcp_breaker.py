@@ -714,6 +714,8 @@ class AlertDue(unittest.TestCase):
         self.assertFalse(due(probes=1, probe_lane="p"))
         self.assertFalse(due(cause="probe_unreported", consecutive_unreported=1))
         self.assertTrue(due(cause="probe_unreported", consecutive_unreported=2))
+        self.assertTrue(due(cause="dhcp_silent", consecutive_unreported=2, probes=3,
+                            probe_lane="p"))
         self.assertFalse(vb.alert_due({"state": "open", "opened_at": T0}, T0 + 100)[0])
         for state in ("closed", "verifying"):
             self.assertFalse(vb.alert_due({"state": state, "alert_now": True}, T0 + 400)[0])

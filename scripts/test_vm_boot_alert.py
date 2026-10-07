@@ -32,7 +32,7 @@ class Alert(Case):
 
     def issue(self, title: str, body: str) -> tuple[int, str]:
         self.opened.append((title, body))
-        return (0, "77") if self.issue_rc == 0 else (1, "rate limited")
+        return (0, str(76 + len(self.opened))) if self.issue_rc == 0 else (1, "rate limited")
 
     def close(self, number: str) -> tuple[int, str]:
         self.closed.append(number)
@@ -103,6 +103,33 @@ class Alert(Case):
         self.check(T0 + 200 + vb.VERIFY_REPORT_SECS + 600, lane="d")  # c never reported
         out = self.watch(T0 + 200 + vb.VERIFY_REPORT_SECS + 610)
         self.assertEqual((out["due"], out["why"]), (True, "two consecutive probes never reported"))
+
+    def test_probes_that_never_report_alert_whatever_opened_it(self):
+        # Opened on a real cause; each cadence probe is superseded unreported.
+        self.open_at(T0)
+        self.assertEqual(vb.status(self.tmp / "vm-dhcp")["cause"], "dhcp_silent")
+        self.check(T0 + 500, lane="p1")
+        self.check(T0 + 800, lane="p2")            # p1 never reported
+        self.assertFalse(self.watch(T0 + 810)["due"], "one unreported probe is a slow boot")
+        self.check(T0 + 1100, lane="p3")           # p2 never reported either
+        out = self.watch(T0 + 1110)
+        self.assertEqual((out["due"], out["why"]), (True, "two consecutive probes never reported"))
+
+    def test_an_outage_across_a_reboot_never_orphans_its_issue(self):
+        self.open_at(T0)
+        self.watch(T0 + 200 + vb.PROBE_SECS)               # issue 77
+        self.assertEqual(len(self.opened), 1)
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 1000)
+        self.check(T0 + 1100, lane="a")                    # verifying: 77 stays open
+        self.assertFalse(self.watch(T0 + 1150)["due"])
+        self.assertEqual(self.closed, [])
+        self.record("no_ip", T0 + 1300, lane="a")          # a new outage, a new since
+        self.watch(T0 + 1310)
+        self.assertEqual(self.closed, ["77"], "the first issue is closed, not forgotten")
+        self.assertEqual(len(self.opened), 2)              # issue 78 is the open one
+        self.record("ip", T0 + 1500, lane="b")
+        self.watch(T0 + 1600)
+        self.assertEqual(self.closed, ["77", "78"])
 
     def test_a_verifying_breaker_raises_nothing(self):
         os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 100)
