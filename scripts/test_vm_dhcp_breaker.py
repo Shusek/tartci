@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 try:
@@ -700,6 +701,24 @@ class PostBoot(Case):
         self.check(T0 + 130, lane="a")
         self.assertIn("a probe is in flight on a",
                       fleet_doctor.check_vm_dhcp(self.state()).detail)
+
+
+class AlertDue(unittest.TestCase):
+    """The breaker's pure trigger; the issue itself is vm_boot_alert's."""
+
+    def test_the_trigger(self):
+        due = lambda **v: vb.alert_due({"state": "open", "opened_at": T0, **v}, T0 + 400)[0]  # noqa: E731
+        self.assertTrue(due(alert_now=True))
+        self.assertTrue(due(failed_probes=1, probes=1))
+        self.assertTrue(due(probes=0))
+        self.assertFalse(due(probes=1, probe_lane="p"))
+        self.assertFalse(due(cause="probe_unreported", consecutive_unreported=1))
+        self.assertTrue(due(cause="probe_unreported", consecutive_unreported=2))
+        self.assertTrue(due(cause="dhcp_silent", consecutive_unreported=2, probes=3,
+                            probe_lane="p"))
+        self.assertFalse(vb.alert_due({"state": "open", "opened_at": T0}, T0 + 100)[0])
+        for state in ("closed", "verifying"):
+            self.assertFalse(vb.alert_due({"state": state, "alert_now": True}, T0 + 400)[0])
 
 
 class BootTimes(unittest.TestCase):
