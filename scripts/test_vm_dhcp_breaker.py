@@ -14,6 +14,7 @@ Run:  python3 scripts/test_vm_dhcp_breaker.py
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -283,7 +284,11 @@ class Shell(Case):
 
     def test_the_runner_logs_the_address_before_recording_it(self):
         body = RUNNER.read_text()
-        at = body.index('  event boot_ip "ip=$ip"\n')
+        at = body.index('event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" '
+                        '"clone_to_ip_s=$clone_to_ip_s"')
+        self.assertLess(body.index('CLONE_STARTED_AT="$(date +%s)"'), at)
+        self.assertLess(body.index('event clone_start "golden=$GOLDEN"'),
+                        body.index('CLONE_STARTED_AT="$(date +%s)"'))
         self.assertLess(at, body.index('tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"'))
         self.assertGreater(at, body.index('CURRENT_IP="$ip"'))
 
@@ -651,10 +656,12 @@ class PostBoot(Case):
         self.assertNotIn("alert=now", result["events"][0][1])
         self.assertEqual(self.state()["state"], "open")
         self.assertIsNone(self.state()["probe_lane"])
-        # A slow probe that does report later still closes it.
+        # A slow probe that does report later is the verification that was owed.
         late = self.record("ip", T0 + 200 + vb.VERIFY_REPORT_SECS + 30, lane="a")
-        self.assertIn("vm_dhcp_recovered", self.names(late))
+        self.assertEqual(self.names(late), ["vm_dhcp_verified"])
+        self.assertIn("reason=host_reboot lane=a late=true", late["events"][0][1])
         self.assertEqual(self.state()["state"], "closed")
+        self.assertEqual(self.state()["boot_time"], T0 + 100)
 
     def test_no_recorded_boot_time_verifies(self):
         (self.tmp / "vm-dhcp" / "breaker.json").write_text(json.dumps(
@@ -710,6 +717,51 @@ class AlertDue(unittest.TestCase):
         self.assertFalse(vb.alert_due({"state": "open", "opened_at": T0}, T0 + 100)[0])
         for state in ("closed", "verifying"):
             self.assertFalse(vb.alert_due({"state": state, "alert_now": True}, T0 + 400)[0])
+
+
+class BootTimes(unittest.TestCase):
+    """The verify bound is re-derived from the lane logs, wherever they live."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def lane(self, rel: str, rows: list[tuple[str, str, str]]) -> None:
+        path = self.root / rel / "events.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("".join(json.dumps({"ts": ts, "event": ev, "runner": "r",
+                                            "detail": detail}) + "\n"
+                                for ts, ev, detail in rows))
+
+    def test_nested_lanes_are_counted(self):
+        # m5studio keeps its lanes at state/macos-fleet/<lane>/.
+        self.lane("macos", [("2026-10-07T10:00:00Z", "clone_start", ""),
+                            ("2026-10-07T10:00:40Z", "boot_ip", "ip=x")])
+        self.lane("macos-fleet/pulp-gate", [("2026-10-07T11:00:00Z", "clone_start", ""),
+                                            ("2026-10-07T11:03:20Z", "boot_failed", "no_ip")])
+        out = vb.boot_times(self.root, 0)
+        self.assertEqual((out["lane_logs"], out["clones"]), (2, 2))
+        self.assertEqual(out["boot_ip"]["max"], 40)
+        self.assertEqual(out["no_ip"]["max"], 200)
+        self.assertEqual(out["suggested_verify_secs"], 420)
+
+    def test_the_window_and_unpaired_reports(self):
+        self.lane("a", [("2026-09-01T10:00:00Z", "clone_start", ""),
+                        ("2026-09-01T10:09:00Z", "boot_failed", "no_ip"),
+                        ("2026-10-07T10:00:00Z", "boot_ip", "ip=x"),
+                        ("2026-10-07T10:01:00Z", "clone_start", ""),
+                        ("2026-10-07T10:02:00Z", "boot_failed", "no_ssh")])
+        out = vb.boot_times(self.root, calendar.timegm((2026, 10, 1, 0, 0, 0)))
+        self.assertEqual(out["clones"], 1)
+        self.assertEqual((out["boot_ip"]["n"], out["no_ip"]["n"]), (0, 0))
+        self.assertIsNone(out["suggested_verify_secs"])
+
+    def test_the_cli_reads_a_root(self):
+        self.lane("x/y", [("2026-10-07T10:00:00Z", "clone_start", ""),
+                          ("2026-10-07T10:01:00Z", "boot_ip", "ip=x")])
+        out = subprocess.run([sys.executable, str(BREAKER), "boot-times", "--days", "100000",
+                              "--root", str(self.root)], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(out.stdout)["boot_ip"]["n"], 1)
 
 
 class Doctor(unittest.TestCase):

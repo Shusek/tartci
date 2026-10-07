@@ -1697,10 +1697,14 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   | m5 | 303 | 205 | 220 | 316 | 464 |
   | m5s | 0 | — | — | — | — (1032 clones, never a `no_ip`) |
 
-  The success report comes earlier. `boot_ip` (logged at the address since
-  this change) gives clone_start to address directly; before it, clone_start
-  to `boot_ok`, which also counts SSH and the JIT mint, passed 960 s in 5 of
-  5215 boots over 30 days.
+  The success report comes earlier. `boot_ip clone_to_ip_s=` (logged at the
+  address since this change) gives clone_start to address directly; before
+  it, clone_start to `boot_ok`, which also counts SSH and the JIT mint,
+  passed 960 s in 5 of 5215 boots over 30 days. **Re-derive the 960 s default
+  once 30 days of `boot_ip` exist**: on each host,
+  `tartci vm-dhcp boot-times --days 30` reads every lane log (at any depth:
+  m5studio nests them under `macos-fleet/<lane>/`) and prints both report
+  distributions and `suggested_verify_secs`; take the fleet-wide maximum.
 - **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
   `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
   the same once-per-episode path as a host left OFF, closed when a VM gets an
