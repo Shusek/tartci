@@ -156,6 +156,7 @@ CODES: tuple[str, ...] = (
     "vm_dhcp_pfd_crash_loop",
     "vm_dhcp_unanswered",
     "vm_dhcp_unreadable",
+    "vm_dhcp_verifying",
     "vm_dhcp_vm_network_missing",
     "warm_vm_none",
     "warm_vm_overdue",
@@ -1161,6 +1162,18 @@ def check_vm_dhcp(value: dict | None) -> Finding:
                        "VM DHCP is not answering on this host: no lane clones except one probe "
                        f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "
                        f"{value.get('probes')} probes)", facts)
+    if value.get("state") == "verifying":
+        since = value.get("verifying_since")
+        held = (f"{int(time.time() - float(since))}s" if isinstance(since, (int, float))
+                else "an unknown time")
+        lane = value.get("probe_lane")
+        probing = (f"a probe is in flight on {lane}" if lane
+                   else "no lane has probed yet")
+        was = value.get("previous_cause")
+        return Finding("vm_dhcp", OK, "vm_dhcp_verifying",
+                       f"proving the VM network after {value.get('verify_reason')} for {held}; "
+                       f"{probing}; other lanes wait" + (f"; was open with {was}" if was else ""),
+                       facts)
     if value.get("state") == "closed":
         return Finding("vm_dhcp", OK, "vm_dhcp_ok", "VM DHCP breaker closed", facts)
     return Finding("vm_dhcp", UNKNOWN, "vm_dhcp_unreadable",

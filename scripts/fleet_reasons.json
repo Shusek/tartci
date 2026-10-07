@@ -481,6 +481,11 @@
       "remedy": "Run `tartci fleet-macos tool-freshness --refresh`, then check the watchdog log for why it did not.",
       "do_not": "Do not read unmeasured as current."
     },
+    "vm_dhcp_verifying": {
+      "summary": "This host is proving its VM network with one probe VM before its lanes clone freely: after a reboot, after a self-update, or on the first run.",
+      "why": "A reboot used to close the breaker, and every lane cloned again into a VM network that was still broken: on m5 on 2026-10-07 that spent about 56 VMs after the reboot. Now one lane probes while the others idle; the probe's address closes the breaker (vm_dhcp_verified), its no_ip opens it at once with the failing layer, and a probe that never reports within 960 s opens it with cause probe_unreported so a crashed probe cannot hold every lane idle. Every host enters this once when the breaker first runs with no recorded boot time.",
+      "remedy": "Nothing, normally: it ends within one boot, about 3 min. If it lasts longer, read the probe lane's log for the VM; the breaker opens on its own if the probe never reports."
+    },
     "vm_dhcp_vm_network_missing": {
       "summary": "VMs on this host stopped getting an address because the VM network itself was never created: no bridge100 existed while a VM ran.",
       "why": "Tart's NAT network is vmnet shared mode, which InternetSharing (com.apple.NetworkSharing) creates per VM as bridge100 and then configures bootpd for. On m5 on 2026-10-07 InternetSharing never answered a VM's request (each VM logged \"xpc send -> client create\" and got nothing back), so no bridge100 appeared and bootpd had nothing to serve; restarting the InternetSharing process did not bring it back. A healthy host answers each VM with \"netrbCreateInterface: VM interface create submitted\". This layer comes before bootpd: no bootpd step can help until it is fixed.",
