@@ -58,6 +58,11 @@ bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
 and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
 needs no tartci update to be read.
 
+The support LaunchAgents a host carries (reclaimer, artifact-cache refresher,
+keychain unlocker, schedule backstop, reuse canary, launchd watchdog, reaper)
+are declared in its fleet profile's `[support_agents]` table and compared after
+every self-update; see [`launchd/README.md`](launchd/README.md#declared-support-agents).
+
 Both `drain` and `off` run a **capacity floor** first
 (`scripts/capacity_floor.py`): they refuse when no host other than this one
 serves a required gate label, because that mutation takes the label to zero
@@ -167,7 +172,8 @@ git clone <this-repo> tartci && cd tartci
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
 ./tartci up macos --src /path/to/pulp     # ephemeral macOS build+test clone (host caches mounted)
-./tartci up windows       # ephemeral Windows build+test (CoW overlay→build→ctest→discard)
+./tartci up windows       # ephemeral Windows build+test (GPU-off default)
+./tartci up windows --gpu # same bounded run with the published Windows Skia slice + plugin scan
 ./tartci serve linux      # serve the GitHub Actions pool: ephemeral per-job runner(s)
 ./tartci serve macos --once --labels self-hosted,macOS,ARM64,pulp-build-vm
 ./tartci serve windows --loop   # keep serving Windows jobs (throwaway overlay each)
@@ -211,22 +217,23 @@ fail-closed `exit 75` restart. A live guardian or a refused teardown still
 restarts immediately.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
-builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]
+builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke] [--gpu]
 [--keep]` makes a per-job CoW overlay off the Windows golden on a dynamic SSH
-port (concurrent-safe), builds GPU-off under MSVC arm64, then discards the
-overlay (see `providers/`). `tartci up macos --src <checkout>` clones the
+port (concurrent-safe), builds under MSVC arm64, optionally links the immutable
+Windows Skia slice, scans produced CLAP/VST3 artifacts, then discards the overlay
+(see `providers/`). `tartci up macos --src <checkout>` clones the
 macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 `~/build`, runs ctest, and discards the clone. See
 `docs/runbook.md` for the from-scratch, gotcha-by-gotcha guide and
 `docs/new-repo-agent-guide.md` to onboard a new repo.
 
 **The fleet is not Macs-only.** A Proxmox host (`macpro`, an x86_64 Xeon Mac
-Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux, and
-Windows x64 later. `tart-linux` provisions **arm64** guests and `qemu-windows` is
-Windows-on-**ARM**, so routing an x64 build at either is an architecture change,
-not a relocation. See [`docs/proxmox-macpro.md`](docs/proxmox-macpro.md); it is not
-TartCI-managed. Its Proxmox/systemd runner service is a separate execution
-provider that Shipyard coordinates alongside TartCI. Native Intel macOS/Metal
+Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux and
+non-blocking Windows x64 validation. `tart-linux` provisions **arm64** guests
+and `qemu-windows` is Windows-on-**ARM**, so routing an x64 build at either is an
+architecture change, not a relocation. See
+[`docs/proxmox-macpro.md`](docs/proxmox-macpro.md) and
+[`docs/proxmox-windows.md`](docs/proxmox-windows.md). Native Intel macOS/Metal
 checks similarly run directly on `macmini`, not inside TartCI.
 
 ### Serve the GitHub Actions pool
@@ -267,7 +274,9 @@ Before each VM boots, the runner quarantines suspect direct-mode manifests
 (no include files, naming a result whose `.d` lists headers or that is
 missing) from the shared cache (`scripts/ccache_guard.py`, fail-open,
 `TARTCI_CCACHE_GUARD=0` disables, `TARTCI_CCACHE_GUARD_BUDGET_SECS` bounds it,
-default 120). Such a manifest matches every lookup and once linked another
+default 120; a run the budget cuts short leaves `cursor.json` in the
+quarantine root and the next run resumes there, so a cache too large for one
+budget is still covered across boots). Such a manifest matches every lookup and once linked another
 source's object into every gate build on one host; see `docs/gotchas.md`.
 `tartci ccache scan|quarantine|reset` is the operator surface.
 

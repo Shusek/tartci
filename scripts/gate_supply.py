@@ -84,6 +84,8 @@ BLOCKED_PHASES = frozenset({
     "admission-precheck-error", "teardown-pending",
     # lease-fit.lib.sh: this lane's VM lease cannot be granted now, or ever.
     "lease-wait", "lease-never-fits",
+    # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.
+    "vm-dhcp-breaker-open",
 })
 # A heartbeat older than this many polls (floor below) is not current.
 HEARTBEAT_STALE_POLLS = 6
@@ -371,7 +373,8 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
                 out = subprocess.run(
                     [sys.executable, str(Path(__file__).with_name("tart_inventory.py")),
                      "--timeout-seconds", timeout],
-                    text=True, capture_output=True, check=False, timeout=float(timeout) + 15)
+                    text=True, capture_output=True, check=False, timeout=float(timeout) + 15,
+                    stdin=subprocess.DEVNULL)
             except (subprocess.TimeoutExpired, OSError, ValueError):
                 continue
             if out.returncode == 0 and out.stdout.strip().isdigit():
@@ -414,11 +417,17 @@ def parse_peers(text: str) -> list[tuple[str, str]]:
 
 def fetch_peer(host_id: str, target: str, repo: str, class_label: str, *,
                ssh: str, timeout: float) -> dict[str, Any]:
-    command = [ssh, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout // 2))}",
+    # `-n` and stdin=DEVNULL: an ssh client forwards its stdin to the remote end,
+    # so without them it drains whatever the caller's stdin is. The supervisor
+    # calls this from inside `while read ... done <<< "$classes"`, where that
+    # stdin is the rest of the class list: one peer read silently ended the
+    # loop and every later class went unobserved.
+    command = [ssh, "-n", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, int(timeout // 2))}",
                target, f"cd ~ && ~/.local/bin/tartci pool supply --repo {repo} --class {class_label} --json"]
     started = time.time()
     try:
-        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=timeout)
+        result = subprocess.run(command, text=True, capture_output=True, check=False,
+                                timeout=timeout, stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {"verdict": "unknown", "reason": f"ssh {target}: {type(exc).__name__}", "host": host_id}
     try:

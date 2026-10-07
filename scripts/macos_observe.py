@@ -194,6 +194,7 @@ find "$HOME/actions-runner/_work" -path '*/Testing/Temporary/LastTest.log' -type
 """
     argv = [
         "ssh",
+        "-n",
         "-o",
         "StrictHostKeyChecking=no",
         "-o",

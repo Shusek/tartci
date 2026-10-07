@@ -15,8 +15,138 @@ LaunchAgent, rather than diagnosing from `command -v` alone. Fleet preflight
 reports `daemon-can-reach-*` and `tartci-installed` separately so this PATH
 difference cannot masquerade as missing TartCI.
 
+So that agents running `ssh host tartci ...` find it, every fleet host puts
+`~/.local/bin` on PATH in `~/.zshenv`, the only startup file a non-interactive
+zsh reads. `~/.zshrc` and `~/.zprofile` do not count: m3 had it in both and
+`ssh m3 'command -v tartci'` still returned nothing (2026-10-05). Use the same
+guarded line on every host:
+
+```sh
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+```
+
+Check it from another host with `ssh HOST 'command -v tartci'`, and run the
+same check against a host known to work as the control.
+
+## `fleet-macos install` reports "installed support member failed verification"
+
+**Symptom:** `tartci fleet-macos install PROFILE` run through the installed
+`~/.local/bin/tartci` fails with
+`support-manifest: installed support member failed verification: fleet/README.md`,
+while the running supervisors are healthy.
+
+**Cause:** with no `--support-source`, the installer used its own root as the
+source. Through the installed entrypoint that root is a sealed generation under
+`~/.local/share/tartci-generations/`: its files are mode 0444 and it is not a
+git checkout, so it can never be a support source. The mode mismatch was the
+first thing to trip. Nothing on the host is broken.
+
+**Fix:** the installer now refuses this case with a message that says so. To
+update a host, run `tartci fleet-macos self-update`. To install a specific
+tree, pass `--support-source` with a clean tartci checkout.
+
+## A support generation will not install on macOS 15 (2026-10-05)
+
+*Symptom:* `stage_install` (the self-update install step) fails with
+`PermissionError: [Errno 13]` renaming the staged generation into place.
+*Cause:* macOS 15 refuses to rename a directory whose own mode is 0555, even
+within the same parent; macOS 27 allows it. The installer used to seal the
+staged root to 0555 before the rename. Found on hosted macos-15 (15.7.9); every
+fleet host runs 27. *Guard:* the root is renamed while 0755, then chmodded 0555,
+fsynced and verified immutable under its final name; a generation that fails
+that check is removed rather than left where the next install would refuse it.
+`test_tartci_support_manifest` records the mode at the rename, so the order is
+checked on every host.
+
+## Timer jobs stop running while the lanes look healthy (m3, 2026-10-04)
+
+**Symptom:** a host falls many commits behind main and its self-update log has
+not changed in hours, yet `launchctl print` shows the agent with `last exit
+code = 0` and the watchdog prints a checkmark for it. The lane supervisors keep
+serving jobs.
+
+**Cause:** launchd's gui domain stopped starting StartInterval jobs on its own.
+`launchctl print gui/$UID/<label>` shows `pended nondemand spawn = interval`
+and a `runs` counter that does not move. A clean last exit says nothing about
+whether the job still runs. On m3 the last update attempt had been correctly
+refused (a peer was draining), and launchd never started the retry, so the fix
+for this stall could not install itself.
+
+**Fix:** `scripts/launchd_interval_guard.py` runs inside the lane supervisors
+and kicks any timer agent whose run count has not moved for twice its interval.
+A host on a generation from before that guard needs one manual
+`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`; after that
+it heals on its own. To spot it, compare the age of the newest entry in
+`~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
+not the exit code.
+
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
+
+## A `while read` loop ends early after a peer read over ssh (2026-10-04)
+
+*Symptom:* the supervisor observed only the first class with young demand;
+every later class in `while read ... done <<< "$classes"` went unobserved, with
+no error. *Cause:* an ssh client forwards its stdin to the remote command, so
+an ssh anywhere under the loop body drains the rest of the loop's input. In
+#371 the ssh was inside a Python helper (`gate_supply.py decide`), which
+inherits stdin. shellcheck's SC2095 (run by `scripts/lint.sh`) catches only an
+ssh written directly in the loop; it cannot see through a function or a
+subprocess. *Guard:* `scripts/ssh_stdin_check.py`, run by
+`scripts/test_ssh_stdin.py` in CI, requires every ssh invocation in the repo
+to state its stdin, wherever it is:
+
+- shell: `ssh -n`, an input redirect on the same command (`</dev/null`,
+  `<<EOF`, `< file`), or ssh as the right side of a pipe (`ssh -G` is exempt);
+- Python: an argv list or tuple whose first element is the ssh client must
+  contain `"-n"`. That is the string `"ssh"` or a path ending in `/ssh`; a
+  name or attribute named like the client (`ssh`, `args.ssh`, `self.ssh_bin`,
+  `ssh_path`, `remote_ssh`); or a name, parameter or argparse option whose
+  value or default is such a string. The rule first matched only `"ssh"` and
+  a bare name `ssh`, so `[args.ssh, "-o", ...]` in `job_claim.gather_peers`
+  passed it without `-n`.
+
+A wrapper whose callers pipe a script into it is the one legitimate exception;
+mark it `# ssh-stdin: <why>` on its line or the line above.
+
+## A test passes in CI and fails on the hosts' Python (2026-10-05)
+
+*Symptom:* a change is green in CI, then its tests fail under
+`/usr/bin/python3` with `No module named 'tomllib'` (#379, #390, #383, #391 on
+one day). *Cause:* `/usr/bin/python3` is 3.9.6 on all four hosts and has no
+tomllib. It runs the tartci shim's support-manifest check, the pinned launch
+interpreter, every explicit `/usr/bin/python3` call site, and each
+`tartci_toml_exec_or_python3` fallback on a host without a tomllib Python;
+interactive ssh shells on m1 also resolve `python3` to it. (Under launchd's
+PATH a bare `python3` is a Homebrew 3.11+ on all four hosts.) CI ran the tests
+only on ubuntu's 3.12+ (`python-floor` only compiles, under 3.11); on
+2026-10-05 main itself failed 203 of 2283 tests under 3.9. *Guard:* the
+`python-39-tests` CI job runs every test module under Python 3.9 (the newest
+3.9 setup-python offers; 3.9.6 itself is not built for current ubuntu
+images), asserted to be 3.9 with no tomllib and first on PATH. A test that genuinely needs tomllib
+says so through `scripts/testing_support.py` and is skipped there, and every
+module that degrades without tomllib has a running test of that branch
+(`scripts/test_no_tomllib_fallbacks.py`):
+
+```python
+import testing_support
+testing_support.skip_module_without_tomllib()   # whole module, before its imports
+
+@testing_support.requires_tomllib                # one test or class
+def test_reads_the_profile(self): ...
+```
+
+Import a tomllib-only module (`macos_fleet_lanes`, `fleet_self_update`, ...)
+inside the test that needs it, not at module level, so the module's other
+tests still run on the hosts' Python.
+
+That skip is not available everywhere. For a module a 3.9 interpreter runs
+(reachable by import from an explicit `/usr/bin/python3` site, or declaring
+itself "3.9-safe"), a skip on 3.9 removes exactly the coverage the job exists
+for, so `scripts/test_system_python_tests_run.py` fails on any
+tomllib-conditional skip in that module's tests unless it is listed in
+`ALLOWED` with the 3.11-only behaviour it guards. Make the test run on 3.9
+first; list it only when what it asserts really needs tomllib.
 
 ## M3 external-volume privacy attribution (2026-09-01)
 
@@ -195,7 +325,10 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   `tartci ccache reset --reset` moves the whole cache aside; it refuses while
   a VM runs or holds a lease unless `--force`. The macOS runner runs the
   quarantine before every VM boot (fail-open, `TARTCI_CCACHE_GUARD=0` disables;
-  events `ccache_guard` in the lane's event log).
+  events `ccache_guard` in the lane's event log). A budget-exhausted run
+  records where it stopped in `cursor.json` and the next run resumes there;
+  without that, a cache too large for the budget had its late fan-outs
+  checked only by the runs that happened to finish.
 
 - **Link error: undefined `icu_74::Locale::...` on Ubuntu.**
   → *Cause:* Pulp opts into direct `icu::Locale`/BreakIterator calls when

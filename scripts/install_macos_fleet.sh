@@ -34,7 +34,19 @@ done
 [ -n "$CONFIG" ] || { echo "$USAGE" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-[ -n "$SUPPORT_SOURCE" ] || SUPPORT_SOURCE="$ROOT"
+if [ -z "$SUPPORT_SOURCE" ]; then
+  # An installed generation is a read-only copy, not a git checkout, so it can
+  # never be a support source: the manifest is rebuilt from the source commit.
+  # Without this check the installed `tartci` reported the 0444-vs-0644 mode
+  # difference as "installed support member failed verification".
+  if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "fleet install: $ROOT is an installed TartCI generation, not a git checkout," >&2
+    echo "  so it cannot be the support source. Run \`tartci fleet-macos self-update\`" >&2
+    echo "  to update this host, or pass --support-source with a clean tartci checkout." >&2
+    exit 2
+  fi
+  SUPPORT_SOURCE="$ROOT"
+fi
 SUPPORT_SOURCE="$(cd "$SUPPORT_SOURCE" && pwd)"
 if [ -z "$SUPPORT_MANIFEST" ]; then
   SUPPORT_MANIFEST="$SUPPORT_SOURCE/.tartci-support-manifest.json"

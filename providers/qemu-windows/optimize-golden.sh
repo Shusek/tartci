@@ -20,7 +20,7 @@ case "$RUNNER_SHA256" in
 esac
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
-SSH=(ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
+SSH=(ssh -n "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 

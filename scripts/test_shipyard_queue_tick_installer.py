@@ -355,6 +355,18 @@ class TickCompletionAndRollbackTests(unittest.TestCase):
         self.assertIn("rolled back: the prior", result.stderr)
         self.assertEqual(str(loaded), "True")
 
+    def test_a_rollback_kickstarts_the_prior_tick_after_reloading_it(self) -> None:
+        # launchd can defer a RunAtLoad launch indefinitely on a busy host, so
+        # a reloaded prior tick that is only bootstrapped may never run.
+        result, home, loaded = self.run_install(
+            FAKE_TICK_SECS="0", FAKE_TICK_HEALTH="unhealthy", FAKE_PRIOR_LOADED="1")
+        self.assertIn("rolled back: the prior", result.stderr)
+        self.assertEqual(str(loaded), "True")
+        calls = (home / "calls").read_text().splitlines()
+        last_bootstrap = max(i for i, call in enumerate(calls) if call.startswith("bootstrap"))
+        self.assertTrue(
+            any(call.startswith("kickstart") for call in calls[last_bootstrap + 1:]), calls)
+
     def test_a_rollback_that_cannot_reload_fails_loudly(self) -> None:
         result, home, loaded = self.run_install(
             FAKE_TICK_SECS="0", FAKE_TICK_HEALTH="unhealthy", FAKE_PRIOR_LOADED="1",

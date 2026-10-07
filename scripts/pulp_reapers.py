@@ -53,6 +53,8 @@ import time
 from typing import Any, Callable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import boot_usage  # noqa: E402
+import gate_ccache_trim  # noqa: E402
 import scratch_dirs  # noqa: E402
 import tmp_checkouts  # noqa: E402
 
@@ -69,9 +71,15 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            # read by tmp_checkouts.py; validated here so one
                            # install-time check covers the whole table
                            "tmp_checkouts", "tmp_checkout_idle_hours",
-                           "worktree_root_checkouts",
+                           "worktree_root_checkouts", "extra_worktree_roots",
                            # read by scratch_dirs.py
-                           "scratch_dirs", "scratch_idle_hours"})
+                           "scratch_dirs", "scratch_idle_hours",
+                           # read by gate_ccache_trim.py
+                           "gate_ccache_trim", "gate_ccache_max_age_days",
+                           "gate_ccache_trim_interval_hours",
+                           # read by boot_usage.py
+                           "boot_usage", "boot_usage_warn_gb",
+                           "boot_usage_growth_gb_per_day"})
 # How long a merged worktree's build tree must sit unwritten before the worktree
 # reaper may take it (its own PULP_WORKTREE_BUILD_IDLE_HOURS gate). The ceiling
 # is a disk-arithmetic fact, not a preference. Measured on m3, 2026-09-27: one
@@ -151,6 +159,8 @@ def validate_table(table: Any) -> list[str]:
                         f"{MIN_IDLE_HOURS} through {MAX_IDLE_HOURS}")
     problems.extend(tmp_checkouts.validate(table))
     problems.extend(scratch_dirs.validate(table))
+    problems.extend(gate_ccache_trim.validate(table))
+    problems.extend(boot_usage.validate(table))
     return problems
 
 
@@ -373,10 +383,80 @@ def tmp_worktrees(repo: pathlib.Path, runner: Runner = subprocess.run,
     return out
 
 
+def normalize_origin(url: str) -> str:
+    """`host/path` for any of git@host:path, ssh://git@host/path and https://host/path.
+
+    Lowercased, with a trailing `.git` and `/` removed, so two clones of one
+    repository compare equal however each was cloned. A local path is kept as
+    a path, normalized the same way.
+    """
+    text = url.strip()
+    for prefix in ("https://", "http://", "ssh://", "git://"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            host, _, rest = text.partition("/")
+            host = host.split("@", 1)[-1]
+            if prefix == "ssh://":
+                host = host.split(":", 1)[0]        # ssh://git@host:22/o/r
+            text = f"{host}/{rest}"
+            break
+    else:
+        head = text.split("/", 1)[0]
+        if ":" in head and "@" in head:          # scp-style git@host:path
+            user_host, path = text.split(":", 1)
+            text = f"{user_host.split('@', 1)[1]}/{path}"
+    text = text.rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-len(".git")]
+    return text.rstrip("/").lower()
+
+
+def origin_of(path: pathlib.Path, runner: Runner) -> str | None:
+    """The normalized origin URL of the repository `path` belongs to, or None."""
+    proc = _git(path, "config", "--get", "remote.origin.url", runner=runner)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return normalize_origin(proc.stdout)
+
+
+def same_origin_worktrees(root: pathlib.Path, origin: str, runner: Runner = subprocess.run
+                          ) -> tuple[list[str], int, list[str], set[str]]:
+    """(matching, children_seen, unreadable, clone_roots) over the children of `root`.
+
+    A child counts when its `.git` is a gitdir file (a worktree) and its
+    repository's origin URL, read through to the common config, equals
+    `origin`. Any clone of the configured repository counts, not only the
+    configured clone: on m5s the worktrees in ~/Code belong to a second clone
+    of Pulp. A child whose URL cannot be read is never counted.
+    """
+    matching: list[str] = []
+    unreadable: list[str] = []
+    clones: set[str] = set()
+    seen = 0
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return matching, seen, unreadable, clones
+    for child in children:
+        if not (child / ".git").is_file():
+            continue
+        seen += 1
+        url = origin_of(child, runner)
+        if url is None:
+            unreadable.append(str(child))
+        elif url == origin:
+            matching.append(str(child))
+            common = _common_dir(child, runner)
+            if common and os.path.basename(common) == ".git":
+                clones.add(os.path.dirname(common))
+    return matching, seen, unreadable, clones
+
+
 def run(*, fix: bool, profile: pathlib.Path | None = None,
         state_dir: pathlib.Path | None = None,
         runner: Runner = subprocess.run, stream: Any = None,
-        reaper: Callable[..., dict[str, Any]] = run_reaper) -> dict[str, Any]:
+        reaper: Callable[..., dict[str, Any]] = run_reaper,
+        discovered_roots: list[pathlib.Path] | None = None) -> dict[str, Any]:
     """One pass of the opt-in Pulp reapers. Never raises, never deletes itself."""
     profile = profile or default_profile_path()
     settings, why = load_settings(profile)
@@ -388,6 +468,11 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         "pressure_free_gb": settings["pressure_free_gb"],
         "worktree_build_idle_hours": settings["worktree_build_idle_hours"], "runs": [],
         "reclaimed_bytes": 0,
+        # Present from the start, so "discovery did not run" reads differently
+        # from "discovery ran and matched nothing".
+        "discovery": {"reason": "not_reached", "roots": [], "children_seen": 0,
+                      "configured_origin": None, "unreadable": [],
+                      "unreadable_children": 0},
     }
     report["worktrees_in_tmp"] = tmp_worktrees(pathlib.Path(settings["repo"]), runner=runner)
     checkout_path = (state_dir or default_state_dir()) / "pulp-reapers"
@@ -434,6 +519,65 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         report["runs"].append(record)
         report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
     report["free_bytes_after"] = free_bytes(root)
+    # Agents do not always create worktrees where the profile says: on m5s on
+    # 2026-10-04, 32 coverage build dirs (~725 GB) in ~/Code worktrees filled
+    # the boot volume while this ran only over the profile's root on another
+    # volume. The cheap coverage reaper therefore also runs, every pass, over
+    # every discovered Code root that holds worktrees of any clone of this
+    # repository. The heavier reaper stays on the configured root.
+    report["outside_profile_roots"] = []
+    configured = os.path.realpath(root)
+    origin = origin_of(pathlib.Path(settings["repo"]), runner)
+    discovery = report["discovery"]
+    discovery.update(reason=None, configured_origin=origin)
+    clones: set[str] = set()
+    if origin is None:
+        # Fail closed and say so: no identity, no pass outside the profile root.
+        discovery["reason"] = "configured_origin_unreadable"
+        discovered_roots = []
+    for extra in discovered_roots or []:
+        resolved = os.path.realpath(extra)
+        if resolved == configured:
+            continue
+        worktrees, seen, unreadable, found = same_origin_worktrees(pathlib.Path(resolved),
+                                                                   origin, runner)
+        discovery["roots"].append(resolved)
+        discovery["children_seen"] += seen
+        discovery["unreadable"] += unreadable
+        discovery["unreadable_children"] += len(unreadable)
+        clones |= found
+        if not worktrees:
+            continue
+        warning = f"worktrees_outside_profile_root root={resolved} count={len(worktrees)}"
+        report["outside_profile_roots"].append({"root": resolved, "count": len(worktrees)})
+        print(f"pulp_reapers: WARNING {warning} (profile worktrees_root={configured})",
+              file=stream or sys.stderr, flush=True)
+        record = reaper(checkout / "tools" / "scripts" / f"{BUILD_COV}.sh", fix=fix,
+                        worktrees_root=resolved, measure_path=pathlib.Path(resolved),
+                        timeout_s=REAPER_TIMEOUT_S[BUILD_COV],
+                        idle_hours=settings["worktree_build_idle_hours"], stream=stream)
+        record["reason"] = "discovered_pulp_root"
+        report["runs"].append(record)
+        report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
+    # A clone's in-repo agent worktrees (.claude/worktrees) are under none of
+    # the roots above: the reaper's own repo root is the materialized checkout,
+    # not any clone. One more run of the same path-based script covers each,
+    # the configured clone's included, where the directory exists.
+    agent_dirs = [(str(pathlib.Path(settings["repo"]) / ".claude" / "worktrees"),
+                   "configured_clone_agent_worktrees")]
+    configured_repo = os.path.realpath(settings["repo"])
+    agent_dirs += [(os.path.join(clone, ".claude", "worktrees"), "discovered_clone_agent_worktrees")
+                   for clone in sorted(clones) if os.path.realpath(clone) != configured_repo]
+    for agent_dir, reason in agent_dirs:
+        if not os.path.isdir(agent_dir):
+            continue
+        record = reaper(checkout / "tools" / "scripts" / f"{BUILD_COV}.sh", fix=fix,
+                        worktrees_root=agent_dir, measure_path=pathlib.Path(agent_dir),
+                        timeout_s=REAPER_TIMEOUT_S[BUILD_COV],
+                        idle_hours=settings["worktree_build_idle_hours"], stream=stream)
+        record["reason"] = reason
+        report["runs"].append(record)
+        report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
     failed = [r["reaper"] for r in report["runs"] if r.get("exit_code") != 0]
     if failed:
         report["error"] = f"reaper(s) did not exit 0: {', '.join(failed)}"

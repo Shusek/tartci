@@ -79,6 +79,12 @@ if [ "$same" != 1 ]; then
   [ "$loaded" = 1 ] && "$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   loaded=0
 fi
-[ "$loaded" = 1 ] || "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$TARGET"
+# A RunAtLoad launch is speculative, and launchd can defer it indefinitely on a
+# busy host (`launchctl print` shows `runs = 0`, `pended nondemand spawn =
+# speculative`). Kickstart makes the first run an on-demand spawn now.
+if [ "$loaded" != 1 ]; then
+  "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$TARGET"
+  "$LAUNCHCTL" kickstart "gui/$(id -u)/$LABEL"
+fi
 "$LAUNCHCTL" print "gui/$(id -u)/$LABEL" >/dev/null
 echo "keychain unlock agent: installed and loaded ($LABEL)"

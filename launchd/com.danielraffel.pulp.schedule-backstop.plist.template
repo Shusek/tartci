@@ -17,20 +17,13 @@
   FAIL OPEN: the crons stay in place. With this agent off, erroring, or its host
   down, the repository behaves exactly as it does without it.
 
-  SAFETY: install on exactly ONE always-on host, dry-run first.
-    1. DRY-RUN (TARTCI_BACKSTOP_APPLY=0) logs what it would dispatch, paced as
-       apply would pace it. Watch the log for a few hours.
-    2. LIVE (TARTCI_BACKSTOP_APPLY=1 and TARTCI_BACKSTOP_AUTHORITY=1) dispatches.
-  Turn it off with `launchctl bootout gui/$(id -u)/com.danielraffel.pulp.schedule-backstop`.
-
-  Install shape:
-
-    mkdir -p "$HOME/Library/Logs"
-    sed -e "s|\$HOME|$HOME|g" \
-      launchd/com.danielraffel.pulp.schedule-backstop.plist.template \
-      > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
-    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.schedule-backstop"
+  SAFETY: installed on exactly ONE always-on host, the one whose fleet
+  profile says `schedule_backstop = "live"` (m3). `tartci setup` renders this
+  template with scripts/install_schedule_backstop_agent.sh, which sets
+  TARTCI_BACKSTOP_APPLY and TARTCI_BACKSTOP_AUTHORITY from the profile ("live"
+  1/1, "dry-run" 0/0, "off" installs nothing). The values below are the
+  dry-run default. Turn it off with
+  `scripts/install_schedule_backstop_agent.sh --uninstall`.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

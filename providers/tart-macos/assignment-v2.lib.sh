@@ -151,7 +151,7 @@ tartci_assignment_v2_tier_demand(){
     --require-label "$tier_label" \
     --min-age-seconds "$min_age" \
     ${count_args[@]+"${count_args[@]}"} \
-    --gh-cli "$GH_CLI" 2>"$error_file"; then
+    --gh-cli "$GH_CLI" </dev/null 2>"$error_file"; then
     rc=0
   else
     rc=$?
@@ -698,10 +698,14 @@ tartci_fallback_decision(){
   fi
   [ "$young" -gt 0 ] || { printf 'none no young demand\n'; return 0; }
   FALLBACK_DEMAND="$young"
+  # stdin from /dev/null: callers run this inside `while read ... done <<<
+  # "$classes"`, and the helper reads peers over ssh. Anything in that chain
+  # that touches stdin consumes the remaining class list and ends the caller's
+  # loop early, so the later classes are never observed.
   line="$(python3 "$TARTCI_ROOT/scripts/gate_supply.py" decide \
     --repo "$REPO" --class "$tier_label" --demand "$young" \
     --peers "$FALLBACK_PEERS" --slot "$SLOT" --state-dir "$STATE_DIR" \
-    --max-age-seconds "$FALLBACK_PEER_MAX_AGE" 2>/dev/null)" || line=""
+    --max-age-seconds "$FALLBACK_PEER_MAX_AGE" </dev/null 2>/dev/null)" || line=""
   case "$line" in
     grant\ *|hold\ *|unknown\ *) printf '%s\n' "$line" ;;
     *) printf 'unknown decision helper failed\n' ;;

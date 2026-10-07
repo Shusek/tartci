@@ -26,6 +26,11 @@ import time
 import unittest
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None  # type: ignore[assignment]
+
 ROOT = Path(__file__).resolve().parents[1]
 CLAIM = ROOT / "scripts/job_claim.py"
 LIB = ROOT / "providers/tart-macos/job-claim.lib.sh"
@@ -64,7 +69,8 @@ class StoreTests(unittest.TestCase):
 
     def acquire(self, claim_id: str, queued: int, *, pid: int | None = None,
                 lower: bool = False, runners: list[dict] | None = None,
-                ttl: int = 1800, labels: str = LABELS, vm: str | None = None) -> tuple[dict, int]:
+                ttl: int = 1800, labels: str = LABELS, vm: str | None = None,
+                peers: list[dict] | None = None) -> tuple[dict, int]:
         argv = [sys.executable, "-B", str(CLAIM), "acquire", "--dir", str(self.dir),
                 "--repo", REPO, "--labels", labels, "--claim-id", claim_id,
                 "--lane", claim_id, "--vm", vm or f"vm-{claim_id}",
@@ -76,6 +82,10 @@ class StoreTests(unittest.TestCase):
             path = self.tmp / f"runners-{claim_id}.jsonl"
             path.write_text("".join(json.dumps(row) + "\n" for row in runners))
             argv += ["--fleet-runners-file", str(path)]
+        if peers is not None:
+            path = self.tmp / f"peers-{claim_id}.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in peers))
+            argv += ["--fleet-claims-file", str(path)]
         proc = subprocess.run(argv, capture_output=True, text=True, check=False)
         return json.loads(proc.stdout), proc.returncode
 
@@ -147,6 +157,217 @@ class StoreTests(unittest.TestCase):
         self.dir = Path("/dev/null/claims")
         result, rc = self.acquire("a", 1)
         self.assertEqual((result["verdict"], rc), ("error", 1))
+
+
+def key(labels: str = LABELS) -> str:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import job_claim  # noqa: PLC0415
+    return job_claim.claim_key(REPO, labels)
+
+
+def peer(host: str, *claims: tuple[str, float], max_age: int | None = None,
+         labels: str = LABELS) -> dict:
+    """One gather-peers line: `host` published these (vm, age_s) claims."""
+    status: dict = {"host": host, "claims": [
+        {"key": key(labels), "vm": vm, "age_s": age} for vm, age in claims]}
+    if max_age is not None:
+        status["max_age_s"] = max_age
+    return {"host": host, "ok": True, "status": status}
+
+
+class FleetPeerTests(StoreTests):
+    """Another host's lane that has claimed but not minted covers the job too."""
+
+    def test_a_peer_claim_covers_the_job(self) -> None:
+        result, rc = self.acquire("a", 1, peers=[peer("m3", ("studio-vm-1", 40))])
+        self.assertEqual((result["verdict"], rc), ("contended", 3))
+        self.assertEqual(result["fleet_booting"], ["studio-vm-1"])
+        self.assertEqual(result["peers_read"], ["m3"])
+
+    def test_the_control_a_second_job_still_boots(self) -> None:
+        self.assertEqual(self.acquire("a", 2, peers=[peer("m3", ("studio-vm-1", 40))])[1], 0)
+
+    def test_another_class_on_a_peer_does_not_count(self) -> None:
+        other = LABELS.replace("pulp-build-pr-head", "pulp-build-merge-group")
+        self.assertEqual(self.acquire("a", 1, peers=[peer("m3", ("vm", 40), labels=other)])[1], 0)
+
+    def test_an_aged_claim_counts_only_within_the_age_its_host_declares(self) -> None:
+        # Undeclared: the consumer default bounds it.
+        self.assertEqual(self.acquire("a", 1, peers=[peer("m1", ("m1-vm", 1200))])[1], 0)
+        self.release("a")
+        # m1 declares 1800 because its lanes wait for a lease after claiming.
+        result, rc = self.acquire("b", 1, peers=[peer("m1", ("m1-vm", 1200), max_age=1800)])
+        self.assertEqual(rc, 3, result)
+        # A declaration can never stretch past the claim TTL.
+        self.assertEqual(self.acquire("c", 1, ttl=1000,
+                                      peers=[peer("m1", ("m1-vm", 1200), max_age=1800)])[1], 0)
+
+    def test_a_claim_dated_in_the_future_does_not_count(self) -> None:
+        # A negative age is clock skew between hosts, not a claim in flight.
+        self.assertEqual(self.acquire("a", 1, peers=[peer("m3", ("studio-vm-1", -5))])[1], 0)
+        self.release("a")
+        # The control: the same claim at age zero stands.
+        self.assertEqual(self.acquire("b", 1, peers=[peer("m3", ("studio-vm-1", 0))])[1], 3)
+
+    def test_a_peer_claim_that_already_minted_is_counted_once(self) -> None:
+        # The runner name IS the VM name (generate-jitconfig name=$vm), so the
+        # same identity appears in both inputs and stands once.
+        idle = {"name": "studio-vm-1", "labels": LABELS.split(",")}
+        result, rc = self.acquire("a", 2, runners=[idle], peers=[peer("m3", ("studio-vm-1", 40))])
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(result["standing_claims"], 1)
+        self.assertEqual(result["fleet_booting"], [])
+
+    def test_unread_or_garbled_peers_count_nothing(self) -> None:
+        stale = peer("m6", ("m6-vm", 10))
+        stale["ok"] = False   # a peer marked unread never counts, whatever it carries
+        rows = [{"host": "m5", "ok": False, "reason": "timeout"},
+                {"host": "m3", "ok": True, "status": "nope"},
+                stale, {"garbage": 1}]
+        result, rc = self.acquire("a", 1, peers=rows)
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(sorted(result["peers_unread"]), ["m3", "m5", "m6"])
+        self.assertEqual(result["fleet_booting"], [])
+        (self.tmp / "broken.jsonl").write_text("not json\n")
+        self.assertEqual(self.acquire("b", 1, peers=None)[1], 3, "local claim a still stands")
+
+    def test_two_hosts_never_both_refuse_one_job(self) -> None:
+        # Each host writes its claim only after reading the other. Every
+        # interleaving of (read A, write A, read B, write B) that keeps each
+        # host's read before its write leaves at least one claimant.
+        orders = [("rA", "wA", "rB", "wB"), ("rA", "rB", "wA", "wB"), ("rA", "rB", "wB", "wA"),
+                  ("rB", "wB", "rA", "wA"), ("rB", "rA", "wB", "wA"), ("rB", "rA", "wA", "wB")]
+        for order in orders:
+            with self.subTest(order=order):
+                stores = {"A": self.tmp / f"A-{'-'.join(order)}", "B": self.tmp / f"B-{'-'.join(order)}"}
+                seen: dict[str, list] = {}
+                verdicts: dict[str, int] = {}
+                for step in order:
+                    host, other = step[1], "B" if step[1] == "A" else "A"
+                    if step[0] == "r":
+                        live = subprocess.run(
+                            [sys.executable, "-B", str(CLAIM), "status", "--dir", str(stores[other])],
+                            capture_output=True, text=True, check=True)
+                        claims = json.loads(live.stdout)["claims"]
+                        seen[host] = [{"host": other, "ok": True, "status": {"claims": claims}}]
+                    else:
+                        self.dir = stores[host]
+                        verdicts[host] = self.acquire(f"lane-{host}", 1, vm=f"vm-{host}",
+                                                      peers=seen[host])[1]
+                self.assertIn(0, verdicts.values(), (order, verdicts))
+
+
+class PeerGatherTests(unittest.TestCase):
+    """gather-peers: every other host, never this one, within a hard budget."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.supply = self.tmp / "supply.json"
+        self.supply.write_text(json.dumps({"hosts": [
+            {"host_id": "m1", "ssh": "m1"}, {"host_id": "studio", "ssh": "m3"},
+            {"host_id": "m5"}, {"host_id": "m5studio", "ssh": "m5s"}]}))
+        self.calls = self.tmp / "ssh-calls"
+        self.ssh = self.tmp / "ssh"
+        good = json.dumps({"host": "x", "claims": [], "max_age_s": None})
+        self.ssh.write_text(
+            "#!/bin/bash\n"
+            f"printf '%s\\n' \"$*\" >> {str(self.calls)!r}\n"
+            "target=\"${@: -2:1}\"\n"
+            f"cat >> {str(self.tmp / 'stdin-seen')!r}\n"
+            "case \"$target\" in\n"
+            f"  m1) echo '{good}' ;;\n"
+            "  m3) sleep 31.731 ;;\n"
+            "  tartci-m5) exit 255 ;;\n"
+            "  m5s) echo 'not json' ;;\n"
+            "esac\n")
+        self.ssh.chmod(0o755)
+
+    def gather(self, me: str, read_secs: float = 1.5) -> tuple[list[dict], float]:
+        out = self.tmp / "peers.jsonl"
+        started = time.monotonic()
+        subprocess.run([sys.executable, "-B", str(CLAIM), "gather-peers", "--out", str(out),
+                        "--self-host", me, "--supply", str(self.supply),
+                        "--read-secs", str(read_secs), "--ssh", str(self.ssh)],
+                       capture_output=True, text=True, check=True, timeout=30)
+        elapsed = time.monotonic() - started
+        return [json.loads(line) for line in out.read_text().splitlines()], elapsed
+
+    def test_never_reads_itself_and_bounds_every_fault(self) -> None:
+        rows, elapsed = self.gather("studio")
+        by = {row["host"]: row for row in rows}
+        self.assertEqual(sorted(by), ["m1", "m5", "m5studio"], "this host is never a peer")
+        self.assertTrue(by["m1"]["ok"])
+        self.assertEqual(by["m5"]["reason"], "exit_255")
+        self.assertEqual(by["m5studio"]["reason"], "unparsable")
+        self.assertNotIn(" m3 ", " " + self.calls.read_text().replace("\n", " ") + " ")
+        self.assertLess(elapsed, 10, "a hung peer must not hold the gather past its budget")
+
+    def test_a_hung_peer_is_killed_at_the_budget(self) -> None:
+        rows, elapsed = self.gather("m1", read_secs=1.0)
+        by = {row["host"]: row for row in rows}
+        self.assertEqual(by["studio"]["reason"], "timeout")
+        self.assertLess(elapsed, 6)
+        time.sleep(0.3)
+        left = subprocess.run(["pgrep", "-f", "sleep 31.731"], capture_output=True, text=True)
+        self.assertEqual(left.stdout.strip(), "", "the straggler's children outlived the budget")
+
+    def test_a_peer_read_never_takes_the_callers_stdin(self) -> None:
+        out = self.tmp / "peers.jsonl"
+        subprocess.run([sys.executable, "-B", str(CLAIM), "gather-peers", "--out", str(out),
+                        "--self-host", "studio", "--supply", str(self.supply),
+                        "--read-secs", "1.5", "--ssh", str(self.ssh)],
+                       input="the rest of the caller's loop\n", capture_output=True,
+                       text=True, check=True, timeout=30)
+        self.assertEqual((self.tmp / "stdin-seen").read_text(), "",
+                         "a peer's ssh drained the caller's stdin")
+        for line in self.calls.read_text().splitlines():
+            self.assertEqual(line.split()[0], "-n", line)
+        lib = (ROOT / "providers" / "tart-macos" / "job-claim.lib.sh").read_text()
+        self.assertIn('</dev/null >/dev/null 2>&1 || : >"$out_file"', lib)
+
+    def test_the_read_is_the_published_status_and_nothing_else(self) -> None:
+        self.gather("studio")
+        for line in self.calls.read_text().splitlines():
+            self.assertIn("BatchMode=yes", line)
+            self.assertTrue(line.endswith("~/.local/bin/tartci job-claim status --publish"), line)
+
+
+class PublishTests(unittest.TestCase):
+    @unittest.skipUnless(tomllib, "the host profile is read with tomllib (Python 3.11+)")
+    def test_status_publishes_live_claims_with_age_host_and_declared_max_age(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        owner = Sleeper()
+        self.addCleanup(owner.stop)
+        subprocess.run([sys.executable, "-B", str(CLAIM), "acquire", "--dir", str(tmp / "c"),
+                        "--repo", REPO, "--labels", LABELS, "--claim-id", "a", "--lane", "a",
+                        "--vm", "vm-a", "--pid", str(owner.pid), "--queued", "1"],
+                       check=True, capture_output=True)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        other = LABELS.replace("pulp-build-pr-head", "pulp-build-merge-group")
+        subprocess.run([sys.executable, "-B", str(CLAIM), "acquire", "--dir", str(tmp / "c"),
+                        "--repo", REPO, "--labels", other, "--claim-id", "b", "--lane", "b",
+                        "--vm", "vm-b", "--pid", str(dead.pid), "--queued", "1"],
+                       check=True, capture_output=True)
+        profile = tmp / "profile.toml"
+        profile.write_text('schema = 1\n[host]\nid = "m1"\njob_claim_max_age_seconds = 1800\n')
+        env = {**os.environ, "TARTCI_FLEET_PROFILE": str(profile)}
+        env.pop("TARTCI_RECEIPT_HOST_ID", None)
+        out = json.loads(subprocess.run(
+            [sys.executable, "-B", str(CLAIM), "status", "--publish", "--dir", str(tmp / "c")],
+            capture_output=True, text=True, check=True, env=env).stdout)
+        self.assertEqual(out["host"], "m1")
+        self.assertEqual(out["max_age_s"], 1800)
+        self.assertEqual([c["vm"] for c in out["claims"]], ["vm-a"], "a dead owner is never published")
+        self.assertEqual(out["claims"][0]["key"], key())
+        self.assertGreaterEqual(out["claims"][0]["age_s"], 0)
+        profile.write_text('schema = 1\n[host]\nid = "m3"\n')
+        out = json.loads(subprocess.run(
+            [sys.executable, "-B", str(CLAIM), "status", "--publish", "--dir", str(tmp / "c")],
+            capture_output=True, text=True, check=True, env=env).stdout)
+        self.assertIsNone(out["max_age_s"], "a host that declares nothing publishes no age")
 
 
 class LibraryTests(unittest.TestCase):
@@ -277,6 +498,60 @@ class LibraryTests(unittest.TestCase):
             + "tartci_job_claim_release\n"
             + f"python3 {str(CLAIM)!r} status --dir \"$TARTCI_JOB_CLAIM_DIR\"\n"))
         self.assertEqual(json.loads(proc.stdout.splitlines()[-1])["claims"], [], proc.stderr)
+
+    def peer_env(self, ssh_body: str) -> dict:
+        supply = self.tmp / "supply.json"
+        supply.write_text(json.dumps({"hosts": [{"host_id": "me", "ssh": "me"},
+                                                {"host_id": "m3", "ssh": "m3"}]}))
+        ssh = self.tmp / "ssh"
+        ssh.write_text("#!/bin/bash\n"
+                       f"printf '%s\\n' \"$*\" >> {str(self.tmp / 'ssh-calls')!r}\n" + ssh_body)
+        ssh.chmod(0o755)
+        return {"TARTCI_JOB_CLAIM_SSH": str(ssh), "TARTCI_JOB_CLAIM_SUPPLY": str(supply),
+                "TARTCI_RECEIPT_HOST_ID": "me", "TARTCI_JOB_CLAIM_FLEET_READ_SECS": "3"}
+
+    def published(self) -> str:
+        return json.dumps({"host": "m3", "max_age_s": None, "claims": [
+            {"key": key(), "vm": "studio-vm-9", "age_s": 30}]})
+
+    def test_a_peer_claim_stops_the_boot_when_the_lane_opted_in(self) -> None:
+        self.gh("exit 0\n")
+        env = {**self.peer_env(f"echo {self.published()!r}\n"), "TARTCI_JOB_CLAIM_FLEET_PEERS": "1"}
+        proc = self.run_bash(self.script(self.acquire_line(), mode="legacy"), env=env)
+        self.assertIn("rc=75 contended=1", proc.stdout, proc.stderr)
+        line = [l for l in self.events.read_text().splitlines() if l.startswith("job_claim_contended")][0]
+        self.assertIn("fleet_booting=1 peers_unread=0", line)
+        calls = (self.tmp / "ssh-calls").read_text()
+        self.assertNotIn(" me ", " " + calls.replace("\n", " ") + " ", "this host never reads itself")
+
+    def test_knob_off_reads_no_peer_at_all(self) -> None:
+        # Negative control: without the lane opting in there is no outbound
+        # read and no fleet_booting, whatever the peers hold.
+        self.gh("exit 0\n")
+        env = self.peer_env(f"echo {self.published()!r}\n")
+        proc = self.run_bash(self.script(self.acquire_line(), mode="legacy"), env=env)
+        self.assertIn("rc=0 contended=0", proc.stdout, proc.stderr)
+        self.assertFalse((self.tmp / "ssh-calls").exists(), "a knob-off lane made an SSH read")
+        self.assertIn("fleet_booting=0", self.events.read_text())
+
+    def test_an_unread_peer_boots_and_is_counted_every_attempt_but_logged_hourly(self) -> None:
+        self.gh("exit 0\n")
+        env = {**self.peer_env("exit 255\n"), "TARTCI_JOB_CLAIM_FLEET_PEERS": "1"}
+        for _ in range(2):
+            proc = self.run_bash(self.script(self.acquire_line() + "tartci_job_claim_release\n",
+                                             mode="legacy"), env=env)
+            self.assertIn("rc=0 contended=0", proc.stdout, proc.stderr)
+        text = self.events.read_text()
+        self.assertEqual(text.count("job_claim_peer_unread\tpeer=m3 reason=exit_255"), 1)
+        self.assertEqual(text.count("peers_unread=1"), 2, "the per-attempt count is on every claim event")
+
+    def test_no_host_identity_reads_no_peer(self) -> None:
+        self.gh("exit 0\n")
+        env = {**self.peer_env(f"echo {self.published()!r}\n"), "TARTCI_JOB_CLAIM_FLEET_PEERS": "1",
+               "TARTCI_RECEIPT_HOST_ID": ""}
+        proc = self.run_bash(self.script(self.acquire_line(), mode="legacy"), env=env)
+        self.assertIn("rc=0 contended=0", proc.stdout, proc.stderr)
+        self.assertFalse((self.tmp / "ssh-calls").exists())
 
     def test_no_queue_count_means_no_claim(self) -> None:
         # --once without tiers passes no count; it boots as before.

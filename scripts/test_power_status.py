@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import subprocess
@@ -120,6 +121,7 @@ class SleepEventTests(Isolated):
 
 
 class ReadinessTests(Isolated):
+    @testing_support.requires_tomllib
     def test_a_host_set_to_sleep_on_ac_is_not_ready(self) -> None:
         import macos_fleet_lanes as fleet
         problem = fleet.idle_sleep_problem(LAPTOP)

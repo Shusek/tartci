@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import json
 import os
 import plistlib
@@ -53,6 +55,7 @@ class FakeSystem(su.System):
         self.peers = {"m1": {"state": "on", "participating": True},
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
+        self.peer_status_errors: dict[str, str] = {}
         self.peer_markers: dict[str, dict] = {}
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
@@ -92,6 +95,11 @@ class FakeSystem(su.System):
         self.settling_code = "heartbeat_missing"
         self.bundle_commit = None      # what the built bundle claims (default: target)
         self.codesign_verify_rc = 0
+        self.agents_check_rc = 0
+        self.agents_rc = 0
+        self.agents_raises = False
+        self.vm_verify_rc = 0
+        self.vm_verify_calls: list[list[str]] = []
         self.installed_after = None    # commit the host executes after install
         self.checked_out = None
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
@@ -168,7 +176,12 @@ class FakeSystem(su.System):
             if "merge-base" in a:
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
-                return ok(self.log_lines)
+                # Honour `base..main` the way git does: commits newer than base.
+                base = next((x.split("..")[0] for x in a if ".." in x), None)
+                lines = self.log_lines.splitlines(keepends=True)
+                cut = next((i for i, line in enumerate(lines) if base and line.startswith(base)),
+                           len(lines))
+                return ok("".join(lines[:cut]))
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
@@ -177,8 +190,15 @@ class FakeSystem(su.System):
                 self.checked_out = a[-1]
             return ok()
         if a[0] == "ssh":
-            peer = a[5]
+            # The target is the first argument that is neither an option nor
+            # an option's value, wherever the options end.
+            i = 1
+            while a[i].startswith("-"):
+                i += 2 if a[i] in ("-o", "-i", "-p") else 1
+            peer = a[i]
             if "pool status" in a[-1]:
+                if peer in self.peer_status_errors:
+                    return su.Result(255, "", self.peer_status_errors[peer])
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
             marker = self.peer_markers.get(peer)
@@ -197,6 +217,9 @@ class FakeSystem(su.System):
                              else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
             return self._render(a)
+        if a[:3] == ["python3", "scripts/support_agents.py", "check-templates"]:
+            return su.Result(self.agents_check_rc, "4 declared agents render" if
+                             self.agents_check_rc == 0 else "reclaim: missing template")
         if a[0] == "codesign" and "--extract-certificates" in joined:
             return ok()
         if a[0] == "codesign" and "--verify" in a:
@@ -310,6 +333,15 @@ class FakeSystem(su.System):
             return ok(json.dumps(self.status_after_on))
         if args[:2] == ["launchd", "guard"]:
             return su.Result(self.guard_rcs[0] if "kickstart" in args[-1] else self.guard_rcs[1])
+        if args[:3] == ["fleet-macos", "support-agents", "auto"]:
+            if self.agents_raises:
+                raise OSError("shim vanished")
+            return su.Result(self.agents_rc, "support agents: ok" if self.agents_rc == 0
+                             else "support agents: drift")
+        if args[:2] == ["vm-dhcp", "verify"]:
+            self.vm_verify_calls.append(list(args))
+            return su.Result(self.vm_verify_rc, '{"action": "verifying"}' if self.vm_verify_rc == 0
+                             else "breaker unreadable")
         raise AssertionError(f"unexpected shim {args}")
 
     def _set_installed(self, commit):
@@ -473,6 +505,86 @@ class SkewTests(Base):
         self.assertIn("UNKNOWN", su.render_skew(None))
 
 
+class SkewAfterApplyTests(Base):
+    """A verified apply records skew for the generation it installed.
+
+    m3, 2026-09-28: skew.json was measured at 05:30:43Z, the update to the
+    newest commit was verified at 05:39Z, and status went on reading "1 commits
+    behind main" because skew.json is otherwise written only before the run.
+    """
+
+    def skew(self) -> dict:
+        return json.loads((self.cfg.state_dir / "skew.json").read_text())
+
+    def test_a_verified_apply_rewrites_skew_for_the_installed_target(self) -> None:
+        self.assertUpdated(self.apply())
+        skew = self.skew()
+        self.assertEqual((skew["installed"], skew["recorded_by"]), (T_OLD, "verified_apply"))
+        # Only the still-soaking commit is ahead now, not the one just installed.
+        self.assertEqual(skew["behind"], 1)
+        steps = [step["step"] for step in json.loads(
+            Path(self.last()["receipt"]).read_text())["steps"]]
+        self.assertIn("skew", steps)
+
+    def test_the_record_does_not_requery_checks(self) -> None:
+        # Verification already proved this generation runs; the record must not
+        # depend on check runs, which can be slow, rate-limited or red later.
+        real, kwargs_seen = su.measure_skew, []
+
+        def spy(*args, **kwargs):
+            kwargs_seen.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(su, "measure_skew", side_effect=spy):
+            self.assertUpdated(self.apply())
+        self.assertEqual(kwargs_seen[-1].get("verify_checks"), False)
+
+    def test_a_failed_skew_record_never_fails_the_update(self) -> None:
+        real, calls = su.measure_skew, []
+
+        def second_call_fails(*args, **kwargs):
+            calls.append(args)
+            if len(calls) > 1:
+                raise OSError("disk")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(su, "measure_skew", side_effect=second_call_fails):
+            self.assertUpdated(self.apply())
+        self.assertEqual(len(calls), 2)
+
+
+class OrchestratorGenerationTests(Base):
+    """Which code ran an update is recorded beside what it installed.
+
+    The installed generation orchestrates; the target's code runs only for
+    support-manifest, validate, install and the template check. So a change to
+    orchestration takes effect one update late, and the receipt must show it.
+    """
+
+    def test_a_receipt_names_the_orchestrating_generation_beside_the_target(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual((receipt["orchestrator_generation"], receipt["target"]),
+                         (INSTALLED, T_OLD))
+        self.assertNotEqual(receipt["orchestrator_generation"], receipt["target"])
+
+    def test_the_generation_is_read_from_the_running_code_path(self) -> None:
+        gen = Path(self.td.name) / ".local/share/tartci-generations" / \
+            f"{'c' * 40}-4757141035587a83" / "scripts"
+        gen.mkdir(parents=True)
+        self.assertEqual(su.orchestrator_generation(gen / "fleet_self_update.py"), "c" * 40)
+        self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
+
+
+class ReserveCheckTests(Base):
+    def test_the_target_is_validated_with_the_gate_reserve_ratchet(self) -> None:
+        self.assertUpdated(self.apply())
+        validates = [a for a, _ in self.sys.calls if a[:3] == ["./tartci", "fleet-macos", "validate"]]
+        self.assertTrue(validates)
+        self.assertTrue(all("--check-reserve" in a for a in validates), validates)
+
+
 class HappyPathTests(Base):
     def test_apply_runs_the_procedure_in_order_and_verifies(self) -> None:
         self.assertEqual(self.apply(), su.EXIT_OK, self.sys.calls[-5:])
@@ -502,6 +614,13 @@ class HappyPathTests(Base):
 
 
 class OneAtATimeTests(Base):
+    def test_peer_authentication_failure_is_named_separately(self) -> None:
+        self.sys.peer_status_errors["m5"] = "Permission denied (publickey)."
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertFalse(peer["readable"])
+        self.assertIn("SSH authentication failed", peer["evidence"])
+        self.assertNotIn("unreachable", peer["evidence"])
+
     def test_peer_draining_refuses_before_any_mutation(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
@@ -1165,7 +1284,8 @@ class SealedTests(Base):
 
     def test_bad_bundle_refuses_before_drain(self) -> None:
         for mutate in (lambda s: setattr(s, "bundle_commit", "9" * 40),
-                       lambda s: setattr(s, "codesign_verify_rc", 1)):
+                       lambda s: setattr(s, "codesign_verify_rc", 1),
+                       lambda s: setattr(s, "agents_check_rc", 3)):
             with self.subTest():
                 self.tearDown()
                 self.setUp()
@@ -1173,6 +1293,22 @@ class SealedTests(Base):
                 self.assertEqual(self.apply(), su.EXIT_REFUSED)
                 self.assertEqual(self.sys.mutations(), [])
                 self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
+
+    def test_support_agents_run_after_verify_and_never_fail_the_update(self) -> None:
+        for mutate in (lambda s: None,
+                       lambda s: setattr(s, "agents_rc", 4),
+                       lambda s: setattr(s, "agents_raises", True)):
+            with self.subTest():
+                self.tearDown()
+                self.setUp()
+                mutate(self.sys)
+                self.assertUpdated(self.apply())
+                steps = json.loads(Path(self.last()["receipt"]).read_text())["steps"]
+                names = [step["step"] for step in steps]
+                self.assertIn("support-agents", names)
+                self.assertLess(names.index("verify"), names.index("support-agents"))
+                agents = next(step for step in steps if step["step"] == "support-agents")
+                self.assertEqual(agents["ok"], self.sys.agents_rc == 0 and not self.sys.agents_raises)
 
     def test_same_sealed_target_can_be_planned_and_applied_again(self) -> None:
         # A previous run's build is left read-only by build_macos_launcher.sh.
@@ -1230,7 +1366,7 @@ class SurfaceTests(Base):
         import macos_fleet_lanes as fleet
         su._write_json(self.cfg.state_dir / "skew.json", {
             "state": "behind", "behind": 3, "oldest_undeployed": "2026-09-23T06:51:41Z",
-            "stale": False, "measured_at": "now"})
+            "stale": False, "measured_at": su._iso(time.time())})
         self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
                          "self_update_current")
         self.assertEqual(fleet_doctor.check_self_update(None).code, "self_update_unmeasured")
@@ -1249,6 +1385,27 @@ class SurfaceTests(Base):
         self.assertIn("self_update=", wd.config_problem(
             {**clean, "self_update": {"problem": "last self-update FAILED"}}))
         self.assertIsNone(wd.config_problem({**clean, "self_update": {"problem": None}}))
+
+
+class VmDhcpVerifyTests(Base):
+    """After the new generation serves, one probe proves the VM network."""
+
+    def test_an_update_asks_the_breaker_to_verify(self):
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.sys.vm_verify_calls, [["vm-dhcp", "verify", "--reason", "self_update"]])
+        steps = {s["step"]: s for s in json.loads(Path(self.last()["receipt"]).read_text())["steps"]}
+        self.assertTrue(steps["vm-dhcp-verify"]["ok"])
+
+    def test_a_failed_verify_never_fails_the_update(self):
+        self.sys.vm_verify_rc = 1
+        self.assertUpdated(self.apply())
+        steps = {s["step"]: s for s in json.loads(Path(self.last()["receipt"]).read_text())["steps"]}
+        self.assertFalse(steps["vm-dhcp-verify"]["ok"])
+
+    def test_a_refused_update_never_verifies(self):
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.apply()
+        self.assertEqual(self.sys.vm_verify_calls, [])
 
 
 class AgentTemplateTests(unittest.TestCase):

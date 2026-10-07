@@ -515,6 +515,7 @@ def run_peer(host: str, target: str, args: argparse.Namespace, until: float) -> 
         source = f.read()
     remote = ["python3", "-", "--json", "--host-label", host, "--range", f"{args.range}s",
               "--until", fmt_ts(until), "--default-poll", str(args.default_poll)]
+    # ssh-stdin: this script's own source is piped in (input=) for `python3 -`
     cmd = [args.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
            " ".join(remote)]
     try:

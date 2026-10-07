@@ -84,6 +84,10 @@ def run(helper: dict, profile: dict, timeout_seconds: float | None = None) -> di
             if result.returncode != 0:
                 fail("launch helper volume probe could not bootstrap")
             bootstrapped = True
+            # A RunAtLoad launch is speculative and launchd can defer it
+            # indefinitely on a busy host; kickstart makes it on-demand.
+            subprocess.run(["launchctl", "kickstart", target], text=True,
+                           capture_output=True, check=False, timeout=5)
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
                 result = subprocess.run(
