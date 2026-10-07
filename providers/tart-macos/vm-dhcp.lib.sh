@@ -16,6 +16,9 @@ VM_DHCP_BACKOFF=0
 VM_DHCP_PROBE=0
 
 tartci_vm_dhcp_enabled(){
+  # Prepared drivers prove readiness through their own transport. Their
+  # Softnet boots do not produce this native DHCP probe's ip/no_ip receipts.
+  [ -z "${GUEST_DRIVER:-}" ] || return 1
   [ "${TARTCI_VM_DHCP_BREAKER:-1}" = 1 ]
 }
 

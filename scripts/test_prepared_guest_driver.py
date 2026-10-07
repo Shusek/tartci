@@ -12,7 +12,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 
 class PreparedGuestDriverTests(unittest.TestCase):
-    def execute(self,provider,fail=False,github=False,drain=False,lease_budget=False,delayed_delete=False,admission=None,pool_drain=False):
+    def execute(self,provider,fail=False,github=False,drain=False,lease_budget=False,delayed_delete=False,admission=None,pool_drain=False,dhcp_verifying=False):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);bin=root/'bin';bin.mkdir();(root/'vms').mkdir()
             driver=bin/'driver'
@@ -59,6 +59,7 @@ elif a[0]=='list':
                 if name=='qemu-system-aarch64':text='#!/bin/bash\nexec sleep 300\n'
                 elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json,os\nfrom pathlib import Path\nwith (Path(os.environ['FIXTURE'])/'gh-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif sys.argv[1:2]==['api'] and sys.argv[-1].startswith('repos/') and sys.argv[-1].count('/')==2:print(json.dumps({'private':True,'visibility':'private'}))\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
                 elif name=='fake-gh':text='#!/bin/bash\necho unexpected-gh >&2; exit 99\n'
+                elif name=='ssh':text='#!/usr/bin/env python3\nimport os,json,sys\nfrom pathlib import Path\nwith (Path(os.environ["FIXTURE"])/"ssh-calls").open("a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n'
                 else:text='#!/bin/bash\nexit 0\n'
                 script.write_text(text);script.chmod(0o700)
             for file in ['golden.qcow2','firmware.fd','vars.fd']:(root/file).touch()
@@ -72,6 +73,12 @@ elif a[0]=='list':
                  'TARTCI_MACOS_VM_CORES':'4','TARTCI_MACOS_VM_MEM_MB':'8192','TARTCI_WIN_CPUS':'2',
                  'TARTCI_WIN_PROXY_COMMAND':'/usr/bin/true','TARTCI_RUNNER_IDLE_TIMEOUT_SECS':'4','TARTCI_TEARDOWN_STEP_TIMEOUT_SECS':'1','TARTCI_JOB_TIMEOUT_SECS':'10'}
             if provider=='tart-macos':env['TARTCI_RUNNER_VERSION']='2.337.0'
+            if dhcp_verifying:
+                breaker=root/'dhcp';breaker.mkdir()
+                breaker_before={'state':'verifying','streak':[],'boot_time':1,
+                                'probe_lane':'native-lane','probe_started_at':time.time()}
+                (breaker/'breaker.json').write_text(json.dumps(breaker_before))
+                env.update(TARTCI_VM_DHCP_DIR=str(breaker),TARTCI_VM_DHCP_BOOT_TIME='1')
             if pool_drain:env.update(DRAIN_DURING_PREFLIGHT='1',TARTCI_POOL_STATE_FILE=str(root/'pool-state'))
             if admission:
                 shipyard=bin/'fake-shipyard'
@@ -134,6 +141,9 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
                 boot=next(c for c in tart_calls if c[0]=='run')
                 self.assertIn('--net-softnet',boot)
                 self.assertFalse(any(c.startswith('--dir') for c in boot))
+            if dhcp_verifying:
+                self.assertEqual(json.loads((breaker/'breaker.json').read_text()),breaker_before)
+                self.assertFalse((root/'ssh-calls').exists())
 
     def test_macos_success_and_failure_cleanup(self):
         for fail in (False,True):
@@ -151,6 +161,12 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
 
     def test_macos_github_jit_fixture_and_cleanup(self):
         self.execute('tart-macos',github=True)
+
+    def test_prepared_local_guest_ignores_native_dhcp_probe_and_direct_ssh(self):
+        self.execute('tart-macos',dhcp_verifying=True)
+
+    def test_prepared_jit_guest_ignores_native_dhcp_probe_and_direct_ssh(self):
+        self.execute('tart-macos',github=True,dhcp_verifying=True)
 
     def test_windows_github_jit_fixture_and_cleanup(self):
         self.execute('qemu-windows',github=True)

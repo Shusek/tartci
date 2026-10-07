@@ -34,6 +34,30 @@ still needs a real GitHub job, drain and restart-recovery check before activatio
 
 ## Upstream changes reviewed for this update
 
+The 2026-10-07 synchronization includes upstream through
+`09e70b721dd7f5f9fcd76d021e04140d0acec06c` (PR #425): 207 commits and 169 changed
+files since the previous `74153a1` snapshot. It adds bounded launchd recovery,
+VM deletion evidence, DHCP diagnostics and a boot breaker, peer boot claims,
+home-volume pressure reporting, cache/worktree maintenance, Python 3.9 test
+coverage, and hardened disposable Windows/QEMU validation. Windows Skia and
+Proxmox proof support target Pulp; they do not change Suvio's GraalVM profile.
+
+The merge preserves the fork's prepared-driver lifecycle, explicit resource
+budgets, queue and runner-group admission, stdin credential transport, cache
+isolation and Softnet configuration. Three textual conflicts were resolved by
+keeping those changes alongside the new diagnostic and interpreter helpers.
+Prepared drivers bypass the native DHCP breaker and direct SSH spawn diagnostics:
+their Softnet readiness and diagnostic endpoint belong to the protected driver,
+and they do not publish native DHCP probe receipts. Regression tests prove that
+both local and JIT jobs still complete and dispose their VM when a native DHCP
+probe is occupied, without changing its state or issuing direct SSH commands.
+
+This synchronization changes the fork source. The installed Suvio service
+remains pinned to `ac966b479e926e0cdb5133c52be884c19a2ab7db`; deployment of a newer
+generation requires a separate private-host canary, job drain and teardown check.
+
+### Initial review
+
 From PR #337 (`d254cf8`) to PR #355 (`d7dba4d`), upstream added 55 commits
 (including merges), changing 41 files. The main changes are:
 

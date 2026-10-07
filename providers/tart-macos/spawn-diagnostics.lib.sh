@@ -32,6 +32,9 @@ tartci_spawn_diag_guest(){
 # Prints nothing and returns 0 when there is none; never fails the caller.
 tartci_capture_guest_spawn_errors(){
   local vm="$1" ip="$2" errors dir file raw rc=0 bytes
+  # The prepared-driver endpoint can be a VM name, not an SSH address. Its
+  # collect operation owns diagnostics and the protected guest transport.
+  [ -z "${GUEST_DRIVER:-}" ] || return 0
   [ -n "$ip" ] || return 0
   errors="$(tartci_spawn_diag_guest "$ip" "$TARTCI_SPAWN_DIAG_PROBE_TIMEOUT" spawn-diag-probe \
     "grep -h -F '$TARTCI_SPAWN_ERROR_PATTERN' \"\$HOME\"/actions-runner/_diag/Worker_*.log 2>/dev/null | tail -n 20" \
