@@ -37,6 +37,7 @@ REF=""; BUILD_TYPE="Release"; SMOKE=0; KEEP=0
 # pass a fuller exclude (e.g. the CI `validation|slow` + an --exclude-regex) via
 # PULP_CTEST_ARGS/--ctest-args, quoting the regex so cmd.exe doesn't pipe on `|`.
 CTEST_ARGS="${PULP_CTEST_ARGS:---output-on-failure --label-exclude validation}"
+CTEST_JOBS="${TARTCI_WIN_CTEST_JOBS:-${PULP_CTEST_JOBS:-4}}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -55,6 +56,11 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+case "$CTEST_JOBS" in
+  ''|*[!0-9]*) die "invalid TARTCI_WIN_CTEST_JOBS='$CTEST_JOBS'";;
+esac
+[ "$CTEST_JOBS" -gt 0 ] || die "TARTCI_WIN_CTEST_JOBS must be greater than zero"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
 
@@ -114,8 +120,31 @@ note "vm $JOB up — $(wsh 'cmd /c ver' 2>/dev/null | tr -d "\r")"
 
 if [ "$SMOKE" = 1 ]; then
   note "smoke: toolchain probe"
-  wsh 'where cmake & where ninja & where git & where python' 2>&1 | tr -d '\r'
-  note "smoke OK (overlay boot + SSH + toolchain reachable)"
+  # A Windows `where a & where b` chain returns the status of the final
+  # command, so the old probe could report success with missing tools.  Probe
+  # every required tool and the architecture-specific MSVC environment, then
+  # fail closed if any component is absent.
+  PS_SMOKE='$ErrorActionPreference = "Stop"
+$required = @("cmake", "ninja", "git", "python")
+foreach ($name in $required) {
+  $cmd = Get-Command $name -ErrorAction SilentlyContinue
+  if (-not $cmd) { throw "required tool missing: $name" }
+  Write-Output ("{0}: {1}" -f $name, $cmd.Source)
+}
+$vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
+if (-not $vcv) { throw "no vcvarsall.bat under BuildTools" }
+$probe = cmd /c "`"$vcv`" arm64 && where cl && cl 2>&1"
+if ($LASTEXITCODE -ne 0) { throw "MSVC arm64 probe failed (exit $LASTEXITCODE)" }
+$probe | ForEach-Object { Write-Output $_ }
+Write-Output "vcvarsall: $vcv"
+Write-Output "smoke: required Windows ARM64 toolchain is present"'
+  ENC="$(printf '%s' "$PS_SMOKE" | iconv -t UTF-16LE | base64)"
+  set +e
+  wsh "powershell -NoProfile -EncodedCommand $ENC" 2>&1 | tr -d '\r'
+  RC=${PIPESTATUS[0]}
+  set -e
+  [ "$RC" -eq 0 ] || die "smoke toolchain probe failed (exit $RC)"
+  note "smoke OK (overlay boot + complete ARM64 toolchain probe)"
   exit 0
 fi
 
@@ -142,8 +171,13 @@ note "build + ctest (Release, GPU off) via MSVC arm64 — the long step"
 PS_BUILD='$ProgressPreference = "SilentlyContinue"
 $vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
 if (-not $vcv) { Write-Error "no vcvarsall.bat under BuildTools"; exit 1 }
-cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU=OFF && cmake --build build && ctest --test-dir build '"$CTEST_ARGS"'"
-exit $LASTEXITCODE'
+cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU=OFF && cmake --build build && ctest --test-dir build --parallel '"$CTEST_JOBS"' '"$CTEST_ARGS"' > C:\tmp\tartci-ctest.log 2>&1"
+$rc = $LASTEXITCODE
+if (Test-Path "C:\tmp\tartci-ctest.log") {
+  Write-Output "--- ctest tail (C:\\tmp\\tartci-ctest.log) ---"
+  Get-Content "C:\tmp\tartci-ctest.log" -Tail 240
+}
+exit $rc'
 ENC="$(printf '%s' "$PS_BUILD" | iconv -t UTF-16LE | base64)"
 set +e
 wsh "powershell -NoProfile -EncodedCommand $ENC"
