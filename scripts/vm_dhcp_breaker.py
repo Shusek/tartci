@@ -54,6 +54,12 @@ One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
   of 5215 boots over the 30 days before. TARTCI_VM_DHCP_VERIFY_SECS
   overrides it.
 
+Someone is told: the launchd watchdog's 300 s pass (scripts/vm_boot_alert.py)
+opens one GitHub issue per outage when `alert_due` here says so (a post-boot no_ip at once;
+open PROBE_SECS with a failed probe or no probe at all; two consecutive
+unreported probes), names the host, the doctor command and the remedy, and
+closes it when a VM gets an address.
+
 The trade is explicit: an outage now costs about one VM per PROBE_SECS
 instead of one per lane every 2-4 min, and recovery is noticed within
 PROBE_SECS plus a boot instead of within minutes.
@@ -386,7 +392,9 @@ def open_breaker(value: dict[str, Any], now: float, *, streak: list[dict[str, An
                   "probes": 0, "last_probe_at": now, "chain": chain(),
                   "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None,
                   "probe_requested_at": None, "probe_lane": None, "streak": streak,
-                  "cause": cause})
+                  "cause": cause, "failed_probes": 0,
+                  "consecutive_unreported": 1 if cause == "probe_unreported" else 0,
+                  "alert_now": bool(extra and extra.get("alert") == "now")})
     return ["vm_dhcp_unanswered", fmt({
         "streak": len(streak), "window_s": int(now - first),
         "lanes": ",".join(sorted({str(r.get("lane")) for r in streak})),
@@ -451,6 +459,8 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
             if not isinstance(seen, dict) or moved:
                 save(path, value)
             return {"action": "backoff", "events": events}
+        if value.get("probe_lane"):
+            value["consecutive_unreported"] = int(value.get("consecutive_unreported") or 0) + 1
         value["last_probe_at"] = now
         value["probe_lane"] = args.lane
         value["probes"] = int(value.get("probes") or 0) + 1
@@ -476,6 +486,7 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
             events.append(["vm_dhcp_probe", fmt({"lane": args.lane, "vm": args.vm,
                                                  "result": args.outcome})])
             value["probe_lane"] = None
+            value["consecutive_unreported"] = 0
         if args.outcome == "ip":
             if verifying:
                 events.append(["vm_dhcp_verified", fmt({
@@ -506,6 +517,8 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
             return {"action": "recorded", "events": events}
         if value.get("state") == "open":
             value["vms_spent"] = int(value.get("vms_spent") or 0) + 1
+            if probe:
+                value["failed_probes"] = int(value.get("failed_probes") or 0) + 1
             save(path, value)
             return {"action": "recorded", "events": events}
         streak = [row for row in value.get("streak") or []
@@ -544,6 +557,89 @@ def probe_now(now: float | None = None) -> dict[str, Any]:
         return {"action": "requested", "events": [["vm_dhcp_probe_requested", fmt({
             "open_s": int(now - float(value.get("opened_at") or now)),
             "cause": value.get("cause")})]]}
+
+
+def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
+    """(state, code, detail) for `tartci doctor fleet` and the outage alert:
+    "ok" | "problem" | "unknown", most fundamental failing layer first."""
+    if value.get("state") == "open":
+        opened = value.get("opened_at")
+        spent = (f"no lane clones except one probe every 300 s (open since {opened}, "
+                 f"{value.get('vms_spent')} VMs spent, {value.get('probes')} probes)")
+        # Most fundamental layer first: the cause read while the last VM that
+        # got no address was still up, then bootpd's live launchd state.
+        cause = value.get("cause")
+        pfd = value.get("pfd") or {}
+        if cause == "pfd_crash_loop" or (cause == "vm_network_missing"
+                                         and pfd_crash_looping(pfd)):
+            return ("problem", "vm_dhcp_pfd_crash_loop",
+                    "VM DHCP is not answering because pfd keeps exiting (state "
+                    f"{pfd.get('state')}, last exit {pfd.get('last_exit')}, "
+                    f"{pfd.get('runs')} runs), so InternetSharing never creates the VM "
+                    "network: " + spent)
+        if cause == "vm_network_missing":
+            return ("problem", "vm_dhcp_vm_network_missing",
+                    "VM DHCP is not answering because the VM network was never created "
+                    "(no bridge100 while a VM ran: InternetSharing is not answering): "
+                    + spent)
+        if (value.get("bootpd") or {}).get("loaded") is False or cause == "bootpd_not_loaded":
+            return ("problem", "vm_dhcp_bootpd_not_loaded",
+                    "VM DHCP is not answering because launchd has no bootpd job loaded "
+                    "(a bootpd kickstart cannot work until it is loaded): " + spent)
+        if cause == "dhcp_config_disabled":
+            return ("problem", "vm_dhcp_config_disabled",
+                    "VM DHCP is not answering because /etc/bootpd.plist does not enable "
+                    "DHCP on the VM network while a VM ran: " + spent)
+        return ("problem", "vm_dhcp_unanswered",
+                "VM DHCP is not answering on this host: no lane clones except one probe "
+                f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "
+                f"{value.get('probes')} probes)")
+    if value.get("state") == "verifying":
+        since = value.get("verifying_since")
+        held = (f"{int(time.time() - float(since))}s" if isinstance(since, (int, float))
+                else "an unknown time")
+        lane = value.get("probe_lane")
+        probing = (f"a probe is in flight on {lane}" if lane
+                   else "no lane has probed yet")
+        was = value.get("previous_cause")
+        return ("ok", "vm_dhcp_verifying",
+                f"proving the VM network after {value.get('verify_reason')} for {held}; "
+                f"{probing}; other lanes wait" + (f"; was open with {was}" if was else ""))
+    if value.get("state") == "closed":
+        return ("ok", "vm_dhcp_ok", "VM DHCP breaker closed")
+    return ("unknown", "vm_dhcp_unreadable",
+            f"VM DHCP breaker unreadable: {value.get('error')}")
+
+
+def alert_due(value: dict[str, Any], now: float,
+              probe_secs: int = PROBE_SECS) -> tuple[bool, str]:
+    """Whether an open breaker is an outage someone must be told about now.
+
+    Pure: no I/O. Due when the breaker is open and
+      (a) a post-boot probe got no address (`alert_now`); or
+      (b) it has been open PROBE_SECS and a probe has failed since, or no
+          probe has been granted at all (an idle host: the two no_ips that
+          opened it are the evidence, and silence would last forever); a
+          probe still in flight is waited for; or
+      (c) it opened on an unreported probe and a second consecutive probe has
+          gone unreported. One unreported probe alone is a slow boot.
+    Closed and verifying never are.
+    """
+    if value.get("state") != "open":
+        return False, ""
+    if value.get("alert_now"):
+        return True, "a post-boot probe got no address"
+    if value.get("cause") == "probe_unreported":
+        if int(value.get("consecutive_unreported") or 0) >= 2:
+            return True, "two consecutive probes never reported"
+        return False, ""
+    if now - float(value.get("opened_at") or now) < probe_secs:
+        return False, ""
+    if int(value.get("failed_probes") or 0) >= 1:
+        return True, "a probe got no address"
+    if not int(value.get("probes") or 0) and not value.get("probe_lane"):
+        return True, "no lane has probed since it opened"
+    return False, ""
 
 
 def status(directory: pathlib.Path | None = None) -> dict[str, Any]:

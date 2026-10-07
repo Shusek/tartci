@@ -1126,58 +1126,12 @@ def check_lane_python(value: dict | None) -> Finding:
 
 
 def check_vm_dhcp(value: dict | None) -> Finding:
-    """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py)."""
+    """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py owns its codes)."""
+    import vm_dhcp_breaker  # noqa: PLC0415 - sibling module; owns the codes
     value = value or {"state": "unreadable", "error": "no status"}
-    facts = {"vm_dhcp": value}
-    if value.get("state") == "open":
-        opened = value.get("opened_at")
-        spent = (f"no lane clones except one probe every 300 s (open since {opened}, "
-                 f"{value.get('vms_spent')} VMs spent, {value.get('probes')} probes)")
-        # Most fundamental layer first: the cause read while the last VM that
-        # got no address was still up, then bootpd's live launchd state.
-        cause = value.get("cause")
-        import vm_dhcp_breaker  # noqa: PLC0415 - owns the pfd crash-loop rule
-        pfd = value.get("pfd") or {}
-        if cause == "pfd_crash_loop" or (cause == "vm_network_missing"
-                                         and vm_dhcp_breaker.pfd_crash_looping(pfd)):
-            return Finding("vm_dhcp", PROBLEM, "vm_dhcp_pfd_crash_loop",
-                           "VM DHCP is not answering because pfd keeps exiting (state "
-                           f"{pfd.get('state')}, last exit {pfd.get('last_exit')}, "
-                           f"{pfd.get('runs')} runs), so InternetSharing never creates the VM "
-                           "network: " + spent, facts)
-        if cause == "vm_network_missing":
-            return Finding("vm_dhcp", PROBLEM, "vm_dhcp_vm_network_missing",
-                           "VM DHCP is not answering because the VM network was never created "
-                           "(no bridge100 while a VM ran: InternetSharing is not answering): "
-                           + spent, facts)
-        if (value.get("bootpd") or {}).get("loaded") is False or cause == "bootpd_not_loaded":
-            return Finding("vm_dhcp", PROBLEM, "vm_dhcp_bootpd_not_loaded",
-                           "VM DHCP is not answering because launchd has no bootpd job loaded "
-                           "(a bootpd kickstart cannot work until it is loaded): " + spent, facts)
-        if cause == "dhcp_config_disabled":
-            return Finding("vm_dhcp", PROBLEM, "vm_dhcp_config_disabled",
-                           "VM DHCP is not answering because /etc/bootpd.plist does not enable "
-                           "DHCP on the VM network while a VM ran: " + spent, facts)
-        return Finding("vm_dhcp", PROBLEM, "vm_dhcp_unanswered",
-                       "VM DHCP is not answering on this host: no lane clones except one probe "
-                       f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "
-                       f"{value.get('probes')} probes)", facts)
-    if value.get("state") == "verifying":
-        since = value.get("verifying_since")
-        held = (f"{int(time.time() - float(since))}s" if isinstance(since, (int, float))
-                else "an unknown time")
-        lane = value.get("probe_lane")
-        probing = (f"a probe is in flight on {lane}" if lane
-                   else "no lane has probed yet")
-        was = value.get("previous_cause")
-        return Finding("vm_dhcp", OK, "vm_dhcp_verifying",
-                       f"proving the VM network after {value.get('verify_reason')} for {held}; "
-                       f"{probing}; other lanes wait" + (f"; was open with {was}" if was else ""),
-                       facts)
-    if value.get("state") == "closed":
-        return Finding("vm_dhcp", OK, "vm_dhcp_ok", "VM DHCP breaker closed", facts)
-    return Finding("vm_dhcp", UNKNOWN, "vm_dhcp_unreadable",
-                   f"VM DHCP breaker unreadable: {value.get('error')}", facts)
+    state, code, detail = vm_dhcp_breaker.doctor_code(value)
+    return Finding("vm_dhcp", {"ok": OK, "problem": PROBLEM}.get(state, UNKNOWN), code, detail,
+                   {"vm_dhcp": value})
 
 
 def check_peer_reachability(value: dict | None) -> Finding:

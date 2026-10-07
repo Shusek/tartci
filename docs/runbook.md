@@ -1701,6 +1701,24 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   this change) gives clone_start to address directly; before it, clone_start
   to `boot_ok`, which also counts SSH and the JIT mint, passed 960 s in 5 of
   5215 boots over 30 days.
+- **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
+  `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
+  the same once-per-episode path as a host left OFF, closed when a VM gets an
+  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
+  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
+  fleet_reasons, so it is usable from a phone notification. It is raised when
+  the breaker is open and:
+  - a post-boot probe got no address (`alert=now`): within one pass, at most
+    300 s;
+  - it has been open 300 s and a probe failed since, or no lane has probed at
+    all (an idle host would otherwise stay silent): about 14 min after it
+    opens;
+  - two consecutive probes never reported. One unreported probe is a slow
+    boot and raises nothing; neither does a closed or `verifying` breaker.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
+  breaker's `events.jsonl`. `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the
+  watchdog's WARN line but opens no issue.
 - **Fails open:** an unreadable breaker reads as closed and never verifies.
   Writes are atomic under a lock.
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
