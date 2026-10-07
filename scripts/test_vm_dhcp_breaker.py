@@ -467,6 +467,27 @@ class PfdLayer(Case):
         self.assertEqual(finding.code, "vm_dhcp_pfd_crash_loop")
         self.assertIn("last exit 3", finding.detail)
 
+    def test_pfd_not_loaded_reads_as_unknown_not_crash_looping(self):
+        # launchctl print exits 113 for a job launchd does not have: the pfd
+        # read is empty, so the layer above it is reported, never pfd.
+        path = self.tmp / "launchctl"
+        body = path.read_text().replace(
+            f"case \"$2\" in *com.apple.pfd) cat {str(self.pfd)!r}; exit 0 ;; esac",
+            "case \"$2\" in *com.apple.pfd) echo 'Could not find service' >&2; exit 113 ;; esac")
+        self.assertNotEqual(body, path.read_text())
+        path.write_text(body)
+        self.assertEqual(vb.pfd_readout(), {})
+        self.ifaces.write_text("lo0 en0")
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 300)
+        self.assertEqual(self.state()["cause"], "vm_network_missing")
+        self.assertEqual(fleet_doctor.check_vm_dhcp(self.state()).code, "vm_dhcp_vm_network_missing")
+
+    def test_a_healthy_pfd_reads_as_running(self):
+        self.assertEqual(vb.pfd_readout(), {"state": "running", "runs": 1,
+                                            "last_exit": "(never exited)"})
+        self.assertFalse(vb.pfd_crash_looping(vb.pfd_readout()))
+
     def test_pfd_runs_climbing_alone_never_triggers_a_probe(self):
         self.pfd.write_text(self.CRASHING)
         self.record("no_ip", T0)
