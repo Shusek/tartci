@@ -39,9 +39,12 @@ lane PATH falls through to /usr/bin/python3 must still stop cloning.
 
 Every `no_ip`, read while that VM is still up, also records which layer
 failed (`cause`), most fundamental first:
+  pfd_crash_loop      no bridge100 and pfd (the packet-filter daemon that
+                      InternetSharing waits on) keeps exiting non-zero: m5
+                      on 2026-10-07, exit 3 every 10 s since boot
   vm_network_missing  no bridge100 exists: InternetSharing (vmnet shared
                       mode) never created the VM network, so bootpd has
-                      nothing to serve (m5, 2026-10-07)
+                      nothing to serve
   bootpd_not_loaded   launchd has no bootpd job (`launchctl print` exit 113)
   dhcp_config_disabled  the network exists but /etc/bootpd.plist does not
                       enable DHCP on it
@@ -237,14 +240,49 @@ def sharing_pid() -> int | None:
     return None
 
 
+def pfd_readout() -> dict[str, Any]:
+    """pfd's launchd state (com.apple.pfd), readable without root; {} when unreadable."""
+    launchctl = os.environ.get("TARTCI_VM_DHCP_LAUNCHCTL", "launchctl")
+    try:
+        proc = subprocess.run([launchctl, "print", "system/com.apple.pfd"],
+                              capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, Any] = {}
+    for line in proc.stdout.splitlines():
+        key, sep, value = line.strip().partition(" = ")
+        if not sep:
+            continue
+        if key == "state" and "state" not in out:
+            out["state"] = value.strip()
+        elif key == "runs":
+            try:
+                out["runs"] = int(value.strip())
+            except ValueError:
+                pass
+        elif key == "last exit code":
+            out["last_exit"] = value.strip()
+    return out
+
+
+def pfd_crash_looping(pfd: dict[str, Any]) -> bool:
+    """Not running, and its last run ended non-zero. A healthy pfd is running
+    or last exited 0 (its idle exit); "(never exited)" is not an exit."""
+    last = str(pfd.get("last_exit") or "")
+    return (bool(pfd) and pfd.get("state") != "running"
+            and last.lstrip("-").isdigit() and int(last) != 0)
+
+
 def diagnose(net: dict[str, Any], bootpd: dict[str, Any],
-             config: dict[str, Any]) -> str:
+             config: dict[str, Any], pfd: dict[str, Any] | None = None) -> str:
     """Which layer failed, read while a VM that got no address is still up."""
     if not net:
         return "unknown"
     bridges = net.get("bridges") or []
     if not bridges:
-        return "vm_network_missing"
+        return "pfd_crash_loop" if pfd_crash_looping(pfd or {}) else "vm_network_missing"
     if bootpd.get("loaded") is False:
         return "bootpd_not_loaded"
     if config.get("present") is False or (
@@ -255,11 +293,16 @@ def diagnose(net: dict[str, Any], bootpd: dict[str, Any],
 
 def chain() -> dict[str, Any]:
     """What an operator's fix changes: compared between looks, a difference
-    triggers a probe at once. Every part is readable without root."""
+    triggers a probe at once. Every part is readable without root. pfd's run
+    count is left out on purpose: a crash-looping pfd bumps it every 10 s,
+    which would make every look a probe; its state and last exit change
+    exactly when it is fixed."""
     bootpd = bootpd_readout()
     config = bootpd_config_readout()
+    pfd = pfd_readout()
     return {"bootpd_loaded": bootpd.get("loaded"), "bootpd_runs": bootpd.get("runs"),
-            "config_mtime": config.get("mtime"), "sharing_pid": sharing_pid()}
+            "config_mtime": config.get("mtime"), "sharing_pid": sharing_pid(),
+            "pfd_state": pfd.get("state"), "pfd_last_exit": pfd.get("last_exit")}
 
 
 def fmt(fields: dict[str, Any]) -> str:
@@ -347,7 +390,7 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
             return {"action": "recorded", "events": events}
         # no_ip: read which layer failed while this VM is still up.
         readout = bootpd_readout()
-        cause = diagnose(vm_network_readout(), readout, bootpd_config_readout())
+        cause = diagnose(vm_network_readout(), readout, bootpd_config_readout(), pfd_readout())
         value["cause"], value["cause_at"] = cause, now
         if probe:
             events[-1][1] += f" cause={cause}"
@@ -410,6 +453,7 @@ def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
         return {"state": "unreadable", "error": "unexpected breaker shape"}
     if value.get("state") == "open":
         value["bootpd"] = bootpd_readout()
+        value["pfd"] = pfd_readout()
     return value
 
 

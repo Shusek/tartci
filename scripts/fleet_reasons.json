@@ -483,8 +483,8 @@
     },
     "vm_dhcp_vm_network_missing": {
       "summary": "VMs on this host stopped getting an address because the VM network itself was never created: no bridge100 existed while a VM ran.",
-      "why": "Tart's NAT network is vmnet shared mode, which InternetSharing (com.apple.NetworkSharing) creates per VM as bridge100 and then configures bootpd for. On m5 on 2026-10-07 InternetSharing had been running since boot but never answered a VM's request (each VM logged \"xpc send -> client create\" and got nothing back), so no bridge100 appeared and bootpd had no subnet to serve. A healthy host answers each VM with \"netrbCreateInterface: VM interface create submitted\". This layer comes before bootpd: no bootpd step can help until it is fixed.",
-      "remedy": "On the host, as root (tartci never runs it): 1) `sudo killall InternetSharing`; launchd starts it again on the next VM's request (SIP blocks a launchctl kickstart of the job, not a signal to its process); 2) or turn Internet Sharing off and on in System Settings > General > Sharing; 3) or reboot. Then `tartci vm-dhcp probe-now` and check that the probe VM brings up bridge100 (`ifconfig -l`). Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
+      "why": "Tart's NAT network is vmnet shared mode, which InternetSharing (com.apple.NetworkSharing) creates per VM as bridge100 and then configures bootpd for. On m5 on 2026-10-07 InternetSharing never answered a VM's request (each VM logged \"xpc send -> client create\" and got nothing back), so no bridge100 appeared and bootpd had nothing to serve; restarting the InternetSharing process did not bring it back. A healthy host answers each VM with \"netrbCreateInterface: VM interface create submitted\". This layer comes before bootpd: no bootpd step can help until it is fixed.",
+      "remedy": "On the host (tartci never runs it): No verified remedy yet; run `tartci vm-dhcp probe-now` after any change and capture `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the InternetSharing pid; the Internet Sharing toggle in System Settings and a reboot are the known resets. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
       "do_not": "Do not move /etc/bootpd.plist or /Library/Preferences/SystemConfiguration/com.apple.vmnet.plist aside: dhcp_enabled=false there is the normal idle state, which InternetSharing rewrites when it creates bridge100."
     },
     "warm_vm_none": {
@@ -571,11 +571,17 @@
     "vm_dhcp_config_disabled": {
       "summary": "VMs on this host stopped getting an address because /etc/bootpd.plist did not enable DHCP on the VM network while a VM ran.",
       "why": "InternetSharing writes /etc/bootpd.plist (dhcp_enabled=[bridge100] plus a Subnets entry created by com.apple.NetworkSharing) when it creates the VM network, and resets it when the last VM stops. dhcp_enabled=false is normal while no VM runs; only a running VM's bridge missing from dhcp_enabled is a fault, and it means InternetSharing did not finish configuring it.",
-      "remedy": "On the host, as root (tartci never runs it): 1) `sudo killall InternetSharing` so it reconfigures on the next VM; 2) or turn Internet Sharing off and on in System Settings > General > Sharing; 3) or reboot. Then `tartci vm-dhcp probe-now`. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
+      "remedy": "On the host (tartci never runs it): No verified remedy yet; run `tartci vm-dhcp probe-now` after any change and capture `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the InternetSharing pid; the Internet Sharing toggle in System Settings and a reboot are the known resets. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
       "do_not": "Do not hand-edit or move /etc/bootpd.plist: InternetSharing owns it and rewrites it per VM."
     },
     "vm_dhcp_ok": {
       "summary": "The host's VM DHCP breaker is closed: booted VMs are getting addresses."
+    },
+    "vm_dhcp_pfd_crash_loop": {
+      "summary": "VMs on this host stopped getting an address because pfd, the packet-filter daemon InternetSharing waits on, keeps exiting, so the VM network is never created.",
+      "why": "InternetSharing asks pfd for packet-filter state before it creates bridge100. On m5 on 2026-10-07 pfd exited 3 every 10 s from boot (runs climbing by thousands, state \"spawn scheduled\"), logging only \"no pf starter references held\" before exiting, so InternetSharing's request was never served and no VM network appeared. On a healthy host pfd runs, activates its com.apple.pfd listener and serves InternetSharing; it never logs that line. `launchctl print system/com.apple.pfd` (no root) shows the state, runs and last exit code.",
+      "remedy": "On the host (tartci never runs it): no verified remedy yet. Compare `sudo pfctl -s info` and `sudo pfctl -s References` with a healthy host, and record what changes pfd to state running; run `tartci vm-dhcp probe-now` after any change and capture `launchctl print system/com.apple.pfd`, `ifconfig -l` and the InternetSharing pid. The Internet Sharing toggle in System Settings and a reboot are the known resets. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150). Never `pfctl -d`: it drops every holder's pf references.",
+      "do_not": "Do not move /etc/bootpd.plist or /Library/Preferences/SystemConfiguration/com.apple.vmnet.plist aside, and do not restart bootpd for this: neither is the failing layer."
     },
     "vm_dhcp_unanswered": {
       "summary": "VMs on this host stopped getting an address from the host's DHCP server; lanes have stopped cloning except one probe every 300 s.",

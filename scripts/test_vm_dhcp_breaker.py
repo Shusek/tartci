@@ -51,8 +51,12 @@ class Case(unittest.TestCase):
         launchctl = self.tmp / "launchctl"
         self.sharing = self.tmp / "sharing-pid"
         self.sharing.write_text("14504")
+        # pfd's `launchctl print` lines; healthy by default.
+        self.pfd = self.tmp / "pfd"
+        self.pfd.write_text("\tstate = running\n\truns = 1\n\tlast exit code = (never exited)\n")
         launchctl.write_text(
             "#!/bin/bash\n"
+            f"case \"$2\" in *com.apple.pfd) cat {str(self.pfd)!r}; exit 0 ;; esac\n"
             "case \"$2\" in *NetworkSharing)\n"
             f"  printf '\\tstate = running\\n\\tpid = %s\\n' \"$(cat {str(self.sharing)!r})\"; exit 0 ;;\n"
             "esac\n"
@@ -421,6 +425,67 @@ class Layers(Case):
         path.chmod(0o755)
 
 
+class PfdLayer(Case):
+    """pfd, which InternetSharing waits on, crash-looping is the deepest layer."""
+
+    CRASHING = "\tstate = spawn scheduled\n\truns = 2621\n\tlast exit code = 3\n"
+
+    def test_the_crash_loop_rule(self):
+        for pfd, looping in (({"state": "spawn scheduled", "runs": 9, "last_exit": "3"}, True),
+                             ({"state": "not running", "runs": 9, "last_exit": "-1"}, True),
+                             ({"state": "running", "runs": 9, "last_exit": "3"}, False),
+                             ({"state": "not running", "runs": 9, "last_exit": "0"}, False),
+                             ({"state": "running", "last_exit": "(never exited)"}, False),
+                             ({}, False)):
+            with self.subTest(pfd=pfd):
+                self.assertEqual(vb.pfd_crash_looping(pfd), looping)
+
+    def test_no_bridge_with_pfd_crashing_names_pfd(self):
+        self.assertEqual(vb.diagnose({"bridges": []}, {"loaded": True}, {"present": False},
+                                     {"state": "spawn scheduled", "last_exit": "3"}),
+                         "pfd_crash_loop")
+        self.assertEqual(vb.diagnose({"bridges": []}, {"loaded": True}, {"present": False},
+                                     {"state": "running", "last_exit": "0"}),
+                         "vm_network_missing")
+        self.assertEqual(vb.diagnose({"bridges": []}, {"loaded": True}, {"present": False}, {}),
+                         "vm_network_missing")
+
+    def test_a_crashing_pfd_with_a_bridge_up_is_not_the_cause(self):
+        self.pfd.write_text(self.CRASHING)
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 300)
+        self.assertEqual(self.state()["cause"], "dhcp_silent")
+
+    def test_m5_on_2026_10_07_reads_as_pfd_crash_looping(self):
+        self.ifaces.write_text("lo0 en0 bridge0 utun0")
+        self.write_plist(False)
+        self.pfd.write_text(self.CRASHING)
+        self.record("no_ip", T0)
+        result = self.record("no_ip", T0 + 300)
+        self.assertIn("cause=pfd_crash_loop", result["events"][0][1])
+        finding = fleet_doctor.check_vm_dhcp(self.state())
+        self.assertEqual(finding.code, "vm_dhcp_pfd_crash_loop")
+        self.assertIn("last exit 3", finding.detail)
+
+    def test_pfd_runs_climbing_alone_never_triggers_a_probe(self):
+        self.pfd.write_text(self.CRASHING)
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.check(T0 + 90)
+        self.pfd.write_text(self.CRASHING.replace("2621", "2640"))
+        self.assertEqual(self.check(T0 + 120)["action"], "backoff")
+
+    def test_pfd_coming_back_triggers_a_probe(self):
+        self.pfd.write_text(self.CRASHING)
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.check(T0 + 90)
+        self.pfd.write_text("\tstate = running\n\truns = 2650\n\tlast exit code = 3\n")
+        result = self.check(T0 + 120)
+        self.assertEqual(result["action"], "probe")
+        self.assertIn("trigger=chain_changed", result["events"][0][1])
+
+
 class ProbeTriggers(Case):
     """Probe at once when an operator's fix changes the chain, or on request."""
 
@@ -507,10 +572,10 @@ class Doctor(unittest.TestCase):
         remedy = reasons["vm_dhcp_unanswered"]["remedy"]
         self.assertIn("sudo launchctl kickstart -k system/com.apple.bootpd", remedy)
         self.assertIn("tartci never runs it", remedy)
-        self.assertIn("sudo killall InternetSharing",
-                      reasons["vm_dhcp_vm_network_missing"]["remedy"])
-        self.assertIn("sudo killall InternetSharing", reasons["vm_dhcp_config_disabled"]["remedy"])
-        for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled"):
+        for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled",
+                     "vm_dhcp_pfd_crash_loop"):
+            self.assertIn("no verified remedy yet", reasons[code]["remedy"].lower())
+            self.assertIn("tartci vm-dhcp probe-now", reasons[code]["remedy"])
             self.assertIn(code, fleet_doctor.CODES)
         not_loaded = reasons["vm_dhcp_bootpd_not_loaded"]
         self.assertEqual(fleet_doctor.check_vm_dhcp(
@@ -526,6 +591,14 @@ class Doctor(unittest.TestCase):
         for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md",
                      ROOT / "scripts" / "fleet_doctor.py", ROOT / "scripts" / "vm_dhcp_breaker.py"):
             self.assertIsNone(blocked.search(path.read_text()), path.name)
+
+    def test_no_remedy_names_the_restart_that_did_not_help(self):
+        # m5, 2026-10-07: InternetSharing relaunched (pid 51580) and the next
+        # probes still created no bridge100.
+        tried = re.compile(r"killall\s+InternetSharing")
+        for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md",
+                     ROOT / "scripts" / "fleet_doctor.py", ROOT / "scripts" / "vm_dhcp_breaker.py"):
+            self.assertIsNone(tried.search(path.read_text()), path.name)
 
 
 if __name__ == "__main__":

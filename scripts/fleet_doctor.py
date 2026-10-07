@@ -153,6 +153,7 @@ CODES: tuple[str, ...] = (
     "vm_dhcp_bootpd_not_loaded",
     "vm_dhcp_config_disabled",
     "vm_dhcp_ok",
+    "vm_dhcp_pfd_crash_loop",
     "vm_dhcp_unanswered",
     "vm_dhcp_unreadable",
     "vm_dhcp_vm_network_missing",
@@ -1134,6 +1135,15 @@ def check_vm_dhcp(value: dict | None) -> Finding:
         # Most fundamental layer first: the cause read while the last VM that
         # got no address was still up, then bootpd's live launchd state.
         cause = value.get("cause")
+        import vm_dhcp_breaker  # noqa: PLC0415 - owns the pfd crash-loop rule
+        pfd = value.get("pfd") or {}
+        if cause == "pfd_crash_loop" or (cause == "vm_network_missing"
+                                         and vm_dhcp_breaker.pfd_crash_looping(pfd)):
+            return Finding("vm_dhcp", PROBLEM, "vm_dhcp_pfd_crash_loop",
+                           "VM DHCP is not answering because pfd keeps exiting (state "
+                           f"{pfd.get('state')}, last exit {pfd.get('last_exit')}, "
+                           f"{pfd.get('runs')} runs), so InternetSharing never creates the VM "
+                           "network: " + spent, facts)
         if cause == "vm_network_missing":
             return Finding("vm_dhcp", PROBLEM, "vm_dhcp_vm_network_missing",
                            "VM DHCP is not answering because the VM network was never created "
