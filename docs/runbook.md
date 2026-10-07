@@ -1662,18 +1662,49 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   `/etc/bootpd.plist`'s mtime, or InternetSharing's pid, all readable without
   root), or at once after `tartci vm-dhcp probe-now`
   (`vm_dhcp_probe result=ip|no_ip cause=…`).
-- **Closes** on the first address any VM on the host gets, or when the host
-  rebooted after the breaker opened. `vm_dhcp_recovered` reports `reason`,
+- **Closes** on the first address any VM on the host gets.
+  `vm_dhcp_recovered` reports `reason`,
   `open_s`, `vms_spent`, `probes`, and `latency_s` (time since the last probe,
   or since the chain last changed).
 - **The trade:** an outage costs about one VM per 300 s instead of one per lane
   every 2 to 4 min. Recovery is noticed within 300 s plus a boot instead of
   within minutes. `latency_s` above 300 s plus boot p99 means the cadence is
   wrong.
-- **Fails open:** an unreadable breaker reads as closed. Writes are atomic
-  under a lock.
+- **Verifies after a boot** (`verifying`, doctor `vm_dhcp_verifying`): when
+  kern.boottime differs from the one recorded, when no boot time is recorded
+  (first run, or a breaker file from before this state), and after a
+  self-update's `pool on` (receipt step `vm-dhcp-verify`, which runs
+  `tartci vm-dhcp verify --reason self_update`), exactly one lane probes and
+  the others idle. Its address closes the breaker (`vm_dhcp_verified`); its
+  `no_ip` opens it at once with the failing layer
+  (`streak=1 trigger=post_boot alert=now`). A probe that reports nothing within
+  960 s opens it with `cause=probe_unreported` and frees the slot; a later
+  address still closes it. A reboot used to close the breaker outright, and on
+  m5 on 2026-10-07 every lane cloned again into a broken VM network (about 56
+  VMs). The cost is one serialised boot, about 3 min, per reboot or
+  self-update. **On first deploy every host verifies once** (no boot time is
+  recorded yet). The self-update trigger runs from the installed
+  orchestrator, so it takes effect one update after deploy.
+- **The 960 s bound** is twice the slowest probe report on current lane code
+  (clone_start to `boot_failed no_ip`, which ends the 120 s address wait),
+  rounded up to the minute. `TARTCI_VM_DHCP_VERIFY_SECS` overrides it. Measured
+  2026-10-07 from every lane's `events.jsonl`:
+
+  | Host | n | p50 | p90 | p99 | max (s) |
+  |---|---|---|---|---|---|
+  | m3 | 6 | 197 | 200 | 200 | 200 |
+  | m1 | 298 | 199 | 353 | 392 | 1129 (one 2026-07-09 event in the retired pre-fleet `macos` lane; next 400) |
+  | m5 | 303 | 205 | 220 | 316 | 464 |
+  | m5s | 0 | — | — | — | — (1032 clones, never a `no_ip`) |
+
+  The success report comes earlier. `boot_ip` (logged at the address since
+  this change) gives clone_start to address directly; before it, clone_start
+  to `boot_ok`, which also counts SSH and the JIT mint, passed 960 s in 5 of
+  5215 boots over 30 days.
+- **Fails open:** an unreadable breaker reads as closed and never verifies.
+  Writes are atomic under a lock.
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
-  it for one host.
+  it for one host, including the post-boot verification.
 
 Recovery needs root, and tartci never runs it. Each `no_ip` records which
 layer failed (`cause`), read while that VM is still up, and `tartci doctor

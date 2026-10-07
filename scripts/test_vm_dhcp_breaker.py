@@ -80,6 +80,10 @@ class Case(unittest.TestCase):
         self.saved = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
         self.addCleanup(self._restore)
+        # A host that has already proven its VM network since its last boot.
+        (self.tmp / "vm-dhcp").mkdir()
+        (self.tmp / "vm-dhcp" / "breaker.json").write_text(json.dumps(
+            {"state": "closed", "streak": [], "boot_time": T0 - 86400}))
 
     def write_plist(self, enabled) -> None:
         import plistlib
@@ -196,20 +200,23 @@ class Open(Case):
         self.assertEqual(self.names(result), ["vm_dhcp_recovered"])
         self.assertIn("reason=boot_ok", result["events"][0][1])
 
-    def test_a_reboot_after_it_opened_closes_it(self):
+    def test_a_reboot_after_it_opened_verifies_and_keeps_the_cause(self):
+        # The old rule closed it here, and every lane cloned again (m5,
+        # 2026-10-07: about 56 VMs after the reboot).
         self.open()
         os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 100)
         result = self.check(T0 + 120)
-        self.assertEqual(result["action"], "clone")
-        self.assertEqual(self.names(result), ["vm_dhcp_recovered"])
-        self.assertIn("reason=host_reboot", result["events"][0][1])
-        self.assertEqual(self.state()["state"], "closed")
+        self.assertEqual(result["action"], "probe")
+        self.assertEqual(self.names(result), ["vm_dhcp_verifying", "vm_dhcp_probe_start"])
+        self.assertIn("reason=host_reboot previous_cause=dhcp_silent", result["events"][0][1])
+        self.assertEqual(self.state()["state"], "verifying")
+        self.assertEqual(self.state()["previous_cause"], "dhcp_silent")
 
 
 class FailOpen(Case):
     def test_a_corrupt_breaker_reads_closed(self):
         directory = self.tmp / "vm-dhcp"
-        directory.mkdir()
+        directory.mkdir(exist_ok=True)
         (directory / "breaker.json").write_text("{not json")
         self.assertEqual(self.check(T0)["action"], "clone")
         (directory / "breaker.json").write_text(json.dumps({"state": "weird"}))
@@ -258,12 +265,26 @@ class Shell(Case):
         self.assertIn("vm_dhcp_unanswered", (self.tmp / "events").read_text())
 
     def test_knob_off_reads_and_writes_nothing(self):
+        before = (self.tmp / "vm-dhcp" / "breaker.json").read_text()
         out = self.run_lib("tartci_vm_dhcp_record l no_ip v1; tartci_vm_dhcp_record l no_ip v2\n"
                            "tartci_vm_dhcp_check l && echo clone\n",
                            {"TARTCI_VM_DHCP_BREAKER": "0"})
         self.assertIn("clone", out.stdout)
-        self.assertFalse((self.tmp / "vm-dhcp").exists())
+        self.assertEqual((self.tmp / "vm-dhcp" / "breaker.json").read_text(), before)
         self.assertFalse((self.tmp / "events").exists())
+
+    def test_knob_off_never_verifies_a_fresh_host(self):
+        (self.tmp / "vm-dhcp" / "breaker.json").unlink()
+        out = self.run_lib("tartci_vm_dhcp_check l && echo clone\n",
+                           {"TARTCI_VM_DHCP_BREAKER": "0"})
+        self.assertIn("clone", out.stdout)
+        self.assertFalse((self.tmp / "vm-dhcp" / "breaker.json").exists())
+
+    def test_the_runner_logs_the_address_before_recording_it(self):
+        body = RUNNER.read_text()
+        at = body.index('  event boot_ip "ip=$ip"\n')
+        self.assertLess(at, body.index('tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"'))
+        self.assertGreater(at, body.index('CURRENT_IP="$ip"'))
 
     def test_a_breaker_failure_boots(self):
         out = self.run_lib("tartci_vm_dhcp_check l && echo clone\n",
@@ -285,7 +306,7 @@ class Wiring(unittest.TestCase):
         self.assertIn("tartci_vm_dhcp_record", body[no_ip:no_ip + 300])
         self.assertIn('no_ip "$vm"', body[no_ip:no_ip + 300])
         got = body.index('CURRENT_IP="$ip"')
-        self.assertIn('ip "$vm"', body[got:got + 200])
+        self.assertIn('ip "$vm"', body[got:got + 400])
 
     def test_a_breaker_backoff_is_an_idle_pass(self):
         body = RUNNER.read_text()
@@ -577,6 +598,101 @@ class ProbeTriggers(Case):
             "esac\n"
             "printf '\\tstate = running\\n\\truns = 4\\n\\tlast exit code = 0\\n'\n")
         path.chmod(0o755)
+
+
+class PostBoot(Case):
+    """After a boot, one probe proves the VM network before lanes clone freely."""
+
+    def reboot(self, at: float = T0 + 100) -> None:
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(at)
+
+    def test_a_matching_boot_time_stays_closed(self):
+        # The negative control: no boot since the breaker last proved itself.
+        result = self.check(T0)
+        self.assertEqual((result["action"], result["events"]), ("clone", []))
+        self.assertEqual(self.state()["state"], "closed")
+
+    def test_a_reboot_admits_one_probe_and_its_address_closes_it(self):
+        self.reboot()
+        first = self.check(T0 + 200, lane="a")
+        self.assertEqual(first["action"], "probe")
+        self.assertEqual(self.names(first), ["vm_dhcp_verifying", "vm_dhcp_probe_start"])
+        self.assertIn("trigger=post_boot", first["events"][1][1])
+        for lane in ("b", "c"):
+            self.assertEqual(self.check(T0 + 210, lane=lane)["action"], "backoff")
+        done = self.record("ip", T0 + 380, lane="a")
+        self.assertEqual(self.names(done), ["vm_dhcp_probe", "vm_dhcp_verified"])
+        self.assertIn("reason=host_reboot lane=a latency_s=180", done["events"][1][1])
+        self.assertEqual(self.state()["state"], "closed")
+        self.assertEqual(self.state()["boot_time"], T0 + 100)
+        self.assertEqual(self.check(T0 + 390, lane="b")["action"], "clone")
+
+    def test_a_post_boot_no_ip_opens_at_once_with_its_cause(self):
+        self.reboot()
+        self.check(T0 + 200, lane="a")
+        result = self.record("no_ip", T0 + 400, lane="a")
+        self.assertEqual(self.names(result), ["vm_dhcp_probe", "vm_dhcp_unanswered"])
+        detail = result["events"][1][1]
+        for token in ("streak=1", "trigger=post_boot", "alert=now", "cause=dhcp_silent"):
+            self.assertIn(token, detail)
+        self.assertEqual(self.state()["state"], "open")
+        self.assertEqual(self.check(T0 + 410, lane="b")["action"], "backoff")
+
+    def test_a_probe_that_never_reports_frees_the_slot(self):
+        self.reboot()
+        self.check(T0 + 200, lane="a")
+        self.assertEqual(self.check(T0 + 200 + vb.VERIFY_REPORT_SECS - 1, lane="b")["action"],
+                         "backoff")
+        self.assertEqual(self.state()["state"], "verifying")
+        result = self.check(T0 + 200 + vb.VERIFY_REPORT_SECS, lane="b")
+        self.assertEqual(self.names(result), ["vm_dhcp_unanswered"])
+        self.assertIn("cause=probe_unreported", result["events"][0][1])
+        self.assertNotIn("alert=now", result["events"][0][1])
+        self.assertEqual(self.state()["state"], "open")
+        self.assertIsNone(self.state()["probe_lane"])
+        # A slow probe that does report later still closes it.
+        late = self.record("ip", T0 + 200 + vb.VERIFY_REPORT_SECS + 30, lane="a")
+        self.assertIn("vm_dhcp_recovered", self.names(late))
+        self.assertEqual(self.state()["state"], "closed")
+
+    def test_no_recorded_boot_time_verifies(self):
+        (self.tmp / "vm-dhcp" / "breaker.json").write_text(json.dumps(
+            {"state": "closed", "streak": []}))
+        result = self.check(T0)
+        self.assertEqual(result["action"], "probe")
+        self.assertIn("reason=first_run", result["events"][0][1])
+
+    def test_no_breaker_file_verifies(self):
+        (self.tmp / "vm-dhcp" / "breaker.json").unlink()
+        result = self.check(T0)
+        self.assertEqual(result["action"], "probe")
+        self.assertIn("reason=first_run", result["events"][0][1])
+
+    def test_a_corrupt_breaker_clones_and_never_verifies(self):
+        (self.tmp / "vm-dhcp" / "breaker.json").write_text("{not json")
+        self.reboot()
+        self.assertEqual(self.check(T0)["action"], "clone")
+        self.assertEqual((self.tmp / "vm-dhcp" / "breaker.json").read_text(), "{not json")
+
+    def test_the_verify_command_enters_verifying(self):
+        result = vb.verify("self_update", now=T0)
+        self.assertEqual(result["action"], "verifying")
+        self.assertIn("reason=self_update", result["events"][0][1])
+        self.assertEqual(self.check(T0 + 10, lane="a")["action"], "probe")
+        self.assertEqual(self.check(T0 + 20, lane="b")["action"], "backoff")
+
+    def test_the_doctor_says_whether_a_probe_is_in_flight(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.reboot()
+        vb.verify("host_reboot", now=T0 + 120)
+        waiting = fleet_doctor.check_vm_dhcp(self.state())
+        self.assertEqual((waiting.state, waiting.code), ("ok", "vm_dhcp_verifying"))
+        self.assertIn("no lane has probed yet", waiting.detail)
+        self.assertIn("was open with dhcp_silent", waiting.detail)
+        self.check(T0 + 130, lane="a")
+        self.assertIn("a probe is in flight on a",
+                      fleet_doctor.check_vm_dhcp(self.state()).detail)
 
 
 class Doctor(unittest.TestCase):

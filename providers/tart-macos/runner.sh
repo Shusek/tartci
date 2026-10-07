@@ -1858,6 +1858,9 @@ boot_vm_to_ssh(){
     return 1
   fi
   CURRENT_IP="$ip"
+  # The moment the VM network answered: clone_start -> boot_ip is the time a
+  # VM-DHCP probe takes to report success.
+  event boot_ip "ip=$ip"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
   rm -f "$boot_log"
   local sshok=0

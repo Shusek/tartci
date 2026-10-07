@@ -23,8 +23,36 @@ One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
   recorded `vm_dhcp_probe result=ip|no_ip`.
 * closed again: the first address any VM on the host gets, probe or not
   (`record ip`), closes it and reports how long it was open, how many VMs it
-  spent, and the recovery latency. A breaker opened before the host last
-  booted is closed too (`reason=host_reboot`): a reboot resets bootpd.
+  spent, and the recovery latency.
+* verifying: after the host boots (kern.boottime differs from the one
+  recorded), when no boot time is recorded yet (first run, or a breaker file
+  from before this state existed), and after a self-update's `pool on`
+  (`verify`), the VM network is proven before lanes clone freely. Exactly one
+  lane is answered `probe`; the rest idle. Its `ip` closes the breaker
+  (`vm_dhcp_verified`); its `no_ip` opens it at once with the layered cause
+  (`streak=1 trigger=post_boot alert=now`), because a host that is broken
+  at boot is not a one-off. A probe that reports nothing within
+  VERIFY_REPORT_SECS opens it with `cause=probe_unreported` and frees the
+  slot, so a crashed probe cannot hold every lane idle; a later `ip` still
+  closes it. On m5 on 2026-10-07 the old rule (a reboot closes the breaker)
+  let every lane clone again after the reboot, and about 56 VMs were spent.
+
+  VERIFY_REPORT_SECS is twice the slowest probe report on current lane code,
+  rounded up to the minute. A probe reports when its 120 s address wait
+  ends, so clone_start -> `boot_failed no_ip` is the measure (read-only, every
+  lane's events.jsonl, 2026-10-07):
+
+    host  n    p50  p90  p99  max (s)
+    m3    6    197  200  200  200
+    m1    298  199  353  392  1129 (one 2026-07-09 event in the retired
+                                    pre-fleet `macos` lane; next 400)
+    m5    303  205  220  316  464
+    m5s   0    (1032 clones, never a no_ip)
+
+  The success report (`record ip`) comes earlier; clone_start -> boot_ok, an
+  upper bound on it that also counts SSH and the JIT mint, passed 960 s in 5
+  of 5215 boots over the 30 days before. TARTCI_VM_DHCP_VERIFY_SECS
+  overrides it.
 
 The trade is explicit: an outage now costs about one VM per PROBE_SECS
 instead of one per lane every 2-4 min, and recovery is noticed within
@@ -54,7 +82,7 @@ Sharing rewrites it when it creates bridge100, so it only means something
 while a VM is up.
 
 Usage: vm_dhcp_breaker.py check --lane L | record --outcome ip|no_ip --lane L
-[--vm V] | probe-now | status --json. `check` and `record` print {"action", "events"}; the
+[--vm V] | probe-now | verify [--reason R] | status --json. `check` and `record` print {"action", "events"}; the
 caller emits the events.
 """
 from __future__ import annotations
@@ -78,6 +106,8 @@ except ImportError:  # pragma: no cover - tartci hosts are POSIX.
 K = 2
 WINDOW_S = 15 * 60
 PROBE_SECS = 300
+VERIFY_REPORT_SECS = 960
+STATES = ("open", "closed", "verifying")
 MAX_STREAK = 50
 
 
@@ -108,19 +138,26 @@ def locked(directory: pathlib.Path) -> Iterator[pathlib.Path]:
 
 
 def load(path: pathlib.Path) -> dict[str, Any]:
-    """The breaker, or a closed one when it is absent or unreadable."""
+    """The breaker, or a closed one when it is absent or unreadable.
+
+    `_source` tells the two apart: an absent file is a host that has never
+    proven its VM network (it verifies), a corrupt one fails open (it clones
+    and is not rewritten here)."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"state": "closed", "streak": [], "_source": "absent"}
     except (OSError, ValueError):
-        return {"state": "closed", "streak": []}
-    if not isinstance(value, dict) or value.get("state") not in ("open", "closed"):
-        return {"state": "closed", "streak": []}
+        return {"state": "closed", "streak": [], "_source": "corrupt"}
+    if not isinstance(value, dict) or value.get("state") not in STATES:
+        return {"state": "closed", "streak": [], "_source": "corrupt"}
     if not isinstance(value.get("streak"), list):
         value["streak"] = []
     return value
 
 
 def save(path: pathlib.Path, value: dict[str, Any]) -> None:
+    value.pop("_source", None)
     tmp = path.with_name(f".breaker.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
@@ -323,9 +360,58 @@ def close(value: dict[str, Any], now: float, reason: str) -> list[list[str]]:
         "probes": int(value.get("probes") or 0),
         "latency_s": int(now - possible) if reason != "host_reboot" else None,
     })]
+    booted = value.get("boot_time")
     value.clear()
-    value.update({"state": "closed", "streak": [], "last_ip_at": now})
+    value.update({"state": "closed", "streak": [], "last_ip_at": now, "boot_time": booted})
     return [event]
+
+
+def enter_verifying(value: dict[str, Any], now: float, reason: str,
+                    booted: float | None) -> list[list[str]]:
+    """Prove the VM network with one probe before lanes clone freely."""
+    previous = value.get("cause") if value.get("state") == "open" else None
+    value.clear()
+    value.update({"state": "verifying", "streak": [], "verify_reason": reason,
+                  "verifying_since": now, "boot_time": booted, "previous_cause": previous,
+                  "probe_lane": None, "probe_started_at": None})
+    return [["vm_dhcp_verifying", fmt({"reason": reason, "previous_cause": previous})]]
+
+
+def open_breaker(value: dict[str, Any], now: float, *, streak: list[dict[str, Any]],
+                 readout: dict[str, Any], cause: str,
+                 extra: dict[str, Any] | None = None) -> list[str]:
+    """Open it; the `vm_dhcp_unanswered` event."""
+    first = float(streak[0]["ts"]) if streak else now
+    value.update({"state": "open", "opened_at": now, "vms_spent": len(streak),
+                  "probes": 0, "last_probe_at": now, "chain": chain(),
+                  "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None,
+                  "probe_requested_at": None, "probe_lane": None, "streak": streak,
+                  "cause": cause})
+    return ["vm_dhcp_unanswered", fmt({
+        "streak": len(streak), "window_s": int(now - first),
+        "lanes": ",".join(sorted({str(r.get("lane")) for r in streak})),
+        "last_no_ip": ",".join(iso(float(r["ts"])) for r in streak),
+        "bootpd_state": readout.get("state", "unreadable"),
+        "bootpd_runs": readout.get("runs"),
+        "bootpd_last_exit": readout.get("last_exit"),
+        "cause": cause, **(extra or {}),
+    })]
+
+
+def verifying_check(value: dict[str, Any], lane: str, now: float) -> tuple[str, list[list[str]]]:
+    """One probe at a time; a probe that never reports frees the slot."""
+    bound = setting("TARTCI_VM_DHCP_VERIFY_SECS", VERIFY_REPORT_SECS)
+    started = value.get("probe_started_at")
+    if value.get("probe_lane") and started is not None:
+        if now - float(started) < bound:
+            return "backoff", []
+        event = open_breaker(value, now, streak=[], readout=bootpd_readout(),
+                             cause="probe_unreported",
+                             extra={"trigger": "post_boot", "lane": value.get("probe_lane")})
+        return "backoff", [event]
+    value["probe_lane"], value["probe_started_at"] = lane, now
+    return "probe", [["vm_dhcp_probe_start", fmt({
+        "lane": lane, "trigger": "post_boot", "reason": value.get("verify_reason")})]]
 
 
 def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
@@ -334,12 +420,20 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
     with locked(breaker_dir()) as path:
         value = load(path)
         events: list[list[str]] = []
-        if value["state"] != "open":
+        if value.get("_source") == "corrupt":
             return {"action": "clone", "events": events}
         booted = boot_time()
-        if booted is not None and float(value.get("opened_at") or now) < booted:
-            events += close(value, now, "host_reboot")
+        recorded = value.get("boot_time")
+        if booted is not None and (recorded is None or abs(float(recorded) - booted) > 1):
+            events += enter_verifying(value, now, "first_run" if recorded is None
+                                      else "host_reboot", booted)
+        if value["state"] == "verifying":
+            action, more = verifying_check(value, args.lane, now)
             save(path, value)
+            return {"action": action, "events": events + more}
+        if value["state"] != "open":
+            if events:
+                save(path, value)
             return {"action": "clone", "events": events}
         last = value.get("last_probe_at")
         if last is None:
@@ -375,13 +469,23 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
     with locked(breaker_dir()) as path:
         value = load(path)
         events: list[list[str]] = []
-        probe = value.get("state") == "open" and value.get("probe_lane") == args.lane
+        verifying = value.get("state") == "verifying"
+        probe = (value.get("state") in ("open", "verifying")
+                 and value.get("probe_lane") == args.lane)
         if probe:
             events.append(["vm_dhcp_probe", fmt({"lane": args.lane, "vm": args.vm,
                                                  "result": args.outcome})])
             value["probe_lane"] = None
         if args.outcome == "ip":
-            if value.get("state") == "open":
+            if verifying:
+                events.append(["vm_dhcp_verified", fmt({
+                    "reason": value.get("verify_reason"), "lane": args.lane,
+                    "latency_s": int(now - float(value.get("verifying_since") or now))})])
+                booted = value.get("boot_time")
+                value.clear()
+                value.update({"state": "closed", "streak": [], "last_ip_at": now,
+                              "boot_time": booted})
+            elif value.get("state") == "open":
                 events += close(value, now, "probe" if probe else "boot_ok")
             else:
                 value["streak"] = []
@@ -394,6 +498,12 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         value["cause"], value["cause_at"] = cause, now
         if probe:
             events[-1][1] += f" cause={cause}"
+        if verifying:
+            events.append(open_breaker(value, now, streak=[{
+                "ts": now, "lane": args.lane, "vm": args.vm}], readout=readout, cause=cause,
+                extra={"trigger": "post_boot", "alert": "now"}))
+            save(path, value)
+            return {"action": "recorded", "events": events}
         if value.get("state") == "open":
             value["vms_spent"] = int(value.get("vms_spent") or 0) + 1
             save(path, value)
@@ -403,21 +513,22 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         streak.append({"ts": now, "lane": args.lane, "vm": args.vm})
         value["streak"] = streak[-MAX_STREAK:]
         if len(streak) >= k:
-            value.update({"state": "open", "opened_at": now, "vms_spent": len(streak),
-                          "probes": 0, "last_probe_at": now, "chain": chain(),
-                          "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None,
-                          "probe_requested_at": None})
-            events.append(["vm_dhcp_unanswered", fmt({
-                "streak": len(streak), "window_s": int(now - float(streak[0]["ts"])),
-                "lanes": ",".join(sorted({str(r.get("lane")) for r in streak})),
-                "last_no_ip": ",".join(iso(float(r["ts"])) for r in streak),
-                "bootpd_state": readout.get("state", "unreadable"),
-                "bootpd_runs": readout.get("runs"),
-                "bootpd_last_exit": readout.get("last_exit"),
-                "cause": cause,
-            })])
+            events.append(open_breaker(value, now, streak=value["streak"], readout=readout,
+                                       cause=cause))
         save(path, value)
         return {"action": "recorded", "events": events}
+
+
+def verify(reason: str, now: float | None = None) -> dict[str, Any]:
+    """Prove the VM network with one probe now (after a self-update's pool on)."""
+    now = time.time() if now is None else now
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        if value.get("_source") == "corrupt":
+            return {"action": "unreadable", "events": []}
+        events = enter_verifying(value, now, reason, boot_time())
+        save(path, value)
+        return {"action": "verifying", "events": events}
 
 
 def probe_now(now: float | None = None) -> dict[str, Any]:
@@ -449,7 +560,7 @@ def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return {"state": "unreadable", "error": str(exc)}
-    if not isinstance(value, dict) or value.get("state") not in ("open", "closed"):
+    if not isinstance(value, dict) or value.get("state") not in STATES:
         return {"state": "unreadable", "error": "unexpected breaker shape"}
     if value.get("state") == "open":
         value["bootpd"] = bootpd_readout()
@@ -467,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--lane", required=True)
     r.add_argument("--vm", default="")
     sub.add_parser("probe-now")
+    v = sub.add_parser("verify")
+    v.add_argument("--reason", default="operator")
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -476,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "probe-now":
             result = probe_now()
+        elif args.command == "verify":
+            result = verify(args.reason)
         else:
             result = check(args) if args.command == "check" else record(args)
     except Exception as exc:  # noqa: BLE001 - the caller fails open
