@@ -52,7 +52,8 @@ One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
   The success report (`record ip`) comes earlier; clone_start -> boot_ok, an
   upper bound on it that also counts SSH and the JIT mint, passed 960 s in 5
   of 5215 boots over the 30 days before. TARTCI_VM_DHCP_VERIFY_SECS
-  overrides it.
+  overrides it. The runner now logs `boot_ip clone_to_ip_s=` at the address;
+  `boot-times` re-derives the bound from both reports once 30 days exist.
 
 The trade is explicit: an outage now costs about one VM per PROBE_SECS
 instead of one per lane every 2-4 min, and recovery is noticed within
@@ -82,12 +83,13 @@ Sharing rewrites it when it creates bridge100, so it only means something
 while a VM is up.
 
 Usage: vm_dhcp_breaker.py check --lane L | record --outcome ip|no_ip --lane L
-[--vm V] | probe-now | verify [--reason R] | status --json. `check` and `record` print {"action", "events"}; the
+[--vm V] | probe-now | verify [--reason R] | boot-times [--days N] | status --json. `check` and `record` print {"action", "events"}; the
 caller emits the events.
 """
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
 import json
 import os
@@ -377,6 +379,17 @@ def enter_verifying(value: dict[str, Any], now: float, reason: str,
     return [["vm_dhcp_verifying", fmt({"reason": reason, "previous_cause": previous})]]
 
 
+def verified(value: dict[str, Any], now: float, lane: str, *, late: bool) -> list[str]:
+    """Close a post-boot verification on an address; the `vm_dhcp_verified` event."""
+    event = ["vm_dhcp_verified", fmt({
+        "reason": value.get("verify_reason"), "lane": lane, "late": "true" if late else None,
+        "latency_s": int(now - float(value.get("verifying_since") or now))})]
+    booted = value.get("boot_time")
+    value.clear()
+    value.update({"state": "closed", "streak": [], "last_ip_at": now, "boot_time": booted})
+    return event
+
+
 def open_breaker(value: dict[str, Any], now: float, *, streak: list[dict[str, Any]],
                  readout: dict[str, Any], cause: str,
                  extra: dict[str, Any] | None = None) -> list[str]:
@@ -478,13 +491,11 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
             value["probe_lane"] = None
         if args.outcome == "ip":
             if verifying:
-                events.append(["vm_dhcp_verified", fmt({
-                    "reason": value.get("verify_reason"), "lane": args.lane,
-                    "latency_s": int(now - float(value.get("verifying_since") or now))})])
-                booted = value.get("boot_time")
-                value.clear()
-                value.update({"state": "closed", "streak": [], "last_ip_at": now,
-                              "boot_time": booted})
+                events.append(verified(value, now, args.lane, late=False))
+            elif value.get("state") == "open" and value.get("cause") == "probe_unreported":
+                # The post-boot probe was slow, not broken: it still proves
+                # the VM network, so this is the verification that was owed.
+                events.append(verified(value, now, args.lane, late=True))
             elif value.get("state") == "open":
                 events += close(value, now, "probe" if probe else "boot_ok")
             else:
@@ -546,6 +557,57 @@ def probe_now(now: float | None = None) -> dict[str, Any]:
             "cause": value.get("cause")})]]}
 
 
+def lane_logs(root: pathlib.Path) -> list[pathlib.Path]:
+    """Every lane's events.jsonl under root, at any depth: m5studio keeps its
+    lanes at state/macos-fleet/<lane>/, and a one-level search reads none."""
+    return sorted(root.glob("**/events.jsonl"))
+
+
+def _quantiles(values: list[float]) -> dict[str, Any]:
+    values = sorted(values)
+    if not values:
+        return {"n": 0}
+    at = lambda q: int(values[min(len(values) - 1, int(q * len(values)))])  # noqa: E731
+    return {"n": len(values), "p50": at(0.5), "p90": at(0.9), "p99": at(0.99),
+            "max": int(values[-1])}
+
+
+def boot_times(root: pathlib.Path, since: float) -> dict[str, Any]:
+    """How long a probe takes to report: clone_start to the address (`boot_ip`)
+    or to the end of the address wait (`boot_failed no_ip`), per lane log, for
+    events at or after `since`. The verify bound is twice the slowest report."""
+    reports: dict[str, list[float]] = {"boot_ip": [], "no_ip": []}
+    clones = 0
+    logs = lane_logs(root)
+    for log in logs:
+        started: dict[str, float] = {}
+        try:
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                row = json.loads(line)
+                at = calendar.timegm(time.strptime(row["ts"], "%Y-%m-%dT%H:%M:%SZ"))
+            except (ValueError, KeyError, TypeError):
+                continue
+            if at < since:
+                continue
+            runner, name = row.get("runner"), row.get("event")
+            if name == "clone_start":
+                started[runner] = at
+                clones += 1
+            elif runner in started and name == "boot_ip":
+                reports["boot_ip"].append(at - started.pop(runner))
+            elif runner in started and name == "boot_failed" and "no_ip" in str(row.get("detail")):
+                reports["no_ip"].append(at - started.pop(runner))
+    slowest = max([*reports["boot_ip"], *reports["no_ip"]], default=None)
+    return {"lane_logs": len(logs), "clones": clones,
+            "boot_ip": _quantiles(reports["boot_ip"]), "no_ip": _quantiles(reports["no_ip"]),
+            "suggested_verify_secs": (None if slowest is None
+                                      else int(-(-2 * slowest // 60) * 60))}
+
+
 def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
     """For `tartci doctor fleet`: never a write, never a lock.
 
@@ -580,12 +642,19 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("probe-now")
     v = sub.add_parser("verify")
     v.add_argument("--reason", default="operator")
+    b = sub.add_parser("boot-times")
+    b.add_argument("--days", type=float, default=30)
+    b.add_argument("--root", default=str(pathlib.Path.home() / ".tartci" / "state"))
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
             print(json.dumps(status(), sort_keys=True))
+            return 0
+        if args.command == "boot-times":
+            print(json.dumps(boot_times(pathlib.Path(args.root),
+                                        time.time() - args.days * 86400), sort_keys=True))
             return 0
         if args.command == "probe-now":
             result = probe_now()
