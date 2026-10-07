@@ -283,6 +283,62 @@ class Wiring(unittest.TestCase):
             self.assertIn("vm_dhcp_breaker", result.stderr)
 
 
+class BootpdNotLoaded(Case):
+    """launchctl's exit 113 is a job launchd does not have, not an unreadable one."""
+
+    def launchctl(self, body: str) -> None:
+        path = self.tmp / "launchctl"
+        path.write_text("#!/bin/bash\n" + body)
+        path.chmod(0o755)
+
+    def not_loaded(self) -> None:
+        # Verbatim shape of `launchctl print` for a label launchd has not loaded.
+        self.launchctl("echo 'Bad request.' >&2\n"
+                       "echo 'Could not find service \"com.apple.bootpd\" in domain for system' >&2\n"
+                       "exit 113\n")
+
+    def test_a_loaded_job_reads_as_loaded_with_its_state(self):
+        self.assertEqual(vb.bootpd_readout(),
+                         {"loaded": True, "state": "not running", "runs": 3, "last_exit": "0"})
+
+    def test_exit_113_reads_as_not_loaded(self):
+        self.not_loaded()
+        self.assertEqual(vb.bootpd_readout(), {"loaded": False, "state": "not_loaded"})
+
+    def test_any_other_failure_stays_unreadable(self):
+        self.launchctl("echo 'Operation not permitted' >&2\nexit 1\n")
+        self.assertEqual(vb.bootpd_readout(), {})
+
+    def test_the_open_event_and_the_doctor_name_the_not_loaded_job(self):
+        self.not_loaded()
+        self.record("no_ip", T0)
+        result = self.record("no_ip", T0 + 300)
+        self.assertIn("bootpd_state=not_loaded", result["events"][0][1])
+        finding = fleet_doctor.check_vm_dhcp(self.state())
+        self.assertEqual((finding.state, finding.code), ("problem", "vm_dhcp_bootpd_not_loaded"))
+
+    def test_a_loaded_but_silent_job_stays_unanswered(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 300)
+        finding = fleet_doctor.check_vm_dhcp(self.state())
+        self.assertEqual(finding.code, "vm_dhcp_unanswered")
+
+    def test_an_unreadable_launchctl_keeps_the_unanswered_code(self):
+        self.launchctl("exit 1\n")
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 300)
+        self.assertEqual(fleet_doctor.check_vm_dhcp(self.state()).code, "vm_dhcp_unanswered")
+
+    def test_a_closed_breaker_never_reads_launchd(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 300)
+        self.record("ip", T0 + 600)
+        self.not_loaded()
+        closed = self.state()
+        self.assertEqual(closed["state"], "closed")
+        self.assertNotIn("bootpd", closed)
+
+
 class Doctor(unittest.TestCase):
     def test_codes_and_the_root_remedy(self):
         reasons = fleet_doctor.load_reasons()
@@ -297,6 +353,13 @@ class Doctor(unittest.TestCase):
         remedy = reasons["vm_dhcp_unanswered"]["remedy"]
         self.assertIn("sudo launchctl kickstart -k system/com.apple.bootpd", remedy)
         self.assertIn("tartci never runs it", remedy)
+        not_loaded = reasons["vm_dhcp_bootpd_not_loaded"]
+        self.assertIn(fleet_doctor.check_vm_dhcp(
+            {"state": "open", "bootpd": {"loaded": False}}).code, fleet_doctor.CODES)
+        for step in ("sudo launchctl kickstart -k system/com.apple.NetworkSharing",
+                     "sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist"):
+            self.assertIn(step, not_loaded["remedy"])
+        self.assertIn("Could not find service", remedy)
 
 
 if __name__ == "__main__":

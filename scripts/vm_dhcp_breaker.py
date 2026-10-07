@@ -126,8 +126,20 @@ def boot_time() -> float | None:
     return float(match.group(1)) if match else None
 
 
+# `launchctl print` exits 113 ("Could not find service") for a job launchd
+# has not loaded. bootpd's plist ships Disabled and only Internet Sharing
+# (com.apple.NetworkSharing) loads it, so "not loaded" is its own failure: a
+# kickstart of bootpd then fails, and the job must be loaded first.
+LAUNCHCTL_NOT_FOUND = 113
+
+
 def bootpd_readout() -> dict[str, Any]:
-    """bootpd's launchd state, readable without root; {} when unreadable."""
+    """bootpd's launchd state, readable without root.
+
+    {"loaded": True, "state", "runs", "last_exit"} for a loaded job,
+    {"loaded": False, "state": "not_loaded"} when launchd does not have it,
+    and {} when it could not be read.
+    """
     launchctl = os.environ.get("TARTCI_VM_DHCP_LAUNCHCTL", "launchctl")
     try:
         proc = subprocess.run([launchctl, "print", "system/com.apple.bootpd"],
@@ -135,8 +147,11 @@ def bootpd_readout() -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError):
         return {}
     if proc.returncode != 0:
+        text = f"{proc.stdout}\n{proc.stderr}"
+        if proc.returncode == LAUNCHCTL_NOT_FOUND or "Could not find service" in text:
+            return {"loaded": False, "state": "not_loaded"}
         return {}
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = {"loaded": True}
     for line in proc.stdout.splitlines():
         key, sep, value = line.strip().partition(" = ")
         if not sep:
@@ -259,7 +274,12 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
 
 
 def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
-    """For `tartci doctor fleet`: never a write, never a lock."""
+    """For `tartci doctor fleet`: never a write, never a lock.
+
+    An open breaker also carries bootpd's launchd state read now, so the
+    doctor can tell a job that is not loaded from one that is loaded but
+    silent: the two need different remedies.
+    """
     path = (directory or breaker_dir()) / "breaker.json"
     if not path.exists():
         return {"state": "closed", "source": "absent"}
@@ -269,6 +289,8 @@ def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
         return {"state": "unreadable", "error": str(exc)}
     if not isinstance(value, dict) or value.get("state") not in ("open", "closed"):
         return {"state": "unreadable", "error": "unexpected breaker shape"}
+    if value.get("state") == "open":
+        value["bootpd"] = bootpd_readout()
     return value
 
 

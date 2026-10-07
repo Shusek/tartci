@@ -150,6 +150,7 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_dhcp_bootpd_not_loaded",
     "vm_dhcp_ok",
     "vm_dhcp_unanswered",
     "vm_dhcp_unreadable",
@@ -1126,6 +1127,13 @@ def check_vm_dhcp(value: dict | None) -> Finding:
     facts = {"vm_dhcp": value}
     if value.get("state") == "open":
         opened = value.get("opened_at")
+        if (value.get("bootpd") or {}).get("loaded") is False:
+            return Finding("vm_dhcp", PROBLEM, "vm_dhcp_bootpd_not_loaded",
+                           "VM DHCP is not answering because launchd has no bootpd job loaded "
+                           "(a bootpd kickstart cannot work until it is loaded): no lane clones "
+                           f"except one probe every 300 s (open since {opened}, "
+                           f"{value.get('vms_spent')} VMs spent, {value.get('probes')} probes)",
+                           facts)
         return Finding("vm_dhcp", PROBLEM, "vm_dhcp_unanswered",
                        "VM DHCP is not answering on this host: no lane clones except one probe "
                        f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "

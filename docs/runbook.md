@@ -1672,7 +1672,14 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
   it for one host.
 
-Recovery needs root, and tartci never runs it:
+Recovery needs root, and tartci never runs it. First tell which failure it is.
+`launchctl print system/com.apple.bootpd` needs no root: exit 0 means the job
+is loaded, and exit 113 ("Could not find service") means launchd has no bootpd
+job at all. `tartci doctor fleet` reads the same thing and reports the open
+breaker as `vm_dhcp_unanswered` (loaded but silent) or
+`vm_dhcp_bootpd_not_loaded`.
+
+**Loaded but silent** (`vm_dhcp_unanswered`):
 
 1. `sudo launchctl print system/com.apple.bootpd` and
    `/usr/bin/log show --last 30m --predicate 'process == "bootpd"'` (expect
@@ -1683,8 +1690,19 @@ Recovery needs root, and tartci never runs it:
    then if needed `sudo launchctl kickstart -k system/com.apple.NetworkSharing`.
    A reboot also clears it.
 
-The probe fires at once when step 2 or 3 moves bootpd's run count. `tartci
-doctor fleet` shows the open breaker as `vm_dhcp_unanswered`.
+**Not loaded** (`vm_dhcp_bootpd_not_loaded`): bootpd's plist
+(`/System/Library/LaunchDaemons/bootps.plist`) ships Disabled, and only
+Internet Sharing (`com.apple.NetworkSharing`) loads it. A bootpd kickstart fails
+with "Could not find service", and disable/enable only changes the override
+without loading anything (m5, 2026-10-07).
+
+1. `sudo launchctl kickstart -k system/com.apple.NetworkSharing`, which reloads
+   bootpd with Internet Sharing.
+2. If `launchctl print system/com.apple.bootpd` still exits 113,
+   `sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist`.
+3. Confirm it now prints a state and a run count.
+
+The probe fires at once when a step moves bootpd's run count.
 
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 

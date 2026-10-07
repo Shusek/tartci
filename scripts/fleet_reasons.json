@@ -556,13 +556,19 @@
     "undeclared_fleet_agents_none": {
       "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
     },
+    "vm_dhcp_bootpd_not_loaded": {
+      "summary": "VMs on this host stopped getting an address, and launchd has no bootpd job loaded at all, so lanes have stopped cloning except one probe every 300 s.",
+      "why": "bootpd's plist (/System/Library/LaunchDaemons/bootps.plist) ships Disabled, and only Internet Sharing (com.apple.NetworkSharing) loads it. When it is not loaded, `launchctl print system/com.apple.bootpd` exits 113 (\"Could not find service\"), a kickstart of bootpd fails the same way, and disable/enable only changes the override without loading anything. On m5 on 2026-10-07 the job was absent while NetworkSharing itself was running.",
+      "remedy": "On the host, as root (tartci never runs it): 1) `sudo launchctl kickstart -k system/com.apple.NetworkSharing`, which reloads bootpd with Internet Sharing; 2) if `launchctl print system/com.apple.bootpd` still exits 113, `sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist`; 3) confirm it now prints a state and a run count. The breaker probes and closes on the first address a VM gets.",
+      "do_not": "Do not kickstart or disable/enable com.apple.bootpd to fix this: neither loads a job launchd does not have."
+    },
     "vm_dhcp_ok": {
       "summary": "The host's VM DHCP breaker is closed: booted VMs are getting addresses."
     },
     "vm_dhcp_unanswered": {
       "summary": "VMs on this host stopped getting an address from the host's DHCP server; lanes have stopped cloning except one probe every 300 s.",
       "why": "Two boots in a row within 15 min waited 120 s for an address and got none. On m5 (2026-09-23 and 2026-10-04) the host's bootpd, which macOS Internet Sharing manages, answered nothing for 47 and 40 minutes while every lane kept cloning and discarding. No boot can succeed until DHCP answers, so the breaker trades about one VM per 300 s for recovery noticed within 300 s plus a boot. The vm_dhcp_unanswered event carries bootpd's state, run count and last exit at the moment it opened, and the no_ip timestamps.",
-      "remedy": "On the host, all of it needs root, and tartci never runs it: 1) confirm with `sudo launchctl print system/com.apple.bootpd` (state, runs, last exit) and `/usr/bin/log show --last 30m --predicate 'process == \"bootpd\"'` (expect silence); 2) `sudo launchctl kickstart -k system/com.apple.bootpd`; 3) if no VM gets an address within 2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl enable system/com.apple.bootpd` (what macOS did itself on 2026-10-04), then if still nothing `sudo launchctl kickstart -k system/com.apple.NetworkSharing`; 4) a reboot also clears it. The breaker probes at once when bootpd's run count moves, and closes on the first address a VM gets.",
+      "remedy": "On the host, all of it needs root, and tartci never runs it: 1) confirm with `sudo launchctl print system/com.apple.bootpd` (state, runs, last exit) and `/usr/bin/log show --last 30m --predicate 'process == \"bootpd\"'` (expect silence); 2) `sudo launchctl kickstart -k system/com.apple.bootpd`; if that says \"Could not find service\", the job is not loaded at all and the doctor reports vm_dhcp_bootpd_not_loaded instead (see its remedy); 3) if no VM gets an address within 2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl enable system/com.apple.bootpd` (what macOS did itself on 2026-10-04), then if still nothing `sudo launchctl kickstart -k system/com.apple.NetworkSharing`; 4) a reboot also clears it. The breaker probes at once when bootpd's run count moves, and closes on the first address a VM gets.",
       "do_not": "Do not delete the breaker file to force cloning: every clone fails the same way until DHCP answers."
     },
     "vm_dhcp_unreadable": {
