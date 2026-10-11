@@ -2535,6 +2535,22 @@ class Run:
         self.receipt.value["host_off"] = pool_state not in ("on", "undrained")
         self.receipt.step(status, message, ok=False)
         self.receipt.finish(status, message)
+        if self.receipt.value["host_off"]:
+            # Do not wait for the watchdog's 15-minute threshold: a roll that
+            # leaves a gate host OFF needs an issue immediately, with the
+            # failure reason and the recovery command in its body.
+            try:
+                import host_off  # noqa: PLC0415 - owns the alert/issue format
+                try:
+                    host = self_host_id(self.cfg)
+                except (Refused, OSError, ValueError):
+                    host = os.uname().nodename.split(".")[0]
+                host_off.alert(host_off.state_dir(self.cfg.home),
+                               host_off.pool_state_file(self.cfg.home),
+                               host=host, now=self.sys.now(),
+                               immediate=True)
+            except Exception as exc:  # noqa: BLE001 - preserve the terminal receipt
+                print(f"self-update: host-off alert failed: {exc}", file=sys.stderr)
         print(f"self-update: {status.upper().replace('_', ' ')}: {message}", file=sys.stderr)
         return EXIT_FAILED
 
