@@ -33,6 +33,7 @@ import network_profile
 import pulp_reapers
 import schedule_backstop_mode
 import support_agents
+import debug_hold
 import reuse_canary
 import power_status
 
@@ -50,7 +51,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary",
+    "reuse_canary", "debug_hold", "launchd_watchdog",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -90,7 +91,7 @@ WORKTREE_CLEANUP_KEYS = {
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
 }
 LANE_KEYS = {
-    "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
+    "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "ccache_write_isolation",
@@ -102,7 +103,8 @@ LANE_KEYS = {
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
-    "warm_vm", "warm_vm_max_park_seconds",
+    "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
+    "v2_gate_classes",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -464,6 +466,16 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    watchdog = data.get("launchd_watchdog")
+    if watchdog is not None:
+        # The watchdog's frozen-lane threshold, rendered into its plist by the
+        # support-agents step; it lived only on hand-edited plists (#195).
+        if not isinstance(watchdog, dict) or set(watchdog) - {"stale_log_seconds"}:
+            fail("launchd_watchdog must be a table with only stale_log_seconds")
+        stale = watchdog.get("stale_log_seconds")
+        if stale is not None and (type(stale) is not int or not 600 <= stale <= 14400):
+            fail("launchd_watchdog.stale_log_seconds must be an integer from 600 "
+                 "through 14400")
     disagreement = data.get("build_disagreement")
     if disagreement is not None:
         if not isinstance(disagreement, dict):
@@ -491,6 +503,12 @@ def load(path: Path) -> dict:
     canary = data.get(reuse_canary.TABLE)
     if canary is not None:
         problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Whether this host keeps failed gate VMs for debugging (off by default).
+    hold = data.get(debug_hold.TABLE)
+    if hold is not None:
+        problems = debug_hold.validate_table(hold)
         if problems:
             fail("; ".join(problems))
     # Which support LaunchAgents this host carries (checked after the agents'
@@ -648,6 +666,12 @@ def load(path: Path) -> dict:
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
+        vm_cores_from = lane.get("vm_cores_from")
+        if vm_cores_from is not None:
+            if vm_cores_from != "gate-reserve":
+                fail(f"lane {lane_id}: vm_cores_from must be \"gate-reserve\"")
+            if vm_cores is not None:
+                fail(f"lane {lane_id}: set vm_cores or vm_cores_from, not both")
         priority = lane.get("priority")
         if priority is not None and (
                 not isinstance(priority, str) or priority not in LEASE_PRIORITIES):
@@ -761,6 +785,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: warm_vm_max_park_seconds must be an integer "
                 "from 300 through 14400 beside warm_vm = true"
+            )
+        guest_stale = lane.get("guest_heartbeat_stale_seconds")
+        if guest_stale is not None and (
+                type(guest_stale) is not int or not 120 <= guest_stale <= 3600):
+            fail(
+                f"lane {lane_id}: guest_heartbeat_stale_seconds must be an "
+                "integer from 120 through 3600"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -906,7 +937,8 @@ def load(path: Path) -> dict:
                 )
             tier_group_by_label[label] = group_id
         if assignment_mode == "event-class-v2":
-            validate_v2_tiers(lane_id, lane["repo"], tiers)
+            validate_v2_tiers(lane_id, lane["repo"], tiers,
+                              v2_gate_classes(lane_id, lane.get("v2_gate_classes")))
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
             if any(group_id != 1 for group_id in tier_groups):
@@ -990,30 +1022,53 @@ def load(path: Path) -> dict:
     return data
 
 
-def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict]) -> None:
+def v2_gate_classes(lane_id: str, declared: object) -> tuple[str, ...]:
+    """The gate classes an event-class-v2 lane serves; both unless it says so.
+
+    A lane may drop a gate class only by naming the ones it keeps, in the
+    canonical order, so an omitted tier is a stated decision and never a
+    typo. m1 serves PR-head only: its 3-core guest ran merge_group jobs in
+    33-35 min against 15-22 min elsewhere.
+    """
+    if declared is None:
+        return V2_GATE_CLASSES
+    if (not isinstance(declared, list) or not declared
+            or len(set(declared)) != len(declared)
+            or any(item not in V2_GATE_CLASSES for item in declared)
+            or list(declared) != [c for c in V2_GATE_CLASSES if c in declared]):
+        fail(
+            f"lane {lane_id}: v2_gate_classes must be a non-empty subset of "
+            f"{list(V2_GATE_CLASSES)} in that order"
+        )
+    return tuple(declared)
+
+
+def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
+                      gate_classes: tuple[str, ...] = V2_GATE_CLASSES) -> None:
     """The event-class-v2 tier contract: gate classes first, then extras.
 
-    The two gate classes lead, one workflow row each. Any further rows belong to
-    declared extra classes: each must be a known class, listed contiguously,
-    with exactly that class's workflows in order and never twice.
+    The lane's gate classes (both, unless `v2_gate_classes` names fewer) lead,
+    one workflow row each. Any further rows belong to declared extra classes:
+    each must be a known class, listed contiguously, with exactly that class's
+    workflows in order and never twice.
     """
     labels = [tier["label"] for tier in tiers]
-    if labels[:2] != list(V2_GATE_CLASSES) or len(set(labels[:2])) != 2:
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    if any(label in V2_GATE_CLASSES for label in labels[2:]):
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    extras = list(dict.fromkeys(labels[2:]))
+    n = len(gate_classes)
+    expected = " then ".join(
+        {"pulp-build-merge-group": "merge-group", "pulp-build-pr-head": "PR-head"}[c]
+        for c in gate_classes)
+    if labels[:n] != list(gate_classes):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    if any(label in V2_GATE_CLASSES for label in labels[n:]):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    extras = list(dict.fromkeys(labels[n:]))
     if not extras:
         return
     if repo != "Generous-Corp/pulp":
         fail(f"lane {lane_id}: extra event classes are Pulp classes")
-    grouped = [label for label in extras for _ in range(labels[2:].count(label))]
-    if grouped != labels[2:]:
-        fail(f"lane {lane_id}: event class {labels[2:]} rows must be contiguous and unique")
+    grouped = [label for label in extras for _ in range(labels[n:].count(label))]
+    if grouped != labels[n:]:
+        fail(f"lane {lane_id}: event class {labels[n:]} rows must be contiguous and unique")
     for label in extras:
         expected = V2_EXTRA_CLASS_WORKFLOWS.get(label)
         if expected is None:
@@ -2382,6 +2437,12 @@ def lane_plist(
         env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
+    if "vm_cores_from" in lane:
+        # Derived at lease time from this host's live gate reserve
+        # (gate_reserve_fit.share_cores), so the rendered plist names the rule
+        # and the slot count, never a size measured on another machine.
+        env["TARTCI_MACOS_VM_CORES_FROM"] = lane["vm_cores_from"]
+        env["TARTCI_MACOS_VM_CORES_SLOTS"] = str(lane.get("supervisors", 1))
     if lane.get("tier"):
         env["TARTCI_RUNNER_WORKFLOW_TIERS"] = "\n".join(
             f"{row['label']}|{row['workflow']}" for row in lane["tier"]
@@ -2451,6 +2512,8 @@ def lane_plist(
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)
+    if "guest_heartbeat_stale_seconds" in lane:
+        env["TARTCI_GUEST_HEARTBEAT_STALE_SECS"] = str(lane["guest_heartbeat_stale_seconds"])
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
