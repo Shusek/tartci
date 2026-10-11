@@ -4,9 +4,9 @@
 A dialog appears when a process in the GUI session touches a non-login
 keychain that is locked in that session: securityd starts SecurityAgent and
 asks for that keychain's password, which only keychain.env holds. On
-2026-10-02 the legacy `pulp-signing.keychain-db` sat on m3's and m5studio's
-user search list beside its `-unattended` replacement. A bare
-`codesign --sign` walks that list, so every unpinned signer was one lock away
+2026-10-02 the legacy pulp-signing.keychain-db sat on m3's and m5studio's
+user search list beside its -unattended replacement. A bare
+codesign --sign walks that list, so every unpinned signer was one lock away
 from a dialog asking Daniel for a password he does not have.
 
 status() reports, without ever prompting:
@@ -14,7 +14,7 @@ status() reports, without ever prompting:
     signing keychain (a legacy or leftover keychain is what a search walks
     into);
   - whether the dedicated keychain unlocks with keychain.env's password
-    (`unlock-keychain -p` never prompts; a refusal means the recorded
+    (unlock-keychain -p never prompts; a refusal means the recorded
     password has drifted);
   - after that unlock, so reading settings cannot prompt, whether the keychain
     re-locks on its own (an inactivity timeout or lock-on-sleep);
@@ -22,7 +22,7 @@ status() reports, without ever prompting:
     succeeded recently. macOS locks the keychain again at every login, and
     that agent is what unlocks it in the GUI session, the only session the
     dialogs come from. Nothing here can read the GUI session's lock state
-    without risking a dialog: even `show-keychain-info` on a locked keychain
+    without risking a dialog: even show-keychain-info on a locked keychain
     raises one, so it is only ever run right after a successful unlock.
 
 States: ok | risk | not_applicable (no keychain.env) | unknown.
@@ -98,7 +98,7 @@ def status(home: Path | None = None, run: Runner = _run,
 
 
 def _redacted(value: Any, home: Path) -> Any:
-    """`value` with every secrets-file value removed from its strings."""
+    """value with every secrets-file value removed from its strings."""
     if isinstance(value, str):
         return secret_files.redact(value, home)
     if isinstance(value, list):

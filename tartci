@@ -112,6 +112,25 @@ tartci_toml_exec_or_python3() {
   exec "$python" "$@"
 }
 
+# Resolve and validate the interpreter for every helper launched by pool status.
+# Never hand a helper to PATH python3: a shell named python3 can interpret
+# Python docstring backticks as commands and recurse.
+tartci_verified_python() {
+  local python
+  python="$(tartci_toml_python_path 2>/dev/null)" || return 127
+  if ! "$python" -c 'import sys' >/dev/null 2>&1; then
+    echo "tartci: helper interpreter failed verification: $python" >&2
+    return 127
+  fi
+  printf '%s\n' "$python"
+}
+
+tartci_verified_python_run() {
+  local python
+  python="$(tartci_verified_python)" || return 127
+  "$python" "$@"
+}
+
 # The Tart store a command reads. A LaunchAgent sets TART_HOME for its lane; a
 # shell over ssh has none, and `tart list` then reads Tart's default ~/.tart,
 # where the gate VMs are not (m1, 2026-10-09: `doctor --reap --json` over ssh
@@ -1177,10 +1196,18 @@ EOF
       for usage_arg in "$@"; do [ "$usage_arg" = --usage ] && want_usage=1; done
       if [ "$want_usage" = 1 ]; then
         for usage_arg in "$@"; do [ "$usage_arg" = --usage ] || usage_args+=("$usage_arg"); done
-        python3 "$HERE/scripts/pool_usage.py" ${usage_args[@]+"${usage_args[@]}"}
+        tartci_verified_python_run "$HERE/scripts/pool_usage.py" ${usage_args[@]+"${usage_args[@]}"}
         return $?
       fi
       local status_json=0 require_ready=0 require_serving=0
+      local status_python
+      if ! status_python="$(tartci_verified_python)"; then
+        # TOML is unavailable, but the read-only helpers only need Python's
+        # base runtime. Use the fixed system interpreter after verifying it;
+        # never fall back to PATH python3.
+        status_python=/usr/bin/python3
+        "$status_python" -c 'import sys' >/dev/null 2>&1 || status_python=false
+      fi
       for arg in "$@"; do
         case "$arg" in
           --json) status_json=1 ;;
@@ -1221,30 +1248,30 @@ EOF
       pool_owned_labels="$(tartci_pool_owned_runner_agents "$agents_dir")"
       # The parked warm gate VM, if this host opted into one (report-only).
       local warm_vm_json
-      warm_vm_json="$(python3 "$HERE/scripts/warm_vm_status.py" --json 2>/dev/null)" \
+      warm_vm_json="$("$status_python" "$HERE/scripts/warm_vm_status.py" --json 2>/dev/null)" \
         || warm_vm_json='{"state":"unreadable"}'
       # The disk reclaimer's last pass, from its own receipt rather than from
       # launchd: a shadowed or dead reclaim agent is still "loaded" there.
       local reclaim_json
-      reclaim_json="$(python3 "$HERE/scripts/reclaim_status.py" --json 2>/dev/null)" \
+      reclaim_json="$("$status_python" "$HERE/scripts/reclaim_status.py" --json 2>/dev/null)" \
         || reclaim_json='{"state":"unreadable"}'
       [ -n "$reclaim_json" ] || reclaim_json='{"state":"unreadable"}'
       # Whether the host is configured to stay awake on AC (report-only): a
       # Studio that sleeps with its display takes every lane with it while
       # launchd still reports them loaded.
       local power_json
-      power_json="$(python3 "$HERE/scripts/power_status.py" --json 2>/dev/null)" \
+      power_json="$("$status_python" "$HERE/scripts/power_status.py" --json 2>/dev/null)" \
         || power_json='{"state":"unknown"}'
       [ -n "$power_json" ] || power_json='{"state":"unknown"}'
       # Whether launchd still starts this host's timer jobs, from the receipt
       # the lane supervisors' interval guard writes every minute.
       local launchd_timers_json
-      launchd_timers_json="$(python3 "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
+      launchd_timers_json="$("$status_python" "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
         || launchd_timers_json='{"state":"unreadable"}'
       [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
       if [ "$status_json" = 1 ]; then
         local lease_fit_json
-        lease_fit_json="$(python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
+        lease_fit_json="$("$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
           || lease_fit_json='{"managed":null}'
         [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
         printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"runners":[' \
@@ -1264,16 +1291,16 @@ EOF
         echo "host: $host"
         echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
-        python3 "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
-        python3 "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
-        python3 "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
-        python3 "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
+        "$status_python" "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
+        "$status_python" "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
+        "$status_python" "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
+        "$status_python" "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
           || echo "launchd timers: UNREADABLE"
-        python3 "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
+        "$status_python" "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
           || echo "signing prompts: UNREADABLE"
         # The readiness payload is already computed above; JSON formatting does
         # not require tomllib, so legacy/unmanaged hosts can still report status.
-        python3 - "$lock_health_json" <<'PY'
+        "$status_python" - "$lock_health_json" <<'PY'
 import json, sys
 value = json.loads(sys.argv[1])
 print(f"pool transition lock: {value['state']}")
@@ -1283,8 +1310,8 @@ if value.get("present"):
 PY
         # A lane that can never lease its VM, or identical lanes the lease
         # budget cannot run together, is configuration and not load.
-        python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
-        python3 - "$fleet_readiness" <<'PY'
+        "$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
+        "$status_python" - "$fleet_readiness" <<'PY'
 import json, sys
 fleet = json.loads(sys.argv[1])
 if fleet["managed"]:
@@ -1385,9 +1412,9 @@ $(tartci_pool_runner_agents "$agents_dir")
 EOF
         [ "$any" = 1 ] || echo "  (no runner agents installed on this host)"
         # One line of the last 24h; `pool status --usage` has the breakdown.
-        python3 "$HERE/scripts/pool_usage.py" --summary 2>/dev/null || true
+        "$status_python" "$HERE/scripts/pool_usage.py" --summary 2>/dev/null || true
       fi
-      if [ "$require_ready" = 1 ] && ! python3 - "$fleet_readiness" <<'PY'
+      if [ "$require_ready" = 1 ] && ! "$status_python" - "$fleet_readiness" <<'PY'
 import json, sys
 raise SystemExit(0 if json.loads(sys.argv[1]).get("fleet_ready") is True else 1)
 PY
@@ -1398,7 +1425,7 @@ PY
       # "is this host installed and running" and one asking "is this host
       # actually serving" want different answers, and an upstream refusal
       # that blocks every lane at once must not fail the first question.
-      if [ "$require_serving" = 1 ] && ! python3 - "$fleet_readiness" <<'SERVINGPY'
+      if [ "$require_serving" = 1 ] && ! "$status_python" - "$fleet_readiness" <<'SERVINGPY'
 import json, sys
 serving = json.loads(sys.argv[1]).get("serving") or {}
 raise SystemExit(0 if serving.get("blocked") is False else 1)
