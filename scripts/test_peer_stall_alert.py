@@ -35,6 +35,7 @@ M3_RECEIPT = {
     "ts": RECEIPT_TS,
 }
 TITLE = "[tartci] studio launchd stalled / self-update paused since 2026-10-05T05:41:27Z"
+VITALS_TITLE = "[tartci] studio host-vitals stalled since 2026-10-09T06:54:45Z"
 PEERS = {"m1": "m1", "m5": "m5", "studio": "m3"}
 
 
@@ -46,11 +47,13 @@ class Fleet:
         self.calls: list[str] = []
 
     def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
-              last: dict | None = None) -> None:
+              last: dict | None = None, vitals: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
         tail = json.dumps(last) if last is not None else ""
         self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
-                                   f"{psa.LAST_SEPARATOR}\n{tail}\n", "")
+                                   f"{psa.LAST_SEPARATOR}\n{tail}\n"
+                                   f"{psa.VITALS_SEPARATOR}\n"
+                                   f"{json.dumps(vitals) if vitals is not None else ''}\n", "")
 
     def healthy(self, target: str) -> None:
         self.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
@@ -108,6 +111,36 @@ class PeerStall(unittest.TestCase):
         self.assertFalse(out["peers"]["studio"]["active"])
         self.assertEqual(out["peers"]["studio"]["hours"], 2.0)
         self.assertEqual(self.opened, [])
+
+    def test_a_peer_tick_alerts_on_stale_host_vitals_with_heal_remedy(self):
+        sampled = RECEIPT_TS - 360
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": sampled})
+        out = self.run_pass(RECEIPT_TS + 60)
+        self.assertEqual(out["peers"]["studio"]["host_vitals"]["state"], "stale")
+        self.assertEqual([title for title, _ in self.opened], [VITALS_TITLE])
+        self.assertIn("tartci launchd heal", self.opened[0][1])
+
+    def test_fresh_host_vitals_is_the_negative_control(self):
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 30})
+        out = self.run_pass(RECEIPT_TS + 60)
+        self.assertEqual(out["peers"]["studio"]["host_vitals"]["state"], "ok")
+        self.assertEqual(self.opened, [])
+
+    def test_host_vitals_recovery_closes_the_peer_issue(self):
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(RECEIPT_TS + 60)
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS + psa.READ_SECS + 60,
+                         vitals={"sampled_at": RECEIPT_TS + psa.READ_SECS + 30})
+        out = self.run_pass(RECEIPT_TS + psa.READ_SECS + 60)
+        self.assertTrue(out["peers"]["studio"]["host_vitals"]["closed"])
 
     def test_the_peer_is_judged_on_its_own_clock(self):
         # This host's clock is a day ahead; the peer's receipt is fresh on its own.

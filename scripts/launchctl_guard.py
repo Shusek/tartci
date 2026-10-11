@@ -28,6 +28,10 @@ data unless they feed a shell interpreter or ssh. Exit 0 otherwise, silently.
 `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself is the explicit,
 auditable escape hatch (exit 0 with a warning). Malformed input exits 0 with
 a note: a broken hook must not break the agent's shell.
+
+The same hook refuses broad process kills: bare-name `pkill`/`killall` of an
+agent shell or interpreter, shell-snapshot `-f` patterns, and `kill -9 -1`.
+Use the tree's top PID or `tartci launchd heal` for targeted recovery.
 """
 
 from __future__ import annotations
@@ -72,6 +76,10 @@ SSH_ARG_OPTS = frozenset({"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
                           "-S", "-W", "-w"})
 XARGS_ARG_OPTS = frozenset({"-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s", "-a", "-d"})
 MAX_DEPTH = 8
+BROAD_KILL_NAMES = frozenset({"bash", "sh", "zsh", "python", "python3", "node"})
+SHELL_SNAPSHOT = re.compile(
+    r"(?:snapshot[-_.]?(?:bash|sh|zsh)|(?:bash|sh|zsh)[-_.]?snapshot)", re.I
+)
 
 
 class Hit(NamedTuple):
@@ -300,6 +308,36 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
     head = os.path.basename(_expand(argv[0], variables))
     if head == "launchctl":
         return _launchctl_hits(argv[1:], from_stdin, variables, depth)
+    if head in ("pkill", "killall"):
+        words = [_expand(word, variables) for word in argv[1:]]
+        operands: list[str] = []
+        patterns: list[str] = []
+        skip = False
+        for word in words:
+            if skip:
+                patterns.append(word)
+                skip = False
+            elif word == "-f":
+                skip = True
+            elif not word.startswith("-"):
+                operands.append(word)
+        hits: list[Hit] = [
+            Hit(head, target,
+                "bare-name kill would terminate every matching agent shell/process")
+            for target in operands if target in BROAD_KILL_NAMES
+        ]
+        hits.extend(
+            Hit(head, target,
+                "-f matches a shell snapshot and can kill every agent session")
+            for target in patterns if SHELL_SNAPSHOT.search(target)
+        )
+        return hits
+    if head == "kill":
+        words = [_expand(word, variables) for word in argv[1:]]
+        if "-1" in words and any(word in ("-9", "-KILL", "-SIGKILL") for word in words):
+            return [Hit("kill", "-9 -1",
+                        "broadcast SIGKILL can terminate every agent and supervisor")]
+        return []
     if head == "export":
         for word in argv[1:]:
             match = ASSIGNMENT.match(word)
@@ -347,7 +385,10 @@ def classify(command: str, depth: int = 0,
 
 
 def block_message(command: str, hits: list[Hit]) -> str:
-    lines = ["BLOCKED by tartci launchd guard: raw launchctl against a CI lane.", ""]
+    broad = any(hit.verb in {"pkill", "killall", "kill"} for hit in hits)
+    heading = ("BLOCKED by tartci launchd guard: broad process kill."
+               if broad else "BLOCKED by tartci launchd guard: raw launchctl against a CI lane.")
+    lines = [heading, ""]
     for hit in hits:
         lines.append(f"  launchctl {hit.verb} {hit.target}: {hit.why}")
     lines += [
@@ -363,10 +404,20 @@ def block_message(command: str, hits: list[Hit]) -> str:
         "                                  the plist; refuses while the lane is",
         "                                  mid-job (--dry-run shows the plan)",
         "  tartci pool drain               stop taking work; running jobs finish",
-        "",
-        "If you really mean it, put TARTCI_ALLOW_RAW_LAUNCHCTL=1 in the command",
-        "itself (e.g. `TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...`).",
     ]
+    if broad:
+        lines += [
+            "  Targeted recovery: kill the tree top by its PID, or run",
+            "  tartci launchd heal             bounded launchd recovery with a receipt",
+        ]
+    lines += [""]
+    if broad:
+        lines.append("Broad process kills have no escape hatch; target the tree by PID or run tartci launchd heal.")
+    else:
+        lines += [
+            "If you really mean it, put TARTCI_ALLOW_RAW_LAUNCHCTL=1 in the command",
+            "itself (e.g. `TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...`).",
+        ]
     return "\n".join(lines)
 
 
@@ -374,7 +425,8 @@ def decide(command: str) -> tuple[int, str]:
     hits = classify(command)
     if not hits:
         return 0, ""
-    if ESCAPE.search(command):
+    broad = any(hit.verb in {"pkill", "killall", "kill"} for hit in hits)
+    if ESCAPE.search(command) and not broad:
         return 0, ("tartci launchd guard: TARTCI_ALLOW_RAW_LAUNCHCTL=1 given; allowing "
                    + "; ".join(f"launchctl {h.verb} {h.target}" for h in hits))
     return 2, block_message(command, hits)

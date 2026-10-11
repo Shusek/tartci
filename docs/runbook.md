@@ -1988,6 +1988,14 @@ alert, so its peers raise it.
   and `events.jsonl` (`peer_launchd_stalled`, once per episode).
   `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
   issue.
+- **Host-vitals timer stall.** The same peer tick reads
+  `~/.local/state/pulp/host_vitals.json` using the peer's clock. A sample older
+  than `TARTCI_HOST_VITALS_ALERT_SECS` (default 300 seconds) opens one issue
+  titled `[tartci] <peer> host-vitals stalled since <sample time>`; its remedy
+  is `ssh <peer> 'tartci launchd heal'`. A fresh sample closes the episode.
+  This check is deliberately peer-driven because a watchdog cannot report its
+  own StartInterval stall. Its receipt is recorded beside the existing peer
+  alert state as `<peer>.host-vitals.json`.
 
 ### System resolver dead while TCP is alive (`resolver_dead`)
 
@@ -2489,10 +2497,16 @@ unless the heredoc feeds `bash|sh|zsh|dash|ksh` or `ssh`. It sees through `&&`, 
 paths or bare labels. A target it cannot resolve statically (a loop variable,
 a glob, labels piped into `xargs`, `bootout gui/<uid>` of the whole domain)
 is blocked too. Read-only verbs (`print`, `list`, `print-disabled`) and
-services outside those families pass silently. The explicit, auditable escape
-hatch is `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself
-(allowed with a warning). Malformed hook input exits 0 with a note so a broken
-hook never breaks the agent's shell.
+  services outside those families pass silently. The explicit, auditable escape
+  hatch is `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself
+  (allowed with a warning). Malformed hook input exits 0 with a note so a broken
+  hook never breaks the agent's shell.
+
+The same Claude and Codex hook formats refuse broad process kills: bare-name
+`pkill` or `killall` of `bash`, `sh`, `zsh`, `python`, `python3`, or `node`,
+`-f` patterns naming shell snapshots, and `kill -9 -1`. These commands can
+remove every agent shell and leave forking lane supervisors behind. Kill the
+tree's top PID when a specific process must stop, or run `tartci launchd heal`.
 
 `tartci hooks print` prints (never writes) the settings snippet for Claude
 Code (`~/.claude/settings.json`, PreToolUse matcher `Bash`) and for Codex

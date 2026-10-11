@@ -74,6 +74,15 @@ ALLOWED = [
     "ls -la",
 ]
 
+BROAD_KILLS = [
+    "pkill -9 -x bash",
+    "pkill sh",
+    "killall python3",
+    "pkill -f snapshot-zsh",
+    "pkill -f zsh-snapshot",
+    "kill -9 -1",
+]
+
 
 class ClassifierTests(unittest.TestCase):
     def test_every_raw_lane_mutation_is_blocked(self) -> None:
@@ -95,6 +104,24 @@ class ClassifierTests(unittest.TestCase):
     def test_same_verb_on_a_foreign_service_is_the_control(self) -> None:
         self.assertEqual(guard.decide("launchctl kickstart -k gui/501/com.example.web")[0], 0)
         self.assertEqual(guard.decide(f"launchctl kickstart -k gui/501/{LANE}")[0], 2)
+
+    def test_broad_process_kills_are_refused_and_targeted_recovery_is_named(self) -> None:
+        for command in BROAD_KILLS:
+            with self.subTest(command=command):
+                code, message = guard.decide(command)
+                self.assertEqual(code, 2, command)
+                self.assertIn("tartci launchd heal", message)
+                self.assertIn("tree top", message)
+
+    def test_benign_kills_are_the_control(self) -> None:
+        for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234"):
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command), (0, ""))
+
+    def test_launchctl_escape_does_not_authorize_a_broad_kill(self) -> None:
+        code, message = guard.decide("TARTCI_ALLOW_RAW_LAUNCHCTL=1 pkill -x zsh")
+        self.assertEqual(code, 2)
+        self.assertIn("broad process kill", message)
 
     def test_escape_hatch_allows_with_a_warning(self) -> None:
         for command in (f"TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl kickstart -k gui/501/{LANE}",
@@ -178,6 +205,19 @@ class HookEntryTests(unittest.TestCase):
             self.assertIn("BLOCKED", blocked.stderr)
             allowed = self._hook(self._payload("launchctl list"), via)
             self.assertEqual((allowed.returncode, allowed.stdout, allowed.stderr), (0, "", ""))
+
+    def test_claude_and_codex_hook_formats_refuse_broad_kills(self) -> None:
+        payloads = [
+            self._payload("pkill -9 -x bash"),
+            json.dumps({"tool_name": "Bash", "tool_input": {
+                "command": ["kill", "-9", "-1"]}}),
+        ]
+        for via in ([str(SHIM)], [str(ROOT / "tartci"), "launchd", "guard", "--hook"]):
+            for payload in payloads:
+                with self.subTest(via=via, payload=payload):
+                    blocked = self._hook(payload, via)
+                    self.assertEqual(blocked.returncode, 2, blocked.stderr)
+                    self.assertIn("broad process kill", blocked.stderr)
 
     def test_shim_resolves_tartci_through_a_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as td:
