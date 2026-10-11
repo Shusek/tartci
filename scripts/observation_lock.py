@@ -68,6 +68,9 @@ class FairObservationLock:
         self.backoff_lock_path = self.backoff_path.with_name(self.backoff_path.name + ".lock")
         self.ticket_path: Path | None = None
         self.handle = None
+        self._holding = False
+        self._owner_pid: int | None = None
+        self._owner_process_start: str | None = None
 
     def _backoff(self) -> dict[str, float]:
         try:
@@ -115,9 +118,52 @@ class FairObservationLock:
             return None
         return value if isinstance(value, dict) else None
 
+    def _write_owner(self, pid: int, *, started_epoch: float | None = None) -> None:
+        """Publish the process that currently holds the inherited flock."""
+        now = time.time() if started_epoch is None else started_epoch
+        owner = {
+            "pid": pid,
+            "process_start": _process_start(pid),
+            "lane": self.lane,
+            "generation": self.generation,
+            "started_epoch": now,
+            "started_at": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(),
+        }
+        temp = self.owner_path.with_name(
+            self.owner_path.name + f".{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        temp.write_text(json.dumps(owner, sort_keys=True, separators=(",", ":")))
+        os.replace(temp, self.owner_path)
+        self._owner_pid = pid
+        self._owner_process_start = owner["process_start"]
+
+    def _clear_owner(self) -> None:
+        owner = self._owner()
+        if owner and owner.get("pid") == self._owner_pid and owner.get("process_start") == self._owner_process_start:
+            try:
+                self.owner_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _after_fork_child(self) -> None:
+        # flock descriptors survive fork; make the inherited child the visible
+        # holder so diagnostics identify the process that can actually release it.
+        if self._holding:
+            self._write_owner(os.getpid())
+
     def _owner_detail(self) -> str:
         owner = self._owner()
         if not owner:
+            return "owner=unknown age=unknown"
+        try:
+            pid = int(owner["pid"])
+            recorded_start = owner.get("process_start")
+            os.kill(pid, 0)
+            if recorded_start and _process_start(pid) != recorded_start:
+                self.owner_path.unlink(missing_ok=True)
+                return "owner=unknown age=unknown"
+        except (KeyError, TypeError, ValueError, OSError):
+            self.owner_path.unlink(missing_ok=True)
             return "owner=unknown age=unknown"
         started = owner.get("started_at")
         try:
@@ -218,18 +264,9 @@ class FairObservationLock:
                             )
                         time.sleep(0.05)
                 self.handle = handle
-                owner = {
-                    "pid": os.getpid(),
-                    "lane": self.lane,
-                    "generation": self.generation,
-                    "started_epoch": time.time(),
-                    "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                }
-                temp = self.owner_path.with_name(
-                    self.owner_path.name + f".{os.getpid()}.{time.time_ns()}.tmp"
-                )
-                temp.write_text(json.dumps(owner, sort_keys=True, separators=(",", ":")))
-                os.replace(temp, self.owner_path)
+                self._holding = True
+                os.register_at_fork(after_in_child=self._after_fork_child)
+                self._write_owner(os.getpid())
                 try:
                     yield handle
                 except BaseException as error:
@@ -240,6 +277,8 @@ class FairObservationLock:
                     self._clear_backoff()
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    self._holding = False
+                    self._clear_owner()
         finally:
             if marker.exists():
                 marker.unlink()

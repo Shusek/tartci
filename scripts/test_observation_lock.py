@@ -200,6 +200,7 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-1", generation="gen-7
                         pass
                 message = str(raised.exception)
                 self.assertIn("owner_pid=", message)
+                self.assertIn(f"owner_pid={int(ready.read_text())}", message)
                 self.assertIn("lane=lane-1", message)
                 self.assertIn("generation=gen-7", message)
                 self.assertIn("age=", message)
@@ -210,6 +211,59 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-1", generation="gen-7
                 os.kill(child, 15)
                 time.sleep(0.05)
                 owner.wait(timeout=3)
+
+    def test_released_lock_has_no_previous_owner_or_escalation(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            with FairObservationLock(lock, 1, "repo", lane="lane", generation="gen").hold():
+                pass
+            self.assertFalse(Path(lock + ".owner.json").exists())
+            queue = Path(lock + ".fifo")
+            queue.mkdir(exist_ok=True)
+            blocker = queue / f"00000000000000000000.{os.getpid()}"
+            blocker.write_text(__import__("json").dumps({"pid": os.getpid(), "start": _process_start(os.getpid())}))
+            try:
+                with self.assertRaises(TimeoutError) as raised:
+                    with FairObservationLock(lock, 0.01, "repo", max_age=0).hold():
+                        pass
+            finally:
+                blocker.unlink()
+            self.assertIn("owner=unknown age=unknown", str(raised.exception))
+            self.assertFalse(Path(lock + ".escalation.json").exists())
+
+    def test_assignment_entry_point_passes_lane_and_generation_to_lock(self):
+        import importlib
+        module = importlib.import_module("assignment_scan")
+        calls = []
+
+        class ProbeLock:
+            def __init__(self, *args):
+                calls.append(args)
+            def hold(self):
+                class Handle:
+                    def fileno(self):
+                        return os.open(os.devnull, os.O_RDONLY)
+                return __import__("contextlib").nullcontext(Handle())
+
+        old = module.FairObservationLock
+        module.FairObservationLock = ProbeLock
+        try:
+            scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
+            scanner.observation_lock_path = Path("/tmp/assignment-probe.lock")
+            scanner.args = type("Args", (), {
+                "observation_lock_timeout": 4,
+                "repo": "owner/repo",
+                "observation_backoff_file": None,
+                "observation_backoff_seconds": 30,
+                "lane_id": "m5-pulp-gate-01",
+                "generation": "gen-123",
+                "scan_timeout": 10,
+            })()
+            with scanner._observation_lock():
+                pass
+            self.assertEqual(calls[0][-2:], ("m5-pulp-gate-01", "gen-123"))
+        finally:
+            module.FairObservationLock = old
 
 
 if __name__ == "__main__":

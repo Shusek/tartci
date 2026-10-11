@@ -751,6 +751,13 @@ first; list it only when what it asserts really needs tomllib.
   backoff is a fairness guard, not a second lock or a per-repository authority;
   all three scanners (`assignment_scan.py`, `queue_scan.py`, and
   `current_job_scan.py`) use the same host lock, FIFO queue, and backoff file.
+  The lock's `<path>.owner.json` records the active holder PID, process start,
+  lane, generation, and start time. A contender that observes a holder past
+  `TARTCI_QUEUE_OBSERVATION_LOCK_MAX_AGE_SECS` (default 300 seconds) writes
+  `<path>.escalation.json` with the same evidence. The owner record is removed
+  when the flock is released; inherited children refresh the PID so a child
+  that keeps the descriptor is the holder named by diagnostics. Missing or
+  stale owner records remain fail-closed and are reported as unknown.
   → *Failure behavior:* lock acquisition is bounded by
   `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
   the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`
