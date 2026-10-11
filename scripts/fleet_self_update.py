@@ -1817,7 +1817,23 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         _write_json(cfg.state_dir / "skew.json", {"state": "unknown", "reason": str(exc),
                                                   "measured_at": _iso(now)})
         return EXIT_UNKNOWN
-    skew = measure_skew(cfg, sys_, installed, now, target_ref, explicit=explicit)
+    try:
+        skew = measure_skew(cfg, sys_, installed, now, target_ref, explicit=explicit)
+    except Refused as exc:
+        # Repository authentication is a normal preflight refusal.  Keep the
+        # scheduled agent alive and leave an attempt receipt behind instead of
+        # allowing a refusal from configured_repository() to escape as a
+        # traceback before Receipt has been created.
+        reason = str(exc)
+        skew = {"state": "unknown", "reason": reason, "measured_at": _iso(now),
+                "installed": installed}
+        _write_json(cfg.state_dir / "skew.json", skew)
+        receipt = Receipt(cfg, sys_, installed, "apply" if apply else "plan")
+        receipt.value["previous"] = installed
+        receipt.step("refused", reason, ok=False)
+        receipt.finish("refused", reason)
+        print(f"self-update: REFUSED {reason}")
+        return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
     print(f"self-update: {render_skew(skew)}")
