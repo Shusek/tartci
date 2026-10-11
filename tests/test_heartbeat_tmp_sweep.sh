@@ -11,8 +11,8 @@ STATE_DIR="$state"
 EVENT_LOG="$tmp/events"
 HOST_NAME=fixture CURRENT_VM=vm CURRENT_LABELS=labels REPO=repo
 CURRENT_RUN_ID=run CURRENT_JOB_ID=job CURRENT_JOB_CAPTURE_STATUS=observed
-CURRENT_ASSIGNMENT_QUARANTINE=none SERVING_BLOCKED_SINCE= SERVING_BLOCKED_STREAK=0
-SERVING_BLOCKED_LAST_PHASE= SUPERVISOR_PID= SUPERVISOR_PID_STARTED_AT=
+CURRENT_ASSIGNMENT_QUARANTINE=none SERVING_BLOCKED_SINCE='' SERVING_BLOCKED_STREAK=0
+SERVING_BLOCKED_LAST_PHASE='' SUPERVISOR_PID='' SUPERVISOR_PID_STARTED_AT=''
 LAST_HEARTBEAT_PHASE=
 json_sanitize() { printf '%s' "$1"; }
 tartci_heartbeat_keepalive_stop() { :; }
@@ -22,6 +22,7 @@ export SERVING_BLOCKED_SINCE SERVING_BLOCKED_STREAK SERVING_BLOCKED_LAST_PHASE
 export SUPERVISOR_PID SUPERVISOR_PID_STARTED_AT LAST_HEARTBEAT_PHASE
 function_file="$tmp/heartbeat-function.sh"
 sed -n '/^heartbeat(){/,/^}/p' "$ROOT/providers/tart-macos/runner.sh" >"$function_file"
+# shellcheck source=/dev/null
 source "$function_file"
 printf 'live\n' >"$state/$RUNNER_NAME.state.json"
 printf 'old\n' >"$state/$RUNNER_NAME.state.json.tmp.old"
