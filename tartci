@@ -13,6 +13,7 @@
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
+#   tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
@@ -42,12 +43,14 @@
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci pool <on|drain|off|status> # durable host admission and participation
 #   tartci pool status --usage [--range 24h] [--json] # slot occupancy, idle-with-demand, discards
+#   tartci held <list|inspect NAME|stop NAME|delete NAME|expire>  # failed gate VMs kept for debugging ([debug_hold])
 #                              # --plan: print the transition, write nothing;
 #                              # off refuses a mid-job lane (exit 12) unless --now
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
 #   tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run]  # copy canonical golden to a host (fastest link) + verify + repoint
+#   tartci goldens doctor [--receipt FILE] [--promotion]                     # read-only receipt/freshness check
 #   tartci prepare <os>        # bake/provision a golden from the provider recipe
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
@@ -96,6 +99,28 @@ tartci_toml_exec_or_python3() {
   exec "$python" "$@"
 }
 
+# The Tart store a command reads. A LaunchAgent sets TART_HOME for its lane; a
+# shell over ssh has none, and `tart list` then reads Tart's default ~/.tart,
+# where the gate VMs are not (m1, 2026-10-09: `doctor --reap --json` over ssh
+# said 0 running and 2 free while two gate VMs ran). When TART_HOME is unset,
+# export the fleet profile's [host].tart_home, so this command and every tart
+# call under it read the store the lanes use. Sets TARTCI_TART_HOME_SOURCE to
+# env, profile or default; scripts/tart_home.py owns the resolution.
+tartci_resolve_tart_home() {
+  [ -z "${TARTCI_TART_HOME_SOURCE:-}" ] || return 0
+  local python out path source
+  python="$(tartci_toml_python_path 2>/dev/null)" || python=python3
+  out="$("$python" "$HERE/scripts/tart_home.py" --lines 2>/dev/null)" || return 0
+  { IFS= read -r path; IFS= read -r source; } <<<"$out"
+  case "$source" in env|profile|default) ;; *) return 0 ;; esac
+  if [ "$source" = profile ] && [ -n "$path" ]; then
+    TART_HOME="$path"
+    export TART_HOME
+  fi
+  TARTCI_TART_HOME_SOURCE="$source"
+  export TARTCI_TART_HOME_SOURCE
+}
+
 # check_shipyard_auth — non-fatal onboarding check (see runbook §1).
 # Shipyard's GitHub auth must point at the GitHub-App installation token (the
 # `[github.auth]` source="command" helper in its config.toml). A host that never
@@ -123,9 +148,14 @@ check_shipyard_auth() {
 }
 
 cmd_doctor() {
+  tartci_resolve_tart_home
   if [ "${1:-}" = "--reap" ]; then
     shift
     exec python3 "$HERE/scripts/vm_reap.py" "$@"
+  fi
+  if [ "${1:-}" = "cpu-pressure" ]; then
+    shift
+    tartci_toml_exec "$HERE/scripts/cpu_pressure_guard.py" "$@"
   fi
   # `doctor fleet` is the fleet-wide diagnosis; bare `doctor` stays the host
   # prereq report, which must keep passing on hosts that run no fleet at all.
@@ -146,6 +176,13 @@ cmd_doctor() {
   done
   # vncdotool + UTM are optional helpers.
   command -v vncdo >/dev/null 2>&1 && c_ok "vncdo (VNC drive)" || c_warn "vncdo (optional: headless VNC drive — pip install vncdotool)"
+  local _store
+  _store="$("$(tartci_toml_python_path 2>/dev/null || echo python3)" "$HERE/scripts/tart_home.py" 2>/dev/null)" \
+    || _store="tart store: unresolved (scripts/tart_home.py failed)"
+  case "$_store" in
+    *WARNING*|*unresolved*) c_warn "$_store" ;;
+    *) c_ok "$_store" ;;
+  esac
   [ -d /Applications/UTM.app ] && c_ok "UTM.app (GUI bench)" || c_warn "UTM.app (optional: GUI/DAW bench)"
   # Two janitors, two different failures: the disk reclaimer keeps the lease's
   # disk axis servable, the VM janitor removes stale VMs and overlays. Report
@@ -259,6 +296,7 @@ cmd_tart_image_sync() {
 
 cmd_observe() {
   local os="${1:-macos}"; shift || true
+  tartci_resolve_tart_home
   case "$os" in
     macos) exec python3 "$HERE/scripts/macos_observe.py" "$@" ;;
     *) echo "usage: tartci observe <macos> [--json] [--runner NAME] [--run-id ID]"; return 2 ;;
@@ -736,6 +774,8 @@ cmd_pool() {
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  --restore-receipt  on: restore the previously receipted serving set during
+           self-update recovery without requiring a fresh relay probe
   status --usage [--range DUR] [--until TS] [--json] [--peer HOST=SSH_TARGET]: slot
            occupancy, idle-with-demand, JIT discards and lease denials from the
            lane event logs (read-only; see scripts/pool_usage.py)
@@ -749,13 +789,14 @@ cmd_pool() {
     # which a fallback lane on another host reads over SSH before booting.
     supply) tartci_toml_exec "$HERE/scripts/gate_supply.py" report "$@" ;;
   esac
-  local arg allow_last_serving_host=0 plan=0 now=0
+  local arg allow_last_serving_host=0 plan=0 now=0 restore_receipt=0
   for arg in "$@"; do
     case "$arg" in
       -h|--help) echo "$pool_usage"; return 0 ;;
       --allow-last-serving-host) allow_last_serving_host=1 ;;
       --plan) plan=1 ;;
       --now) now=1 ;;
+      --restore-receipt) restore_receipt=1 ;;
     esac
   done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
@@ -855,7 +896,10 @@ cmd_pool() {
         # Converge and prove its relay before making participation visible or
         # loading controllers; absent/disabled profiles are a strict no-op.
         local network_profile_output
-        if ! network_profile_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" reconcile --pool-lock-held 2>&1)"; then
+        if [ "$restore_receipt" = 1 ]; then
+          network_profile_output="restoring the prior receipted serving set; relay proof intentionally reused"
+          echo "  $network_profile_output"
+        elif ! network_profile_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" reconcile --pool-lock-held 2>&1)"; then
           tartci_pool_lock_release
           printf 'pool on refused: %s\n' "${network_profile_output:-network-profile reconcile failed without a typed cause}" >&2
           return 6
@@ -1365,7 +1409,9 @@ case "${1:-help}" in
   reclaim) shift; cmd_reclaim "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
+  retention) shift; exec python3 "$HERE/scripts/state_retention.py" "$@" ;;
   vm-dhcp) shift; exec python3 "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
+  held) shift; tartci_toml_python "$HERE/scripts/debug_hold.py" "$@"; exit $? ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;

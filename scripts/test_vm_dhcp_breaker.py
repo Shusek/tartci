@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -493,6 +494,29 @@ class PfdLayer(Case):
         finding = fleet_doctor.check_vm_dhcp(self.state())
         self.assertEqual(finding.code, "vm_dhcp_pfd_crash_loop")
         self.assertIn("last exit 3", finding.detail)
+        self.assertIn("pf holds no enable reference", finding.detail)
+
+    def test_another_pfd_exit_is_not_read_as_no_reference(self):
+        detail = vb.doctor_code({"state": "open", "cause": "pfd_crash_loop",
+                                 "pfd": {"state": "spawn scheduled", "last_exit": "1"}})[2]
+        self.assertIn("pfd keeps exiting", detail)
+        self.assertNotIn("no enable reference", detail)
+
+    def test_an_ordinary_pfd_failure_does_not_claim_a_reboot(self):
+        detail = vb.doctor_code({"state": "open", "cause": "pfd_crash_loop",
+                                 "pfd": {"state": "spawn scheduled", "last_exit": "3"}})[2]
+        self.assertIn("pf holds no enable reference", detail)
+        self.assertNotIn("found by the post-boot probe", detail)
+
+    def test_a_post_boot_pfd_failure_says_it_followed_a_reboot(self):
+        self.ifaces.write_text("lo0 en0")
+        self.pfd.write_text(self.CRASHING)
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 100)
+        self.check(T0 + 200, lane="a")
+        self.record("no_ip", T0 + 400, lane="a")
+        detail = fleet_doctor.check_vm_dhcp(self.state()).detail
+        self.assertIn("pf holds no enable reference", detail)
+        self.assertIn("found by the post-boot probe after host_reboot", detail)
 
     def test_pfd_not_loaded_reads_as_unknown_not_crash_looping(self):
         # launchctl print exits 113 for a job launchd does not have: the pfd
@@ -766,6 +790,173 @@ class BootTimes(unittest.TestCase):
         self.assertEqual(json.loads(out.stdout)["boot_ip"]["n"], 1)
 
 
+class Metrics(Case):
+    """Every boot is counted and every outage kept, across any change of state."""
+
+    def hour(self, at: float) -> str:
+        return time.strftime("%Y-%m-%dT%H", time.gmtime(at))
+
+    def test_each_record_counts_one_boot_in_its_hour(self):
+        self.record("ip", T0)
+        self.record("no_ip", T0 + 10)
+        self.record("ip", T0 + 3600)
+        hourly = self.state()["hourly"]
+        self.assertEqual(hourly[self.hour(T0)], {"ip": 1, "no_ip": 1})
+        self.assertEqual(hourly[self.hour(T0 + 3600)], {"ip": 1, "no_ip": 0})
+
+    def test_counts_older_than_fourteen_days_are_pruned(self):
+        self.record("ip", T0)
+        self.record("ip", T0 + vb.HOURLY_KEEP_SECS + 7200)
+        self.assertNotIn(self.hour(T0), self.state()["hourly"])
+        self.assertEqual(len(self.state()["hourly"]), 1)
+
+    def test_concurrent_records_count_exactly(self):
+        def worker(n: int) -> None:
+            for i in range(25):
+                self.record("ip" if (n + i) % 2 else "no_ip", T0 + 1, lane=f"l{n}")
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        bucket = self.state()["hourly"][self.hour(T0 + 1)]
+        self.assertEqual(bucket["ip"] + bucket["no_ip"], 100)
+        self.assertEqual(bucket, {"ip": 50, "no_ip": 50})
+
+    def test_every_state_change_carries_every_carried_key(self):
+        keep = {"boot_time": 1.0, "hourly": {"x": {"ip": 1, "no_ip": 0}},
+                "outages": [{"opened_at": 1}], "outage": {"opened_at": 2, "vms_spent": 3}}
+        for name, change in (
+                ("close", lambda v: vb.close(v, T0, "boot_ok")),
+                ("verified", lambda v: vb.verified(v, T0, "a", late=False)),
+                ("enter_verifying", lambda v: vb.enter_verifying(v, T0, "host_reboot", 1.0))):
+            with self.subTest(change=name):
+                value = {"state": "verifying", "opened_at": T0 - 60, **json.loads(json.dumps(keep))}
+                change(value)
+                self.assertEqual(value["hourly"], keep["hourly"])
+                self.assertEqual(value["boot_time"], 1.0)
+                self.assertEqual(value["outages"][0], keep["outages"][0])
+        self.assertEqual(set(vb.CARRIED_KEYS), set(keep))
+
+    def outage(self) -> dict:
+        return self.state()["outages"][-1]
+
+    def test_an_outage_closed_by_any_boot_is_kept(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.record("ip", T0 + 900, lane="other")
+        o = self.outage()
+        self.assertEqual((o["opened_at"], o["closed_at"], o["duration_s"]), (T0 + 60, T0 + 900, 840))
+        self.assertEqual((o["closed_by"], o["cause"], o["vms_spent"]), ("boot_ok", "dhcp_silent", 2))
+
+    def test_an_outage_closed_by_its_probe(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.check(T0 + 400, lane="p")
+        self.record("ip", T0 + 500, lane="p")
+        self.assertEqual(self.outage()["closed_by"], "probe")
+
+    def test_an_outage_across_a_reboot_is_one_outage(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 1000)
+        self.check(T0 + 1100, lane="a")
+        self.record("ip", T0 + 1300, lane="a")
+        o = self.outage()
+        self.assertEqual((o["opened_at"], o["closed_by"], o["duration_s"]),
+                         (T0 + 60, "verified", 1240))
+        self.assertEqual(len(self.state()["outages"]), 1)
+        self.assertNotIn("outage", self.state())
+
+    def test_a_clean_reboot_records_no_outage(self):
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 1000)
+        self.check(T0 + 1100, lane="a")
+        self.record("ip", T0 + 1300, lane="a")
+        self.assertEqual(self.state().get("outages", []), [])
+
+    def test_a_late_probe_address_closes_the_outage_as_late(self):
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 100)
+        self.check(T0 + 200, lane="a")
+        self.check(T0 + 200 + vb.VERIFY_REPORT_SECS, lane="b")
+        self.record("ip", T0 + 200 + vb.VERIFY_REPORT_SECS + 30, lane="a")
+        self.assertEqual(self.outage()["closed_by"], "late")
+
+    def test_the_history_keeps_the_newest_fifty(self):
+        value = {"outages": [{"opened_at": n, "closed_at": n} for n in range(60)],
+                 "state": "open", "opened_at": T0}
+        vb.end_outage(value, T0 + 10, "boot_ok")
+        self.assertEqual(len(value["outages"]), vb.OUTAGES_KEEP)
+        self.assertEqual(value["outages"][0]["opened_at"], 11)
+        self.assertEqual(value["outages"][-1]["closed_by"], "boot_ok")
+
+
+class BootHealth(unittest.TestCase):
+    """A count threshold, max(2, lanes) failed boots in 24 h; the rate is reported."""
+
+    NOW = T0 + 10 * 3600
+
+    def value(self, ip: int, no_ip: int, **extra) -> dict:
+        hour = time.strftime("%Y-%m-%dT%H", time.gmtime(self.NOW - 3600))
+        return {"state": "closed", "hourly": {hour: {"ip": ip, "no_ip": no_ip}}, **extra}
+
+    def test_the_isolated_day_stays_ok_and_an_outage_day_trips(self):
+        # m5, 2026-09-22: 2 in 53; 2026-09-23: 13 in 76.
+        state, code, detail = vb.boot_health(self.value(51, 2), self.NOW, 4)
+        self.assertEqual((state, code), ("ok", "vm_boot_ok"))
+        self.assertIn("51/53 boots got an address (96.2%)", detail)
+        state, code, detail = vb.boot_health(self.value(63, 13), self.NOW, 4)
+        self.assertEqual((state, code), ("problem", "vm_boot_degraded"))
+        self.assertIn("threshold 4", detail)
+
+    def test_the_threshold_is_max_two_and_lanes(self):
+        for lanes, quiet, trips in ((1, 1, 2), (2, 1, 2), (4, 3, 4), (5, 4, 5)):
+            with self.subTest(lanes=lanes):
+                self.assertEqual(vb.boot_health(self.value(50, quiet), self.NOW, lanes)[1],
+                                 "vm_boot_ok")
+                self.assertEqual(vb.boot_health(self.value(50, trips), self.NOW, lanes)[1],
+                                 "vm_boot_degraded")
+
+    def test_only_the_last_24_hours_count(self):
+        old = time.strftime("%Y-%m-%dT%H", time.gmtime(self.NOW - 30 * 3600))
+        value = {"state": "closed", "hourly": {old: {"ip": 0, "no_ip": 50}}}
+        state, code, detail = vb.boot_health(value, self.NOW, 4)
+        self.assertEqual(code, "vm_boot_ok")
+        self.assertIn("7 d: 0/50", detail)
+
+    def test_outages_of_the_last_week_are_summarised(self):
+        value = self.value(10, 0, outages=[
+            {"closed_at": self.NOW - 3600, "duration_s": 5400},
+            {"closed_at": self.NOW - 8 * 86400, "duration_s": 99999}])
+        self.assertIn("outages in 7 d: 1, 1h30m down", vb.boot_health(value, self.NOW, 4)[2])
+
+    def test_unmeasured_and_unreadable(self):
+        self.assertEqual(vb.boot_health({"state": "closed", "source": "absent"}, self.NOW, 4)[:2],
+                         ("not_applicable", "vm_boot_unmeasured"))
+        self.assertEqual(vb.boot_health({"state": "unreadable", "error": "x"}, self.NOW, 4)[:2],
+                         ("unknown", "vm_boot_unreadable"))
+
+    def test_the_doctor_run_reads_the_breaker_record(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        (home / "Library" / "LaunchAgents").mkdir(parents=True)
+        rows = fleet_doctor.collect(home=home, skip_census=True,
+                                    probe=lambda root: {"error": "stub"},
+                                    vm_dhcp_value=self.value(63, 13))
+        boot = next(row for row in rows if row.check == "vm_boot")
+        # No lane agents in this home: the threshold is the floor of 2.
+        self.assertEqual((boot.state, boot.code), ("problem", "vm_boot_degraded"))
+        self.assertIn("threshold 2", boot.detail)
+
+    def test_the_doctor_reports_it_with_its_reason(self):
+        finding = fleet_doctor.check_vm_boot(self.value(63, 13), lanes=4, now=self.NOW)
+        self.assertEqual((finding.state, finding.code), ("problem", "vm_boot_degraded"))
+        reasons = fleet_doctor.load_reasons()
+        for code in ("vm_boot_ok", "vm_boot_degraded", "vm_boot_unmeasured",
+                     "vm_boot_unreadable"):
+            self.assertIn(code, reasons)
+            self.assertIn(code, fleet_doctor.CODES)
+
+
 class Doctor(unittest.TestCase):
     def test_codes_and_the_root_remedy(self):
         reasons = fleet_doctor.load_reasons()
@@ -780,11 +971,18 @@ class Doctor(unittest.TestCase):
         remedy = reasons["vm_dhcp_unanswered"]["remedy"]
         self.assertIn("sudo launchctl kickstart -k system/com.apple.bootpd", remedy)
         self.assertIn("tartci never runs it", remedy)
+        # Only the pfd layer has a verified remedy (m5, 2026-10-07).
+        for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled"):
+            self.assertIn("no verified remedy yet", reasons[code]["remedy"].lower())
         for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled",
                      "vm_dhcp_pfd_crash_loop"):
-            self.assertIn("no verified remedy yet", reasons[code]["remedy"].lower())
             self.assertIn("tartci vm-dhcp probe-now", reasons[code]["remedy"])
             self.assertIn(code, fleet_doctor.CODES)
+        pfd = reasons["vm_dhcp_pfd_crash_loop"]["remedy"]
+        self.assertTrue(pfd.startswith("On the host (tartci never runs it): `sudo pfctl -E`."), pfd)
+        self.assertIn("`sudo pfctl -X <token>`", pfd)
+        self.assertIn("does not survive a reboot", pfd)
+        self.assertNotIn("no verified remedy", pfd.lower())
         not_loaded = reasons["vm_dhcp_bootpd_not_loaded"]
         self.assertEqual(fleet_doctor.check_vm_dhcp(
             {"state": "open", "bootpd": {"loaded": False}}).code, "vm_dhcp_bootpd_not_loaded")
@@ -799,6 +997,15 @@ class Doctor(unittest.TestCase):
         for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md",
                      ROOT / "scripts" / "fleet_doctor.py", ROOT / "scripts" / "vm_dhcp_breaker.py"):
             self.assertIsNone(blocked.search(path.read_text()), path.name)
+
+    def test_pfctl_d_is_only_ever_named_as_never(self):
+        # Disabling pf drops every holder's references; the undo for one's own
+        # `pfctl -E` is `pfctl -X <token>`.
+        for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md"):
+            text = path.read_text()
+            for found in re.finditer(r"pfctl -d", text):
+                self.assertIn("Never", text[max(0, found.start() - 12):found.start()],
+                              f"{path.name}: {text[found.start() - 40:found.end() + 20]!r}")
 
     def test_no_remedy_names_the_restart_that_did_not_help(self):
         # m5, 2026-10-07: InternetSharing relaunched (pid 51580) and the next
