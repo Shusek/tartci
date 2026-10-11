@@ -43,12 +43,14 @@
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci pool <on|drain|off|status> # durable host admission and participation
 #   tartci pool status --usage [--range 24h] [--json] # slot occupancy, idle-with-demand, discards
+#   tartci held <list|inspect NAME|stop NAME|delete NAME|expire>  # failed gate VMs kept for debugging ([debug_hold])
 #                              # --plan: print the transition, write nothing;
 #                              # off refuses a mid-job lane (exit 12) unless --now
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
 #   tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run]  # copy canonical golden to a host (fastest link) + verify + repoint
+#   tartci goldens doctor [--receipt FILE] [--promotion]                     # read-only receipt/freshness check
 #   tartci prepare <os>        # bake/provision a golden from the provider recipe
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
@@ -1399,6 +1401,7 @@ case "${1:-help}" in
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
   retention) shift; exec python3 "$HERE/scripts/state_retention.py" "$@" ;;
   vm-dhcp) shift; exec python3 "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
+  held) shift; tartci_toml_python "$HERE/scripts/debug_hold.py" "$@"; exit $? ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;

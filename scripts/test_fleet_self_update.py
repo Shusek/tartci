@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
+import contextlib
+import io
 import json
 import os
 import plistlib
@@ -108,6 +110,7 @@ class FakeSystem(su.System):
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
+        self.launchd_print = None
 
     def now(self) -> float:
         return self.clock
@@ -147,6 +150,8 @@ class FakeSystem(su.System):
         joined = " ".join(a)
         if self.hook:
             self.hook(a)
+        if a[:2] == ["launchctl", "print"]:
+            return self.launchd_print or su.Result(1, "", "not configured")
         if a[0] == FAKE_GH:
             repository = a[2].removeprefix("repos/").split("/commits/")[0]
             if repository in self.unreadable_repositories:
@@ -1618,6 +1623,26 @@ class AgentTemplateTests(unittest.TestCase):
 
 
 class VerifySettleTests(Base):
+    def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
+        self.assertEqual(
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: "
+                "[{'code': 'heartbeat_missing', 'label': 'lane'}]",
+                "b" * 40,
+            ),
+            "rollback installed; verification timed out; rolled back to bbbbbbbbbbbb and verified",
+        )
+
+    def test_heartbeat_missing_with_crashed_launchd_lane_includes_last_log_line(self) -> None:
+        log = self.home / "lane.log"
+        log.write_text("booting\nlaunchd: runner crashed\n")
+        self.sys.launchd_print = su.Result(
+            0,
+            f"last exit code = 75\nstderr path = {log}\n",
+        )
+        details = su._heartbeat_failure_diagnostics(self.sys, ["lane"])
+        self.assertEqual(details, ["lane lane last exit 75; last log line: launchd: runner crashed"])
+
     def test_a_first_heartbeat_still_pending_is_waited_for(self) -> None:
         self.sys.settling_reads = 3
         start = self.sys.clock
@@ -1659,11 +1684,38 @@ class CensusEnvTests(unittest.TestCase):
             os.environ.pop("TARTCI_PYTHON", None)
             env = su.census_env()
         self.assertEqual(env["TARTCI_PYTHON"], sys.executable)
+        self.assertEqual(env["HOME"], os.environ.get("HOME") or os.path.expanduser("~"))
         proc = subprocess.run(["/bin/sh", "-c", "python3 -c 'import sys; print(sys.executable)'"],
                               env={**os.environ, "PATH": "/usr/bin:/bin", **env},
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(os.path.realpath(proc.stdout.strip()), os.path.realpath(sys.executable))
+
+    def test_census_env_preserves_home_for_production_shaped_ghapp(self) -> None:
+        # The real ghapp wrapper uses HOME for its cache and refuses to run
+        # without it. Exercise the exact reduced census environment rather
+        # than a stub that accepts any environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            ghapp = Path(tmp) / "ghapp"
+            ghapp.write_text(
+                "#!/bin/sh\n"
+                "[ -n \"${HOME:-}\" ] || { echo 'ghapp requires HOME' >&2; exit 78; }\n"
+                "printf '%s\\n' authenticated\n"
+            )
+            ghapp.chmod(0o755)
+            env = su.census_env("danielraffel/tartci")
+            env["PATH"] = f"{tmp}:{env['PATH']}"
+            ok_run = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(ok_run.returncode, 0, ok_run.stderr)
+            self.assertEqual(ok_run.stdout.strip(), "authenticated")
+
+            mutant_env = env.copy()
+            mutant_env.pop("HOME", None)
+            denied = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=mutant_env, capture_output=True, text=True)
+            self.assertEqual(denied.returncode, 78)
+            self.assertIn("requires HOME", denied.stderr)
 
 
 class RollbackTests(Base):
@@ -1819,6 +1871,63 @@ class ChecksAndTargetTests(Base):
         self.assertEqual(self.sys.mutations(), [])
         skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
         self.assertEqual(skew["state"], "unverified")
+
+    def test_explicit_main_tip_soaking_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIn("soaking until", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_explicit_main_tip_soaked_but_red_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIn("not green: ", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_default_path_falls_back_to_soaked_green_and_records_skipped(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW)
+        self.assertEqual(skew["selected_target"], T_OLD)
+        self.assertTrue(skew["skipped"])
+
+    def test_explicit_selection_is_printed_and_recorded(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=False,
+                                              target_ref=T_OLD, explicit=True), su.EXIT_OK)
+        self.assertIn(f"selected {T_OLD} (requested {T_OLD}; same)", output.getvalue())
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual({key: receipt[key] for key in
+                          ("requested_target", "selected_target", "explicit", "soak_until")},
+                         {"requested_target": T_OLD, "selected_target": T_OLD,
+                          "explicit": True, "soak_until": None})
+
+    def test_main_explicit_target_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--target", T_NEW, "--plan"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_main_without_target_keeps_default_green_fallback(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--plan"])
+        self.assertEqual(result, su.EXIT_OK)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())["target"], T_OLD)
 
     def test_explicit_target_must_be_on_the_first_parent_chain(self) -> None:
         skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, "d" * 40)

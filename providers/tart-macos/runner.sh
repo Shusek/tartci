@@ -92,6 +92,8 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
+# shellcheck source=providers/tart-macos/lifecycle.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/lifecycle.lib.sh"
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
 # GitHub CLI used for every API call (queue polling, JIT mint, runner reclaim,
 # job/run polling, cancel). Default `gh` (the personal/host auth) keeps generic
@@ -455,6 +457,8 @@ source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/guest-dns.lib.sh"
 # shellcheck source=providers/tart-macos/spawn-diagnostics.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/spawn-diagnostics.lib.sh"
+# shellcheck source=providers/tart-macos/debug-hold.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/debug-hold.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -586,11 +590,25 @@ STATE_DIR="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(j
 [ "$PRINT_EVENT_LOG" = 1 ] && { printf '%s\n' "$EVENT_LOG"; exit 0; }
 [ -n "${PRINT_BOOT_NAME:-}" ] && { printf '%s\n' "$(ephemeral_boot_name "$PRINT_BOOT_NAME")"; exit 0; }
 if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then
-  python3 "$TARTCI_ROOT/scripts/macos_runner_identity_guard.py" \
-    --current-label "$TARTCI_LAUNCHD_LABEL" \
-    --runner-name "$RUNNER_NAME" \
-    --state-dir "$STATE_DIR" \
-    || die "another loaded LaunchAgent resolves to this runner/state identity"
+  identity_guard_rc=2
+  identity_guard_attempt=1
+  while [ "$identity_guard_attempt" -le 3 ]; do
+    identity_guard_rc=0
+    python3 "$TARTCI_ROOT/scripts/macos_runner_identity_guard.py" \
+      --current-label "$TARTCI_LAUNCHD_LABEL" \
+      --runner-name "$RUNNER_NAME" \
+      --state-dir "$STATE_DIR" || identity_guard_rc=$?
+    [ "$identity_guard_rc" -ne 2 ] && break
+    if [ "$identity_guard_attempt" -lt 3 ]; then
+      identity_guard_backoff=$((identity_guard_attempt * ${TARTCI_IDENTITY_GUARD_RETRY_BACKOFF_SECS:-5}))
+      sleep "$identity_guard_backoff"
+    fi
+    identity_guard_attempt=$((identity_guard_attempt + 1))
+  done
+  [ "$identity_guard_rc" -eq 0 ] || {
+    [ "$identity_guard_rc" -eq 1 ] && die "another loaded LaunchAgent resolves to this runner/state identity"
+    die "could not enumerate loaded LaunchAgents after 3 attempts"
+  }
 fi
 command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
@@ -1688,9 +1706,16 @@ run_runner_until_done_unlayered(){
       sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
       return 124
     fi
+    if tartci_lifecycle_unmarked listening \
+      && grep -q 'Listening for Jobs' "$runner_log" 2>/dev/null; then
+      tartci_lifecycle_mark listening "$now"
+    fi
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
       assigned=1
       assigned_at="$now"
+      # A job can be picked up inside one 5 s look: registration is no later.
+      tartci_lifecycle_mark listening "$now"
+      tartci_lifecycle_mark assigned "$now"
       for _ in $(seq 1 6); do
         capture_current_job && break
         sleep 2
@@ -1834,6 +1859,8 @@ boot_vm_to_ssh(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
+  tartci_lifecycle_mark clone_start "${CLONE_STARTED_AT:-0}"
+  tartci_lifecycle_mark cloned
   if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
     discard_current_vm
     tartci_release_vm_lease
@@ -1897,6 +1924,7 @@ boot_vm_to_ssh(){
   local clone_to_ip_s=$(( $(date +%s) - ${CLONE_STARTED_AT:-$(date +%s)} ))
   event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
+  tartci_lifecycle_mark ip
   rm -f "$boot_log"
   BOOT_SSH_HEARTBEAT_PHASE="$boot_phase"
   if ! tartci_vm_ssh_wait "$VM_USER@$ip"; then
@@ -1908,6 +1936,7 @@ boot_vm_to_ssh(){
     tartci_release_vm_lease
     return 1
   fi
+  tartci_lifecycle_mark ssh
   return 0
 }
 
@@ -2001,6 +2030,7 @@ run_one(){
   PRE_CLONE_DEMAND_GONE=0
   VM_DHCP_BACKOFF=0
   LAST_RUN_LEASE_DENIED=0
+  tartci_lifecycle_reset
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
@@ -2128,6 +2158,7 @@ run_one(){
     fi
     if [ "$handoff_rc" -eq 0 ]; then
       vm="$CURRENT_VM"
+      tartci_lifecycle_mark warm
       # No clone or boot to overlap with; start the boundary proofs now so the
       # boundary consumes them exactly as for a cold VM.
       tartci_boundary_proof_start "$vm" "$selected_labels" "$selected_group_id"
@@ -2310,6 +2341,7 @@ run_one(){
     return 75
   fi
   event mint_jit "labels=$selected_labels tier=$selected_tier"
+  tartci_lifecycle_mark minted
   # Claim the exact per-boot registration name before minting. Cleanup can then
   # reclaim it even when a signal lands immediately after GitHub creates it.
   CURRENT_REGISTERED_RUNNER="$vm"
@@ -2358,18 +2390,22 @@ run_one(){
 
   note "[$i] discarding ephemeral VM $vm"
   event teardown "rc=$rc"
-  if ! discard_current_vm; then
+  if tartci_debug_hold_current_vm; then
+    :
+  elif ! discard_current_vm; then
     note "[$i] teardown ownership could not be proved — capacity stays held (pending-delete when the guardian is terminal, fail-closed restart otherwise)"
     return 75
   fi
   tartci_release_vm_lease
   t_done="$(now_epoch)"
+  tartci_lifecycle_emit "$t_start" "$t_runner_done" "$t_done" "$rc"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     {
       printf 'phase\tseconds\n'
       printf 'boot_to_ssh\t%s\n' "$(elapsed "$t_start" "$t_booted")"
       printf 'runner_process\t%s\n' "$(elapsed "$t_booted" "$t_runner_done")"
       printf 'cleanup\t%s\n' "$(elapsed "$t_runner_done" "$t_done")"
+      tartci_lifecycle_tsv_rows "$t_start" "$t_runner_done" "$t_done"
       printf 'total\t%s\n' "$(elapsed "$t_start" "$t_done")"
     } >"$logdir/timing.tsv"
     if [ "$rc" -eq 0 ]; then

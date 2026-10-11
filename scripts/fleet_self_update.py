@@ -651,7 +651,8 @@ def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
 
 
 def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
-                 target_ref: str = "origin/main", verify_checks: bool = True) -> dict:
+                 target_ref: str = "origin/main", verify_checks: bool = True,
+                 explicit: bool | None = None) -> dict:
     """First-parent commits on main the host does not run, and the target.
 
     The target is the newest first-parent main commit that is past the soak
@@ -669,11 +670,14 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
         return skew
     skew["main"] = main.out.strip()
     head_sha = head.out.strip()
-    explicit = head_sha != skew["main"]
+    if explicit is None:
+        explicit = target_ref != "origin/main"
+    skew.update(explicit=explicit, requested_target=head_sha if explicit else None,
+                selected_target=None)
     if explicit:
         chain = sys_.run([*git, "rev-list", "--first-parent", skew["main"]])
         if head_sha not in chain.out.split():
-            skew.update(state="unknown",
+            skew.update(state="unknown", selected_target=None, selection_reason="not on first-parent chain",
                         reason=f"--target {target_ref} is not on origin/main's first-parent chain")
             return skew
     if sys_.run([*git, "cat-file", "-e", f"{installed}^{{commit}}"]).rc != 0:
@@ -708,20 +712,30 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
     soaked = [(sha, ts) for sha, ts in commits if ts <= now - cfg.soak_seconds]
     if not soaked:
         skew["state"] = "soaking"
+        if explicit:
+            soak_until = min(ts for _, ts in commits) + cfg.soak_seconds
+            skew["soak_until"] = _iso(soak_until)
+            skew["selection_reason"] = f"soaking until {skew['soak_until']}"
         return skew
     if not verify_checks:
-        skew.update(state="behind", target=None)
+        skew.update(state="behind", target=None, selected_target=None, selection_reason="same")
         return skew
     rejected = []
     for sha, _ in soaked[:CHECK_CANDIDATES]:
         green, detail = checks_green(cfg, sys_, sha)
         if green:
-            skew.update(state="behind", target=sha)
+            skew.update(state="behind", target=sha, selected_target=sha,
+                        selection_reason="same" if explicit else None)
             if rejected:
                 skew["skipped"] = rejected
             return skew
         rejected.append(f"{sha[:12]}: {detail}")
     skew.update(state="unverified", reason="; ".join(rejected))
+    if explicit:
+        detail = rejected[0].split(": ", 1)[1]
+        if detail.startswith("not green: "):
+            detail = detail[len("not green: "):]
+        skew["selection_reason"] = "not green: " + detail
     return skew
 
 
@@ -735,11 +749,14 @@ def render_skew(skew: dict | None) -> str:
         return f"tartci: skew n/a ({skew.get('reason')})"
     if state in ("behind", "soaking", "unverified"):
         flag = " STALE" if skew.get("stale") else ""
+        requested = skew.get("requested_target")
+        selection = (f"; selected {skew.get('selected_target') or 'none'} (requested {requested}; "
+                     f"{skew.get('selection_reason', 'same')})" if requested else "")
         return (f"tartci: {skew['behind']} commits behind main (oldest undeployed: "
                 f"{skew['oldest_undeployed']}){flag}"
                 + {"behind": "", "soaking": " [all still soaking]",
                    "unverified": f" [no soaked commit has green checks: {skew.get('reason')}]"}[state]
-                + f" (measured {skew.get('measured_at')})")
+                + selection + f" (measured {skew.get('measured_at')})")
     return f"tartci: skew {str(state).upper()} ({skew.get('reason') or 'no reason'})"
 
 
@@ -1153,6 +1170,7 @@ def census_env(repository: str | None = None) -> dict[str, str]:
     env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
         "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
     if repository is not None:
@@ -1753,7 +1771,7 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
 
 
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
-                  scheduled: bool = False) -> int:
+                  explicit: bool = False, scheduled: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
@@ -1782,10 +1800,17 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         _write_json(cfg.state_dir / "skew.json", {"state": "unknown", "reason": str(exc),
                                                   "measured_at": _iso(now)})
         return EXIT_UNKNOWN
-    skew = measure_skew(cfg, sys_, installed, now, target_ref)
+    skew = measure_skew(cfg, sys_, installed, now, target_ref, explicit=explicit)
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
     print(f"self-update: {render_skew(skew)}")
+    if skew.get("explicit"):
+        print(f"self-update: selected {skew.get('selected_target') or 'none'} "
+              f"(requested {skew.get('requested_target')}; {skew.get('selection_reason', 'same')})")
+        if skew["state"] in ("soaking", "unverified"):
+            print(f"self-update: REFUSED explicit target {skew.get('requested_target')}: "
+                  f"{skew.get('selection_reason')}")
+            return EXIT_REFUSED
     if skew["state"] in ("unknown", "diverged"):
         return EXIT_UNKNOWN
     target = skew.get("target")
@@ -1803,6 +1828,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
+    receipt.value.update(requested_target=skew.get("requested_target"),
+                         selected_target=skew.get("selected_target"),
+                         explicit=bool(skew.get("explicit")),
+                         soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
     try:
@@ -2433,8 +2462,7 @@ class Run:
                                   f"{type(exc).__name__}: {exc}; host is "
                                   f"{_state_words(state)} running "
                                   f"{str(self._running())[:12]}", pool_state=state)
-        return self._terminal("rolled_back", f"{reason}; rolled back to {self.previous[:12]} "
-                              "and verified")
+        return self._terminal("rolled_back", _rollback_terminal_message(reason, self.previous))
 
     def _terminal(self, status: str, message: str, *, pool_state: str = "on") -> int:
         self.receipt.value["pool_state"] = pool_state
@@ -2479,12 +2507,13 @@ def _announce(cfg: Config, sys_: System, me: str, target: str,
             raise Deferred(f"peer announced first (or won the tie): {info['evidence']}")
 
 
-def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool]:
+def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool, list[str]]:
     """(problems, settling). settling: every problem is a lane that has not yet
     written its first heartbeat, which a freshly loaded supervisor needs a few
     seconds to do."""
     problems = []
     settling = False
+    heartbeat_labels: list[str] = []
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         value = json.loads(status.out)
@@ -2500,6 +2529,10 @@ def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], boo
                      if not (isinstance(p, dict) and p.get("code") in HOST_CONDITION_CODES)]
             if found or not fleet.get("problems"):
                 problems.append(f"fleet not ready: {found}")
+            heartbeat_labels = [str(p.get("label")) for p in found
+                                if isinstance(p, dict)
+                                and p.get("code") == "heartbeat_missing"
+                                and p.get("label")]
             settling = bool(found) and all(
                 isinstance(p, dict) and p.get("code") in SETTLING_PROBLEM_CODES
                 for p in found)
@@ -2518,7 +2551,43 @@ def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], boo
     if guard.rc != 2 or allow.rc != 0:
         problems.append(f"installed `tartci launchd guard` missing or wrong "
                         f"(block={guard.rc}, allow={allow.rc})")
-    return problems, settling and len(problems) == 1
+    return problems, settling and len(problems) == 1, heartbeat_labels
+
+
+def _heartbeat_failure_diagnostics(sys_: System, labels: list[str]) -> list[str]:
+    """Include a failed lane's final log line when launchd reports a crash."""
+    details: list[str] = []
+    domain = f"gui/{os.getuid()}"
+    for label in labels:
+        try:
+            result = sys_.run(["launchctl", "print", f"{domain}/{label}"], timeout=10)
+        except Exception:
+            continue
+        if result.rc != 0:
+            continue
+        exit_match = re.search(r"^\s*last exit (?:code|status)\s*=\s*(-?\d+)\s*$",
+                               result.out, re.MULTILINE)
+        if not exit_match or int(exit_match.group(1)) == 0:
+            continue
+        path_match = re.search(r"^\s*(?:stderr|stdout) path\s*=\s*(\S+)\s*$",
+                               result.out, re.MULTILINE)
+        if not path_match:
+            continue
+        try:
+            lines = Path(path_match.group(1)).read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        if lines:
+            details.append(f"lane {label} last exit {exit_match.group(1)}; "
+                           f"last log line: {lines[-1]}")
+    return details
+
+
+def _rollback_terminal_message(reason: str, previous: str) -> str:
+    if "verification of" in reason and "heartbeat_missing" in reason:
+        return (f"rollback installed; verification timed out; rolled back to "
+                f"{previous[:12]} and verified")
+    return f"{reason}; rolled back to {previous[:12]} and verified"
 
 
 def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
@@ -2530,10 +2599,11 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     """
     deadline = sys_.now() + VERIFY_SETTLE_SECONDS
     while True:
-        problems, settling = _verify_once(cfg, sys_, target)
+        problems, settling, heartbeat_labels = _verify_once(cfg, sys_, target)
         if not problems:
             break
         if not settling or sys_.now() >= deadline:
+            problems.extend(_heartbeat_failure_diagnostics(sys_, heartbeat_labels))
             raise Failed(f"verification of {target[:12]}: " + "; ".join(problems))
         sys_.sleep(VERIFY_SETTLE_POLL_SECONDS)
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
@@ -2608,7 +2678,7 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tartci fleet-macos self-update")
-    parser.add_argument("--target", default="origin/main")
+    parser.add_argument("--target", default=None)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="read-only (default)")
     mode.add_argument("--apply", action="store_true")
@@ -2672,7 +2742,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             installed, _ = installed_commit(cfg)
             refresh_checkout(cfg, sys_)
-            skew = measure_skew(cfg, sys_, installed, sys_.now(), args.target)
+            target_ref = args.target or "origin/main"
+            skew = measure_skew(cfg, sys_, installed, sys_.now(), target_ref,
+                               explicit=args.target is not None)
         except NotManaged as exc:
             skew = {"state": "not_applicable", "reason": str(exc), "measured_at": _iso(sys_.now())}
         except Refused as exc:
@@ -2680,8 +2752,9 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(cfg.state_dir / "skew.json", skew)
         print(render_skew(skew))
         return 0
-    return plan_or_apply(cfg, sys_, apply=args.apply, target_ref=args.target,
-                         scheduled=args.scheduled)
+    target_ref = args.target or "origin/main"
+    return plan_or_apply(cfg, sys_, apply=args.apply, target_ref=target_ref,
+                         explicit=args.target is not None, scheduled=args.scheduled)
 
 
 if __name__ == "__main__":
