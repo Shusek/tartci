@@ -1,5 +1,16 @@
 # Event-class JIT assignment V2 rollout
 
+## Serving fewer gate classes
+
+M1 temporarily omitted `pulp-build-merge-group` after #439 because its
+three-core gate guest measured 33–35 minutes while other hosts measured
+15–22 minutes. On 2026-10-11 Daniel reversed that decision: other hosts now
+have a 29-minute median and merge-group capacity is the scarce resource, with
+queue-head waits reaching 95 minutes. M1 therefore serves both gate classes
+again. Slot 1 orders merge-group before PR-head; slot 2 keeps release classes
+first, followed by merge-group and PR-head. The gate guest size is unchanged;
+`vm_cores_from` continues to govern admission.
+
 V2 partitions Pulp's required macOS JIT capacity at GitHub's assignment
 boundary. A runner advertises the shared platform/base labels plus exactly one
 of:
