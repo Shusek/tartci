@@ -62,6 +62,8 @@ MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MA
 # satisfied by this runner's labels. This keeps the supervisor safe while repo
 # defaults still route Linux to GitHub-hosted ubuntu-latest.
 QUEUE_MATCH_LABELS="${TARTCI_RUNNER_QUEUE_MATCH_LABELS:-${PULP_RUNNER_QUEUE_MATCH_LABELS:-1}}"
+GUEST_DRIVER="${TARTCI_GUEST_DRIVER:-}"
+LOCAL_JOB=""
 LOOP=0
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-${PULP_RUNNER_IDLE_TIMEOUT_SECS:-900}}"
@@ -98,11 +100,16 @@ source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 # shellcheck source=providers/common/runner-assignment.lib.sh
 source "$TARTCI_ROOT/providers/common/runner-assignment.lib.sh"
+# shellcheck source=providers/common/runner-scope.lib.sh
+source "$TARTCI_ROOT/providers/common/runner-scope.lib.sh"
 
 discard_current_linux_vm(){
   tartci_pool_lock_release
   [ "$CURRENT_CLEANED_UP" = 0 ] || return 0
   CURRENT_CLEANED_UP=1
+  if [ -n "$GUEST_DRIVER" ] && [ -n "$CURRENT_VM" ]; then
+    python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 20 --operation guest-stop -- "$GUEST_DRIVER" stop "$CURRENT_VM" "$CURRENT_VM" >/dev/null 2>&1 || true
+  fi
   if [ -n "$CURRENT_RUNNER_PID" ]; then
     kill -9 "$CURRENT_RUNNER_PID" 2>/dev/null || true
     wait "$CURRENT_RUNNER_PID" 2>/dev/null || true
@@ -112,7 +119,7 @@ discard_current_linux_vm(){
     wait "$CURRENT_RPID" 2>/dev/null || true
   fi
   if [ "$CURRENT_VM_OWNED" = 1 ] && [ -n "$CURRENT_VM" ]; then
-    tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
+    tart stop "$CURRENT_VM" --timeout 15 >/dev/null 2>&1 || true
     tart delete "$CURRENT_VM" >/dev/null 2>&1 || true
   fi
   if [ "$CURRENT_LEASE_ACTIVE" = 1 ]; then
@@ -135,9 +142,16 @@ discard_current_linux_vm(){
 }
 
 handle_linux_runner_signal(){
+  local signal_rc=143
+  if [ -n "$GUEST_DRIVER" ] && [ -n "$CURRENT_RUNNER_PID" ]; then
+    trap '' INT TERM
+    kill -TERM "$CURRENT_RUNNER_PID" 2>/dev/null || true
+    while kill -0 "$CURRENT_RUNNER_PID" 2>/dev/null; do sleep 1; done
+    if wait "$CURRENT_RUNNER_PID" 2>/dev/null; then signal_rc=0; else signal_rc=$?; fi
+  fi
   discard_current_linux_vm
   trap - EXIT
-  exit 143
+  exit "$signal_rc"
 }
 trap handle_linux_runner_signal INT TERM
 trap discard_current_linux_vm EXIT
@@ -145,7 +159,7 @@ trap discard_current_linux_vm EXIT
 linux_runner_authoritatively_busy(){
   local payload
   [ -n "$CURRENT_VM" ] || return 2
-  payload="$("$GH_CLI" api --method GET "repos/$REPO/actions/runners" \
+  payload="$("$GH_CLI" api --method GET "$RUNNER_API_ROOT" \
     -f per_page=10 -f "name=$CURRENT_VM" 2>/dev/null)" || return 2
   TARTCI_RUNNER_JSON="$payload" TARTCI_RUNNER_NAME="$CURRENT_VM" python3 - <<'PY'
 import json
@@ -164,13 +178,13 @@ PY
 delete_linux_runner_registration(){
   local name="$1" ids id attempt delete_failed
   for attempt in 1 2 3; do
-    if ids="$("$GH_CLI" api --method GET "repos/$REPO/actions/runners" \
+    if ids="$("$GH_CLI" api --method GET "$RUNNER_API_ROOT" \
       -f per_page=10 -f "name=$name" \
       --jq ".runners[] | select(.name==\"$name\" and .busy==false) | .id" \
       2>/dev/null)"; then
       delete_failed=0
       for id in $ids; do
-        "$GH_CLI" api -X DELETE "repos/$REPO/actions/runners/$id" \
+        "$GH_CLI" api -X DELETE "$RUNNER_API_ROOT/$id" \
           >/dev/null 2>&1 || delete_failed=1
       done
       if [ "$delete_failed" = 0 ]; then
@@ -224,6 +238,7 @@ PRINT_HOST_HEALTH=0
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
+  --local-job) LOCAL_JOB="$2"; shift 2;;
   --golden) GOLDEN="$2"; shift 2;;
   --labels) LABELS="$2"; shift 2;;
   --repo) REPO="$2"; shift 2;;
@@ -231,6 +246,11 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+if [ -n "$GUEST_DRIVER" ]; then
+  [ "${GUEST_DRIVER#/}" != "$GUEST_DRIVER" ] && [ -x "$GUEST_DRIVER" ] || die "TARTCI_GUEST_DRIVER must be an absolute executable path"
+fi
+[ -z "$LOCAL_JOB" ] || { [ -n "$GUEST_DRIVER" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires a guest driver and --once"
+RUNNER_API_ROOT="$(tartci_runner_api_root "$REPO" "$RUNNER_GROUP_ID" "${TARTCI_RUNNER_SCOPE:-repo}")"
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 
 # Count fresh queued jobs whose labels this runner can satisfy. 0 on any gh
@@ -253,13 +273,13 @@ queued_work(){
 # labels match, so this runs before a VM boots (a refusal must not boot VMs in
 # a loop) and again right before the JIT mint. $1 receives the receipt.
 verify_runner_repository_access(){
-  SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE=repo \
+  SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" TARTCI_RUNNER_SCOPE="${TARTCI_RUNNER_SCOPE:-repo}" \
     python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
     --repo "$REPO" --runner-group-id "$RUNNER_GROUP_ID" --gh-cli "$GH_CLI" >"$1"
 }
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
-  local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_mem lease_priority
+  local i="$1" vm="${TARTCI_RUNNER_NAME_PREFIX:-linux-ephr}-$$-$1" jit="" lease_cores lease_mem lease_priority
   local build_parallel_effective
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
@@ -276,7 +296,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-linux \
     "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
   state_dir="$(tartci_provider_state_dir tart-linux)"
-  if ! verify_runner_repository_access "$logdir/repository-access.json"; then
+  if [ -z "$LOCAL_JOB" ] && ! verify_runner_repository_access "$logdir/repository-access.json"; then
     note "[$i] runner repository access not proven — not booting a VM"
     return 1
   fi
@@ -328,6 +348,31 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
+  if [ -n "$GUEST_DRIVER" ]; then
+    tartci_vm_lease_guard_exec tart run --no-graphics --no-audio --no-clipboard --net-softnet "$vm" >"$logdir/tart-run.log" 2>&1 & rpid=$!
+    CURRENT_RPID="$rpid"
+    write_state booting
+    local ready=0 deadline
+    deadline=$(( $(now_epoch) + ${TARTCI_GUEST_READY_TIMEOUT_SECS:-180} ))
+    while [ "$(now_epoch)" -lt "$deadline" ] && kill -0 "$rpid" 2>/dev/null; do
+      if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 15 --operation guest-ready -- "$GUEST_DRIVER" ready "$vm" "$vm" >/dev/null 2>&1; then ready=1; break; fi
+      sleep 2
+    done
+    if [ "$ready" != 1 ] || ! python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_GUEST_PREFLIGHT_TIMEOUT_SECS:-360}" --operation guest-preflight -- "$GUEST_DRIVER" preflight "$vm" "$vm" >"$logdir/preflight.log" 2>&1; then
+      prefix_guest_log "$logdir/preflight.log"
+      discard_current_linux_vm
+      return 1
+    fi
+    t_booted="$(now_epoch)"
+    write_state booted
+    if [ -n "$LOCAL_JOB" ]; then
+      local local_rc=0
+      python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}" --operation local-job -- "$GUEST_DRIVER" run-local "$vm" "$vm" "$LOCAL_JOB" >"$logdir/local-output.log" 2>&1 || local_rc=$?
+      prefix_guest_log "$logdir/local-output.log"
+      discard_current_linux_vm
+      return "$local_rc"
+    fi
+  else
   tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux" || {
     discard_current_linux_vm
     runtime_emit_complete fail cache_setup_failed 1 "$vm" "$vm" "" "$logdir"
@@ -373,6 +418,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   prefix_guest_log "$logdir/ccache-setup.log"
 
+  fi
+
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
     write_state admission-check
@@ -417,7 +464,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # creates the registration but the response is lost, teardown still queries
   # and removes this exact non-busy name.
   CURRENT_JIT_REGISTERED=1
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+  jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
@@ -434,6 +481,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] vm $vm up at $ip — launching JIT runner (assignment_timeout=${IDLE_TIMEOUT}s, build_parallel=${build_parallel_effective}, one job)"
   write_state idle-wait
 
+  if [ -n "$GUEST_DRIVER" ]; then
+    printf '%s' "$jit" | python3 "$TARTCI_ROOT/scripts/guest_driver_listener.py" \
+      --idle-timeout "$IDLE_TIMEOUT" --job-timeout "${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}" \
+      --receipt "$logdir/listener-receipt.json" -- "$GUEST_DRIVER" run-jit "$vm" "$vm" >"$logdir/runner-output.log" 2>&1 &
+    CURRENT_RUNNER_PID=$!
+    jit=""
+  else
   # Stream the JIT config over stdin into an owner-only guest file. Embedding
   # it in the ssh command line exposed this runner credential to every local
   # user on the host (ps) for the whole job.
@@ -467,11 +521,20 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
      ./run.sh --jitconfig \"\$jit_config\"" \
     >"$logdir/runner-output.log" 2>&1 &
   CURRENT_RUNNER_PID=$!
+
+  fi
   if ! tartci_pool_lock_handoff_to_listener "$CURRENT_RUNNER_PID"; then
     note "[$i] listener exited before pool transition handoff"
     discard_current_linux_vm
     return 1
   fi
+  if [ -n "$GUEST_DRIVER" ]; then
+    # The prepared listener owns assignment deadlines and graceful drain.
+    # Keep the shell alive so an EXIT trap never discards an assigned VM.
+    if wait "$CURRENT_RUNNER_PID"; then run_status=0; else run_status=$?; fi
+    TARTCI_RUNNER_WAS_ASSIGNED="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("assigned",False)))' "$logdir/listener-receipt.json" 2>/dev/null || echo 0)"
+    discard_current_linux_vm
+  else
   if tartci_monitor_runner_assignment \
     "$CURRENT_RUNNER_PID" "$logdir/runner-output.log" "$IDLE_TIMEOUT" \
     discard_current_linux_vm 5 mark_runner_assigned \
@@ -479,6 +542,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     run_status=0
   else
     run_status=$?
+  fi
+
   fi
   tartci_pool_lock_release
   t_runner_done="$(now_epoch)"

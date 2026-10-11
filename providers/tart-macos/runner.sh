@@ -1931,10 +1931,12 @@ boot_vm_to_ssh(){
       --root-disk-opts=caching=cached,sync=fsync "$vm" >"$boot_log" 2>&1 & rpid=$!
     CURRENT_RPID="$rpid"; CURRENT_IP="$vm"
     heartbeat "$boot_phase"
-    local ready=0
-    for _ in $(seq 1 90); do
+    local ready=0 ready_started="$SECONDS" ready_bound
+    while [ $((SECONDS - ready_started)) -lt 180 ]; do
+      ready_bound=$((180 - (SECONDS - ready_started)))
+      [ "$ready_bound" -le 15 ] || ready_bound=15
       kill -0 "$rpid" 2>/dev/null || break
-      if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout 15 --operation guest-ready -- "$GUEST_DRIVER" ready "$vm" "$vm" >/dev/null 2>&1; then ready=1; break; fi
+      if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "$ready_bound" --operation guest-ready -- "$GUEST_DRIVER" ready "$vm" "$vm" >/dev/null 2>&1; then ready=1; break; fi
       sleep 3
     done
     rm -f "$boot_log"

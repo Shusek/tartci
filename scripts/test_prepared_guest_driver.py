@@ -12,7 +12,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 
 class PreparedGuestDriverTests(unittest.TestCase):
-    def execute(self,provider,fail=False,github=False,drain=False,lease_budget=False,delayed_delete=False,admission=None,pool_drain=False,dhcp_verifying=False):
+    def execute(self,provider,fail=False,github=False,drain=False,lease_budget=False,delayed_delete=False,admission=None,pool_drain=False,dhcp_verifying=False,org=False):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);bin=root/'bin';bin.mkdir();(root/'vms').mkdir()
             driver=bin/'driver'
@@ -57,7 +57,7 @@ elif a[0]=='list':
             for name in ['qemu-img','qemu-system-aarch64','ssh','fake-gh']:
                 script=bin/name
                 if name=='qemu-system-aarch64':text='#!/bin/bash\nexec sleep 300\n'
-                elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json,os\nfrom pathlib import Path\nwith (Path(os.environ['FIXTURE'])/'gh-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif sys.argv[1:2]==['api'] and sys.argv[-1].startswith('repos/') and sys.argv[-1].count('/')==2:print(json.dumps({'private':True,'visibility':'private'}))\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
+                elif name=='fake-gh' and github:text="#!/usr/bin/env python3\nimport sys,json,os\nfrom pathlib import Path\nwith (Path(os.environ['FIXTURE'])/'gh-calls').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\\n')\nassert 'actions/runners/actions/runners' not in ' '.join(sys.argv)\nif any('generate-jitconfig' in a for a in sys.argv):\n assert '-f' in sys.argv and 'labels[]=self-hosted' in sys.argv\n print('ZmFrZS1qaXQ=')\nelif sys.argv[1:2]==['api'] and sys.argv[-1].startswith('repos/') and sys.argv[-1].count('/')==2:print(json.dumps({'private':True,'visibility':'private'}))\nelif any('runner-groups/2/repositories' in a for a in sys.argv):print(json.dumps({'total_count':1,'repositories':[{'full_name':'Generous-Corp/pulp'}]}))\nelif any('runner-groups/2' in a for a in sys.argv):print(json.dumps({'visibility':'selected','allows_public_repositories':False}))\nelif '--jq' not in sys.argv:print(json.dumps({'runners':[]}))\n"
                 elif name=='fake-gh':text='#!/bin/bash\necho unexpected-gh >&2; exit 99\n'
                 elif name=='ssh':text='#!/usr/bin/env python3\nimport os,json,sys\nfrom pathlib import Path\nwith (Path(os.environ["FIXTURE"])/"ssh-calls").open("a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n'
                 else:text='#!/bin/bash\nexit 0\n'
@@ -65,7 +65,7 @@ elif a[0]=='list':
             for file in ['golden.qcow2','firmware.fd','vars.fd']:(root/file).touch()
             env={'PATH':str(bin)+':'+os.environ['PATH'],'HOME':str(root),'FIXTURE':str(root),
                  'TARTCI_GUEST_DRIVER':str(driver),'TARTCI_VM_LEASES':'0',
-                 'TART_HOME':str(root/'vms'),'TARTCI_VM_DISK_FREE_FLOOR_GB':'1','TARTCI_STATE_DIR':str(root/'state'),'TARTCI_MACOS_GOLDEN':'fixture-golden',
+                 'TART_HOME':str(root/'vms'),'TARTCI_VM_DISK_FREE_FLOOR_GB':'1','TARTCI_STATE_DIR':str(root/'state'),'TARTCI_MACOS_GOLDEN':'fixture-golden','TARTCI_LINUX_GOLDEN':'fixture-golden','TARTCI_LINUX_LOGS':str(root/'logs'),
                  'TARTCI_GH_CLI':str(bin/'fake-gh'),'TARTCI_JIT_GH_CLI':str(bin/'fake-gh'),
                  'TARTCI_WIN_WORK':str(root/'jobs'),'TARTCI_WIN_LOGS':str(root/'logs'),
                  'TARTCI_WIN_GOLDEN':str(root/'golden.qcow2'),'TARTCI_WIN_FIRMWARE':str(root/'firmware.fd'),
@@ -100,6 +100,7 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
                 env.update(TARTCI_VM_LEASES='1',TARTCI_LEASE_DIR=str(root/'leases'),TARTCI_LEASE_CAPACITY_CORES='10',TARTCI_LEASE_CAPACITY_MEM_MB='24576',TARTCI_GATE_RESERVED_CORES='6',TARTCI_GATE_RESERVED_MEM_MB='12288',TARTCI_NON_GATE_CAPACITY_CORES='4',TARTCI_MACOS_VM_MEM_MB='12288')
             if delayed_delete:env.update(DELAY_DELETE='1',TARTCI_PENDING_DELETE_RETRY_SECS='1',TARTCI_PENDING_DELETE_MAX_ATTEMPTS='3')
             if fail:env['FAIL_JOB']='1'
+            if org:env.update(TARTCI_RUNNER_SCOPE='org',TARTCI_RUNNER_GROUP_ID='2')
             if drain:env['DRAIN_JOB']='1'
             command=['/bin/bash',str(ROOT/'providers'/provider/'runner.sh'),'--once',* ([] if github else ['--local-job','fixture'])]
             if drain:
@@ -129,6 +130,9 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
                 self.assertIn('run-jit' if github else 'run-local',[c[0] for c in calls])
                 if admission and github:self.assertTrue((root/'admission-seen').exists())
                 if admission and not github:self.assertFalse((root/'admission-seen').exists())
+            if org:
+                self.assertIn('orgs/Generous-Corp/actions/runners/generate-jitconfig',(root/'gh-calls').read_text())
+                self.assertNotIn('repos/Generous-Corp/pulp/actions/runners/generate-jitconfig',(root/'gh-calls').read_text())
             self.assertNotIn('unexpected-gh',result.stderr)
             if delayed_delete:self.assertIn('pending-delete VM',result.stdout+result.stderr)
             if lease_budget:
@@ -136,7 +140,7 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
                 self.assertEqual(json.loads((root/'leases/leases.json').read_text()),[])
             self.assertFalse((root/'present').exists())
             self.assertFalse(list((root/'jobs').glob('tc-fixture-*')))
-            if provider=='tart-macos':
+            if provider in ('tart-macos','tart-linux'):
                 tart_calls=[json.loads(s) for s in (root/'tart-calls').read_text().splitlines()]
                 boot=next(c for c in tart_calls if c[0]=='run')
                 self.assertIn('--net-softnet',boot)
@@ -187,8 +191,31 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
     def test_windows_provider_drains_assigned_job_before_cleanup(self):
         self.execute('qemu-windows',github=True,drain=True)
 
+    def test_linux_prepared_local_success_and_failure_cleanup(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail): self.execute('tart-linux',fail)
+
+    def test_linux_prepared_github_stdin_and_cleanup(self):
+        self.execute('tart-linux',github=True)
+
+    def test_linux_prepared_organization_registration_scope(self):
+        self.execute('tart-linux',github=True,org=True)
+
+    def test_linux_prepared_admission_refuses_and_cleans(self):
+        for verdict in ('defer','error'):
+            with self.subTest(verdict=verdict): self.execute('tart-linux',github=True,admission=verdict)
+
+    def test_linux_prepared_pool_drain_refuses_jit(self):
+        self.execute('tart-linux',github=True,pool_drain=True)
+
+    def test_linux_prepared_local_skips_github_and_ssh(self):
+        self.execute('tart-linux',admission='defer',dhcp_verifying=True)
+
+    def test_linux_prepared_drains_assigned_job(self):
+        self.execute('tart-linux',github=True,drain=True)
+
     def test_missing_driver_cannot_enable_local_mode(self):
-        for provider in ('tart-macos','qemu-windows'):
+        for provider in ('tart-macos','qemu-windows','tart-linux'):
             with tempfile.TemporaryDirectory() as directory:
                 env={'PATH':os.environ['PATH'],'HOME':directory}
                 r=subprocess.run(['/bin/bash',str(ROOT/'providers'/provider/'runner.sh'),'--once','--local-job','fixture'],env=env,capture_output=True,text=True,timeout=5)
