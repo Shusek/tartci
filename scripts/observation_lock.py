@@ -8,6 +8,7 @@ import os
 import subprocess
 import time
 import datetime as dt
+import weakref
 from pathlib import Path
 from typing import Iterator
 
@@ -30,6 +31,35 @@ def _process_start(pid: int) -> str | None:
         ).strip() or None
     except (OSError, subprocess.SubprocessError):
         return None
+
+_ACTIVE_LOCKS: weakref.WeakSet["FairObservationLock"] = weakref.WeakSet()
+
+def _after_fork_child() -> None:
+    # Registered once at import time; supervisors may create many lock objects.
+    for lock in list(_ACTIVE_LOCKS):
+        if lock._holding:
+            lock._write_owner(os.getpid())
+
+os.register_at_fork(after_in_child=_after_fork_child)
+
+
+def _live_lock_holders(path: Path) -> list[int]:
+    """Return processes that still have the flock file open, including exec children."""
+    try:
+        output = subprocess.check_output(
+            ["lsof", "-t", "--", str(path)], text=True, stderr=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    holders: list[int] = []
+    for line in output.splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid not in holders:
+            holders.append(pid)
+    return holders
 
 
 def _timed_out(error: BaseException) -> bool:
@@ -145,31 +175,44 @@ class FairObservationLock:
             except FileNotFoundError:
                 pass
 
-    def _after_fork_child(self) -> None:
-        # flock descriptors survive fork; make the inherited child the visible
-        # holder so diagnostics identify the process that can actually release it.
-        if self._holding:
-            self._write_owner(os.getpid())
-
     def _owner_detail(self) -> str:
         owner = self._owner()
-        if not owner:
+        holders = _live_lock_holders(self.lock_path)
+        if not owner and not holders:
             return "owner=unknown age=unknown"
+        owner_pid = None if not owner else owner.get("pid")
+        recorded_start = None if not owner else owner.get("process_start")
+        live_owner = False
+        pid_reused = False
         try:
-            pid = int(owner["pid"])
-            recorded_start = owner.get("process_start")
-            os.kill(pid, 0)
-            if recorded_start and _process_start(pid) != recorded_start:
-                self.owner_path.unlink(missing_ok=True)
-                return "owner=unknown age=unknown"
-        except (KeyError, TypeError, ValueError, OSError):
+            if owner_pid is not None:
+                pid = int(owner_pid)
+                live_owner = pid in holders or (os.kill(pid, 0) is None)
+                if recorded_start and _process_start(pid) != recorded_start:
+                    live_owner = False
+                    pid_reused = True
+        except (TypeError, ValueError, OSError):
+            live_owner = False
+        holder_pid = int(owner_pid) if live_owner and owner_pid is not None else (holders[0] if holders else None)
+        if holder_pid is None:
             self.owner_path.unlink(missing_ok=True)
             return "owner=unknown age=unknown"
+        if owner is None or not live_owner:
+            # An exec'd child inherited the descriptor; retain lane/generation
+            # metadata while naming the process that actually holds the flock.
+            owner = {
+                "pid": holder_pid,
+                "lane": owner.get("lane", "unknown") if owner and not pid_reused else "unknown",
+                "generation": owner.get("generation", "unknown") if owner and not pid_reused else "unknown",
+                "started_at": owner.get("started_at", "unknown") if owner and not pid_reused else "unknown",
+                "started_epoch": owner.get("started_epoch") if owner and not pid_reused else None,
+            }
         started = owner.get("started_at")
         try:
-            age = max(0.0, time.time() - float(owner["started_epoch"]))
-            age_text = f"{age:.1f}s"
+            age_seconds = max(0.0, time.time() - float(owner["started_epoch"]))
+            age_text = f"{age_seconds:.1f}s"
         except (KeyError, TypeError, ValueError):
+            age_seconds = None
             age_text = "unknown"
         detail = (
             f"owner_pid={owner.get('pid', 'unknown')} "
@@ -177,10 +220,10 @@ class FairObservationLock:
             f"generation={owner.get('generation', 'unknown')} "
             f"started_at={started or 'unknown'} age={age_text}"
         )
-        if age_text != "unknown" and float(age_text[:-1]) >= self.max_age:
+        if age_seconds is not None and age_seconds >= self.max_age:
             escalation = {
                 **owner,
-                "age_seconds": float(age_text[:-1]),
+                "age_seconds": age_seconds,
                 "escalated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "reason": "observation lock owner exceeded bounded age",
             }
@@ -191,10 +234,7 @@ class FairObservationLock:
                 temp.write_text(json.dumps(escalation, sort_keys=True, separators=(",", ":")))
                 os.replace(temp, self.escalation_path)
             except OSError:
-                try:
-                    temp.unlink()
-                except OSError:
-                    pass
+                temp.unlink(missing_ok=True)
             detail += f" escalation=owner_age_exceeded:{self.max_age:.1f}s"
         return detail
 
@@ -265,7 +305,7 @@ class FairObservationLock:
                         time.sleep(0.05)
                 self.handle = handle
                 self._holding = True
-                os.register_at_fork(after_in_child=self._after_fork_child)
+                _ACTIVE_LOCKS.add(self)
                 self._write_owner(os.getpid())
                 try:
                     yield handle
@@ -278,6 +318,7 @@ class FairObservationLock:
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                     self._holding = False
+                    _ACTIVE_LOCKS.discard(self)
                     self._clear_owner()
         finally:
             if marker.exists():
