@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -7,6 +8,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "agent-hygiene"
+
+if shutil.which("zsh") is None:
+    raise unittest.SkipTest("agent-hygiene is a macOS zsh entry point")
 
 
 class AgentHygieneTests(unittest.TestCase):
