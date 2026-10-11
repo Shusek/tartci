@@ -2158,12 +2158,12 @@ class Run:
             self._write_pin(self.approval.read_text())
             self.pin_moved = True
             self.receipt.step("pin", "new launcher approval pinned (previous in the snapshot)")
-            self.receipt.step("install-dry-run", "checking installer preflight against the new pin")
+            self.receipt.step("install-dry-run", "checking installer staging after the pin move; dry-run does not perform pin validation")
             dry = tartci(cfg, sys_, *self.install_args, repository=self.repository)
             if dry.rc != 0:
                 self.receipt.step("install-dry-run", f"refused: {dry.text[:300]}", ok=False)
-                raise Refused(f"sealed-launcher install preflight refused before install: {dry.text}")
-            self.receipt.step("install-dry-run", "ok against the new pin")
+                raise Refused(f"sealed-launcher post-pin installer staging refused: {dry.text}")
+            self.receipt.step("install-dry-run", "staging checks ok; pin validation runs in install --apply")
         self.phase = "install"
         self._install(self.install_args)
         self.receipt.step("install", f"applied {self.target[:12]}")
@@ -2476,15 +2476,21 @@ class Run:
     def _rollback(self, reason: str) -> int:
         cfg, sys_ = self.cfg, self.sys
         self.receipt.step("rollback", f"reinstalling {self.previous[:12]} from {self.snapshot}")
+        rollback_install_ok = False
+        rollback_pin_ok = self.helper is None
+        rollback_pool_on_ok = False
         try:
             self._wait_idle()
             off = tartci(cfg, sys_, "pool", "off", *self.flag)
             if off.rc != 0:
                 raise Failed(f"pool off for rollback failed: {off.text}")
             self._reinstall_previous()
+            rollback_install_ok = True
+            rollback_pin_ok = True
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
             if not self._pool_on(restore_receipt=True):
                 raise Failed("pool on after rollback failed")
+            rollback_pool_on_ok = True
             verify(cfg, sys_, self.previous, self.receipt)
         except BaseException as exc:  # noqa: BLE001 - incl. a second SIGTERM
             # Whatever the rollback's own failure, capacity comes back: a
@@ -2492,7 +2498,12 @@ class Run:
             self._repin_to_live()
             state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated),
                                     restore_receipt=True)
-            if "verification of" in reason and "heartbeat_missing" in reason:
+            rollback_verify_timeout = (
+                isinstance(exc, Failed)
+                and "verification of" in str(exc)
+                and "heartbeat_missing" in str(exc)
+            )
+            if rollback_install_ok and rollback_pin_ok and rollback_pool_on_ok and rollback_verify_timeout:
                 message = (f"{reason}; rollback installed and pool on; rollback verification "
                            f"timed out: {type(exc).__name__}: {exc}; host is "
                            f"{_state_words(state)} running {str(self._running())[:12]}")

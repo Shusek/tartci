@@ -483,6 +483,13 @@ class Base(unittest.TestCase):
         ticket = json.loads((self.cfg.state_dir / "waiting.json").read_text())
         self.assertTrue(ticket.get("reason"), ticket)
 
+    def test_scheduled_pause_refuses_real_apply_before_any_mutation(self) -> None:
+        su._write_json(self.cfg.state_dir / "scheduled-pause.json",
+                       {"at": su._iso(self.sys.now()), "reason": "bad rollout"})
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("self-update PAUSED", "\n".join(su.status_lines(self.cfg.state_dir)))
+
 
 class SkewTests(Base):
     def test_target_is_newest_first_parent_commit_past_the_soak(self) -> None:
@@ -1665,6 +1672,14 @@ class VerifySettleTests(Base):
             "rollback installed; verification timed out; rolled back to bbbbbbbbbbbb and verified",
         )
 
+    def test_rollback_wording_requires_rollback_steps_to_succeed(self) -> None:
+        self.assertNotIn(
+            "rollback installed and pool on",
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: heartbeat_missing",
+                "b" * 40),
+        )
+
     def test_heartbeat_missing_with_crashed_launchd_lane_includes_last_log_line(self) -> None:
         log = self.home / "lane.log"
         log.write_text("booting\nlaunchd: runner crashed\n")
@@ -1801,6 +1816,12 @@ class RollbackTests(Base):
 class RelayRollbackTests(Base):
     relay = True
 
+    def test_recovery_pool_on_reuses_receipted_serving_set(self) -> None:
+        self.sys.install_rcs = [1]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        pool_on = [a for a, _ in self.sys.calls if "pool" in a and "on" in a]
+        self.assertTrue(any("--restore-receipt" in a for a in pool_on), pool_on)
+
     def test_relay_failure_after_install_rolls_back(self) -> None:
         self.sys.relay = {"ok": False, "reason": "probe failed"}
         calls = {"n": 0}
@@ -1820,6 +1841,13 @@ class SealedRollbackTests(Base):
 
     def pin(self) -> Path:
         return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+    def test_rollback_pool_on_failure_cannot_claim_installed_and_on(self) -> None:
+        self.sys.broken_target = True
+        self.sys.on_rcs = [0, 1, 1, 1, 1, 1]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("ROLLBACK FAILED", self.last()["error"])
+        self.assertNotIn("rollback installed and pool on", self.last()["error"])
 
     def test_sealed_rollback_restores_bundle_and_pin_together(self) -> None:
         self.sys.broken_target = True
