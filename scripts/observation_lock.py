@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import time
 import datetime as dt
@@ -45,9 +46,18 @@ os.register_at_fork(after_in_child=_after_fork_child)
 
 def _live_lock_holders(path: Path) -> list[int]:
     """Return processes that still have the flock file open, including exec children."""
+    # Census and launchd environments intentionally have a minimal PATH that
+    # often omits /usr/sbin, where macOS installs lsof. Resolve it explicitly
+    # so the live-holder probe does not silently fall back to the old
+    # owner-record-only behavior.
+    lsof = shutil.which("lsof") or next(
+        (candidate for candidate in ("/usr/sbin/lsof", "/usr/bin/lsof")
+         if os.access(candidate, os.X_OK)),
+        "lsof",
+    )
     try:
         output = subprocess.check_output(
-            ["lsof", "-t", "--", str(path)], text=True, stderr=subprocess.DEVNULL
+            [lsof, "-t", "--", str(path)], text=True, stderr=subprocess.DEVNULL
         )
     except (OSError, subprocess.SubprocessError):
         return []

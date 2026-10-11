@@ -187,7 +187,8 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-1", generation="gen-7
 """
             owner = subprocess.Popen(
                 [sys.executable, "-c", owner_code, lock, str(ready)],
-                env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)},
+                env={**os.environ, "PATH": "/usr/bin:/bin:/opt/homebrew/bin",
+                     "PYTHONPATH": str(Path(__file__).parent)},
             )
             deadline = time.monotonic() + 2
             while not ready.exists() and time.monotonic() < deadline:
@@ -231,7 +232,8 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-exec", generation="ge
 """
             owner = subprocess.Popen(
                 [sys.executable, "-c", owner_code, lock, str(ready)],
-                env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)},
+                env={**os.environ, "PATH": "/usr/bin:/bin:/opt/homebrew/bin",
+                     "PYTHONPATH": str(Path(__file__).parent)},
             )
             deadline = time.monotonic() + 2
             while not ready.exists() and time.monotonic() < deadline:
