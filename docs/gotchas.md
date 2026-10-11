@@ -1054,3 +1054,5 @@ machine-readable disk-axis lease denial. Do not broaden it to old receipts,
 CPU/RAM failures, mount probes, timers, arbitrary repositories, or PR scans.
 Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
+
+- **A fleet pin is an install contract, not a PATH preference.** The installer probes api.github.com before writing LaunchAgents. It records TARTCI_PYTHON, carries the same path into sealed lanes.json and ghapp, and uses TARTCI_RENDER_PYTHON while rendering. A blocked or vanished interpreter names the path and requires reinstalling the current TartCI generation; do not relink python3 underneath a live generation.

@@ -621,7 +621,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
         #
         # The rule now: a delegation may only pass when it names the ARTIFACT
         # carrying the other side's verdict, and absence of that artifact is a
-        # fault. `tartci_host_attestation.py` writes it; Shipyard's landability
+        # fault. tartci_host_attestation.py writes it; Shipyard's landability
         # preflight reads it and reports Unknown - never Served - when it is
         # missing or stale. The verdict is still not computed here, because
         # that is genuinely Shipyard's half; what changed is that the reader is
@@ -717,7 +717,7 @@ def is_pool_runner(label: str) -> bool:
 def pool_participating(path: str) -> bool:
     """Read durable pool intent. Missing/unrecognised values preserve legacy ON.
 
-    `tartci pool` and Shipyard use the numeric 1/0 contract; accepting the old
+    tartci pool and Shipyard use the numeric 1/0 contract; accepting the old
     true/false spelling keeps deployed hosts compatible.
     """
     try:
@@ -841,7 +841,7 @@ def mid_job_refusal(label: str, launch_agents_dir: str | None = None) -> str | N
 
 def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
                    allow_mid_job: bool) -> int:
-    """The explicit `tartci launchd reload LABEL` entry, with every guard."""
+    """The explicit tartci launchd reload LABEL entry, with every guard."""
     plist = os.path.join(launch_agents_dir, f"{label}.plist")
     verb = "would" if dry_run else "will"
     if not os.path.exists(plist):
@@ -853,7 +853,7 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
         if refusal is not None:
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "
-                  "`tartci pool drain` so it finishes its job and stops.\n"
+                  "tartci pool drain so it finishes its job and stops.\n"
                   "  Override (kills the job): tartci launchd reload "
                   f"{label} --allow-mid-job", file=sys.stderr)
             return RELOAD_REFUSED
@@ -1623,7 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
         if config["warned"] or (args.status and config_summary):
             # Report only: the watchdog never acts on configuration drift.
             print(f"{_iso(now)} launchd-watchdog: WARN config: {config_summary} "
-                  "(report only; see `tartci fleet-macos verify-supply` / `profile-drift`)")
+                  "(report only; see tartci fleet-macos verify-supply / profile-drift)")
         # no_tomllib is already covered by the config WARN; printing it here
         # would repeat every pass rather than every due cycle.
         if disagreement.get("ran") or (disagreement.get("state") == "unknown"
