@@ -77,10 +77,21 @@ ALLOWED = [
 BROAD_KILLS = [
     "pkill -9 -x bash",
     "pkill sh",
+    "pkill -f bash",
+    "pkill '^bash$'",
+    "pkill -x 'bash|sh'",
+    "pkill -x Python",
     "killall python3",
+    "killall -u $USER",
+    "pkill -u $USER",
     "pkill -f snapshot-zsh",
     "pkill -f zsh-snapshot",
+    "pkill -f SNAPSHOT-ZSH",
     "kill -9 -1",
+    "kill -TERM -1",
+    "kill -s KILL -1",
+    "kill -1",
+    "agent-hygiene --reap 5 --yes",
 ]
 
 
@@ -114,7 +125,8 @@ class ClassifierTests(unittest.TestCase):
                 self.assertIn("tree top", message)
 
     def test_benign_kills_are_the_control(self) -> None:
-        for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234"):
+        for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",
+                        "agent-hygiene --status", "pkill -u $USER worker-job"):
             with self.subTest(command=command):
                 self.assertEqual(guard.decide(command), (0, ""))
 

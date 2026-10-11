@@ -60,6 +60,10 @@ class Fleet:
                             "paused": []})
 
     def run(self, argv: list[str]) -> tuple[int, str, str]:
+        # The fixture must observe the exact production transport command;
+        # hand-building a replacement stdout would miss PEER_READ regressions.
+        if argv[-1] != psa.PEER_READ:
+            raise AssertionError("fixture did not receive the production PEER_READ command")
         target = argv[argv.index("ConnectTimeout=10") + 1]
         self.calls.append(target)
         return self.answers.get(target, (255, "", "ssh: connect to host: Operation timed out"))

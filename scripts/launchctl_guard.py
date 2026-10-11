@@ -312,31 +312,53 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
         words = [_expand(word, variables) for word in argv[1:]]
         operands: list[str] = []
         patterns: list[str] = []
+        user_selector = False
+        has_user_selector = False
         skip = False
         for word in words:
             if skip:
-                patterns.append(word)
+                # -f consumes a pattern; -u consumes a user name.
+                if user_selector:
+                    user_selector = False
+                else:
+                    patterns.append(word)
                 skip = False
             elif word == "-f":
+                skip = True
+            elif word in ("-u", "--user"):
+                has_user_selector = True
+                user_selector = True
                 skip = True
             elif not word.startswith("-"):
                 operands.append(word)
         hits: list[Hit] = [
             Hit(head, target,
                 "bare-name kill would terminate every matching agent shell/process")
-            for target in operands if target in BROAD_KILL_NAMES
+            for target in operands
+            if any(re.search(target, name, re.IGNORECASE) for name in BROAD_KILL_NAMES)
         ]
         hits.extend(
             Hit(head, target,
                 "-f matches a shell snapshot and can kill every agent session")
-            for target in patterns if SHELL_SNAPSHOT.search(target)
+            for target in patterns
+            if SHELL_SNAPSHOT.search(target) or any(
+                re.search(target, name, re.IGNORECASE) for name in BROAD_KILL_NAMES
+            )
         )
+        if has_user_selector and not operands:
+            hits.append(Hit(head, "-u", "whole-user selector has no process operand"))
         return hits
     if head == "kill":
         words = [_expand(word, variables) for word in argv[1:]]
-        if "-1" in words and any(word in ("-9", "-KILL", "-SIGKILL") for word in words):
-            return [Hit("kill", "-9 -1",
-                        "broadcast SIGKILL can terminate every agent and supervisor")]
+        if "-1" in words:
+            signal = next((word for word in words if word.startswith("-") and word != "-1"), "default")
+            return [Hit("kill", f"{signal} -1",
+                        "broadcast signal can terminate every agent and supervisor")]
+        return []
+    if head == "agent-hygiene":
+        if "--reap" in argv[1:]:
+            return [Hit(head, "--reap",
+                        "age-based agent reaping is human-only and unsafe from an agent")]
         return []
     if head == "export":
         for word in argv[1:]:
@@ -385,12 +407,12 @@ def classify(command: str, depth: int = 0,
 
 
 def block_message(command: str, hits: list[Hit]) -> str:
-    broad = any(hit.verb in {"pkill", "killall", "kill"} for hit in hits)
+    broad = any(hit.verb in {"pkill", "killall", "kill", "agent-hygiene"} for hit in hits)
     heading = ("BLOCKED by tartci launchd guard: broad process kill."
                if broad else "BLOCKED by tartci launchd guard: raw launchctl against a CI lane.")
     lines = [heading, ""]
     for hit in hits:
-        lines.append(f"  launchctl {hit.verb} {hit.target}: {hit.why}")
+        lines.append(f"  {hit.verb} {hit.target}: {hit.why}")
     lines += [
         "",
         "Why: `kickstart` re-runs launchd's CACHED job spec (never the plist on",
@@ -425,7 +447,7 @@ def decide(command: str) -> tuple[int, str]:
     hits = classify(command)
     if not hits:
         return 0, ""
-    broad = any(hit.verb in {"pkill", "killall", "kill"} for hit in hits)
+    broad = any(hit.verb in {"pkill", "killall", "kill", "agent-hygiene"} for hit in hits)
     if ESCAPE.search(command) and not broad:
         return 0, ("tartci launchd guard: TARTCI_ALLOW_RAW_LAUNCHCTL=1 given; allowing "
                    + "; ".join(f"launchctl {h.verb} {h.target}" for h in hits))
