@@ -906,7 +906,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "Generous-Corp/pulp": None,
                             "danielraffel/spectr": "vm" if host_id == "m1" else "gate",
                             "Generous-Corp/forge": "gate",
-                            "Generous-Corp/vellum": "gate",
+                            "Generous-Corp/vellum": "vm",
                         },
                     )
                     for value in values:
