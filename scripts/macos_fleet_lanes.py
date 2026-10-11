@@ -1256,7 +1256,24 @@ def write_receipt(
     data = load(config)
     support_root = support_root.resolve()
     launch_entrypoint = launch_entrypoint.resolve()
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                installed_env = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {})
+            except (OSError, plistlib.InvalidFileException):
+                continue
+            pinned = installed_env.get("TARTCI_PYTHON")
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     digests: dict[str, str] = {}
     for name, body in expected.items():
         installed = agents_dir / name
@@ -1285,7 +1302,7 @@ def write_receipt(
         entrypoint_source, entrypoint, support_root
     )
     launch = support_manifest.launch_record(launch_entrypoint, support_root)
-    interpreter = Path("/usr/bin/python3")
+    interpreter = Path(os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3"))
     interpreter_info = interpreter.lstat()
     if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter must be a regular non-symlink file")
@@ -1425,7 +1442,12 @@ def verify_receipt(
         != support.get("launch_entrypoint")
     ):
         fail("installed TartCI launch entrypoint does not match its receipt")
-    interpreter = Path("/usr/bin/python3")
+    recorded_interpreter = support.get("interpreter")
+    interpreter = Path(
+        recorded_interpreter["path"]
+        if isinstance(recorded_interpreter, dict) and recorded_interpreter.get("path")
+        else os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3")
+    )
     interpreter_info = interpreter.lstat()
     interpreter_record = {
         "path": str(interpreter),
@@ -1450,7 +1472,15 @@ def verify_receipt(
     recorded_persistent = receipt.get("persistent_plists", {})
     if recorded_persistent != expected_persistent:
         fail("installed persistent runner plist set does not match the profile receipt")
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    os.environ["TARTCI_RENDER_PYTHON"] = str(interpreter)
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
         fail("install receipt plist set does not match the profile")
@@ -1461,6 +1491,15 @@ def verify_receipt(
     }
     if installed_names != set(expected):
         fail("installed fleet plist set does not exactly match the profile")
+    # Check that the installed LaunchAgents execute this generation before
+    # comparing byte receipts, so an ineffective sealed launcher is reported
+    # with its actionable install_ineffective diagnosis.
+    assert_executed_generation(
+        agents_dir, expected,
+        launch_entrypoint=launch_entrypoint,
+        source_commit=verified_support["source_commit"],
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    )
     for name, body in expected.items():
         installed = agents_dir / name
         digest = hashlib.sha256(body).hexdigest()
@@ -1477,12 +1516,6 @@ def verify_receipt(
     for label in expected_retired:
         if (agents_dir / f"{label}.plist").exists():
             fail(f"declared legacy LaunchAgent became installable again: {label}")
-    assert_executed_generation(
-        agents_dir, expected,
-        launch_entrypoint=launch_entrypoint,
-        source_commit=verified_support["source_commit"],
-        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-    )
     return receipt
 
 
@@ -2395,6 +2428,14 @@ def lane_plist(
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    # The installer resolves and probes one interpreter before rendering. Keep
+    # that exact path in every LaunchAgent so TartCILauncher and ghapp cannot
+    # follow a later PATH relink.
+    pinned_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if pinned_python:
+        env["TARTCI_PYTHON"] = pinned_python
+        env["SHIPYARD_GHAPP_PYTHON_BINARY"] = pinned_python
+        env["PATH"] = f"{Path(pinned_python).parent}:{env['PATH']}"
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"] and lane["id"] == "pulp-gate":
         env.update({

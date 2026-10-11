@@ -232,6 +232,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         # a test deliberately removes it. This prevents ambient GH_REPO from
         # hiding the bound-identity path under test.
         self.env["GH_REPO"] = "danielraffel/tartci"
+        self.env["TARTCI_TESTING"] = "1"
         # The fixture has no governed Runner.Worker; make that evidence
         # explicit rather than inheriting unrelated host processes.
         ps = self.fakebin / "ps-empty"
@@ -310,6 +311,34 @@ class InstallMacosFleetTests(unittest.TestCase):
         interpreter.chmod(0o755)
         result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_install_persists_pinned_interpreter_for_launcher_and_ghapp(self) -> None:
+        interpreter = self.root / "pinned-python3"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = list(self.agents.glob("*macos-fleet*.plist"))
+        self.assertEqual(len(installed), 1)
+        env = plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]
+        self.assertEqual(env["TARTCI_PYTHON"], str(interpreter))
+        self.assertEqual(env["SHIPYARD_GHAPP_PYTHON_BINARY"], str(interpreter))
+        self.assertTrue(env["PATH"].startswith(str(interpreter.parent) + ":"))
+
+    def test_slow_pinned_interpreter_fails_fast_with_path(self) -> None:
+        interpreter = self.root / "slow-python"
+        interpreter.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+              *api.github.com*) sleep 5 ;;
+            esac
+            exec {sys.executable} "$@"
+        """))
+        interpreter.chmod(0o755)
+        result = self.run_installer(TARTCI_PYTHON=str(interpreter), TARTCI_TESTING="0")
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn("timed out after 3s", result.stderr)
+        self.assertIn(str(interpreter), result.stderr)
 
     def test_installed_generation_refuses_itself_as_support_source(self) -> None:
         # The installed `tartci` lives in a read-only generation, not a git
@@ -1238,12 +1267,22 @@ class InstallMacosFleetTests(unittest.TestCase):
 
                 [github_app]"""))
         )
+        installed_env = plistlib.loads(next(self.agents.glob("*macos-fleet*.plist")).read_bytes())["EnvironmentVariables"]
         for installed in self.agents.glob("*macos-fleet*.plist"):
             installed.unlink()
         data = fleet.load(helper_config)
-        for name, body in fleet.rendered_plists(
-            data, launch_entrypoint=Path(support["launch_entrypoint"]["path"])
-        ).items():
+        previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+        os.environ["TARTCI_RENDER_PYTHON"] = installed_env["TARTCI_PYTHON"]
+        try:
+            rendered = fleet.rendered_plists(
+                data, launch_entrypoint=Path(support["launch_entrypoint"]["path"])
+            )
+        finally:
+            if previous_render_python is None:
+                os.environ.pop("TARTCI_RENDER_PYTHON", None)
+            else:
+                os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
+        for name, body in rendered.items():
             target = self.agents / name
             target.write_bytes(body)
             target.chmod(0o644)

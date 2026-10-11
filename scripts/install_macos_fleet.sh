@@ -96,6 +96,43 @@ fi
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# Record the executable behind a Homebrew `python3` symlink.  Do this without
+# executing the candidate: wrappers used by tests and launchers must remain the
+# pinned executable, while a symlinked Homebrew entry resolves to its target.
+while [ -L "$PYTHON_BIN" ]; do
+  PYTHON_TARGET="$(readlink "$PYTHON_BIN")"
+  case "$PYTHON_TARGET" in
+    /*) PYTHON_BIN="$PYTHON_TARGET" ;;
+    *) PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd)/$PYTHON_TARGET" ;;
+  esac
+done
+[ -x "$PYTHON_BIN" ] || { echo "fleet install resolved an unusable Python: $PYTHON_BIN" >&2; exit 127; }
+# The interpreter is part of the installed launch contract.  Probe GitHub
+# through that exact executable before writing any LaunchAgent; a PATH python3
+# may be a newly linked Homebrew build that is blocked by the host firewall.
+if [ "${TARTCI_TESTING:-0}" != 1 ]; then
+  if ! /usr/bin/python3 - "$PYTHON_BIN" <<'PY'
+import subprocess
+import sys
+
+interpreter = sys.argv[1]
+code = ("import urllib.request; "
+        "urllib.request.urlopen('https://api.github.com', timeout=2).read(1)")
+try:
+    result = subprocess.run([interpreter, "-c", code], text=True,
+                            capture_output=True, timeout=3, check=False)
+except subprocess.TimeoutExpired:
+    raise SystemExit(f"interpreter GitHub probe timed out after 3s: {interpreter}")
+if result.returncode != 0:
+    detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["unknown error"]
+    raise SystemExit(f"interpreter GitHub probe failed ({interpreter}): {detail[0]}")
+PY
+  then
+    echo "fleet install requires the pinned interpreter to reach api.github.com: $PYTHON_BIN" >&2
+    exit 127
+  fi
+fi
+export TARTCI_RENDER_PYTHON="$PYTHON_BIN"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 RECEIPT="$HOME/.config/tartci/macos-fleet-install.json"
 PROFILE_SNAPSHOT="$HOME/.config/tartci/macos-fleet-profile.toml"
