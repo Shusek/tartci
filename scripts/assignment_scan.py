@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
 from gh_identity import (
     CLI_REFUSED,
     NO_VALID_CREDENTIALS,
@@ -329,7 +329,7 @@ class AssignmentScanner:
             self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise ScanError("assignment scan exceeded its overall deadline")
+            raise ObservationTimeout("assignment scan exceeded its overall deadline")
         try:
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
@@ -347,6 +347,8 @@ class AssignmentScanner:
             reason = self._reason(
                 f"GitHub API failed for {path}: {result.stderr.strip()}"
             )
+            if getattr(result, "timed_out", False) or reason.reason_code == "timeout":
+                raise ObservationTimeout(str(reason))
             if reason.reason_code == NO_VALID_CREDENTIALS:
                 # Retrying cannot turn an anonymous caller into an
                 # authenticated one, and each attempt spends another request

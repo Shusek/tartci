@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
 from gh_identity import (
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
@@ -195,6 +195,10 @@ class QueueScanner:
             if self.observation_lock_fd is not None
             else (),
         )
+        if getattr(result, "timed_out", False):
+            raise ObservationTimeout(
+                f"queue_scan_github_api:timeout:timed out after {self.args.gh_timeout}s"
+            )
         if result.returncode:
             error = GitHubApiError(path, result.returncode, result.stderr, self.identity)
             if error.reason.reason_code == NO_VALID_CREDENTIALS:

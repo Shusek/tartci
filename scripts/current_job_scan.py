@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
 
 PER_PAGE = 100
 
@@ -67,7 +67,7 @@ class CurrentJobScanner:
             self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise ScanError("scan exceeded its overall deadline")
+            raise ObservationTimeout("scan exceeded its overall deadline")
         try:
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
@@ -79,6 +79,10 @@ class CurrentJobScanner:
             )
         except ObservationError as error:
             raise ScanError(f"GitHub API unavailable for {path}: {error}") from error
+        if getattr(result, "timed_out", False):
+            raise ObservationTimeout(
+                f"current_job_github_api:timeout:timed out after {self.args.gh_timeout}s"
+            )
         if result.returncode:
             raise ScanError(f"GitHub API failed for {path}: {result.stderr.strip()}")
         try:

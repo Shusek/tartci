@@ -2,6 +2,7 @@ import threading
 import time
 import tempfile
 import os
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,63 @@ from observation_lock import FairObservationLock, ObservationBackoff, _process_s
 
 
 class ObservationLockTests(unittest.TestCase):
+    def _real_timeout_scan(self, scanner: str, extra: list[str], td: str, expected_rc: int = 2) -> dict[str, float]:
+        fake = Path(td) / "sleeping-gh"
+        fake.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(2)\n")
+        fake.chmod(0o755)
+        lock = Path(td) / "observation.lock"
+        backoff = Path(td) / "backoff.json"
+        result = subprocess.run(
+            ["python3", str(Path(__file__).with_name(scanner)), "--gh-cli", str(fake),
+             "--observation-lock-file", str(lock), "--observation-backoff-file", str(backoff),
+             "--gh-timeout", "1", *extra],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)},
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, expected_rc, result.stderr)
+        return __import__("json").loads(backoff.read_text())
+
+    def test_assignment_real_wrapper_timeout_records_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            values = self._real_timeout_scan(
+                "assignment_scan.py",
+                ["--repo", "forge/repo", "--workflow", "Build", "--labels", "x",
+                 "--require-label", "x", "--scan-timeout", "5", "--max-workers", "1"], td)
+            self.assertIn("forge/repo", values)
+
+    def test_queue_real_wrapper_timeout_records_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            values = self._real_timeout_scan(
+                "queue_scan.py",
+                ["--repo", "forge/repo", "--workflow", "Build", "--labels", "x",
+                 "--state-file", str(Path(td) / "state.json"), "--provider", "p",
+                 "--max-job-fetches", "3", "--newest-quota", "1", "--force-refresh"], td, 1)
+            self.assertIn("forge/repo", values)
+
+    def test_current_job_real_wrapper_timeout_records_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            values = self._real_timeout_scan(
+                "current_job_scan.py",
+                ["--repo", "spectr/repo", "--runner", "r", "--workflow", "Build",
+                 "--scan-timeout", "5"], td)
+            self.assertIn("spectr/repo", values)
+
+    def test_assignment_overall_deadline_records_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            values = self._real_timeout_scan(
+                "assignment_scan.py",
+                ["--repo", "forge/deadline", "--workflow", "Build", "--labels", "x",
+                 "--require-label", "x", "--scan-timeout", "1"], td)
+            self.assertIn("forge/deadline", values)
+
+    def test_current_job_overall_deadline_records_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            values = self._real_timeout_scan(
+                "current_job_scan.py",
+                ["--repo", "spectr/deadline", "--runner", "r", "--workflow", "Build",
+                 "--scan-timeout", "0.1"], td)
+            self.assertIn("spectr/deadline", values)
+
     def test_fifo_order_honors_older_ticket(self):
         with tempfile.TemporaryDirectory() as td:
             lock = Path(td) / "observation.lock"

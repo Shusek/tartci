@@ -17,6 +17,10 @@ class ObservationBackoff(RuntimeError):
     """This repository recently timed out and must yield the host slot."""
 
 
+class ObservationTimeout(TimeoutError):
+    """A scanner exhausted a bounded observation timeout."""
+
+
 def _process_start(pid: int) -> str | None:
     try:
         return subprocess.check_output(
