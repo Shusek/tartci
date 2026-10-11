@@ -3243,3 +3243,7 @@ one exact admission retry is eligible.
 compile or link what another gate host builds green: the signature of a
 poisoned shared compiler cache. Read-only, never schedules, default off. Rules,
 detection floor, enablement and remedy: [build-disagreement.md](build-disagreement.md).
+
+#### Install-time interpreter pin
+
+On macOS fleet installs, the installer resolves one regular interpreter, probes api.github.com through that exact path, and records it as TARTCI_PYTHON. LaunchAgents, sealed TartCILauncher lane bundles, and the ghapp token minter carry the same path; TARTCI_RENDER_PYTHON is the render-time handoff used while building a launcher. A probe failure names the interpreter and must be repaired before admission.

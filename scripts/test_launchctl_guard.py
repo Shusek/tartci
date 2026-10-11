@@ -87,10 +87,16 @@ BROAD_KILLS = [
     "pkill -f snapshot-zsh",
     "pkill -f zsh-snapshot",
     "pkill -f SNAPSHOT-ZSH",
+    "pkill python3.12",
     "kill -9 -1",
     "kill -TERM -1",
     "kill -s KILL -1",
     "kill -1",
+    "kill -s TERM -1",
+    "pkill -U 1234",
+    "pkill -G 1234",
+    "pkill -g 1234",
+    "pkill -t ttys001",
     "agent-hygiene --reap 5 --yes",
 ]
 
@@ -126,9 +132,17 @@ class ClassifierTests(unittest.TestCase):
 
     def test_benign_kills_are_the_control(self) -> None:
         for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",
-                        "agent-hygiene --status", "pkill -u $USER worker-job"):
+                        "kill -1 1234", "pkill a", "pkill -f bin/bash",
+                        "pkill -u $USER worker-job", "pkill -U 1234 worker-job",
+                        "pkill -G 1234 worker-job", "pkill -g 1234 worker-job",
+                        "pkill -t ttys001 worker-job", "pkill -f bin/bash"):
             with self.subTest(command=command):
                 self.assertEqual(guard.decide(command), (0, ""))
+
+    def test_malformed_regex_fails_closed_without_traceback(self) -> None:
+        code, message = guard.decide("pkill '['")
+        self.assertEqual(code, 2)
+        self.assertIn("broad process kill", message)
 
     def test_launchctl_escape_does_not_authorize_a_broad_kill(self) -> None:
         code, message = guard.decide("TARTCI_ALLOW_RAW_LAUNCHCTL=1 pkill -x zsh")

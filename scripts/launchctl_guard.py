@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""Block raw `launchctl` mutations of tartci lanes from an agent's shell.
+"""Block raw launchctl mutations of tartci lanes from an agent's shell.
 
 Why this exists
 ---------------
-On 2026-09-22 an agent ran a raw `launchctl kickstart` against a lane
+On 2026-09-22 an agent ran a raw launchctl kickstart against a lane
 supervisor and killed a healthy, just-recovered VM mid-job. No tartci code was
 on that path, so no tartci guard could refuse it. The one choke point every
 agent shell command passes through is the agent harness's PreToolUse hook;
 this is the classifier that hook runs.
 
 Raw launchctl is dangerous on a lane for two reasons:
-  * `kickstart` (and KeepAlive) re-run launchd's CACHED job spec, never the
-    plist on disk, so it cannot pick up a plist change; and `kickstart -k`,
-    `bootout`, `unload`, `remove`, `kill`, `stop` and `disable` all kill the
+  * kickstart (and KeepAlive) re-run launchd's CACHED job spec, never the
+    plist on disk, so it cannot pick up a plist change; and kickstart -k,
+    bootout, unload, remove, kill, stop and disable all kill the
     supervisor's process tree, including a VM that is running a job.
-  * `tartci launchd reload <label>` does the full bootout+bootstrap that
-    re-reads the plist AND refuses while that lane is mid-job; `tartci pool
-    drain` lets running jobs finish. Those are the safe paths.
+  * tartci launchd reload <label> does the full bootout+bootstrap that
+    re-reads the plist AND refuses while that lane is mid-job; tartci pool
+    drain lets running jobs finish. Those are the safe paths.
 
-Contract (`--hook`): read a PreToolUse JSON object on stdin
+Contract (--hook): read a PreToolUse JSON object on stdin
 ({"tool_name": ..., "tool_input": {"command": ...}}). Exit 2 with the reason
 on stderr when the command would run launchctl kickstart|bootout|unload|
 remove|kill|disable|stop against a tartci runner/lane supervisor or an
-`actions.runner.*` service, or against a target that cannot be resolved
+actions.runner.* service, or against a target that cannot be resolved
 statically (a variable, a glob, stdin via xargs). Here-document bodies are
 data unless they feed a shell interpreter or ssh. Exit 0 otherwise, silently.
-`TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself is the explicit,
+TARTCI_ALLOW_RAW_LAUNCHCTL=1 written in the command itself is the explicit,
 auditable escape hatch (exit 0 with a warning). Malformed input exits 0 with
 a note: a broken hook must not break the agent's shell.
 
@@ -77,9 +77,25 @@ SSH_ARG_OPTS = frozenset({"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
 XARGS_ARG_OPTS = frozenset({"-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s", "-a", "-d"})
 MAX_DEPTH = 8
 BROAD_KILL_NAMES = frozenset({"bash", "sh", "zsh", "python", "python3", "node"})
+WHOLE_USER_SELECTOR_OPTS = frozenset({"-u", "--user", "-U", "-G", "-g", "-t"})
 SHELL_SNAPSHOT = re.compile(
     r"(?:snapshot[-_.]?(?:bash|sh|zsh)|(?:bash|sh|zsh)[-_.]?snapshot)", re.I
 )
+
+
+def _matches(pattern: str, value: str, *, full: bool = False) -> bool:
+    """Match a kill operand without letting malformed regex escape the hook."""
+    try:
+        return (re.fullmatch if full else re.search)(pattern, value, re.IGNORECASE) is not None
+    except re.error:
+        return True
+
+
+def _matches_broad_name(pattern: str, name: str) -> bool:
+    return _matches(pattern, name, full=True) or (
+        name in {"python", "python3"}
+        and _matches(r"python3(?:\.\d+)?", pattern, full=True)
+    )
 
 
 class Hit(NamedTuple):
@@ -97,7 +113,7 @@ def _tokens(command: str) -> list[str]:
 
 
 def _extract_substitutions(command: str) -> tuple[str, list[str]]:
-    """Replace $(...) and `...` with a placeholder, returning their bodies.
+    """Replace $(...) and ... with a placeholder, returning their bodies.
 
     Deliberately quote-blind: text that only looks like a substitution inside
     single quotes is classified too, which can only err toward blocking.
@@ -105,6 +121,7 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
     bodies: list[str] = []
     out: list[str] = []
     i = 0
+    tick = chr(96)
     while i < len(command):
         if command.startswith("$(", i) and not command.startswith("$((", i):
             depth, j = 1, i + 2
@@ -117,8 +134,8 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
             bodies.append(command[i + 2:j - 1] if depth == 0 else command[i + 2:])
             out.append(UNRESOLVED)
             i = j
-        elif command[i] == "`":
-            j = command.find("`", i + 1)
+        elif command[i] == tick:
+            j = command.find(tick, i + 1)
             end = len(command) if j < 0 else j
             bodies.append(command[i + 1:end])
             out.append(UNRESOLVED)
@@ -130,13 +147,13 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
 
 
 def _heredoc_feeds_shell(prefix: str) -> bool:
-    """Whether the command owning a `<<` reads its stdin as shell commands.
+    """Whether the command owning a << reads its stdin as shell commands.
 
     PREFIX is the line text before the operator. The owner is the last simple
-    command in it: `bash`, `sh -s`, `sudo zsh`, `ssh host` execute the body;
-    `cat`, `git commit -F -`, `tee` treat it as data.
+    command in it: bash, sh -s, sudo zsh, ssh host execute the body;
+    cat, git commit -F -, tee treat it as data.
     """
-    segment = re.split(r"\$\(|`|[;&|()]", prefix)[-1]
+    segment = re.split(r"\$\(|" + re.escape(chr(96)) + r"|[;&|()]", prefix)[-1]
     try:
         words = shlex.split(segment)
     except ValueError:
@@ -312,22 +329,22 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
         words = [_expand(word, variables) for word in argv[1:]]
         operands: list[str] = []
         patterns: list[str] = []
-        user_selector = False
+        selector_arg = False
         has_user_selector = False
         skip = False
         for word in words:
             if skip:
-                # -f consumes a pattern; -u consumes a user name.
-                if user_selector:
-                    user_selector = False
+                # -f consumes a pattern; selector options consume a value.
+                if selector_arg:
+                    selector_arg = False
                 else:
                     patterns.append(word)
                 skip = False
             elif word == "-f":
                 skip = True
-            elif word in ("-u", "--user"):
+            elif word in WHOLE_USER_SELECTOR_OPTS:
                 has_user_selector = True
-                user_selector = True
+                selector_arg = True
                 skip = True
             elif not word.startswith("-"):
                 operands.append(word)
@@ -335,14 +352,14 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
             Hit(head, target,
                 "bare-name kill would terminate every matching agent shell/process")
             for target in operands
-            if any(re.search(target, name, re.IGNORECASE) for name in BROAD_KILL_NAMES)
+            if any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
         ]
         hits.extend(
             Hit(head, target,
                 "-f matches a shell snapshot and can kill every agent session")
             for target in patterns
             if SHELL_SNAPSHOT.search(target) or any(
-                re.search(target, name, re.IGNORECASE) for name in BROAD_KILL_NAMES
+                _matches(target, name) for name in BROAD_KILL_NAMES
             )
         )
         if has_user_selector and not operands:
@@ -350,8 +367,17 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
         return hits
     if head == "kill":
         words = [_expand(word, variables) for word in argv[1:]]
-        if "-1" in words:
-            signal = next((word for word in words if word.startswith("-") and word != "-1"), "default")
+        signal_index = 0
+        if words[:1] in (["-s"], ["--signal"]):
+            signal_index = 2
+        elif words and words[0] == "-1" and len(words) > 1:
+            signal_index = 1
+        elif words and words[0].startswith("-") and words[0] != "-1":
+            signal_index = 1
+        targets = words[signal_index:]
+        broadcast = "-1" in targets or (words == ["-1"])
+        if broadcast:
+            signal = words[0] if words and words[0] != "-1" else "default"
             return [Hit("kill", f"{signal} -1",
                         "broadcast signal can terminate every agent and supervisor")]
         return []
@@ -415,7 +441,7 @@ def block_message(command: str, hits: list[Hit]) -> str:
         lines.append(f"  {hit.verb} {hit.target}: {hit.why}")
     lines += [
         "",
-        "Why: `kickstart` re-runs launchd's CACHED job spec (never the plist on",
+        "Why: kickstart re-runs launchd's CACHED job spec (never the plist on",
         "disk), and kickstart -k / bootout / unload / remove / kill / stop /",
         "disable kill the supervisor's process tree, including a VM that is",
         "running a job. On 2026-09-22 a raw kickstart of a lane supervisor",
