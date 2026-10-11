@@ -51,6 +51,7 @@ class CurrentJobScanner:
             str(self.observation_lock_path), self.args.observation_lock_timeout,
             self.args.repo, getattr(self.args, "observation_backoff_file", None),
             getattr(self.args, "observation_backoff_seconds", 30.0),
+            getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
         ).hold() as handle:
             self.observation_lock_fd = os.dup(handle.fileno())
             os.set_inheritable(self.observation_lock_fd, True)
@@ -244,6 +245,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
     parser.add_argument("--runner", required=True)
+    parser.add_argument(
+        "--lane-id",
+        default=os.environ.get("TARTCI_QUEUE_LANE_ID")
+        or os.environ.get("TARTCI_RUNNER_SLOT")
+        or f"supervisor-{os.getppid()}",
+    )
+    parser.add_argument("--generation", default=os.environ.get("TARTCI_GENERATION") or "unknown")
     parser.add_argument("--workflow", required=True, action="append")
     parser.add_argument("--mode", choices=("discover", "revalidate"), default="discover")
     parser.add_argument("--run-id", type=int)

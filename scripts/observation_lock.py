@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import time
+import datetime as dt
 from pathlib import Path
 from typing import Iterator
 
@@ -47,12 +48,23 @@ def _timed_out(error: BaseException) -> bool:
 
 class FairObservationLock:
     def __init__(self, lock_file: str, timeout: float, repo: str,
-                 backoff_file: str | None = None, backoff_seconds: float = 30.0) -> None:
+                 backoff_file: str | None = None, backoff_seconds: float = 30.0,
+                 lane: str | None = None, generation: str | None = None,
+                 max_age: float | None = None) -> None:
         self.lock_path = Path(lock_file)
         self.timeout = timeout
         self.repo = repo
         self.backoff_path = Path(backoff_file or (str(self.lock_path) + ".backoff.json"))
         self.backoff_seconds = backoff_seconds
+        self.lane = lane or os.environ.get("TARTCI_QUEUE_LANE_ID") or f"pid-{os.getppid()}"
+        self.generation = generation or os.environ.get("TARTCI_GENERATION") or "unknown"
+        self.max_age = max_age if max_age is not None else float(
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_MAX_AGE_SECS", "300")
+        )
+        self.owner_path = self.lock_path.with_name(self.lock_path.name + ".owner.json")
+        self.escalation_path = self.lock_path.with_name(
+            self.lock_path.name + ".escalation.json"
+        )
         self.backoff_lock_path = self.backoff_path.with_name(self.backoff_path.name + ".lock")
         self.ticket_path: Path | None = None
         self.handle = None
@@ -95,6 +107,50 @@ class FairObservationLock:
                 values.pop(self.repo, None)
                 self._write_backoff(values)
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _owner(self) -> dict[str, object] | None:
+        try:
+            value = json.loads(self.owner_path.read_text())
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _owner_detail(self) -> str:
+        owner = self._owner()
+        if not owner:
+            return "owner=unknown age=unknown"
+        started = owner.get("started_at")
+        try:
+            age = max(0.0, time.time() - float(owner["started_epoch"]))
+            age_text = f"{age:.1f}s"
+        except (KeyError, TypeError, ValueError):
+            age_text = "unknown"
+        detail = (
+            f"owner_pid={owner.get('pid', 'unknown')} "
+            f"lane={owner.get('lane', 'unknown')} "
+            f"generation={owner.get('generation', 'unknown')} "
+            f"started_at={started or 'unknown'} age={age_text}"
+        )
+        if age_text != "unknown" and float(age_text[:-1]) >= self.max_age:
+            escalation = {
+                **owner,
+                "age_seconds": float(age_text[:-1]),
+                "escalated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "reason": "observation lock owner exceeded bounded age",
+            }
+            temp = self.escalation_path.with_name(
+                self.escalation_path.name + f".{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            try:
+                temp.write_text(json.dumps(escalation, sort_keys=True, separators=(",", ":")))
+                os.replace(temp, self.escalation_path)
+            except OSError:
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            detail += f" escalation=owner_age_exceeded:{self.max_age:.1f}s"
+        return detail
 
     def _next_ticket(self, queue: Path) -> Path:
         queue.mkdir(parents=True, exist_ok=True)
@@ -144,7 +200,10 @@ class FairObservationLock:
                 if not lower:
                     break
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("host queue observation lock timed out")
+                    raise TimeoutError(
+                        "host queue observation lock timed out; "
+                        + self._owner_detail()
+                    )
                 time.sleep(0.05)
             with self.lock_path.open("a+", encoding="utf-8") as handle:
                 while True:
@@ -153,9 +212,24 @@ class FairObservationLock:
                         break
                     except BlockingIOError:
                         if time.monotonic() >= deadline:
-                            raise TimeoutError("host queue observation lock timed out")
+                            raise TimeoutError(
+                                "host queue observation lock timed out; "
+                                + self._owner_detail()
+                            )
                         time.sleep(0.05)
                 self.handle = handle
+                owner = {
+                    "pid": os.getpid(),
+                    "lane": self.lane,
+                    "generation": self.generation,
+                    "started_epoch": time.time(),
+                    "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+                temp = self.owner_path.with_name(
+                    self.owner_path.name + f".{os.getpid()}.{time.time_ns()}.tmp"
+                )
+                temp.write_text(json.dumps(owner, sort_keys=True, separators=(",", ":")))
+                os.replace(temp, self.owner_path)
                 try:
                     yield handle
                 except BaseException as error:

@@ -3,6 +3,7 @@ import time
 import tempfile
 import os
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -166,6 +167,49 @@ class ObservationLockTests(unittest.TestCase):
             time.sleep(0.08)
             with FairObservationLock(lock, 1, "repo", backoff, 0.05).hold():
                 pass
+
+    def test_inherited_child_past_deadline_reports_owner_and_escalates(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            ready = Path(td) / "child-ready"
+            owner_code = """
+import os, sys, time
+from observation_lock import FairObservationLock
+lock, ready = sys.argv[1:]
+with FairObservationLock(lock, 5, "owner/repo", lane="lane-1", generation="gen-7").hold():
+    pid = os.fork()
+    if pid == 0:
+        open(ready, "w").write(str(os.getpid()))
+        time.sleep(3)
+        os._exit(0)
+    os._exit(0)
+"""
+            owner = subprocess.Popen(
+                [sys.executable, "-c", owner_code, lock, str(ready)],
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)},
+            )
+            deadline = time.monotonic() + 2
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists())
+            try:
+                with self.assertRaises(TimeoutError) as raised:
+                    with FairObservationLock(
+                        lock, 0.05, "contender/repo", max_age=0.01
+                    ).hold():
+                        pass
+                message = str(raised.exception)
+                self.assertIn("owner_pid=", message)
+                self.assertIn("lane=lane-1", message)
+                self.assertIn("generation=gen-7", message)
+                self.assertIn("age=", message)
+                self.assertIn("escalation=owner_age_exceeded", message)
+                self.assertTrue(Path(lock + ".escalation.json").exists())
+            finally:
+                child = int(ready.read_text())
+                os.kill(child, 15)
+                time.sleep(0.05)
+                owner.wait(timeout=3)
 
 
 if __name__ == "__main__":
