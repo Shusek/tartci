@@ -184,6 +184,7 @@ cmd_doctor() {
   if [ "${1:-}" = "--reap" ]; then
     shift
     tartci_verified_python_run "$HERE/scripts/vm_reap.py" "$@"
+    return $?
   fi
   if [ "${1:-}" = "cpu-pressure" ]; then
     shift

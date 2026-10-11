@@ -119,6 +119,30 @@ exec /bin/sh "$@"
                     self.assertNotIn("recursion", result.stderr.lower())
             self.assertFalse(counter.exists())
 
+    def test_every_helper_uses_verified_resolver_not_bare_python3(self) -> None:
+        """A shell named python3 must never be reached by any helper launch."""
+        with tempfile.TemporaryDirectory(prefix="tartci-helper-resolver-") as tmp:
+            root = Path(tmp)
+            fake = root / "python3"
+            fake.write_text("#!/bin/sh\nprintf x >> \"$TARTCI_FAKE_PYTHON_COUNT\"\nexit 97\n")
+            fake.chmod(0o755)
+            counter = root / "python-count"
+            env = dict(os.environ, HOME=tmp, PATH=f"{root}:/usr/bin:/bin",
+                       TARTCI_PYTHON="/usr/bin/python3",
+                       TARTCI_FAKE_PYTHON_COUNT=str(counter))
+            for helper in HELPERS:
+                with self.subTest(helper=helper):
+                    result = subprocess.run(
+                        ["bash", "-c",
+                         f"source {ROOT / 'tartci'}; "
+                         f"tartci_verified_python_run {ROOT / 'scripts' / helper}"],
+                        cwd=ROOT, env=env, text=True, capture_output=True,
+                        timeout=5, check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 97,
+                                        f"bare python3 reached by {helper}: {result.stderr}")
+            self.assertFalse(counter.exists(), counter.read_text() if counter.exists() else "")
+
     def test_python_shim_is_not_exported_to_children(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tartci-env-") as tmp:
             env = dict(os.environ, HOME=tmp, PATH=f"{tmp}:/usr/bin:/bin",
