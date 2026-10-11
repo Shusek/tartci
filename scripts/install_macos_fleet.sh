@@ -102,6 +102,7 @@ PROFILE_SNAPSHOT="$HOME/.config/tartci/macos-fleet-profile.toml"
 LOADED_RECEIPT="$HOME/.config/tartci/macos-fleet-loaded.json"
 SUPPORT_GENERATIONS="$HOME/.local/share/tartci-generations"
 ENTRYPOINT="$HOME/.local/bin/tartci"
+AGENT_HYGIENE_ENTRYPOINT="$HOME/.local/bin/agent-hygiene"
 DOMAIN="gui/$(id -u)"
 CONFIG="$("$PYTHON_BIN" - "$CONFIG" <<'PY'
 from pathlib import Path
@@ -178,6 +179,7 @@ echo "  installed_profile=$PROFILE_SNAPSHOT"
 echo "  support_manifest=$SUPPORT_MANIFEST"
 echo "  support_source=$SUPPORT_SOURCE"
 echo "  entrypoint=$ENTRYPOINT"
+echo "  agent_hygiene_entrypoint=$AGENT_HYGIENE_ENTRYPOINT"
 echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
 echo "  activation=deferred to tartci pool on"
@@ -637,6 +639,19 @@ PY
 wrapper_candidate="$(mktemp "$(dirname "$ENTRYPOINT")/.tartci-wrapper.XXXXXX")"
 "$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" wrapper-write "$wrapper_candidate" \
   --support-root "$support_root" >/dev/null
+
+# Keep the human-only agent hygiene command tied to this immutable support cohort.
+mkdir -p "$(dirname "$AGENT_HYGIENE_ENTRYPOINT")"
+"$PYTHON_BIN" - "$AGENT_HYGIENE_ENTRYPOINT" "$support_root/scripts/agent-hygiene" <<'PY'
+import os, stat, sys
+from pathlib import Path
+target, source = map(Path, sys.argv[1:])
+if target.parent.is_symlink() or not target.parent.is_dir() or target.parent.stat().st_uid != os.getuid():
+    raise SystemExit("agent-hygiene entrypoint parent must be owned and non-symlinked")
+content = "#!/bin/zsh\nexec " + str(source) + ' "$@"\n'
+target.write_text(content)
+target.chmod(0o755)
+PY
 
 if [ -z "$launcher_target" ]; then
   "$PYTHON_BIN" - "$render_dir" "$launch_entrypoint" "$ENTRYPOINT" <<'PY'
