@@ -99,7 +99,13 @@ fi
 # Record the executable behind a Homebrew `python3` symlink.  Do this without
 # executing the candidate: wrappers used by tests and launchers must remain the
 # pinned executable, while a symlinked Homebrew entry resolves to its target.
+python_link_hops=0
 while [ -L "$PYTHON_BIN" ]; do
+  python_link_hops=$((python_link_hops + 1))
+  if [ "$python_link_hops" -gt 16 ]; then
+    echo "fleet install refused a symlink cycle while resolving Python: $PYTHON_BIN" >&2
+    exit 127
+  fi
   PYTHON_TARGET="$(readlink "$PYTHON_BIN")"
   case "$PYTHON_TARGET" in
     /*) PYTHON_BIN="$PYTHON_TARGET" ;;
@@ -555,6 +561,18 @@ print(value.strip())
 PY
 )"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
+  # A sealed launcher owns the lane environment; reject a source bundle that
+  # was rendered without the same verified interpreter as this install.
+  "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
+import json, sys
+from pathlib import Path
+bundle, expected = Path(sys.argv[1]), sys.argv[2]
+lanes = json.loads((bundle / "Contents/Resources/lanes.json").read_text()).get("lanes", {})
+if not lanes or any((row.get("environment") or {}).get("TARTCI_PYTHON") != expected
+                    or (row.get("environment") or {}).get("SHIPYARD_GHAPP_PYTHON_BINARY") != expected
+                    for row in lanes.values()):
+    raise SystemExit(f"launch helper lanes are missing pinned interpreter: {expected}")
+PY
   launcher_identity_json="$("$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
     --sha256 "$launcher_sha256" \

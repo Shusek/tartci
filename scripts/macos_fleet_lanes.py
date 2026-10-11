@@ -1303,7 +1303,13 @@ def write_receipt(
     )
     launch = support_manifest.launch_record(launch_entrypoint, support_root)
     interpreter = Path(os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3"))
-    interpreter_info = interpreter.lstat()
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter must be a regular non-symlink file")
     interpreter_record = {
@@ -1448,7 +1454,13 @@ def verify_receipt(
         if isinstance(recorded_interpreter, dict) and recorded_interpreter.get("path")
         else os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3")
     )
-    interpreter_info = interpreter.lstat()
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     interpreter_record = {
         "path": str(interpreter),
         "mode": stat.S_IMODE(interpreter_info.st_mode),
@@ -1472,8 +1484,19 @@ def verify_receipt(
     recorded_persistent = receipt.get("persistent_plists", {})
     if recorded_persistent != expected_persistent:
         fail("installed persistent runner plist set does not match the profile receipt")
+    # Render with the same rule as write_receipt: pin only when the installed
+    # plist cohort carries TARTCI_PYTHON. Unpinned source renders must verify
+    # as unpinned rather than being silently rewritten during verification.
     previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
-    os.environ["TARTCI_RENDER_PYTHON"] = str(interpreter)
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                pinned = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {}).get("TARTCI_PYTHON")
+            except (OSError, plistlib.InvalidFileException):
+                pinned = None
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
     try:
         expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
     finally:
@@ -1491,15 +1514,6 @@ def verify_receipt(
     }
     if installed_names != set(expected):
         fail("installed fleet plist set does not exactly match the profile")
-    # Check that the installed LaunchAgents execute this generation before
-    # comparing byte receipts, so an ineffective sealed launcher is reported
-    # with its actionable install_ineffective diagnosis.
-    assert_executed_generation(
-        agents_dir, expected,
-        launch_entrypoint=launch_entrypoint,
-        source_commit=verified_support["source_commit"],
-        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-    )
     for name, body in expected.items():
         installed = agents_dir / name
         digest = hashlib.sha256(body).hexdigest()
@@ -1510,6 +1524,12 @@ def verify_receipt(
             installed_body = _verified_network_overlay(installed, body, config)
         if recorded.get(name) != digest or installed_body is None:
             fail(f"installed fleet plist failed receipt verification: {installed}")
+    assert_executed_generation(
+        agents_dir, expected,
+        launch_entrypoint=launch_entrypoint,
+        source_commit=verified_support["source_commit"],
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    )
     expected_retired = replacements(data)
     if receipt.get("retired_launchd_labels") != expected_retired:
         fail("install receipt retired-label set does not match the profile")
@@ -1991,7 +2011,10 @@ def fleet_readiness(
                 "blocked_seconds_threshold": blocked_serving_seconds,
             },
             "problems": [{"code": INTERPRETER_CHANGED_BY_OS_UPDATE
-                          if isinstance(exc, InterpreterChangedByOSUpdate) else "receipt_mismatch",
+                          if isinstance(exc, InterpreterChangedByOSUpdate)
+                          else ("lane_python_unavailable"
+                                if "interpreter unavailable" in str(exc)
+                                else "receipt_mismatch"),
                           "detail": str(exc)}],
             "config": config_verdicts(config, support_root),
         }

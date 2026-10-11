@@ -340,6 +340,36 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("timed out after 3s", result.stderr)
         self.assertIn(str(interpreter), result.stderr)
 
+    def test_blocked_pinned_interpreter_fails_with_path(self) -> None:
+        interpreter = self.root / "blocked-python"
+        interpreter.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+              *api.github.com*) exit 1 ;;
+            esac
+            exec {sys.executable} "$@"
+        """))
+        interpreter.chmod(0o755)
+        result = self.run_installer(TARTCI_PYTHON=str(interpreter), TARTCI_TESTING="0")
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn("interpreter GitHub probe failed", result.stderr)
+        self.assertIn(str(interpreter), result.stderr)
+
+    def test_pinned_interpreter_probe_positive_control(self) -> None:
+        interpreter = self.root / "working-python"
+        interpreter.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+              *api.github.com*) exit 0 ;;
+            esac
+            exec {sys.executable} "$@"
+        """))
+        interpreter.chmod(0o755)
+        result = self.run_installer(
+            "--apply", TARTCI_PYTHON=str(interpreter), TARTCI_TESTING="0"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_installed_generation_refuses_itself_as_support_source(self) -> None:
         # The installed `tartci` lives in a read-only generation, not a git
         # checkout; defaulting the support source to it used to fail with a

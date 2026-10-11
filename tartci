@@ -80,19 +80,6 @@ c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
 # shellcheck source=providers/common/toml-python.lib.sh
 . "$HERE/providers/common/toml-python.lib.sh"
 
-# Installed fleet LaunchAgents carry the exact interpreter selected by the
-# installer. Export a bash function so provider scripts that historically call
-# `python3` cannot silently fall back to a newly linked PATH interpreter; the
-# ghapp wrapper receives the same path through SHIPYARD_GHAPP_PYTHON_BINARY.
-if [ -n "${TARTCI_PYTHON:-}" ]; then
-  [ -x "$TARTCI_PYTHON" ] || {
-    echo "tartci: pinned interpreter is unavailable: $TARTCI_PYTHON" >&2
-    exit 127
-  }
-  python3() { "$TARTCI_PYTHON" "$@"; }
-  export -f python3
-fi
-
 # Replace this process with a TOML-reading helper. A bare `python3` under ssh or
 # launchd is /usr/bin/python3 (3.9, no tomllib): the helper then cannot read the
 # fleet profile and fails with a misleading cause (e.g. "Tart store unavailable").
@@ -130,6 +117,17 @@ tartci_verified_python_run() {
   python="$(tartci_verified_python)" || return 127
   "$python" "$@"
 }
+
+# Only install the PATH shim after the resolver has accepted the configured
+# interpreter. A rejected TARTCI_PYTHON must not hijack fallback diagnostics.
+if [ -n "${TARTCI_PYTHON:-}" ]; then
+  if _tartci_verified_pin="$(tartci_toml_python_path 2>/dev/null)"       && "$_tartci_verified_pin" -c 'import sys' >/dev/null 2>&1; then
+    TARTCI_PYTHON="$_tartci_verified_pin"
+    export TARTCI_PYTHON
+    python3() { "$TARTCI_PYTHON" "$@"; }
+    export -f python3
+  fi
+fi
 
 # The Tart store a command reads. A LaunchAgent sets TART_HOME for its lane; a
 # shell over ssh has none, and `tart list` then reads Tart's default ~/.tart,

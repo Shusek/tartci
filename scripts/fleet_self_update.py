@@ -1475,10 +1475,15 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
+        launcher_python = os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
+            "TARTCI_PYTHON") or sys.executable
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
                            "--support-root", ".", "--profile", str(profile), *pinned],
-                          cwd=str(cfg.checkout), timeout=1800)
+                          cwd=str(cfg.checkout),
+                          env={"TARTCI_RENDER_PYTHON": launcher_python,
+                               "TARTCI_PYTHON": launcher_python},
+                          timeout=1800)
     finally:
         restore_writable(cfg.checkout)
     # The builder's cleanup trap cannot remove its read-only staging copy and
@@ -1499,8 +1504,12 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
+    launcher_python = os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
+        "TARTCI_PYTHON") or sys.executable
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
-                       "--output", str(rendered)], cwd=str(cfg.checkout))
+                       "--output", str(rendered)], cwd=str(cfg.checkout),
+                      env={"TARTCI_RENDER_PYTHON": launcher_python,
+                           "TARTCI_PYTHON": launcher_python})
     if result.rc != 0:
         raise Refused(f"cannot render the profile to verify the bundle: {result.text}")
     import plistlib
@@ -1510,6 +1519,11 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
         expected[env.get("TARTCI_QUEUE_LANE_ID")] = dict(sorted(env.items()))
     if not expected or {k: (v or {}).get("environment") for k, v in lanes.items()} != expected:
         raise Refused("new launcher lanes.json does not carry the rendered lane environment")
+    for lane, environment in expected.items():
+        if environment.get("TARTCI_PYTHON") != launcher_python:
+            raise Refused(f"new launcher lane {lane} is missing pinned TARTCI_PYTHON {launcher_python}")
+        if environment.get("SHIPYARD_GHAPP_PYTHON_BINARY") != launcher_python:
+            raise Refused(f"new launcher lane {lane} is missing pinned ghapp interpreter {launcher_python}")
     check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
     if check.rc != 0:
         raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
