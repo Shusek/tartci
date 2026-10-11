@@ -237,7 +237,7 @@ class FakeSystem(su.System):
             return su.Result(self.snapshot_verify_rc, "{}", "" if self.snapshot_verify_rc == 0
                              else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
-            return self._render(a)
+            return self._render(a, env)
         if a[:3] == ["python3", "scripts/support_agents.py", "check-templates"]:
             return su.Result(self.agents_check_rc, "4 declared agents render" if
                              self.agents_check_rc == 0 else "reclaim: missing template")
@@ -250,7 +250,7 @@ class FakeSystem(su.System):
         if a[0] == "security":
             return ok(f'  1) {IDENTITY} "Developer ID Application: X (95CX6P84C4)"\n')
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
-            return self._build(a)
+            return self._build(a, env)
         if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
             if a[1:] == ["writer-domain-exec", "--help"]:
                 return ok() if self.writer_domain_exec else su.Result(2, "", "unrecognized subcommand")
@@ -377,21 +377,27 @@ class FakeSystem(su.System):
             receipt = self.home / ".config/tartci/macos-fleet-install.json"
             receipt.write_text(json.dumps({"support": {"source_commit": commit}}))
 
-    def _render(self, a):
+    def _render(self, a, env=None):
         proc = subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), *a[2:]],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env={**os.environ, **(env or {})})
         return su.Result(proc.returncode, proc.stdout, proc.stderr)
 
-    def _build(self, a):
+    def _build(self, a, env=None):
         out = Path(a[a.index("--output") + 1])
         approval = Path(a[a.index("--approval-output") + 1])
         profile = Path(a[a.index("--profile") + 1])
         rendered = out.parent / "render"
+        render_env = {**os.environ, **(env or {})}
+        render_env.setdefault("TARTCI_RENDER_PYTHON", sys.executable)
         subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), "render",
-                        str(profile), "--output", str(rendered)], check=True, capture_output=True)
+                        str(profile), "--output", str(rendered)], check=True,
+                       capture_output=True, env=render_env)
         lanes = {}
         for plist in rendered.glob("*.plist"):
             env = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
+            expected = os.path.realpath(render_env["TARTCI_RENDER_PYTHON"])
+            assert env["TARTCI_PYTHON"] == expected
+            assert env["SHIPYARD_GHAPP_PYTHON_BINARY"] == expected
             lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
         res = out / "Contents" / "Resources"
         res.mkdir(parents=True)
@@ -1412,6 +1418,16 @@ class SealedTests(Base):
         self.assertTrue((snapshot / "profile.toml").is_file())
         # The checkout is writable again after the immutable build.
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
+
+    def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        pinned = self.home / "pinned-python"
+        pinned.symlink_to(sys.executable)
+        with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
+            self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        build_index = next(i for i, (args, _) in enumerate(self.sys.calls)
+                           if args[:2] == ["bash", "scripts/build_macos_launcher.sh"])
+        build_env = self.sys.env_calls[build_index]
+        self.assertEqual(build_env["TARTCI_RENDER_PYTHON"], os.path.realpath(pinned))
 
     def test_install_failure_restores_the_pin(self) -> None:
         self.sys.install_rcs = [1]
