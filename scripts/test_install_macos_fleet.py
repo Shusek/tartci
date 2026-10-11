@@ -312,6 +312,20 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_python_symlink_cycle_is_bounded(self) -> None:
+        first = self.root / "python-cycle-0"
+        first.symlink_to(sys.executable)
+        previous = first
+        for index in range(1, 18):
+            link = self.root / f"python-cycle-{index}"
+            link.symlink_to(previous)
+            previous = link
+        first.unlink()
+        first.symlink_to(previous)
+        result = self.run_installer("--preflight", TARTCI_PYTHON=str(first))
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("symlink cycle", result.stderr)
+
     def test_install_persists_pinned_interpreter_for_launcher_and_ghapp(self) -> None:
         interpreter = self.root / "pinned-python3"
         shutil.copy2(sys.executable, interpreter)
@@ -321,9 +335,10 @@ class InstallMacosFleetTests(unittest.TestCase):
         installed = list(self.agents.glob("*macos-fleet*.plist"))
         self.assertEqual(len(installed), 1)
         env = plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]
-        self.assertEqual(env["TARTCI_PYTHON"], str(interpreter))
-        self.assertEqual(env["SHIPYARD_GHAPP_PYTHON_BINARY"], str(interpreter))
-        self.assertTrue(env["PATH"].startswith(str(interpreter.parent) + ":"))
+        expected = os.path.realpath(interpreter)
+        self.assertEqual(env["TARTCI_PYTHON"], expected)
+        self.assertEqual(env["SHIPYARD_GHAPP_PYTHON_BINARY"], expected)
+        self.assertTrue(env["PATH"].startswith(str(Path(expected).parent) + ":"))
 
     def test_slow_pinned_interpreter_fails_fast_with_path(self) -> None:
         interpreter = self.root / "slow-python"
@@ -371,7 +386,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_installed_generation_refuses_itself_as_support_source(self) -> None:
-        # The installed `tartci` lives in a read-only generation, not a git
+        # The installed tartci lives in a read-only generation, not a git
         # checkout; defaulting the support source to it used to fail with a
         # misleading "support member failed verification".
         staged = support_manifest.stage_install(
@@ -1319,12 +1334,32 @@ class InstallMacosFleetTests(unittest.TestCase):
             self.assertEqual(
                 plistlib.loads(body)["ProgramArguments"][0], str(executable)
             )
+        lanes = {}
+        for body in rendered.values():
+            env = plistlib.loads(body)["EnvironmentVariables"]
+            lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
+        (bundle / "Contents/Resources/lanes.json").write_text(
+            json.dumps({"schema": 1, "lanes": lanes})
+        )
         return {
             "config": helper_config,
             "support": support,
             "sealed_launch": sealed_launch,
             "output": self.root / "receipt.json",
         }
+
+    def test_real_installer_checks_build_launcher_lanes_pin(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        lanes_path = self.home / ".local/libexec/TartCILauncher.app/Contents/Resources/lanes.json"
+        lanes = json.loads(lanes_path.read_text())
+        next(iter(lanes["lanes"].values()))["environment"]["TARTCI_PYTHON"] = "/wrong/python"
+        lanes_path.write_text(json.dumps(lanes))
+        result = self.run_installer(
+            "--apply", "--launch-helper-source",
+            str(self.home / ".local/libexec/TartCILauncher.app"),
+        )
+        self.assertIn("launch helper lanes are missing pinned interpreter", result.stderr)
 
     def write_receipt(self, fixture: dict) -> None:
         support = fixture["support"]

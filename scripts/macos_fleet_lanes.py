@@ -485,7 +485,7 @@ def load(path: Path) -> dict:
             fail(f"unknown build_disagreement keys: {sorted(unknown)}")
         if type(disagreement.get("enabled", False)) is not bool:
             fail("build_disagreement.enabled must be a boolean")
-    # Opt-in: run Pulp's own build-directory reapers from `tartci reclaim`
+    # Opt-in: run Pulp's own build-directory reapers from tartci reclaim
     # (scripts/pulp_reapers.py). One validator for install time and run time,
     # so a profile that installs is a profile the reclaim pass acts on.
     reclaim = data.get("reclaim")
@@ -1476,7 +1476,7 @@ def verify_receipt(
                 f"{INTERPRETER_CHANGED_BY_OS_UPDATE}: the OS-managed {interpreter} changed "
                 f"with a macOS update ({evidence}), so the receipt no longer describes it; "
                 "remedy: reinstall the same generation to refresh the receipt "
-                "(`tartci fleet-macos self-update --apply` does this at the next idle window)")
+                "(tartci fleet-macos self-update --apply does this at the next idle window)")
         fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
@@ -2392,7 +2392,7 @@ def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
     """The SSH target a fallback lane reaches a preferred host by.
 
     The same rule self-update uses for its peers: the host's published
-    `host.ssh` from its checked-in profile, else the `tartci-<host_id>` alias
+    host.ssh from its checked-in profile, else the tartci-<host_id> alias
     convention. Resolved at render time, so the LaunchAgent carries the exact
     target and the supervisor never re-reads profiles.
     """
@@ -2809,7 +2809,7 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         # Additive to v1: runners a host owns whose labels tartci does not set.
         "persistent_runners": persistent,
         # Additive to v1: how fleet hosts reach each other (self-update's
-        # one-at-a-time check). ssh null means the alias `tartci-<host_id>`.
+        # one-at-a-time check). ssh null means the alias tartci-<host_id>.
         "hosts": hosts,
     }
 
@@ -3468,7 +3468,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     if current != body:
                         print(f"fleet-macos: {args.check} is stale; regenerate with "
-                              "`tartci fleet-macos advertised-labels --publish > "
+                              "tartci fleet-macos advertised-labels --publish > "
                               "fleet/advertised-labels.json`", file=sys.stderr)
                         return 1
                     print(f"up to date: {args.check}")

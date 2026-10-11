@@ -128,12 +128,12 @@ def _status(home: Path, run: Runner, now: float | None, dedicated: str,
     rc, out = call(["security", "unlock-keychain", "-p", password, dedicated])
     if rc != 0:
         risks.append(f"{dedicated} does not unlock with keychain.env's password "
-                     f"({out.strip()[:120]}); run `pulp ship doctor`")
+                     f"({out.strip()[:120]}); run pulp ship doctor")
     else:
         rc, out = call(["security", "show-keychain-info", dedicated])
         if rc == 0 and (re.search(r"timeout=\d+", out) or "lock-on-sleep" in out):
             risks.append(f"{dedicated} re-locks on its own ({out.strip()[:120]}); "
-                         "`pulp ship doctor` sets it to no-timeout")
+                         "pulp ship doctor sets it to no-timeout")
     agent = unlock_agent_risk(home, now)
     if agent:
         risks.append(agent)

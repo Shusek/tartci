@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep a fleet host on the tartci code that main has, verified.
 
-`tartci fleet-macos self-update [--target REF] [--plan] [--apply]` codifies the
+tartci fleet-macos self-update [--target REF] [--plan] [--apply] codifies the
 manual procedure that brought m1, m5 and m3 up to date on 2026-09-23. It adds
 no new mechanics; every step is a command that already exists:
 
@@ -170,7 +170,7 @@ EXIT_REFUSED = 3       # a precondition refused; the host was not touched
 # waiting.json and `pool status` carry it, and it becomes EXIT_REFUSED plus a
 # self_update_starved event once it has lasted STARVED_AFTER_SECONDS.
 EXIT_DEFERRED = 0
-# `tartci pool off` exits these when a precondition refuses before it stops
+# tartci pool off exits these when a precondition refuses before it stops
 # anything: 11 the capacity floor (including an unreadable census), 12 a lane
 # that could not be proven idle, 13 lanes launchd still held after the unload
 # wait (m5studio, 2026-10-01: "launchd still holds ... forge-gate after 40s").
@@ -779,7 +779,7 @@ def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
     """host_id -> SSH target for every host in the CURRENT published supply.
 
     A profile's `host.ssh` is published there; without it the alias
-    convention `tartci-<host_id>` applies; [peers] only overrides. Adding a
+    convention tartci-<host_id> applies; [peers] only overrides. Adding a
     machine therefore needs its profile and nothing on other hosts.
     """
     value = published_supply(cfg, sys_)
@@ -1109,7 +1109,7 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
              f"since {_iso(float(ticket['since']))}")
     body = (f"{me} has deferred its tartci self-update for {waited / 3600:.1f} h: {reason}\n\n"
             "A busy, unreachable or longer-waiting peer holds the update turn. Check "
-            "`tartci pool status` on every host. This issue closes itself when the host "
+            "tartci pool status on every host. This issue closes itself when the host "
             "gets its turn.")
     rc, text = host_off._open_issue(title, body)
     if rc == 0 and text.strip().isdigit():
@@ -1475,8 +1475,8 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
-        launcher_python = os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-            "TARTCI_PYTHON") or sys.executable
+        launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
+            "TARTCI_PYTHON") or sys.executable)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
                            "--support-root", ".", "--profile", str(profile), *pinned],
@@ -1504,8 +1504,8 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
-    launcher_python = os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-        "TARTCI_PYTHON") or sys.executable
+    launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
+        "TARTCI_PYTHON") or sys.executable)
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
                        "--output", str(rendered)], cwd=str(cfg.checkout),
                       env={"TARTCI_RENDER_PYTHON": launcher_python,
@@ -1547,7 +1547,7 @@ def orchestrator_generation(script: Path | None = None) -> str | None:
 
     The orchestration (gates, drain, install sequencing, verify, rollback) is
     the INSTALLED generation's code: the agent runs ~/.local/bin/tartci. Only
-    the steps run through `tartci()` (support-manifest, validate, install) and
+    the steps run through tartci() (support-manifest, validate, install) and
     the template check run the TARGET's code. So a change to orchestration takes
     effect from the update after the one that installs it. Recording which code
     orchestrated each attempt makes that visible. None when the code is not
@@ -1633,7 +1633,7 @@ def halt_reason(state_dir: Path) -> str | None:
         streak = 0 if value.get("status") == "succeeded" else streak + 1
     if streak >= MAX_CONSECUTIVE_FAILURES:
         return (f"self-update HALTED after {streak} consecutive failed attempts; read the "
-                "receipts, fix the cause, then `tartci fleet-macos self-update --clear-halt`")
+                "receipts, fix the cause, then tartci fleet-macos self-update --clear-halt")
     return None
 
 
@@ -1642,7 +1642,7 @@ def scheduled_pause(state_dir: Path) -> str | None:
     if not isinstance(value, dict) or not value.get("reason"):
         return None
     return (f"self-update PAUSED by operator at {value.get('at')}: {value['reason']} "
-            "(resume with `tartci fleet-macos self-update --resume`)")
+            "(resume with tartci fleet-macos self-update --resume)")
 
 
 def record_pause_control(state_dir: Path, action: str, reason: str | None = None) -> None:
@@ -1710,7 +1710,7 @@ def previous_run_state(cfg: Config, sys_: System) -> tuple[str | None, list[Path
             and _alive(sys_, installer["pgid"], installer.get("start")):
         return (f"a previous self-update's installer is still running (pgid {installer['pgid']}, "
                 f"started {installer.get('start')}); wait for it to exit, then run "
-                "`tartci fleet-macos self-update --verify`"), []
+                "tartci fleet-macos self-update --verify"), []
     interrupted = []
     for path, value in _attempts(cfg.state_dir):
         if value.get("mode") != "apply" or value.get("status") != "running":
@@ -1758,7 +1758,7 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
         message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
                    f"during {value['steps'][-1]['step'] if value.get('steps') else 'start'}; "
                    f"host runs {str(running)[:12]}; " + "; ".join(notes)
-                   + "; run `tartci fleet-macos self-update --verify`")
+                   + "; run tartci fleet-macos self-update --verify")
         value.setdefault("steps", []).append({"at": _iso(sys_.now()), "step": "interrupted",
                                               "ok": False, "detail": message})
         value.update(status="failed", error=message, finished_at=_iso(sys_.now()))
@@ -2215,7 +2215,7 @@ class Run:
         Non-fatal by design: the lanes are verified and serving by now, and a
         janitor's plist must not be able to take the serving generation back.
         A failure is a receipt step with ok=False, an event in the support
-        agents' own log, and a `tartci doctor fleet` finding.
+        agents' own log, and a tartci doctor fleet finding.
         """
         try:
             result = installed_tartci(self.cfg, self.sys, "fleet-macos", "support-agents",
@@ -2448,7 +2448,7 @@ class Run:
             return self._terminal("failed", pool_state="on" if on else self._pool_state_quiet(), message=f"{reason}; RECOVERY INTERRUPTED "
                                   f"({type(exc).__name__}: {exc}); host is "
                                   f"{'on' if on else 'possibly OFF'} running "
-                                  f"{str(self._running())[:12]}; run `tartci fleet-macos "
+                                  f"{str(self._running())[:12]}; run tartci fleet-macos "
                                   "self-update --verify`")
 
     def _pool_state_quiet(self) -> str:
@@ -2483,7 +2483,7 @@ class Run:
             state = self._ensure_on(allow_reinstall=False)
             return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
                                   f"{_state_words(state)} running {str(running)[:12]}; run "
-                                  "`tartci fleet-macos self-update --verify` to check it",
+                                  "tartci fleet-macos self-update --verify to check it",
                                   pool_state=state)
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
@@ -2629,7 +2629,7 @@ def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], boo
                              "tart-runner-macos-fleet.verify.lane")
     allow = installed_tartci(cfg, sys_, "launchd", "guard", "--command", "launchctl list")
     if guard.rc != 2 or allow.rc != 0:
-        problems.append(f"installed `tartci launchd guard` missing or wrong "
+        problems.append(f"installed tartci launchd guard missing or wrong "
                         f"(block={guard.rc}, allow={allow.rc})")
     return problems, settling and len(problems) == 1, heartbeat_labels
 
@@ -2707,8 +2707,8 @@ def status_lines(state_dir: Path) -> list[str]:
                      f"{str(last.get('target'))[:12]}: {last.get('error')}")
     if last and last.get("host_off"):
         lines.append(f"self-update: THIS HOST WAS LEFT {str(last.get('pool_state') or 'off').upper()} "
-                     "(pool on failed after a failed update); check `tartci pool status`, "
-                     "then `tartci pool on`")
+                     "(pool on failed after a failed update); check tartci pool status, "
+                     "then tartci pool on")
     waiting = waiting_line(state_dir)
     if waiting:
         lines.append(waiting)

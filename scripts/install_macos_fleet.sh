@@ -71,7 +71,10 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # Python 3.11+ and its stdlib tomllib module.
 PYTHON_BIN=""
 if [ -n "${TARTCI_PYTHON:-}" ]; then
-  PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)"
+  case "$TARTCI_PYTHON" in
+    */*) PYTHON_BIN="$TARTCI_PYTHON" ;;
+    *) PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)" ;;
+  esac
 else
   for candidate in python3 python3.12 python3.11; do
     candidate="$(command -v "$candidate" 2>/dev/null || true)"
@@ -92,7 +95,7 @@ else
     fi
   done
 fi
-[ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+[ -n "$PYTHON_BIN" ] || {
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
@@ -112,7 +115,14 @@ while [ -L "$PYTHON_BIN" ]; do
     *) PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd)/$PYTHON_TARGET" ;;
   esac
 done
+# Match fleet_self_update's pin rule: canonicalise the resolved executable's
+# parent path so a Homebrew bin/.. spelling cannot disagree with lanes.json.
+PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")"
 [ -x "$PYTHON_BIN" ] || { echo "fleet install resolved an unusable Python: $PYTHON_BIN" >&2; exit 127; }
+"$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+  echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+  exit 127
+}
 # The interpreter is part of the installed launch contract.  Probe GitHub
 # through that exact executable before writing any LaunchAgent; a PATH python3
 # may be a newly linked Homebrew build that is blocked by the host firewall.

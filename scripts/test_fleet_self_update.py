@@ -388,15 +388,16 @@ class FakeSystem(su.System):
         profile = Path(a[a.index("--profile") + 1])
         rendered = out.parent / "render"
         render_env = {**os.environ, **(env or {})}
-        render_env["TARTCI_RENDER_PYTHON"] = sys.executable
+        render_env.setdefault("TARTCI_RENDER_PYTHON", sys.executable)
         subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), "render",
                         str(profile), "--output", str(rendered)], check=True,
                        capture_output=True, env=render_env)
         lanes = {}
         for plist in rendered.glob("*.plist"):
             env = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
-            assert env["TARTCI_PYTHON"] == sys.executable
-            assert env["SHIPYARD_GHAPP_PYTHON_BINARY"] == sys.executable
+            expected = os.path.realpath(render_env["TARTCI_RENDER_PYTHON"])
+            assert env["TARTCI_PYTHON"] == expected
+            assert env["SHIPYARD_GHAPP_PYTHON_BINARY"] == expected
             lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
         res = out / "Contents" / "Resources"
         res.mkdir(parents=True)
@@ -1417,6 +1418,16 @@ class SealedTests(Base):
         self.assertTrue((snapshot / "profile.toml").is_file())
         # The checkout is writable again after the immutable build.
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
+
+    def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        pinned = self.home / "pinned-python"
+        pinned.symlink_to(sys.executable)
+        with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
+            self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        build_index = next(i for i, (args, _) in enumerate(self.sys.calls)
+                           if args[:2] == ["bash", "scripts/build_macos_launcher.sh"])
+        build_env = self.sys.env_calls[build_index]
+        self.assertEqual(build_env["TARTCI_RENDER_PYTHON"], os.path.realpath(pinned))
 
     def test_install_failure_restores_the_pin(self) -> None:
         self.sys.install_rcs = [1]

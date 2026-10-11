@@ -303,8 +303,8 @@ def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
             f"[tartci] {host} left OFF by a failed self-update since {current['since']}",
             f"{current['detail']}\n\nThe host's launchd watchdog and self-update agent "
             "retry `pool on` every 5 min; this issue closes itself when the pool is on "
-            "again. Check `tartci pool status` and "
-            "`~/.tartci/state/self-update/last.json` on the host."),
+            "again. Check tartci pool status and "
+            "~/.tartci/state/self-update/last.json on the host."),
         issue=issue, close=close,
         issues_enabled=os.environ.get("TARTCI_HOST_OFF_ISSUE", "1") != "0")
     out.pop("closed", None)

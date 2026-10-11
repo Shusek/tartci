@@ -95,7 +95,8 @@ tartci_toml_exec() {
 # judging every scanned volume rather than refusing to run at all.
 tartci_toml_exec_or_python3() {
   local python
-  python="$(tartci_toml_python_path 2>/dev/null)" || python=python3
+  python="$(tartci_verified_python 2>/dev/null)" || python=/usr/bin/python3
+  "$python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || return 127
   exec "$python" "$@"
 }
 
@@ -105,8 +106,10 @@ tartci_toml_exec_or_python3() {
 tartci_verified_python() {
   local python
   python="$(tartci_toml_python_path 2>/dev/null)" || return 127
-  if ! "$python" -c 'import sys' >/dev/null 2>&1; then
-    echo "tartci: helper interpreter failed verification: $python" >&2
+  local implementation
+  implementation="$("$python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null || true)"
+  if [ "$implementation" != cpython ]; then
+    echo "tartci: helper interpreter failed verification: $python (expected cpython, got ${implementation:-unavailable})" >&2
     return 127
   fi
   printf '%s\n' "$python"
@@ -121,11 +124,9 @@ tartci_verified_python_run() {
 # Only install the PATH shim after the resolver has accepted the configured
 # interpreter. A rejected TARTCI_PYTHON must not hijack fallback diagnostics.
 if [ -n "${TARTCI_PYTHON:-}" ]; then
-  if _tartci_verified_pin="$(tartci_toml_python_path 2>/dev/null)"       && "$_tartci_verified_pin" -c 'import sys' >/dev/null 2>&1; then
+  if _tartci_verified_pin="$(tartci_verified_python 2>/dev/null)"; then
     TARTCI_PYTHON="$_tartci_verified_pin"
     export TARTCI_PYTHON
-    python3() { "$TARTCI_PYTHON" "$@"; }
-    export -f python3
   fi
 fi
 
@@ -139,7 +140,8 @@ fi
 tartci_resolve_tart_home() {
   [ -z "${TARTCI_TART_HOME_SOURCE:-}" ] || return 0
   local python out path source
-  python="$(tartci_toml_python_path 2>/dev/null)" || python=python3
+  python="$(tartci_toml_python_path 2>/dev/null)" || python=/usr/bin/python3
+  "$python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || python=/usr/bin/python3
   out="$("$python" "$HERE/scripts/tart_home.py" --lines 2>/dev/null)" || return 0
   { IFS= read -r path; IFS= read -r source; } <<<"$out"
   case "$source" in env|profile|default) ;; *) return 0 ;; esac
@@ -181,7 +183,7 @@ cmd_doctor() {
   tartci_resolve_tart_home
   if [ "${1:-}" = "--reap" ]; then
     shift
-    exec python3 "$HERE/scripts/vm_reap.py" "$@"
+    tartci_verified_python_run "$HERE/scripts/vm_reap.py" "$@"
   fi
   if [ "${1:-}" = "cpu-pressure" ]; then
     shift
@@ -207,7 +209,7 @@ cmd_doctor() {
   # vncdotool + UTM are optional helpers.
   command -v vncdo >/dev/null 2>&1 && c_ok "vncdo (VNC drive)" || c_warn "vncdo (optional: headless VNC drive — pip install vncdotool)"
   local _store
-  _store="$("$(tartci_toml_python_path 2>/dev/null || echo python3)" "$HERE/scripts/tart_home.py" 2>/dev/null)" \
+  _store="$(tartci_toml_exec_or_python3 "$HERE/scripts/tart_home.py" 2>/dev/null)" \
     || _store="tart store: unresolved (scripts/tart_home.py failed)"
   case "$_store" in
     *WARNING*|*unresolved*) c_warn "$_store" ;;
@@ -247,7 +249,8 @@ cmd_doctor() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   echo "pool transition lock:"
-  tartci_pool_lock_health_json | python3 -c '
+  local lock_python; lock_python="$(tartci_verified_python)" || lock_python=/usr/bin/python3
+  tartci_pool_lock_health_json | "$lock_python" -c '
 import json, sys
 value = json.load(sys.stdin)
 print("  state: {}".format(value["state"]))
@@ -274,7 +277,7 @@ cmd_network_profile() {
 }
 
 cmd_leases() {
-  exec python3 "$HERE/scripts/leases.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/leases.py" "$@"
 }
 
 cmd_governor() {
@@ -308,13 +311,13 @@ cmd_fleet_macos() {
 }
 
 cmd_support_manifest() {
-  exec python3 "$HERE/scripts/tartci_support_manifest.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/tartci_support_manifest.py" "$@"
 }
 
 cmd_gate_slot2() {
   local sub="${1:-}"; shift || true
   case "$sub" in
-    render|validate) exec python3 "$HERE/scripts/macos_gate_slot2.py" "$sub" "$@" ;;
+    render|validate) tartci_verified_python_run "$HERE/scripts/macos_gate_slot2.py" "$sub" "$@" ;;
     install) exec "$HERE/scripts/install_macos_gate_slot2.sh" "$@" ;;
     *) echo "usage: tartci gate-slot2 <render|validate|install> [...]"; return 2 ;;
   esac
@@ -328,7 +331,7 @@ cmd_observe() {
   local os="${1:-macos}"; shift || true
   tartci_resolve_tart_home
   case "$os" in
-    macos) exec python3 "$HERE/scripts/macos_observe.py" "$@" ;;
+    macos) tartci_verified_python_run "$HERE/scripts/macos_observe.py" "$@" ;;
     *) echo "usage: tartci observe <macos> [--json] [--runner NAME] [--run-id ID]"; return 2 ;;
   esac
 }
@@ -406,18 +409,18 @@ cmd_metrics() {
   local mode="${1:-report}"; shift || true
   local file="${1:-$HERE/metrics/sample.jsonl}"
   case "$mode" in
-    report)    exec python3 "$HERE/metrics/report.py" "$file" ;;
-    dashboard) exec python3 "$HERE/metrics/dashboard.py" "$file" "${2:-$HERE/metrics/index.html}" ;;
+    report)    tartci_verified_python_run "$HERE/metrics/report.py" "$file" ;;
+    dashboard) tartci_verified_python_run "$HERE/metrics/dashboard.py" "$file" "${2:-$HERE/metrics/index.html}" ;;
     *) echo "usage: tartci metrics [report|dashboard] [file]"; return 2 ;;
   esac
 }
 
 cmd_timings() {
-  exec python3 "$HERE/scripts/timing_summary.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/timing_summary.py" "$@"
 }
 
 cmd_runtime() {
-  exec python3 "$HERE/scripts/runtime_measure.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/runtime_measure.py" "$@"
 }
 
 cmd_reclaim() {
@@ -485,7 +488,7 @@ cmd_ccache() {
   if [ "$have_cache" = 0 ]; then
     args=(--cache "${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}/ccache" ${args[@]+"${args[@]}"})
   fi
-  exec python3 "$HERE/scripts/ccache_guard.py" "$sub" ${args[@]+"${args[@]}"}
+  tartci_verified_python_run "$HERE/scripts/ccache_guard.py" "$sub" ${args[@]+"${args[@]}"}
 }
 
 cmd_windows() {
@@ -547,7 +550,7 @@ cmd_launchd() {
     reload) tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" --reload "$@" ;;
     # PreToolUse classifier for agent shells: exit 2 blocks a raw launchctl
     # mutation of a lane (see scripts/launchctl_guard.py, `tartci hooks print`).
-    guard) exec python3 "$HERE/scripts/launchctl_guard.py" "$@" ;;
+    guard) tartci_verified_python_run "$HERE/scripts/launchctl_guard.py" "$@" ;;
     status) tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
     heal)
       # Reboot/offline rejoin convergence includes the optional per-host relay
@@ -1208,7 +1211,7 @@ EOF
         # base runtime. Use the fixed system interpreter after verifying it;
         # never fall back to PATH python3.
         status_python=/usr/bin/python3
-        "$status_python" -c 'import sys' >/dev/null 2>&1 || status_python=false
+        "$status_python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || status_python=false
       fi
       for arg in "$@"; do
         case "$arg" in
@@ -1447,8 +1450,8 @@ case "${1:-help}" in
   reclaim) shift; cmd_reclaim "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
-  retention) shift; exec python3 "$HERE/scripts/state_retention.py" "$@" ;;
-  vm-dhcp) shift; exec python3 "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
+  retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;
+  vm-dhcp) shift; tartci_verified_python_run "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
   held) shift; tartci_toml_python "$HERE/scripts/debug_hold.py" "$@"; exit $? ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;

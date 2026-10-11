@@ -85,6 +85,7 @@ CODES: tuple[str, ...] = (
     "lane_python_not_applicable",
     "lane_python_tomllib",
     "lane_python_unknown",
+    "lane_python_unavailable",
     "lanes_exceed_lease_capacity",
     "launchd_registration_leaked",
     "launchd_registrations_ok",
@@ -418,7 +419,7 @@ def read_hold_receipt(path: Path) -> tuple[bool | None, str]:
 
 def check_drain_capability(agents_dir: Path, hold_file: Path,
                            *, agents_dir_readable: bool = True) -> Finding:
-    """Report whether `tartci pool drain` can complete, BEFORE a deploy starts.
+    """Report whether tartci pool drain can complete, BEFORE a deploy starts.
 
     Drain is not atomic. It writes participation=0 and pool-state=draining and
     only then discovers it cannot quiesce a persistent Actions listener, so a
@@ -806,7 +807,7 @@ def check_self_update(summary: dict | None) -> Finding:
     if not isinstance(summary, dict) or summary.get("skew") is None:
         return Finding("self_update", UNKNOWN, "self_update_unmeasured",
                        "tartci's skew against main was never measured on this host "
-                       "(run `tartci fleet-macos self-update --plan`)")
+                       "(run tartci fleet-macos self-update --plan)")
     lines = "; ".join(summary.get("lines") or [])
     if summary.get("paused"):
         # Not a failed update: launchd is not starting it and the interval
@@ -884,7 +885,7 @@ def check_tool_freshness(summary: dict | None) -> Finding:
     if not isinstance(summary, dict) or summary.get("state") is None:
         return Finding("tool_freshness", UNKNOWN, "tool_freshness_unmeasured",
                        "tool freshness was never measured on this host "
-                       "(run `tartci fleet-macos tool-freshness --refresh`)")
+                       "(run tartci fleet-macos tool-freshness --refresh)")
     lines = "; ".join(summary.get("lines") or [])
     if summary.get("problem"):
         return Finding("tool_freshness", PROBLEM, "tool_freshness_stale",
@@ -933,7 +934,7 @@ def check_launchd_registrations(rows: list[dict] | None, *, home: Path,
     """Every loaded tartci LaunchAgent must come from <home>/Library/LaunchAgents.
 
     `rows` is [{"label", "path"}] for each loaded job whose label carries a
-    tartci prefix; `path` is launchd's own record of the plist it loaded (None
+    tartci prefix; path is launchd's own record of the plist it loaded (None
     when launchd holds no path for it). None means launchd could not be asked.
     """
     if rows is None:
