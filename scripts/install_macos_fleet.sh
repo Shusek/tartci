@@ -13,14 +13,18 @@ esac
 TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
 
 APPLY=0
+PREFLIGHT_ONLY=0
+SKIP_PREFLIGHT=0
 CONFIG=""
 SUPPORT_MANIFEST=""
 SUPPORT_SOURCE=""
 LAUNCH_HELPER_SOURCE=""
-USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--apply]"
+USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--preflight|--skip-preflight] [--apply]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
+    --preflight) PREFLIGHT_ONLY=1 ;;
+    --skip-preflight) SKIP_PREFLIGHT=1 ;;
     --support-manifest)
       shift
       [ "$#" -gt 0 ] || { echo "--support-manifest requires a path" >&2; exit 2; }
@@ -180,6 +184,7 @@ echo "  activation=deferred to tartci pool on"
 
 # Authenticate the exact support commit before the dry-run exit. This makes
 # --plan exercise the same rendered App executable and HOME context as --apply.
+if [ "$SKIP_PREFLIGHT" = 0 ]; then
 preflight_ghapp_path="$("$PYTHON_BIN" - "$plan_dir" <<'PY'
 import plistlib, shutil, sys
 from pathlib import Path
@@ -255,6 +260,13 @@ esac
   echo "fleet install source authority returned a mismatched commit ($preflight_actual != $preflight_commit)" >&2
   exit 3
 }
+if [ "$PREFLIGHT_ONLY" = 1 ]; then
+  echo "  action=preflight (repository and exact source commit authenticated)"
+  exit 0
+fi
+else
+  [ "$PREFLIGHT_ONLY" = 0 ] || { echo "--preflight cannot be combined with --skip-preflight" >&2; exit 2; }
+fi
 [ "$APPLY" = 1 ] || { echo "  action=dry-run (pass --apply only while the pool is terminally off)"; exit 0; }
 
 # shellcheck source=providers/common/pool.lib.sh

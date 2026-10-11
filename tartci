@@ -770,6 +770,8 @@ cmd_pool() {
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  --restore-receipt  on: restore the previously receipted serving set during
+           self-update recovery without requiring a fresh relay probe
   status --usage [--range DUR] [--until TS] [--json] [--peer HOST=SSH_TARGET]: slot
            occupancy, idle-with-demand, JIT discards and lease denials from the
            lane event logs (read-only; see scripts/pool_usage.py)
@@ -783,13 +785,14 @@ cmd_pool() {
     # which a fallback lane on another host reads over SSH before booting.
     supply) tartci_toml_exec "$HERE/scripts/gate_supply.py" report "$@" ;;
   esac
-  local arg allow_last_serving_host=0 plan=0 now=0
+  local arg allow_last_serving_host=0 plan=0 now=0 restore_receipt=0
   for arg in "$@"; do
     case "$arg" in
       -h|--help) echo "$pool_usage"; return 0 ;;
       --allow-last-serving-host) allow_last_serving_host=1 ;;
       --plan) plan=1 ;;
       --now) now=1 ;;
+      --restore-receipt) restore_receipt=1 ;;
     esac
   done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
@@ -889,7 +892,10 @@ cmd_pool() {
         # Converge and prove its relay before making participation visible or
         # loading controllers; absent/disabled profiles are a strict no-op.
         local network_profile_output
-        if ! network_profile_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" reconcile --pool-lock-held 2>&1)"; then
+        if [ "$restore_receipt" = 1 ]; then
+          network_profile_output="restoring the prior receipted serving set; relay proof intentionally reused"
+          echo "  $network_profile_output"
+        elif ! network_profile_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" reconcile --pool-lock-held 2>&1)"; then
           tartci_pool_lock_release
           printf 'pool on refused: %s\n' "${network_profile_output:-network-profile reconcile failed without a typed cause}" >&2
           return 6
