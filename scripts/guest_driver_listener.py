@@ -9,7 +9,22 @@ import selectors
 import signal
 import subprocess
 import sys
+import queue
+import threading
 import time
+
+
+def assignment_observation(repo, runner, policy):
+    """Read the exact assigned job across the declared repository scope."""
+    result = subprocess.run([sys.executable, str(Path(__file__).with_name('current_job_scan.py')),
+                             '--repo', repo, '--runner', runner, '--policy-file', str(policy),
+                             '--scan-timeout', '10', '--parallelism', '4'],
+                            capture_output=True, text=True, timeout=20)
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return 'observation_error'
+    return value.get('kind', 'observation_error')
 
 
 def main():
@@ -17,11 +32,16 @@ def main():
     parser.add_argument('--idle-timeout', type=int, required=True)
     parser.add_argument('--job-timeout', type=int, required=True)
     parser.add_argument('--receipt', type=Path, required=True)
+    parser.add_argument('--assignment-policy', type=Path)
+    parser.add_argument('--repo')
+    parser.add_argument('--runner')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command or min(args.idle_timeout, args.job_timeout) <= 0:
         parser.error('command and positive deadlines are required')
+    if args.assignment_policy and not (args.repo and args.runner):
+        parser.error('assignment policy requires repository and runner identity')
     process = subprocess.Popen(command, stdin=sys.stdin.buffer, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, start_new_session=True)
     assigned = False
@@ -48,6 +68,15 @@ def main():
     selector.register(process.stdout, selectors.EVENT_READ)
     buffered = b''
     code = 0
+    observations = queue.Queue()
+    observing = False
+    next_observation = 0
+    observation_errors = 0
+    def observe():
+        try:
+            observations.put(assignment_observation(args.repo, args.runner, args.assignment_policy))
+        except Exception:
+            observations.put('observation_error')
     try:
         while selector.get_map() or process.poll() is None:
             for key, _ in selector.select(0.5):
@@ -60,6 +89,27 @@ def main():
                 if not assigned and b'Running job:' in buffered:
                     assigned = True; assigned_at = time.monotonic()
                     receipt['assigned'] = True; save()
+            if assigned and args.assignment_policy:
+                try:
+                    verdict = observations.get_nowait()
+                except queue.Empty:
+                    verdict = None
+                if verdict is not None:
+                    observing = False
+                    next_observation = time.monotonic() + 30
+                    receipt['assignment_observation'] = verdict
+                    observation_errors = observation_errors + 1 if verdict == 'observation_error' else 0
+                    save()
+                    if verdict in ('unexpected_assignment', 'policy_violation', 'assignment_changed') or observation_errors >= 3:
+                        receipt['assignment_refused'] = True
+                        code = 126
+                        os.killpg(process.pid, signal.SIGTERM)
+                        try: process.wait(timeout=10)
+                        except subprocess.TimeoutExpired: os.killpg(process.pid, signal.SIGKILL)
+                        break
+                if not observing and time.monotonic() >= next_observation and process.poll() is None:
+                    observing = True
+                    threading.Thread(target=observe, daemon=True).start()
             elapsed = time.monotonic() - (assigned_at if assigned else started)
             if elapsed >= (args.job_timeout if assigned else args.idle_timeout):
                 code = 124

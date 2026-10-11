@@ -482,9 +482,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   write_state idle-wait
 
   if [ -n "$GUEST_DRIVER" ]; then
+    local policy_args=()
+    if [ -n "${TARTCI_QUEUE_POLICY_FILE:-}" ]; then
+      policy_args=(--assignment-policy "$TARTCI_QUEUE_POLICY_FILE" --repo "$REPO" --runner "$vm")
+    fi
     printf '%s' "$jit" | python3 "$TARTCI_ROOT/scripts/guest_driver_listener.py" \
       --idle-timeout "$IDLE_TIMEOUT" --job-timeout "${TARTCI_JOB_TIMEOUT_SECS:-$TARTCI_RUNNER_JOB_TIMEOUT_DEFAULT}" \
-      --receipt "$logdir/listener-receipt.json" -- "$GUEST_DRIVER" run-jit "$vm" "$vm" >"$logdir/runner-output.log" 2>&1 &
+      --receipt "$logdir/listener-receipt.json" ${policy_args[@]+"${policy_args[@]}"} -- "$GUEST_DRIVER" run-jit "$vm" "$vm" >"$logdir/runner-output.log" 2>&1 &
     CURRENT_RUNNER_PID=$!
     jit=""
   else

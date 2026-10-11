@@ -223,6 +223,17 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
                 self.assertIn('requires',r.stderr)
 
 class GuestListenerTests(unittest.TestCase):
+    def test_assignment_policy_rejects_foreign_and_fork_jobs(self):
+        for verdict in ('unexpected_assignment', 'policy_violation', 'assignment_changed'):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as directory:
+                receipt=Path(directory)/'receipt.json'
+                child="import time;print('Running job: fixture',flush=True);time.sleep(10)"
+                code="import sys;sys.path.insert(0,sys.argv[1]);import guest_driver_listener as m;m.assignment_observation=lambda *a,v=sys.argv[2]:v;sys.argv=['listener','--idle-timeout','2','--job-timeout','20','--receipt',sys.argv[3],'--assignment-policy','fixture.json','--repo','owner/repo','--runner','fixture','--',sys.executable,'-c',sys.argv[4]];raise SystemExit(m.main())"
+                result=subprocess.run([sys.executable,'-c',code,str(ROOT/'scripts'),verdict,str(receipt),child],capture_output=True,timeout=5)
+                self.assertEqual(result.returncode,126,result.stderr)
+                proof=json.loads(receipt.read_text())
+                self.assertTrue(proof['assigned'] and proof['terminal'] and proof['assignment_refused'])
+
     def test_stdin_reaches_child_without_argv_secret(self):
         with tempfile.TemporaryDirectory() as directory:
             receipt=Path(directory)/'receipt.json'
