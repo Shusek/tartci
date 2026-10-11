@@ -5,6 +5,8 @@ import os
 import unittest
 from pathlib import Path
 
+from bounded_subprocess import ObservationError
+from assignment_scan import TransientApiFault
 from observation_lock import FairObservationLock, ObservationBackoff, _process_start
 
 
@@ -63,6 +65,48 @@ class ObservationLockTests(unittest.TestCase):
                 with FairObservationLock(lock, 1, "slow", backoff, 30).hold():
                     pass
             with FairObservationLock(lock, 1, "other", backoff, 30).hold():
+                pass
+
+    def test_queue_scan_real_timeout_shape_sets_repo_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            backoff = str(Path(td) / "backoff.json")
+            error = ObservationError(
+                "queue_scan_github_api", "timeout", "timed out after 30s"
+            )
+            wrapped = RuntimeError(str(error))
+            wrapped.__cause__ = error
+            with self.assertRaises(RuntimeError):
+                with FairObservationLock(lock, 1, "forge/repo", backoff, 30).hold():
+                    raise wrapped
+            self.assertIn("forge/repo", __import__("json").loads(Path(backoff).read_text()))
+
+    def test_assignment_scan_real_timeout_shape_sets_repo_backoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            backoff = str(Path(td) / "backoff.json")
+            cause = ObservationError(
+                "assignment_scan_github_api", "timeout", "timed out after 30.0s"
+            )
+            error = TransientApiFault(str(cause))
+            error.__cause__ = cause
+            with self.assertRaises(TransientApiFault):
+                with FairObservationLock(lock, 1, "vellum/repo", backoff, 30).hold():
+                    raise error
+            self.assertIn("vellum/repo", __import__("json").loads(Path(backoff).read_text()))
+
+    def test_backoff_expires_and_repository_can_scan_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            backoff = str(Path(td) / "backoff.json")
+            with self.assertRaises(TimeoutError):
+                with FairObservationLock(lock, 1, "repo", backoff, 0.05).hold():
+                    raise TimeoutError("scan exceeded its overall deadline")
+            with self.assertRaises(ObservationBackoff):
+                with FairObservationLock(lock, 1, "repo", backoff, 0.05).hold():
+                    pass
+            time.sleep(0.08)
+            with FairObservationLock(lock, 1, "repo", backoff, 0.05).hold():
                 pass
 
 

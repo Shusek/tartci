@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from bounded_subprocess import ObservationError
+
 
 class ObservationBackoff(RuntimeError):
     """This repository recently timed out and must yield the host slot."""
@@ -26,11 +28,17 @@ def _process_start(pid: int) -> str | None:
 
 
 def _timed_out(error: BaseException) -> bool:
-    text = str(error).lower()
-    return any(token in text for token in (
-        "scan exceeded its overall deadline",
-        "host queue observation lock timed out",
-    ))
+    """Recognize typed observation timeouts through scanner wrapping layers."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ObservationError) and current.kind == "timeout":
+            return True
+        if isinstance(current, TimeoutError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class FairObservationLock:
