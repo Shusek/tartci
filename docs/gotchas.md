@@ -757,9 +757,9 @@ first; list it only when what it asserts really needs tomllib.
   `<path>.escalation.json` with the same evidence. The owner record is removed
   when the flock is released. At timeout diagnostics enumerate live processes
   that still have the lock file open, so an exec'd child that inherited the
-  descriptor can be named even after the acquirer exits; lane and generation
-  metadata come from the owner record. Missing or stale records, or an
-  unavailable holder probe, remain fail-closed and are reported as unknown.
+  descriptor can be identified when the holder probe reports it; lane and
+  generation metadata come from the owner record. Missing or stale records, or
+  an unavailable holder probe, remain fail-closed and are reported as unknown.
   → *Failure behavior:* lock acquisition is bounded by
   `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
   the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`

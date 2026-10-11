@@ -219,15 +219,15 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-1", generation="gen-7
             lock = str(Path(td) / "observation.lock")
             ready = Path(td) / "child-ready"
             owner_code = """
-import os, sys, time
+import os, subprocess, sys
 from observation_lock import FairObservationLock
 lock, ready = sys.argv[1:]
 with FairObservationLock(lock, 5, "owner/repo", lane="lane-exec", generation="gen-exec").hold() as handle:
-    os.set_inheritable(handle.fileno(), True)
-    pid = os.fork()
-    if pid == 0:
-        open(ready, "w").write(str(os.getpid()))
-        os.execl("/bin/sleep", "sleep", "3")
+    inherited = os.dup(handle.fileno())
+    os.set_inheritable(inherited, True)
+    child = subprocess.Popen(["/bin/sleep", "3"], close_fds=False)
+    open(ready, "w").write(str(child.pid))
+    os.close(inherited)
     os._exit(0)
 """
             owner = subprocess.Popen(
@@ -240,9 +240,14 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-exec", generation="ge
                 time.sleep(0.01)
             self.assertTrue(ready.exists())
             try:
-                with self.assertRaises(TimeoutError) as raised:
-                    with FairObservationLock(lock, 0.05, "contender/repo", max_age=0.01).hold():
-                        pass
+                import observation_lock as module
+                with mock.patch.object(
+                    module, "_live_lock_holders",
+                    return_value=[os.getpid(), int(ready.read_text())],
+                ):
+                    with self.assertRaises(TimeoutError) as raised:
+                        with FairObservationLock(lock, 0.05, "contender/repo", max_age=0.01).hold():
+                            pass
                 message = str(raised.exception)
                 self.assertIn(f"owner_pid={int(ready.read_text())}", message)
                 self.assertIn("lane=lane-exec", message)
@@ -290,6 +295,59 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-exec", generation="ge
             self.assertIn("lane=unknown", detail)
             self.assertIn("generation=unknown", detail)
             self.assertNotIn("stale-lane", detail)
+
+    def test_holder_probe_excludes_contender_and_uses_last_live_candidate(self):
+        import observation_lock as module
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "observation.lock"
+            item = FairObservationLock(str(lock), 1, "repo")
+            with mock.patch.object(module, "_live_lock_holders",
+                                   return_value=[os.getpid(), 111, 222]), \
+                 mock.patch.object(module, "_fifo_pids", return_value={os.getpid()}):
+                detail = item._owner_detail()
+            self.assertIn("owner_pid=222", detail)
+            self.assertNotIn("owner_pid=111", detail)
+
+    def test_holder_probe_excludes_self_and_fifo_waiters(self):
+        import observation_lock as module
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "observation.lock"
+            item = FairObservationLock(str(lock), 1, "repo")
+            with mock.patch.object(module, "_live_lock_holders",
+                                   return_value=[111, os.getpid()]), \
+                 mock.patch.object(module, "_fifo_pids", return_value=set()):
+                detail = item._owner_detail()
+            self.assertIn("owner_pid=111", detail)
+            with mock.patch.object(module, "_live_lock_holders",
+                                   return_value=[111, 222]), \
+                 mock.patch.object(module, "_fifo_pids", return_value={222}):
+                detail = item._owner_detail()
+            self.assertIn("owner_pid=111", detail)
+
+    def test_unavailable_holder_probe_is_reported(self):
+        import observation_lock as module
+        with tempfile.TemporaryDirectory() as td:
+            item = FairObservationLock(str(Path(td) / "observation.lock"), 1, "repo")
+            with mock.patch.object(module, "_lsof_path", return_value=None), \
+                 mock.patch.object(module, "_live_lock_holders", return_value=[]):
+                detail = item._owner_detail()
+            self.assertEqual(detail, "owner=unknown age=unknown holders=unavailable")
+
+    def test_zombie_acquirer_is_not_reported_as_holder(self):
+        import observation_lock as module
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "observation.lock"
+            item = FairObservationLock(str(lock), 1, "repo")
+            owner_path = Path(str(lock) + ".owner.json")
+            owner_path.write_text(__import__("json").dumps({
+                "pid": 123, "process_start": "start", "lane": "lane",
+                "generation": "gen", "started_epoch": time.time() - 10,
+                "started_at": "started",
+            }))
+            with mock.patch.object(module, "_live_lock_holders", return_value=[123]), \
+                 mock.patch.object(module, "_pid_is_zombie", return_value=True):
+                detail = item._owner_detail()
+            self.assertEqual(detail, "owner=unknown age=unknown")
 
     def test_queue_and_current_job_entries_pass_lane_and_generation(self):
         import contextlib

@@ -44,17 +44,23 @@ def _after_fork_child() -> None:
 os.register_at_fork(after_in_child=_after_fork_child)
 
 
+def _lsof_path() -> str | None:
+    return shutil.which("lsof") or next(
+        (candidate for candidate in ("/usr/sbin/lsof", "/usr/bin/lsof")
+         if os.access(candidate, os.X_OK)),
+        None,
+    )
+
+
 def _live_lock_holders(path: Path) -> list[int]:
     """Return processes that still have the flock file open, including exec children."""
     # Census and launchd environments intentionally have a minimal PATH that
     # often omits /usr/sbin, where macOS installs lsof. Resolve it explicitly
     # so the live-holder probe does not silently fall back to the old
     # owner-record-only behavior.
-    lsof = shutil.which("lsof") or next(
-        (candidate for candidate in ("/usr/sbin/lsof", "/usr/bin/lsof")
-         if os.access(candidate, os.X_OK)),
-        "lsof",
-    )
+    lsof = _lsof_path()
+    if lsof is None:
+        return []
     try:
         output = subprocess.check_output(
             [lsof, "-t", "--", str(path)], text=True, stderr=subprocess.DEVNULL
@@ -70,6 +76,30 @@ def _live_lock_holders(path: Path) -> list[int]:
         if pid not in holders:
             holders.append(pid)
     return holders
+
+
+def _fifo_pids(lock_path: Path) -> set[int]:
+    """Return PIDs with a ticket in the lock's FIFO wait queue."""
+    queue = lock_path.with_name(lock_path.name + ".fifo")
+    result: set[int] = set()
+    for marker in queue.glob("[0-9]*.*"):
+        try:
+            result.add(int(marker.name.rsplit(".", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return result
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    """Return whether ps reports a process that has already exited."""
+    try:
+        state = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return state.startswith("Z")
 
 
 def _timed_out(error: BaseException) -> bool:
@@ -187,26 +217,40 @@ class FairObservationLock:
 
     def _owner_detail(self) -> str:
         owner = self._owner()
+        probe_available = _lsof_path() is not None
         holders = _live_lock_holders(self.lock_path)
-        if not owner and not holders:
-            return "owner=unknown age=unknown"
         owner_pid = None if not owner else owner.get("pid")
         recorded_start = None if not owner else owner.get("process_start")
+        try:
+            recorded_pid = int(owner_pid) if owner_pid is not None else None
+        except (TypeError, ValueError):
+            recorded_pid = None
+        # lsof sees this contender and all queued contenders because they hold
+        # the lock file open while waiting. Keep only a real holder: the
+        # recorded acquirer may still be valid, while every other FIFO ticket
+        # and this process itself are contenders.
+        waiter_pids = _fifo_pids(self.lock_path)
+        candidates = [pid for pid in holders
+                      if pid != os.getpid()
+                      and (pid == recorded_pid or pid not in waiter_pids)]
+        if recorded_pid in candidates and _pid_is_zombie(recorded_pid):
+            candidates.remove(recorded_pid)
+        if not owner and not candidates:
+            return "owner=unknown age=unknown" + (" holders=unavailable" if not probe_available else "")
         live_owner = False
         pid_reused = False
         try:
             if owner_pid is not None:
                 pid = int(owner_pid)
-                live_owner = pid in holders or (os.kill(pid, 0) is None)
-                if recorded_start and _process_start(pid) != recorded_start:
+                live_owner = pid in candidates if probe_available else os.kill(pid, 0) is None
+                if live_owner and recorded_start and _process_start(pid) != recorded_start:
                     live_owner = False
                     pid_reused = True
         except (TypeError, ValueError, OSError):
             live_owner = False
-        holder_pid = int(owner_pid) if live_owner and owner_pid is not None else (holders[0] if holders else None)
+        holder_pid = int(owner_pid) if live_owner and owner_pid is not None else (candidates[-1] if candidates else None)
         if holder_pid is None:
-            self.owner_path.unlink(missing_ok=True)
-            return "owner=unknown age=unknown"
+            return "owner=unknown age=unknown" + (" holders=unavailable" if not probe_available else "")
         if owner is None or not live_owner:
             # An exec'd child inherited the descriptor; retain lane/generation
             # metadata while naming the process that actually holds the flock.
