@@ -217,7 +217,7 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
     def test_missing_driver_cannot_enable_local_mode(self):
         for provider in ('tart-macos','qemu-windows','tart-linux'):
             with tempfile.TemporaryDirectory() as directory:
-                env={'PATH':os.environ['PATH'],'HOME':directory}
+                env={'PATH':'/usr/bin:/bin','HOME':directory}
                 r=subprocess.run(['/bin/bash',str(ROOT/'providers'/provider/'runner.sh'),'--once','--local-job','fixture'],env=env,capture_output=True,text=True,timeout=5)
                 self.assertNotEqual(r.returncode,0)
                 self.assertIn('requires',r.stderr)

@@ -225,14 +225,12 @@ runtime_emit_complete(){
     --gh-enrich \
     --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
-command -v tart >/dev/null 2>&1 || die "tart not installed"
 # GitHub CLI for all API calls. Default `gh`; hosts authenticating as a GitHub
 # App set TARTCI_GH_CLI=ghapp to move provider API traffic off the personal PAT
 # (the per-poll calls are the dominant throttle). Exported so the inline python
 # poller inherits it.
 export TARTCI_GH_CLI="${TARTCI_GH_CLI:-gh}"
 GH_CLI="$TARTCI_GH_CLI"
-command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT config)"
 
 PRINT_HOST_HEALTH=0
 while [ $# -gt 0 ]; do case "$1" in
@@ -250,6 +248,8 @@ if [ -n "$GUEST_DRIVER" ]; then
   [ "${GUEST_DRIVER#/}" != "$GUEST_DRIVER" ] && [ -x "$GUEST_DRIVER" ] || die "TARTCI_GUEST_DRIVER must be an absolute executable path"
 fi
 [ -z "$LOCAL_JOB" ] || { [ -n "$GUEST_DRIVER" ] && [ "$LOOP" = 0 ]; } || die "--local-job requires a guest driver and --once"
+command -v tart >/dev/null 2>&1 || die "tart not installed"
+command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT config)"
 RUNNER_API_ROOT="$(tartci_runner_api_root "$REPO" "$RUNNER_GROUP_ID" "${TARTCI_RUNNER_SCOPE:-repo}")"
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 
