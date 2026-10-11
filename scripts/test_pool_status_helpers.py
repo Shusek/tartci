@@ -6,9 +6,12 @@ import os
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+import testing_support
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -119,6 +122,7 @@ exec /bin/sh "$@"
                     self.assertNotIn("recursion", result.stderr.lower())
             self.assertFalse(counter.exists())
 
+    @testing_support.requires_tomllib
     def test_every_helper_uses_verified_resolver_not_bare_python3(self) -> None:
         """A shell named python3 must never be reached by any helper launch."""
         with tempfile.TemporaryDirectory(prefix="tartci-helper-resolver-") as tmp:
@@ -128,7 +132,7 @@ exec /bin/sh "$@"
             fake.chmod(0o755)
             counter = root / "python-count"
             env = dict(os.environ, HOME=tmp, PATH=f"{root}:/usr/bin:/bin",
-                       TARTCI_PYTHON="/usr/bin/python3",
+                       TARTCI_PYTHON=sys.executable,
                        TARTCI_FAKE_PYTHON_COUNT=str(counter))
             for helper in HELPERS:
                 with self.subTest(helper=helper):
@@ -142,6 +146,29 @@ exec /bin/sh "$@"
                     self.assertNotEqual(result.returncode, 97,
                                         f"bare python3 reached by {helper}: {result.stderr}")
             self.assertFalse(counter.exists(), counter.read_text() if counter.exists() else "")
+
+    @testing_support.requires_tomllib
+    def test_entry_points_never_hand_a_helper_to_path_python3(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tartci-callsite-") as tmp:
+            root = Path(tmp); fake = root / "python3"; counter = root / "count"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$TARTCI_FAKE_PYTHON_COUNT"\nexit 97\n')
+            fake.chmod(0o755)
+            env = dict(os.environ, HOME=tmp, PATH=f"{root}:/usr/bin:/bin",
+                       TARTCI_PYTHON=sys.executable,
+                       TARTCI_FAKE_PYTHON_COUNT=str(counter))
+            for argv in (("pool", "status", "--json"), ("pool", "status", "--usage"),
+                         ("pool", "status"), ("doctor", "--json")):
+                with self.subTest(argv=argv):
+                    proc = subprocess.run(
+                        ["bash", str(ROOT / "tartci"), *argv], cwd=ROOT, env=env,
+                        text=True, capture_output=True, timeout=120, check=False,
+                    )
+                    self.assertFalse(
+                        counter.exists(),
+                        f"PATH python3 was handed: {counter.read_text() if counter.exists() else ''}",
+                    )
+                    if argv == ("pool", "status", "--json"):
+                        self.assertIn('"warm_vm":{', proc.stdout)
 
     def test_python_shim_is_not_exported_to_children(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tartci-env-") as tmp:
