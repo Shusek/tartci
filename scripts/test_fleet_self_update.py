@@ -2350,6 +2350,24 @@ class IncidentTests(Base):
 
 
 class RepositoryIdentityTests(Base):
+    def test_repository_resolution_refusal_is_receipted_at_the_entry_point(self):
+        self.sys.unreadable_repositories.update(
+            {su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY})
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True), \
+                mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--apply"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertEqual(receipt["target"], INSTALLED)
+        self.assertIn("no accepted TartCI repository is readable", receipt["error"])
+        self.assertEqual(receipt["steps"][-1]["step"], "refused")
+        self.assertEqual(json.loads((self.cfg.state_dir / "skew.json").read_text())["state"],
+                         "unknown")
+
     def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
         self.sys.api_repository = su.LEGACY_REPOSITORY
         self.sys.unreadable_repositories.add(su.DEFAULT_REPOSITORY)
