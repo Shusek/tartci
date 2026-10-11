@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""Block raw `launchctl` mutations of tartci lanes from an agent's shell.
+"""Block raw launchctl mutations of tartci lanes from an agent's shell.
 
 Why this exists
 ---------------
-On 2026-09-22 an agent ran a raw `launchctl kickstart` against a lane
+On 2026-09-22 an agent ran a raw launchctl kickstart against a lane
 supervisor and killed a healthy, just-recovered VM mid-job. No tartci code was
 on that path, so no tartci guard could refuse it. The one choke point every
 agent shell command passes through is the agent harness's PreToolUse hook;
 this is the classifier that hook runs.
 
 Raw launchctl is dangerous on a lane for two reasons:
-  * `kickstart` (and KeepAlive) re-run launchd's CACHED job spec, never the
-    plist on disk, so it cannot pick up a plist change; and `kickstart -k`,
-    `bootout`, `unload`, `remove`, `kill`, `stop` and `disable` all kill the
+  * kickstart (and KeepAlive) re-run launchd's CACHED job spec, never the
+    plist on disk, so it cannot pick up a plist change; and kickstart -k,
+    bootout, unload, remove, kill, stop and disable all kill the
     supervisor's process tree, including a VM that is running a job.
-  * `tartci launchd reload <label>` does the full bootout+bootstrap that
-    re-reads the plist AND refuses while that lane is mid-job; `tartci pool
-    drain` lets running jobs finish. Those are the safe paths.
+  * tartci launchd reload <label> does the full bootout+bootstrap that
+    re-reads the plist AND refuses while that lane is mid-job; tartci pool
+    drain lets running jobs finish. Those are the safe paths.
 
-Contract (`--hook`): read a PreToolUse JSON object on stdin
+Contract (--hook): read a PreToolUse JSON object on stdin
 ({"tool_name": ..., "tool_input": {"command": ...}}). Exit 2 with the reason
 on stderr when the command would run launchctl kickstart|bootout|unload|
 remove|kill|disable|stop against a tartci runner/lane supervisor or an
-`actions.runner.*` service, or against a target that cannot be resolved
+actions.runner.* service, or against a target that cannot be resolved
 statically (a variable, a glob, stdin via xargs). Here-document bodies are
 data unless they feed a shell interpreter or ssh. Exit 0 otherwise, silently.
-`TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself is the explicit,
+TARTCI_ALLOW_RAW_LAUNCHCTL=1 written in the command itself is the explicit,
 auditable escape hatch (exit 0 with a warning). Malformed input exits 0 with
 a note: a broken hook must not break the agent's shell.
 """
@@ -89,7 +89,7 @@ def _tokens(command: str) -> list[str]:
 
 
 def _extract_substitutions(command: str) -> tuple[str, list[str]]:
-    """Replace $(...) and `...` with a placeholder, returning their bodies.
+    """Replace $(...) and ... with a placeholder, returning their bodies.
 
     Deliberately quote-blind: text that only looks like a substitution inside
     single quotes is classified too, which can only err toward blocking.
@@ -97,6 +97,7 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
     bodies: list[str] = []
     out: list[str] = []
     i = 0
+    tick = chr(96)
     while i < len(command):
         if command.startswith("$(", i) and not command.startswith("$((", i):
             depth, j = 1, i + 2
@@ -109,8 +110,8 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
             bodies.append(command[i + 2:j - 1] if depth == 0 else command[i + 2:])
             out.append(UNRESOLVED)
             i = j
-        elif command[i] == "`":
-            j = command.find("`", i + 1)
+        elif command[i] == tick:
+            j = command.find(tick, i + 1)
             end = len(command) if j < 0 else j
             bodies.append(command[i + 1:end])
             out.append(UNRESOLVED)
@@ -122,13 +123,13 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
 
 
 def _heredoc_feeds_shell(prefix: str) -> bool:
-    """Whether the command owning a `<<` reads its stdin as shell commands.
+    """Whether the command owning a << reads its stdin as shell commands.
 
     PREFIX is the line text before the operator. The owner is the last simple
-    command in it: `bash`, `sh -s`, `sudo zsh`, `ssh host` execute the body;
-    `cat`, `git commit -F -`, `tee` treat it as data.
+    command in it: bash, sh -s, sudo zsh, ssh host execute the body;
+    cat, git commit -F -, tee treat it as data.
     """
-    segment = re.split(r"\$\(|`|[;&|()]", prefix)[-1]
+    segment = re.split(r"\$\(|" + re.escape(chr(96)) + r"|[;&|()]", prefix)[-1]
     try:
         words = shlex.split(segment)
     except ValueError:
@@ -352,7 +353,7 @@ def block_message(command: str, hits: list[Hit]) -> str:
         lines.append(f"  launchctl {hit.verb} {hit.target}: {hit.why}")
     lines += [
         "",
-        "Why: `kickstart` re-runs launchd's CACHED job spec (never the plist on",
+        "Why: kickstart re-runs launchd's CACHED job spec (never the plist on",
         "disk), and kickstart -k / bootout / unload / remove / kill / stop /",
         "disable kill the supervisor's process tree, including a VM that is",
         "running a job. On 2026-09-22 a raw kickstart of a lane supervisor",
@@ -365,7 +366,7 @@ def block_message(command: str, hits: list[Hit]) -> str:
         "  tartci pool drain               stop taking work; running jobs finish",
         "",
         "If you really mean it, put TARTCI_ALLOW_RAW_LAUNCHCTL=1 in the command",
-        "itself (e.g. `TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...`).",
+        "itself (e.g. TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...).",
     ]
     return "\n".join(lines)
 

@@ -71,7 +71,10 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # Python 3.11+ and its stdlib tomllib module.
 PYTHON_BIN=""
 if [ -n "${TARTCI_PYTHON:-}" ]; then
-  PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)"
+  case "$TARTCI_PYTHON" in
+    */*) PYTHON_BIN="$TARTCI_PYTHON" ;;
+    *) PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)" ;;
+  esac
 else
   for candidate in python3 python3.12 python3.11; do
     candidate="$(command -v "$candidate" 2>/dev/null || true)"
@@ -92,10 +95,60 @@ else
     fi
   done
 fi
-[ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+[ -n "$PYTHON_BIN" ] || {
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# Record the executable behind a Homebrew `python3` symlink.  Do this without
+# executing the candidate: wrappers used by tests and launchers must remain the
+# pinned executable, while a symlinked Homebrew entry resolves to its target.
+python_link_hops=0
+while [ -L "$PYTHON_BIN" ]; do
+  python_link_hops=$((python_link_hops + 1))
+  if [ "$python_link_hops" -gt 16 ]; then
+    echo "fleet install refused a symlink cycle while resolving Python: $PYTHON_BIN" >&2
+    exit 127
+  fi
+  PYTHON_TARGET="$(readlink "$PYTHON_BIN")"
+  case "$PYTHON_TARGET" in
+    /*) PYTHON_BIN="$PYTHON_TARGET" ;;
+    *) PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd)/$PYTHON_TARGET" ;;
+  esac
+done
+# Match fleet_self_update's pin rule: canonicalise the resolved executable's
+# parent path so a Homebrew bin/.. spelling cannot disagree with lanes.json.
+PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")"
+[ -x "$PYTHON_BIN" ] || { echo "fleet install resolved an unusable Python: $PYTHON_BIN" >&2; exit 127; }
+"$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+  echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+  exit 127
+}
+# The interpreter is part of the installed launch contract.  Probe GitHub
+# through that exact executable before writing any LaunchAgent; a PATH python3
+# may be a newly linked Homebrew build that is blocked by the host firewall.
+if [ "${TARTCI_TESTING:-0}" != 1 ]; then
+  if ! /usr/bin/python3 - "$PYTHON_BIN" <<'PY'
+import subprocess
+import sys
+
+interpreter = sys.argv[1]
+code = ("import urllib.request; "
+        "urllib.request.urlopen('https://api.github.com', timeout=2).read(1)")
+try:
+    result = subprocess.run([interpreter, "-c", code], text=True,
+                            capture_output=True, timeout=3, check=False)
+except subprocess.TimeoutExpired:
+    raise SystemExit(f"interpreter GitHub probe timed out after 3s: {interpreter}")
+if result.returncode != 0:
+    detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["unknown error"]
+    raise SystemExit(f"interpreter GitHub probe failed ({interpreter}): {detail[0]}")
+PY
+  then
+    echo "fleet install requires the pinned interpreter to reach api.github.com: $PYTHON_BIN" >&2
+    exit 127
+  fi
+fi
+export TARTCI_RENDER_PYTHON="$PYTHON_BIN"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 RECEIPT="$HOME/.config/tartci/macos-fleet-install.json"
 PROFILE_SNAPSHOT="$HOME/.config/tartci/macos-fleet-profile.toml"
@@ -520,6 +573,18 @@ print(value.strip())
 PY
 )"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
+  # A sealed launcher owns the lane environment; reject a source bundle that
+  # was rendered without the same verified interpreter as this install.
+  "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
+import json, sys
+from pathlib import Path
+bundle, expected = Path(sys.argv[1]), sys.argv[2]
+lanes = json.loads((bundle / "Contents/Resources/lanes.json").read_text()).get("lanes", {})
+if not lanes or any((row.get("environment") or {}).get("TARTCI_PYTHON") != expected
+                    or (row.get("environment") or {}).get("SHIPYARD_GHAPP_PYTHON_BINARY") != expected
+                    for row in lanes.values()):
+    raise SystemExit(f"launch helper lanes are missing pinned interpreter: {expected}")
+PY
   launcher_identity_json="$("$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
     --sha256 "$launcher_sha256" \

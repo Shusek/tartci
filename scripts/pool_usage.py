@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""How the macOS VM slots were used: `tartci pool status --usage`.
+"""How the macOS VM slots were used: tartci pool status --usage.
 
 Read-only. Everything here is derived from what the lane supervisors already
 append to ~/.tartci/state/macos-fleet/<lane>/events.jsonl; nothing is sampled,
@@ -10,29 +10,29 @@ scanned or written. Per host and fleet-wide over a window (default 24h):
   at most one VM, so a lane's occupancy is its busy time over the window.
 * idle-with-demand: time a lane saw matching queued work, did not boot, and a
   VM slot was physically free (the guest count was below the host cap). The
-  samples are the per-poll `demand_waiting` (slot_full branch),
-  `yielded_to_priority` and `yielded_host_health` events. Demand while the host
+  samples are the per-poll demand_waiting (slot_full branch),
+  yielded_to_priority and yielded_host_health events. Demand while the host
   was full is reported separately as full-host wait: that is queueing, not
   waste. A lane in a lease-fit hold does not scan the queue, so its demand is
   not observed; those holds are reported as their own count and duration.
 * JIT discards: VMs that were cloned and torn down without being assigned a
   job, by the event that named the cause.
-* lease denials by axis (cores / memory / disk), from `lease_denied`.
-* lifecycle: where a served VM's slot time went, from the one `vm_lifecycle`
+* lease denials by axis (cores / memory / disk), from lease_denied.
+* lifecycle: where a served VM's slot time went, from the one vm_lifecycle
   event a lane writes at teardown (providers/tart-macos/lifecycle.lib.sh):
   clone, boot to address, address to SSH, prep, runner registration, idle
   until assigned, the job, teardown. Per phase: VMs, total and median
-  seconds. `job_share` is job seconds over VM seconds (clone through
+  seconds. job_share is job seconds over VM seconds (clone through
   teardown, so pre_clone is excluded: no VM exists yet), and
-  `overhead_per_served_job_s` is the rest of those VM seconds per served
+  overhead_per_served_job_s is the rest of those VM seconds per served
   job. Only VMs that reached a runner write the event; VMs discarded earlier
   are the JIT discards above. Hosts on a tartci without the event report
-  `vms: 0`.
+  vms: 0.
 
 Per-job VM CPU and IO are not sampled anywhere in tartci (runtime_measure
 records only the configured cpu_count), so they are omitted and say so.
 
-`--peer HOST=SSH_TARGET` runs this same file on a peer over ssh (the source is
+--peer HOST=SSH_TARGET runs this same file on a peer over ssh (the source is
 piped to the peer's python3, so the peer needs no tartci update) and adds a
 fleet-wide total. Python 3.9 compatible on purpose: that is the python3 an ssh
 session gets on a stock Mac.
@@ -213,7 +213,7 @@ def reconstruct_vms(events: List[Dict[str, Any]], now: float,
     """One interval per VM this lane cloned.
 
     A VM is live from clone_start while the supervisor's events carry its name.
-    It ends at its `teardown`, else at the last event that named it (every
+    It ends at its teardown, else at the last event that named it (every
     discard path clears CURRENT_VM, so the next event has an empty vm).
     """
     vms: List[Vm] = []
@@ -430,7 +430,7 @@ def _median(values: List[float]) -> Optional[float]:
 
 
 def lifecycle_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Per-phase VMs, total and median seconds over `vm_lifecycle` fields, and
+    """Per-phase VMs, total and median seconds over vm_lifecycle fields, and
     how much of the VMs' slot time was the job."""
     phases: Dict[str, Dict[str, Any]] = {}
     for phase in LIFECYCLE_PHASES:
@@ -583,7 +583,7 @@ def run_peer(host: str, target: str, args: argparse.Namespace, until: float) -> 
         source = f.read()
     remote = ["python3", "-", "--json", "--host-label", host, "--range", f"{args.range}s",
               "--until", fmt_ts(until), "--default-poll", str(args.default_poll)]
-    # ssh-stdin: this script's own source is piped in (input=) for `python3 -`
+    # ssh-stdin: this script's own source is piped in (input=) for python3 -
     cmd = [args.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
            " ".join(remote)]
     try:
@@ -724,7 +724,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--range", type=parse_duration, default=86400, help="window length (default 24h)")
     p.add_argument("--until", type=parse_until, default=None, help="window end, UTC (default now)")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--summary", action="store_true", help="one line for `tartci pool status`")
+    p.add_argument("--summary", action="store_true", help="one line for tartci pool status")
     p.add_argument("--events-root", default=os.environ.get("TARTCI_POOL_USAGE_ROOT", DEFAULT_ROOT))
     p.add_argument("--cap-file", default=os.environ.get("TARTCI_MACOS_CAP_FILE", DEFAULT_CAP_FILE))
     p.add_argument("--slots", type=int, default=None, help="host VM slots (default: cap file, else 2)")
