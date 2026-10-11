@@ -581,8 +581,7 @@
         "vellum-host-m5studio"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     }
   ],

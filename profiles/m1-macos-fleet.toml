@@ -233,6 +233,7 @@ supervisors = 1
 min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
 workflows = ["Locked macOS GPU proof"]
+runner_idle_timeout_seconds = 60
 replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.

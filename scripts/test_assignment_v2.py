@@ -2474,6 +2474,19 @@ class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
             f"{offenders}",
         )
 
+    def test_admission_scan_requires_first_party_head_repository(self) -> None:
+        source = self.LIB.read_text()
+        self.assertIn(
+            '--require-head-repo "$REPO"',
+            source,
+            "assignment admission must exclude fork head repositories",
+        )
+        self.assertIn(
+            "assignment_group_unservable",
+            source,
+            "unservable runner-group demand must not boot a VM",
+        )
+
     def test_arithmetic_on_the_count_only_happens_where_it_is_bought(self) -> None:
         """Summing counts is legitimate, but only with an exhaustive scan.
 
