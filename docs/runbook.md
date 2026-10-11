@@ -2237,6 +2237,12 @@ fleet`), and check GitHub's job history against it with
   host runs) is written as such in the receipt.
   `pool on` itself now waits up to 45 s for a just-kickstarted persistent
   Actions runner to reach `running` instead of failing on the first read.
+  Self-update recovery passes `pool on --restore-receipt` when restoring the
+  previous serving generation. That mode intentionally skips both
+  network-profile convergence and the fresh relay proof; it reuses the
+  previously receipted serving set so a transient relay failure cannot strand
+  a recovered host out of service. A normal operator `pool on` still performs
+  convergence and the relay proof.
 - **macOS updates.** A macOS update replaces `/usr/bin/python3`, so the
   install receipt's interpreter hash stops matching. When the OS-managed
   interpreter changed (still root-owned, same path and mode) and the OS build

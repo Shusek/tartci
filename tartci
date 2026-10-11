@@ -153,6 +153,10 @@ cmd_doctor() {
     shift
     exec python3 "$HERE/scripts/vm_reap.py" "$@"
   fi
+  if [ "${1:-}" = "cpu-pressure" ]; then
+    shift
+    tartci_toml_exec "$HERE/scripts/cpu_pressure_guard.py" "$@"
+  fi
   # `doctor fleet` is the fleet-wide diagnosis; bare `doctor` stays the host
   # prereq report, which must keep passing on hosts that run no fleet at all.
   if [ "${1:-}" = "fleet" ]; then
