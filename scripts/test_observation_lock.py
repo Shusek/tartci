@@ -58,7 +58,7 @@ class ObservationLockTests(unittest.TestCase):
             values = self._real_timeout_scan(
                 "assignment_scan.py",
                 ["--repo", "forge/deadline", "--workflow", "Build", "--labels", "x",
-                 "--require-label", "x", "--scan-timeout", "1"], td)
+                 "--require-label", "x", "--scan-timeout", "1", "--gh-timeout", "5"], td)
             self.assertIn("forge/deadline", values)
 
     def test_current_job_overall_deadline_records_backoff(self):
@@ -66,7 +66,7 @@ class ObservationLockTests(unittest.TestCase):
             values = self._real_timeout_scan(
                 "current_job_scan.py",
                 ["--repo", "spectr/deadline", "--runner", "r", "--workflow", "Build",
-                 "--scan-timeout", "0.1"], td)
+                 "--scan-timeout", "0.1", "--gh-timeout", "5"], td)
             self.assertIn("spectr/deadline", values)
 
     def test_fifo_order_honors_older_ticket(self):

@@ -291,7 +291,15 @@ def main() -> int:
         with scanner.observation_lock():
             receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
         print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
-    except (TimeoutError, ObservationBackoff) as error:
+    except ObservationBackoff as error:
+        print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
+                         sort_keys=True, separators=(",", ":")))
+        return 2
+    except ObservationTimeout as error:
+        print(json.dumps({"kind": "observation_error", "detail": f"api_timeout: {error}"},
+                         sort_keys=True, separators=(",", ":")))
+        return 2
+    except TimeoutError as error:
         print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
                          sort_keys=True, separators=(",", ":")))
         return 2

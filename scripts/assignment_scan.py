@@ -82,6 +82,10 @@ class TransientApiFault(ScanError):
     """
 
 
+class AssignmentObservationTimeout(TransientApiFault, ObservationTimeout):
+    """A retryable assignment API timeout that also marks the host backoff."""
+
+
 class WitnessAbandon(Exception):
     """A matching queued job was seen, so the walk in progress can stop here.
 
@@ -329,7 +333,7 @@ class AssignmentScanner:
             self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise ObservationTimeout("assignment scan exceeded its overall deadline")
+            raise AssignmentObservationTimeout("assignment scan exceeded its overall deadline")
         try:
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
@@ -348,7 +352,7 @@ class AssignmentScanner:
                 f"GitHub API failed for {path}: {result.stderr.strip()}"
             )
             if getattr(result, "timed_out", False) or reason.reason_code == "timeout":
-                raise ObservationTimeout(str(reason))
+                raise AssignmentObservationTimeout(str(reason))
             if reason.reason_code == NO_VALID_CREDENTIALS:
                 # Retrying cannot turn an anonymous caller into an
                 # authenticated one, and each attempt spends another request
