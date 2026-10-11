@@ -2311,6 +2311,8 @@ class IncidentTests(Base):
         self.sys.on_rc = 7
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertTrue(self.last()["host_off"])
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("left OFF", self.issues[0][1])
         self.assertIn("LEFT THIS HOST OFF", su.summary(self.home)["problem"])
         self.assertTrue(any("WAS LEFT OFF" in line for line in su.status_lines(self.cfg.state_dir)))
 

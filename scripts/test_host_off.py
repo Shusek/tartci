@@ -288,7 +288,7 @@ class VolumeProbeTests(unittest.TestCase):
     def test_the_probe_is_not_background_throttled_and_says_why_it_timed_out(self) -> None:
         plists: list[dict] = []
         with mock.patch.object(macos_launcher_probe.subprocess, "run", self.fake_run(plists)):
-            with self.assertRaisesRegex(ValueError, r"measured latency [0-9.]+s;.*volume I/O slow"):
+            with self.assertRaisesRegex(ValueError, r"probe wait elapsed [0-9.]+s;.*volume I/O slow"):
                 macos_launcher_probe.run(self.helper, self.profile, timeout_seconds=0.3)
         self.assertEqual(plists[0]["ProcessType"], "Standard")
 

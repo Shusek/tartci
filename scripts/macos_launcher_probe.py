@@ -118,9 +118,9 @@ def run(helper: dict, profile: dict, timeout_seconds: float | None = None) -> di
                     break
                 time.sleep(0.1)
             if outcome is None:
-                elapsed = time.monotonic() - probe_started
+                wait_elapsed = time.monotonic() - probe_started
                 fail(f"launch helper volume probe timed out after {timeout_seconds:g}s "
-                     f"(measured latency {elapsed:.3f}s; its write to {host['tart_home']} "
+                     f"(probe wait elapsed {wait_elapsed:.3f}s; its write to {host['tart_home']} "
                      "did not finish: volume I/O slow, not an access denial)")
         except Exception as error:  # Preserve the primary probe diagnosis.
             probe_error = error
