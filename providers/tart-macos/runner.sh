@@ -820,6 +820,9 @@ heartbeat(){
   LAST_HEARTBEAT_PHASE="$phase"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
+  # A killed heartbeat can leave its mktemp sibling behind. Sweep only this
+  # runner's day-old siblings before creating the next atomic update.
+  find "$STATE_DIR" -type f -name "$RUNNER_NAME.state.json.tmp.*" -mtime +1 -delete 2>/dev/null || true
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
 {"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}

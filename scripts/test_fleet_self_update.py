@@ -51,6 +51,8 @@ class FakeSystem(su.System):
         self.pool_state = "on"
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.install_rcs = [0]         # successive `install --apply` exit codes
+        self.dry_run_rc = 0
+        self.preflight_rc = 0
         self.floor = {"allowed": True, "reason": "", "findings": []}
         # Keyed by SSH target (what the peer resolves to), not host_id.
         self.peers = {"m1": {"state": "on", "participating": True},
@@ -278,7 +280,11 @@ class FakeSystem(su.System):
             return ok("valid")
         if args[:2] == ["fleet-macos", "install"]:
             if "--apply" not in args:
-                return ok("dry run")
+                if "--preflight" in args:
+                    return su.Result(self.preflight_rc, "preflight ok" if self.preflight_rc == 0 else "preflight rejected",
+                                     "" if self.preflight_rc == 0 else "installer preflight failed")
+                return su.Result(self.dry_run_rc, "dry run" if self.dry_run_rc == 0 else "preflight rejected",
+                                 "" if self.dry_run_rc == 0 else "installer preflight failed")
             if self.checked_out == INSTALLED:  # a rollback reinstall
                 if self.rollback_install_rc == 0:
                     self._set_installed(INSTALLED)
@@ -1405,6 +1411,32 @@ class SealedTests(Base):
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
         self.assertEqual(self.sys.pool_state, "on")
+
+    def test_installer_preflight_failure_refuses_before_drain(self) -> None:
+        self.sys.preflight_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.sys.mutations(), [])
+        receipt_path = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertIn("installer preflight refused before drain", receipt["error"])
+        self.assertFalse(any("--apply" in args for args, _ in self.sys.calls
+                             if args[:2] == ["./tartci", "fleet-macos"]))
+
+    def test_pin_dependent_preflight_refusal_restores_after_drain(self) -> None:
+        self.sys.dry_run_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
+        receipt_path = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        receipt = json.loads(receipt_path.read_text())
+        names = [step["step"] for step in receipt["steps"]]
+        self.assertIn("drain", names)
+        self.assertIn("pool-on", names)
+        self.assertLess(names.index("drain"), names.index("pool-on"))
+        self.assertIn("install-dry-run", names)
+        self.assertIn("refused after drain", receipt["error"])
+        self.assertNotEqual(receipt["status"], "failed")
 
     def test_bad_bundle_refuses_before_drain(self) -> None:
         for mutate in (lambda s: setattr(s, "bundle_commit", "9" * 40),

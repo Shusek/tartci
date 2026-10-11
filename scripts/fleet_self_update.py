@@ -1623,6 +1623,23 @@ def halt_reason(state_dir: Path) -> str | None:
     return None
 
 
+def scheduled_pause(state_dir: Path) -> str | None:
+    value = _read_json(state_dir / "scheduled-pause.json")
+    if not isinstance(value, dict) or not value.get("reason"):
+        return None
+    return (f"self-update PAUSED by operator at {value.get('at')}: {value['reason']} "
+            "(resume with `tartci fleet-macos self-update --resume`)")
+
+
+def record_pause_control(state_dir: Path, action: str, reason: str | None = None) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "scheduled-pause-receipts.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"action": action, "at": _iso(time.time()),
+                                 **({"reason": reason} if reason else {})},
+                                sort_keys=True) + "\n")
+
+
 def prune_refusals(state_dir: Path, now: float) -> None:
     for path, value in _attempts(state_dir):
         if value.get("status") in ("refused", "planned") \
@@ -1837,6 +1854,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     try:
         me = self_host_id(cfg)
         if apply:
+            paused = scheduled_pause(cfg.state_dir)
+            if paused:
+                raise Refused(paused)
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
@@ -1875,10 +1895,14 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 raise Refused(f"install dry-run failed: {dry.text}")
             receipt.step("install-dry-run", "ok")
         else:
-            # The installer verifies the new bundle against the approval pin,
-            # and the pin may only move once the host is out of service, so a
-            # sealed host's dry run happens right after the pin, before --apply.
-            receipt.step("install-dry-run", "deferred until the approval pin moves (after pool off)")
+            # Authenticate the repository and exact support commit while the
+            # host is still serving. Only approval-pin dependent validation is
+            # allowed to wait until after drain and the pin move.
+            preflight = tartci(cfg, sys_, *install_args, "--preflight", repository=repository)
+            if preflight.rc != 0:
+                raise Refused(f"sealed-launcher installer preflight refused before drain: {preflight.text}")
+            receipt.step("installer-preflight", "repository and exact source commit authenticated before drain")
+            install_args += ["--skip-preflight"]
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
@@ -2134,9 +2158,11 @@ class Run:
             self._write_pin(self.approval.read_text())
             self.pin_moved = True
             self.receipt.step("pin", "new launcher approval pinned (previous in the snapshot)")
+            self.receipt.step("install-dry-run", "checking installer preflight against the new pin")
             dry = tartci(cfg, sys_, *self.install_args, repository=self.repository)
             if dry.rc != 0:
-                raise Failed(f"install dry-run failed against the new pin: {dry.text}")
+                self.receipt.step("install-dry-run", f"refused: {dry.text[:300]}", ok=False)
+                raise Refused(f"sealed-launcher install preflight refused before install: {dry.text}")
             self.receipt.step("install-dry-run", "ok against the new pin")
         self.phase = "install"
         self._install(self.install_args)
@@ -2267,11 +2293,16 @@ class Run:
 
     POOL_ON_BACKOFF = (15, 45, 90)
 
-    def _pool_on(self) -> bool:
+    def _pool_on(self, *, restore_receipt: bool = False) -> bool:
         for attempt in range(1, self.POOL_ON_ATTEMPTS + 1):
-            on = installed_tartci(self.cfg, self.sys, "pool", "on")
+            args = ["pool", "on"]
+            if restore_receipt:
+                args.append("--restore-receipt")
+            on = installed_tartci(self.cfg, self.sys, *args)
             if on.rc == 0:
-                self.receipt.step("pool-on", "installed shim")
+                self.receipt.step("pool-on", "installed shim" +
+                                  ("; restored prior receipted serving set without fresh relay proof"
+                                   if restore_receipt else ""))
                 return True
             self.receipt.step("pool-on", f"attempt {attempt} failed (exit {on.rc}): {on.text[:300]}",
                               ok=False)
@@ -2302,7 +2333,8 @@ class Run:
         except (json.JSONDecodeError, AttributeError):
             return "unknown"
 
-    def _ensure_on(self, *, allow_reinstall: bool = True) -> str:
+    def _ensure_on(self, *, allow_reinstall: bool = True,
+                   restore_receipt: bool = False) -> str:
         """Put the host back in service, whatever else failed. Returns the
         resulting pool state: "on", "undrained", or what the host is left in.
 
@@ -2315,7 +2347,7 @@ class Run:
         and never strands it drained. `allow_reinstall=False` (a terminated
         run, with launchd's SIGKILL pending) tries `pool on` only.
         """
-        if self._pool_on():
+        if self._pool_on(restore_receipt=restore_receipt):
             return "on"
         state = self._pool_state()
         if not allow_reinstall:
@@ -2352,7 +2384,8 @@ class Run:
         except Exception as exc:  # noqa: BLE001 - recorded; the host stays as it is
             self.receipt.step("reinstall-for-pool-on", f"{type(exc).__name__}: {exc}", ok=False)
             return self._pool_state()
-        return "on" if self._pool_on() else self._pool_state()
+        return ("on" if self._pool_on(restore_receipt=restore_receipt)
+                else self._pool_state())
 
     def _undrain_or(self, state: str) -> str:
         if state != "draining":
@@ -2410,7 +2443,7 @@ class Run:
             return None
 
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
-        self.receipt.step("failed", reason, ok=False)
+        self.receipt.step("refused" if refused else "failed", reason, ok=False)
         running = self._running()
         if terminated:
             # launchd will SIGKILL soon: no reinstall, no rollback. Get the
@@ -2427,7 +2460,7 @@ class Run:
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            state = self._ensure_on()
+            state = self._ensure_on(restore_receipt=True)
             if state not in ("on", "undrained"):
                 return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
                                       f"failed (generation {self.previous[:12]} is installed)",
@@ -2450,18 +2483,23 @@ class Run:
                 raise Failed(f"pool off for rollback failed: {off.text}")
             self._reinstall_previous()
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
-            if not self._pool_on():
+            if not self._pool_on(restore_receipt=True):
                 raise Failed("pool on after rollback failed")
             verify(cfg, sys_, self.previous, self.receipt)
         except BaseException as exc:  # noqa: BLE001 - incl. a second SIGTERM
             # Whatever the rollback's own failure, capacity comes back: a
             # failed verification is never a reason to leave the host out.
             self._repin_to_live()
-            state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated))
-            return self._terminal("failed", f"{reason}; ROLLBACK FAILED: "
-                                  f"{type(exc).__name__}: {exc}; host is "
-                                  f"{_state_words(state)} running "
-                                  f"{str(self._running())[:12]}", pool_state=state)
+            state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated),
+                                    restore_receipt=True)
+            if "verification of" in reason and "heartbeat_missing" in reason:
+                message = (f"{reason}; rollback installed and pool on; rollback verification "
+                           f"timed out: {type(exc).__name__}: {exc}; host is "
+                           f"{_state_words(state)} running {str(self._running())[:12]}")
+            else:
+                message = (f"{reason}; ROLLBACK FAILED: {type(exc).__name__}: {exc}; host is "
+                           f"{_state_words(state)} running {str(self._running())[:12]}")
+            return self._terminal("failed", message, pool_state=state)
         return self._terminal("rolled_back", _rollback_terminal_message(reason, self.previous))
 
     def _terminal(self, status: str, message: str, *, pool_state: str = "on") -> int:
@@ -2617,6 +2655,9 @@ def status_lines(state_dir: Path) -> list[str]:
     paused = paused_line(state_dir)
     if paused:
         lines.append(paused)
+    scheduled = scheduled_pause(state_dir)
+    if scheduled:
+        lines.append(scheduled)
     last = _read_json(state_dir / "last.json")
     if last and last.get("status") in ("failed", "rolled_back"):
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"
@@ -2688,6 +2729,10 @@ def main(argv: list[str] | None = None) -> int:
                       "the installer says, guard present) without changing anything")
     mode.add_argument("--clear-halt", action="store_true",
                       help="resume automatic attempts after consecutive failures")
+    mode.add_argument("--pause", metavar="REASON",
+                      help="pause scheduled self-updates with an operator reason")
+    mode.add_argument("--resume", action="store_true",
+                      help="resume scheduled self-updates")
     mode.add_argument("--peers", action="store_true",
                       help="print each published peer and the SSH target it resolves to")
     mode.add_argument("--refresh-skew", action="store_true",
@@ -2716,6 +2761,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.clear_halt:
         _write_json(cfg.state_dir / "halt-cleared.json", {"at": _iso(sys_.now())})
         print("self-update: halt cleared; automatic attempts resume")
+        return 0
+    if args.pause is not None:
+        reason = args.pause.strip()
+        if not reason:
+            parser.error("--pause requires a non-empty reason")
+        _write_json(cfg.state_dir / "scheduled-pause.json",
+                    {"at": _iso(sys_.now()), "reason": reason})
+        record_pause_control(cfg.state_dir, "pause", reason)
+        print(f"self-update: scheduled attempts paused: {reason}")
+        return 0
+    if args.resume:
+        (cfg.state_dir / "scheduled-pause.json").unlink(missing_ok=True)
+        record_pause_control(cfg.state_dir, "resume")
+        print("self-update: scheduled attempts resumed")
         return 0
     if args.peers:
         try:
