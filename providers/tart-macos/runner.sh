@@ -590,11 +590,25 @@ STATE_DIR="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(j
 [ "$PRINT_EVENT_LOG" = 1 ] && { printf '%s\n' "$EVENT_LOG"; exit 0; }
 [ -n "${PRINT_BOOT_NAME:-}" ] && { printf '%s\n' "$(ephemeral_boot_name "$PRINT_BOOT_NAME")"; exit 0; }
 if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then
-  python3 "$TARTCI_ROOT/scripts/macos_runner_identity_guard.py" \
-    --current-label "$TARTCI_LAUNCHD_LABEL" \
-    --runner-name "$RUNNER_NAME" \
-    --state-dir "$STATE_DIR" \
-    || die "another loaded LaunchAgent resolves to this runner/state identity"
+  identity_guard_rc=2
+  identity_guard_attempt=1
+  while [ "$identity_guard_attempt" -le 3 ]; do
+    identity_guard_rc=0
+    python3 "$TARTCI_ROOT/scripts/macos_runner_identity_guard.py" \
+      --current-label "$TARTCI_LAUNCHD_LABEL" \
+      --runner-name "$RUNNER_NAME" \
+      --state-dir "$STATE_DIR" || identity_guard_rc=$?
+    [ "$identity_guard_rc" -ne 2 ] && break
+    if [ "$identity_guard_attempt" -lt 3 ]; then
+      identity_guard_backoff=$((identity_guard_attempt * ${TARTCI_IDENTITY_GUARD_RETRY_BACKOFF_SECS:-5}))
+      sleep "$identity_guard_backoff"
+    fi
+    identity_guard_attempt=$((identity_guard_attempt + 1))
+  done
+  [ "$identity_guard_rc" -eq 0 ] || {
+    [ "$identity_guard_rc" -eq 1 ] && die "another loaded LaunchAgent resolves to this runner/state identity"
+    die "could not enumerate loaded LaunchAgents after 3 attempts"
+  }
 fi
 command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"

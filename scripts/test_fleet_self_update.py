@@ -108,6 +108,7 @@ class FakeSystem(su.System):
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
+        self.launchd_print = None
 
     def now(self) -> float:
         return self.clock
@@ -147,6 +148,8 @@ class FakeSystem(su.System):
         joined = " ".join(a)
         if self.hook:
             self.hook(a)
+        if a[:2] == ["launchctl", "print"]:
+            return self.launchd_print or su.Result(1, "", "not configured")
         if a[0] == FAKE_GH:
             repository = a[2].removeprefix("repos/").split("/commits/")[0]
             if repository in self.unreadable_repositories:
@@ -1618,6 +1621,26 @@ class AgentTemplateTests(unittest.TestCase):
 
 
 class VerifySettleTests(Base):
+    def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
+        self.assertEqual(
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: "
+                "[{'code': 'heartbeat_missing', 'label': 'lane'}]",
+                "b" * 40,
+            ),
+            "rollback installed; verification timed out; rolled back to bbbbbbbbbbbb and verified",
+        )
+
+    def test_heartbeat_missing_with_crashed_launchd_lane_includes_last_log_line(self) -> None:
+        log = self.home / "lane.log"
+        log.write_text("booting\nlaunchd: runner crashed\n")
+        self.sys.launchd_print = su.Result(
+            0,
+            f"last exit code = 75\nstderr path = {log}\n",
+        )
+        details = su._heartbeat_failure_diagnostics(self.sys, ["lane"])
+        self.assertEqual(details, ["lane lane last exit 75; last log line: launchd: runner crashed"])
+
     def test_a_first_heartbeat_still_pending_is_waited_for(self) -> None:
         self.sys.settling_reads = 3
         start = self.sys.clock
