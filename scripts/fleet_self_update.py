@@ -1869,6 +1869,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
         repository = configured_repository(cfg, sys_)
+        print(f"self-update: repository={repository}")
         if helper is None:
             dry = tartci(cfg, sys_, *install_args, repository=repository)
             if dry.rc != 0:

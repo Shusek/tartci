@@ -1902,6 +1902,7 @@ class ChecksAndTargetTests(Base):
             self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=False,
                                               target_ref=T_OLD, explicit=True), su.EXIT_OK)
         self.assertIn(f"selected {T_OLD} (requested {T_OLD}; same)", output.getvalue())
+        self.assertIn(f"repository={su.DEFAULT_REPOSITORY}", output.getvalue())
         receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
         self.assertEqual(len(receipts), 1)
         receipt = json.loads(receipts[0].read_text())
