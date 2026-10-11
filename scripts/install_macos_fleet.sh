@@ -7,7 +7,7 @@ LEGACY_TARTCI_REPOSITORY="danielraffel/tartci"
 REQUESTED_TARTCI_REPOSITORY="${GH_REPO:-}"
 case "$REQUESTED_TARTCI_REPOSITORY" in
   "") TARTCI_REPOSITORY="$DEFAULT_TARTCI_REPOSITORY" ;;
-  "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
+  "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") TARTCI_REPOSITORY="$REQUESTED_TARTCI_REPOSITORY" ;;
   *) echo "fleet install refuses unsupported TartCI repository identity: $REQUESTED_TARTCI_REPOSITORY" >&2; exit 3 ;;
 esac
 TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
@@ -178,6 +178,7 @@ echo "  installed_profile=$PROFILE_SNAPSHOT"
 echo "  support_manifest=$SUPPORT_MANIFEST"
 echo "  support_source=$SUPPORT_SOURCE"
 echo "  entrypoint=$ENTRYPOINT"
+echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
 echo "  activation=deferred to tartci pool on"
 
@@ -240,7 +241,7 @@ for candidate in $preflight_repositories; do
     esac
   fi
 done
-[ -n "$preflight_repository" ] || {
+[ -n "$preflight_canonical" ] || {
   echo "fleet install could not authenticate either supported TartCI repository via rendered ghapp ($preflight_ghapp_path)" >&2
   exit 3
 }

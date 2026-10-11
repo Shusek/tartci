@@ -228,6 +228,10 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.legacy.write_text("legacy\n")
         self.env = os.environ.copy()
         self.env.update(HOME=str(self.home), PATH=f"{self.fakebin}:{os.environ['PATH']}")
+        # Every installer subprocess gets an explicit repository binding unless
+        # a test deliberately removes it. This prevents ambient GH_REPO from
+        # hiding the bound-identity path under test.
+        self.env["GH_REPO"] = "danielraffel/tartci"
         # The fixture has no governed Runner.Worker; make that evidence
         # explicit rather than inheriting unrelated host processes.
         ps = self.fakebin / "ps-empty"
@@ -262,11 +266,13 @@ class InstallMacosFleetTests(unittest.TestCase):
                 directory.chmod(0o755)
         self.temp.cleanup()
 
-    def run_installer(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+    def run_installer(
+        self, *args: str, installer_root: Path = ROOT, **env: str
+    ) -> subprocess.CompletedProcess[str]:
         effective = self.env.copy()
         effective.update(env)
         return subprocess.run(
-            [str(ROOT / "tartci"), "fleet-macos", "install", str(self.config),
+            [str(installer_root / "tartci"), "fleet-macos", "install", str(self.config),
              "--support-source", str(self.support_source),
              "--support-manifest", str(self.support_manifest), *args],
             text=True, capture_output=True, check=False, env=effective,
@@ -337,6 +343,37 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("action=dry-run", result.stdout)
+
+    def test_dry_run_bound_legacy_repository_resolves_and_reports_slug(self) -> None:
+        result = self.run_installer(GH_REPO="danielraffel/tartci")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repository=danielraffel/tartci", result.stdout)
+        self.assertIn("action=dry-run", result.stdout)
+
+    def test_dry_run_bound_default_repository_reports_auth_failure(self) -> None:
+        result = self.run_installer(GH_REPO="Generous-Corp/tartci")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("could not authenticate", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+
+    def test_mutant_removing_bound_assignment_fails_bound_fixture(self) -> None:
+        mutant_root = self.root / "mutant-installer"
+        shutil.copytree(
+            ROOT,
+            mutant_root,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        path = mutant_root / "scripts/install_macos_fleet.sh"
+        source = path.read_text()
+        assignment = (
+            '"$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") '
+            'TARTCI_REPOSITORY="$REQUESTED_TARTCI_REPOSITORY" ;;'
+        )
+        self.assertIn(assignment, source)
+        path.write_text(source.replace(assignment, assignment.split(") ", 1)[0] + ") ;;", 1))
+        result = self.run_installer(installer_root=mutant_root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TARTCI_REPOSITORY: unbound variable", result.stderr)
 
     def test_dry_run_resolves_legacy_repository_when_gh_repo_is_unset(self) -> None:
         self.env.pop("GH_REPO", None)
