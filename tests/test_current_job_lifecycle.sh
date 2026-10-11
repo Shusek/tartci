@@ -29,6 +29,7 @@ trap report_exit EXIT
 # "host queue observation lock timed out", and adds contention to the resource
 # it was starved by.
 export TARTCI_QUEUE_OBSERVATION_LOCK_FILE="$TMP/queue-observation.lock"
+export TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE="$TMP/queue-observation-backoff.json"
 
 # Exercise the production shell functions directly while replacing only their
 # external GitHub/event/heartbeat/cleanup boundaries.
@@ -91,6 +92,9 @@ cleanup(){
 }
 
 reset_state(){
+  # Each case owns a new observation history. Timeout cases deliberately
+  # establish backoff; that must not suppress the next policy assertion.
+  rm -f "$TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE"
   # Consumed by production functions loaded through eval above.
   # shellcheck disable=SC2034
   CURRENT_RUN_ID=333 CURRENT_JOB_ID=444 CURRENT_WORKFLOW_NAME="Build and Test"

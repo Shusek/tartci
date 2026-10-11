@@ -12,14 +12,15 @@ import sys
 import queue
 import threading
 import time
+from bounded_subprocess import run_bounded
 
 
 def assignment_observation(repo, runner, policy):
     """Read the exact assigned job across the declared repository scope."""
-    result = subprocess.run([sys.executable, str(Path(__file__).with_name('current_job_scan.py')),
+    result = run_bounded([sys.executable, str(Path(__file__).with_name('current_job_scan.py')),
                              '--repo', repo, '--runner', runner, '--policy-file', str(policy),
-                             '--scan-timeout', '10', '--parallelism', '4'],
-                            capture_output=True, text=True, timeout=20)
+                             '--scan-timeout', '120', '--parallelism', '1'],
+                            timeout=130, operation='prepared_guest_assignment')
     try:
         value = json.loads(result.stdout)
     except (TypeError, ValueError):
