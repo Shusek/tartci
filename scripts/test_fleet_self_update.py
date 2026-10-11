@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
+import contextlib
+import io
 import json
 import os
 import plistlib
@@ -1869,6 +1871,63 @@ class ChecksAndTargetTests(Base):
         self.assertEqual(self.sys.mutations(), [])
         skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
         self.assertEqual(skew["state"], "unverified")
+
+    def test_explicit_main_tip_soaking_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIn("soaking until", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_explicit_main_tip_soaked_but_red_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIn("not green: ", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_default_path_falls_back_to_soaked_green_and_records_skipped(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW)
+        self.assertEqual(skew["selected_target"], T_OLD)
+        self.assertTrue(skew["skipped"])
+
+    def test_explicit_selection_is_printed_and_recorded(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=False,
+                                              target_ref=T_OLD, explicit=True), su.EXIT_OK)
+        self.assertIn(f"selected {T_OLD} (requested {T_OLD}; same)", output.getvalue())
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual({key: receipt[key] for key in
+                          ("requested_target", "selected_target", "explicit", "soak_until")},
+                         {"requested_target": T_OLD, "selected_target": T_OLD,
+                          "explicit": True, "soak_until": None})
+
+    def test_main_explicit_target_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--target", T_NEW, "--plan"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_main_without_target_keeps_default_green_fallback(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--plan"])
+        self.assertEqual(result, su.EXIT_OK)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())["target"], T_OLD)
 
     def test_explicit_target_must_be_on_the_first_parent_chain(self) -> None:
         skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, "d" * 40)
