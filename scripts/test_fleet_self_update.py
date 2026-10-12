@@ -114,6 +114,8 @@ class FakeSystem(su.System):
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
         self.launchd_print = None
+        self.target_orchestrator_rc = 0
+        self.target_orchestrator_calls: list[list[str]] = []
 
     def now(self) -> float:
         return self.clock
@@ -270,6 +272,10 @@ class FakeSystem(su.System):
 
     # ── fakes for tartci subcommands ────────────────────────────────────
     def _tartci(self, args):
+        if args[:2] == ["fleet-macos", "self-update"]:
+            self.target_orchestrator_calls.append(list(args))
+            return su.Result(self.target_orchestrator_rc, "target orchestrator", ""
+                             if self.target_orchestrator_rc == 0 else "target refused")
         if args[:2] == ["support-manifest", "write"]:
             manifest = self.home / ".local/share/tartci/update-checkout/.tartci-support-manifest.json"
             (manifest.parent / "scripts").mkdir(parents=True, exist_ok=True)
@@ -616,6 +622,74 @@ class OrchestratorGenerationTests(Base):
         self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
 
 
+class TargetOrchestratorHandoffTests(Base):
+    sealed = True
+
+    def test_an_installed_orchestrator_hands_off_to_the_target_checkout(self) -> None:
+        calls = []
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve", side_effect=lambda *args: calls.append(args)):
+            self.assertTrue(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=True, refresh=False))
+        self.assertEqual(calls[0][0], str(self.cfg.checkout / "tartci"))
+        self.assertEqual(calls[0][1], [
+            str(self.cfg.checkout / "tartci"), "fleet-macos", "self-update", "--apply",
+            "--target", T_OLD, "--home", str(self.home), "--scheduled"])
+        self.assertEqual(calls[0][2]["TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR"], "1")
+
+    def test_handoff_is_disabled_for_plan_unsealed_refresh_or_marker(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve") as execve:
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=False, scheduled=False, refresh=False))
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=False, refresh=True))
+            with mock.patch.dict(os.environ, {"TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"}):
+                self.assertFalse(su.handoff_target_orchestrator(
+                    self.cfg, T_OLD, apply=True, scheduled=False, refresh=False))
+        execve.assert_not_called()
+
+    def test_apply_calls_handoff_before_the_installed_builder(self) -> None:
+        with mock.patch.object(su, "handoff_target_orchestrator", return_value=True) as handoff:
+            self.assertEqual(self.apply(), su.EXIT_OK)
+        handoff.assert_called_once_with(self.cfg, T_OLD, apply=True, scheduled=False, refresh=False)
+
+
+class HandoffNegativeSelectionTests(Base):
+    def test_unsealed_hosts_never_handoff(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve") as execve:
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=False, refresh=False))
+        execve.assert_not_called()
+
+    def test_soaking_target_never_reaches_handoff(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True),
+                su.EXIT_REFUSED)
+        handoff.assert_not_called()
+
+    def test_unverified_target_never_reaches_handoff(self) -> None:
+        self.sys.log_lines = f"{T_OLD} {int(NOW - 7200)}\n"
+        self.sys.checks[T_OLD] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_OLD, explicit=True),
+                su.EXIT_REFUSED)
+        handoff.assert_not_called()
+
+    def test_non_first_parent_target_never_reaches_handoff(self) -> None:
+        self.sys.ancestor = False
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_OLD, explicit=True),
+                su.EXIT_UNKNOWN)
+        handoff.assert_not_called()
+
+
 class ReserveCheckTests(Base):
     def test_the_target_is_validated_with_the_gate_reserve_ratchet(self) -> None:
         self.assertUpdated(self.apply())
@@ -630,8 +704,12 @@ class HappyPathTests(Base):
         joined = [" ".join(a) for a, _ in self.sys.calls]
         def first(pred):
             return next(i for i, c in enumerate(joined) if pred(c))
-        order = [first(lambda c, n=n: n in c) for n in (
-            "support-manifest write", "fleet-macos validate", "fleet-macos install", "ssh",
+        # Peer observation intentionally leads the procedure: a later gate
+        # may refuse before queue handling, but must not skip the unreadable
+        # streak that breaks a dead-peer deadlock.
+        order = [first(lambda c: c.startswith("ssh "))]
+        order += [first(lambda c, n=n: n in c) for n in (
+            "support-manifest write", "fleet-macos validate", "fleet-macos install",
             "capacity_floor.py", "pool drain", "pool off --plan")]
         order.append(first(lambda c: c.startswith("./tartci pool off") and "--plan" not in c))
         order += [first(lambda c, n=n: n in c) for n in ("--apply", "pool on")]
@@ -1026,6 +1104,39 @@ class UpdateQueueTests(Base):
                          and "self_update_starved" in (self.cfg.state_dir / "events.jsonl").read_text())
         self.assertIsNone(su.summary(self.home)["problem"])
         self.assertEqual(self.issues, [])
+
+
+class RefusedTurnTests(Base):
+    sealed = True
+
+    def test_a_pre_drain_refusal_releases_an_old_queue_ticket(self) -> None:
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "target": T_OLD, "since": NOW - 3 * 3600,
+            "ts": NOW - 60, "reason": "previous refusal",
+        })
+        self.sys.codesign_verify_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertIsNone(su.waiting_ticket(self.cfg))
+
+    def test_capacity_floor_refusal_keeps_the_ticket(self) -> None:
+        self.ticket = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600,
+                       "ts": NOW - 60, "reason": "capacity"}
+        su._write_json(self.cfg.state_dir / "waiting.json", self.ticket)
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], self.ticket["since"])
+
+    def test_recent_attempt_refusal_keeps_the_ticket(self) -> None:
+        ticket = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600,
+                  "ts": NOW - 60, "reason": "recent attempt"}
+        su._write_json(self.cfg.state_dir / "waiting.json", ticket)
+        attempts = self.cfg.state_dir / "attempts"
+        su._write_json(attempts / "recent.json", {
+            "mode": "apply", "target": T_OLD, "status": "failed",
+            "started_at": su._iso(NOW - 60),
+        })
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], ticket["since"])
 
 
 class AnnounceOrderTests(Base):
@@ -2071,7 +2182,13 @@ class ScaleTests(Base):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copytree(ROOT / "profiles", root / "profiles")
-            text = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            original = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            # This test exercises profile-to-publication alias derivation for
+            # every profile.  Keep its fixture published even when production
+            # temporarily withdraws a host from the fleet.
+            (root / "profiles/m1-macos-fleet.toml").write_text(
+                original.replace("published = false", "published = true", 1))
+            text = original.replace("published = false", "published = true", 1)
             text = text.replace('name = "m1-macos-fleet"', 'name = "x9-macos-fleet"')
             text = text.replace('id = "m1"', 'id = "x9"', 1).replace('ssh = "m1"\n', "")
             (root / "profiles/x9-macos-fleet.toml").write_text(text)

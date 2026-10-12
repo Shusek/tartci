@@ -184,6 +184,10 @@ class Refused(Exception):
     """A precondition failed before anything on the host changed."""
 
 
+class HostFault(Refused):
+    """A local host/build fault that must release a stale queue ticket."""
+
+
 class Deferred(Refused):
     """Refused only because another host holds, or has waited longer for, a turn."""
 
@@ -1700,6 +1704,37 @@ def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900,
                     timeout=timeout)
 
 
+def handoff_target_orchestrator(cfg: Config, target: str, *,
+                                apply: bool, scheduled: bool, refresh: bool) -> bool:
+    """Run the target checkout's orchestration code before sealed builds.
+
+    A sealed launcher starts the self-update script copied into its installed
+    generation.  That copy may predate a launcher verification fix and can
+    therefore reject the target's corrected bundle forever.  Once the
+    authenticated checkout is detached at the selected target, hand off to
+    its own dispatcher.  The environment marker prevents the target copy from
+    handing off to itself again.
+    """
+    if (not apply or refresh
+            or os.environ.get("TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR") == "1"):
+        return False
+    if orchestrator_generation() is None:
+        return False
+    if launch_helper(cfg) is None:
+        return False
+    dispatcher = cfg.checkout / "tartci"
+    args = [str(dispatcher), "fleet-macos", "self-update", "--apply",
+            "--target", target, "--home", str(cfg.home)]
+    if scheduled:
+        args.append("--scheduled")
+    # The checkout was authenticated and detached immediately before this
+    # call. Replace the installed-generation process so launchd's signal
+    # reaches the real orchestrator and its output remains attached.
+    environment = {**os.environ, "TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"}
+    os.execve(str(dispatcher), args, environment)
+    return True  # only reachable under the unit-test execve stub
+
+
 def installed_tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
     """The INSTALLED shim, run from $HOME (never a checkout)."""
     return sys_.run([str(cfg.shim), *args], cwd=str(cfg.home), env=census_env(),
@@ -1887,6 +1922,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             "soaking": " (undeployed commits are still soaking)",
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
+    if apply and launch_helper(cfg) is not None:
+        _checkout(cfg, sys_, target)
+    if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
+                                   refresh=bool(refresh)):
+        return EXIT_OK
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
     receipt.value.update(requested_target=skew.get("requested_target"),
                          selected_target=skew.get("selected_target"),
@@ -1896,6 +1936,12 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     receipt.value["refresh"] = refresh
     try:
         me = self_host_id(cfg)
+        # Observe peers before any later gate can defer this run.  In
+        # particular, capacity-floor and installer checks may refuse before
+        # the queue decision below; skipping the survey there meant a dead
+        # peer never accumulated its unreadable-read streak and every host
+        # could wait forever for a fresh report.  Plans remain read-only.
+        survey = survey_peers(cfg, sys_, me, record=apply)
         if apply:
             paused = scheduled_pause(cfg.state_dir)
             if paused:
@@ -1950,7 +1996,6 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        survey = survey_peers(cfg, sys_, me, record=apply)
         busy, waiting, off = survey.busy, survey.waiting, survey.off
         ticket = waiting_ticket(cfg)
         my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
@@ -1994,7 +2039,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             out_dir = builds / target
             clear_dir(out_dir)
             out_dir.mkdir(parents=True)
-            bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+            try:
+                bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+            except Refused as exc:
+                raise HostFault(str(exc)) from exc
             prune_dirs(builds, KEEP_BUILDS)
             install_args += ["--launch-helper-source", str(bundle)]
             receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
@@ -2016,6 +2064,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         receipt.value["deferred"] = True
         receipt.finish("refused", str(exc))
         return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
+    except HostFault as exc:
+        # A pre-drain refusal must not retain an old queue ticket forever.
+        # Leave the turn available to peers; the next scheduled attempt gets
+        # a fresh ticket and naturally backs off behind any active holder.
+        if apply:
+            clear_waiting(cfg)
+        receipt.step("refused", str(exc), ok=False)
+        receipt.finish("refused", str(exc))
+        return EXIT_REFUSED
     except Refused as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))

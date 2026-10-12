@@ -68,7 +68,7 @@ class PublishedSupplyTests(unittest.TestCase):
         return {row["host_id"] for row in value["registrations"]
                 if row.get("class_label") == MERGE_GROUP}
 
-    def test_the_published_supply_includes_every_gate_host(self) -> None:
+    def test_republished_m1_is_present_in_published_supply(self) -> None:
         self.assertEqual(self.published(), {"m1", "studio", "m5", "m5studio"})
 
 

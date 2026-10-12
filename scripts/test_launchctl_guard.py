@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -17,6 +18,7 @@ import launchctl_guard as guard
 
 ROOT = Path(__file__).resolve().parents[1]
 SHIM = ROOT / "hooks" / "claude-pretooluse-launchctl.sh"
+PS_FIXTURE = ROOT / "scripts" / "fixtures" / "launchctl_guard_ps_m3.txt"
 LANE = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate"
 RUNNER = "actions.runner.Generous-Corp-pulp.pulp-preamble-m5"
 LEGACY = "com.danielraffel.pulp.tart-runner-macos-release"
@@ -115,6 +117,24 @@ BROAD_KILLS = [
 
 
 class ClassifierTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._old_ps_snapshot = os.environ.get("TARTCI_GUARD_PS_SNAPSHOT")
+        cls._old_testing = os.environ.get("TARTCI_GUARD_TESTING")
+        os.environ["TARTCI_GUARD_TESTING"] = "1"
+        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(PS_FIXTURE)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._old_ps_snapshot is None:
+            os.environ.pop("TARTCI_GUARD_PS_SNAPSHOT", None)
+        else:
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = cls._old_ps_snapshot
+        if cls._old_testing is None:
+            os.environ.pop("TARTCI_GUARD_TESTING", None)
+        else:
+            os.environ["TARTCI_GUARD_TESTING"] = cls._old_testing
+
     def test_proxy_snapshot_and_sh_process_shapes_are_refused(self) -> None:
         # These are command-line shapes captured from ``ps -axo command`` on
         # the fleet.  ``pkill -f`` matches the complete command line, so each
@@ -147,16 +167,137 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(guard.decide(f"launchctl kickstart -k gui/501/{LANE}")[0], 2)
 
     def test_broad_process_kills_are_refused_and_targeted_recovery_is_named(self) -> None:
-        for command in BROAD_KILLS:
+        # The static list is only the fail-closed path when ps is unavailable.
+        old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
+        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(ROOT / "missing-ps-snapshot")
+        try:
+            for command in BROAD_KILLS:
+                with self.subTest(command=command):
+                    code, message = guard.decide(command)
+                    self.assertEqual(code, 2, command)
+                    self.assertIn("tartci launchd heal", message)
+                    self.assertIn("tree top", message)
+        finally:
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
+
+    def test_live_process_table_refuses_real_agent_and_lane_shapes(self) -> None:
+        patterns = (
+            "pkill -f tartci-launcher",
+            "pkill -f resume",
+            "pkill -f 'codex resume'",
+            "pkill -f 'sr codex'",
+            "pkill -f 'claude proxy'",
+            "pkill -f 'login -flp'",
+            "pkill -f '^/Users/danielraffel/.subrouter/codex/claude-proxy'",
+            "pgrep -f 'sr codex' | xargs kill",
+        )
+        for command in patterns:
             with self.subTest(command=command):
                 code, message = guard.decide(command)
                 self.assertEqual(code, 2, command)
                 self.assertIn("tartci launchd heal", message)
-                self.assertIn("tree top", message)
+
+    def test_live_process_table_allows_pattern_matching_no_protected_process(self) -> None:
+        self.assertEqual(guard.decide("pkill -f '^/Users/example/harmless-worker$'"), (0, ""))
+
+    def test_read_only_pgrep_is_allowed(self) -> None:
+        self.assertEqual(guard.decide("pgrep -f 'sr codex'"), (0, ""))
+        self.assertEqual(guard.decide("pidof tartci-launcher"), (0, ""))
+
+    def test_pid_source_patterns_are_checked_when_any_kill_is_present(self) -> None:
+        commands = (
+            "kill $(pgrep -f 'sr codex')",
+            "kill -9 $(pgrep -f tartci-launcher)",
+            "kill `pgrep -f 'sr codex'`",
+            "pgrep -f tartci-launcher | sudo xargs kill",
+            "while read pid; do kill $pid; done < <(pgrep -f 'sr codex')",
+            "for p in $(pgrep -f tartci-launcher); do kill $p; done",
+            "kill $(pidof tartci-launcher)",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
+
+    def test_raw_wrappers_and_interpreters_are_checked(self) -> None:
+        commands = (
+            "ssh m3 \"kill $(pgrep -f 'sr codex')\"",
+            "ssh m3 'kill $(pgrep -f tartci-launcher)'",
+            "bash -c \"kill $(pgrep -f 'sr codex')\"",
+            "eval \"kill $(pgrep -f tartci-launcher)\"",
+            "pgrep -f 'sr codex' | xargs sh -c 'kill $0'",
+            "perl -e 'kill 9, grep(/sr codex/, qx(pgrep -f sr codex))'",
+            "python3 -c \"import os; os.kill(int(next(iter([]))), 9) # pgrep -f sr codex\"",
+            "awk 'system(\"kill $(pgrep -f tartci-launcher)\")'",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
+
+    def test_unquoted_pid_source_operands_and_assignments_are_checked(self) -> None:
+        commands = (
+            "ps aux | grep tartci-launcher | awk '{print $2}' | xargs kill -9",
+            "kill $(ps aux | grep tartci-launcher | awk '{print $2}')",
+            "PAT=tartci-launcher; kill $(pgrep -f $PAT)",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
+        code, message = guard.decide("kill $(pgrep -f $UNKNOWN)")
+        self.assertEqual(code, 2)
+        self.assertIn("<unresolved>", message)
+
+    def test_read_only_grep_for_kill_words_is_allowed(self) -> None:
+        for command in ("grep -i kill notes.txt | less", "grep pkill README.md | cat"):
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command), (0, ""))
+
+    def test_raw_read_only_wrappers_remain_allowed(self) -> None:
+        for command in ("ssh m3 \"pgrep -f 'sr codex'\"",
+                        "bash -c \"pgrep -f tartci-launcher\"",
+                        "eval \"pidof tartci-launcher\""):
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command), (0, ""))
+
+    def test_descendant_of_protected_lane_is_refused(self) -> None:
+        rows = "\n".join([
+            "1 0 /sbin/launchd",
+            "10 1 /Users/danielraffel/bin/tartci-launcher --lane pulp-gate",
+            "11 10 /usr/bin/helper --safe-child",
+        ] + [f"{100 + i} 1 /usr/bin/idle-{i}" for i in range(41)])
+        with mock.patch.object(guard, "_process_table", return_value=[
+            guard.ProcessRow(int(a), int(b), c)
+            for a, b, c in (line.split(" ", 2) for line in rows.splitlines())
+        ]):
+            self.assertEqual(guard.decide("pkill -f safe-child")[0], 2)
+
+    def test_static_protection_is_added_to_live_table(self) -> None:
+        rows = [guard.ProcessRow(i, 1, f"/usr/bin/idle-{i}") for i in range(1, 42)]
+        self.assertTrue(guard.classify("pkill -f tartci-launcher", process_rows=rows))
+
+    def test_partial_table_fails_closed(self) -> None:
+        partial = "\n".join(f"{i} 1 /usr/bin/idle-{i}" for i in range(1, 41))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial-ps.txt"
+            path.write_text(partial + "\n", encoding="utf-8")
+            old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(path)
+            try:
+                self.assertEqual(guard.decide("pkill -f harmless-worker")[0], 2)
+            finally:
+                os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
+
+    def test_slow_ps_fails_closed(self) -> None:
+        with mock.patch.object(guard.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            old = os.environ.pop("TARTCI_GUARD_PS_SNAPSHOT", None)
+            try:
+                self.assertEqual(guard.decide("pkill -f harmless-worker")[0], 2)
+            finally:
+                if old is not None:
+                    os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
 
     def test_benign_kills_are_the_control(self) -> None:
         for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",
-                        "kill -1 1234", "pkill a",
+                        "kill -1 1234",
                         "pkill -u $USER worker-job", "pkill -U 1234 worker-job",
                         "pkill -G 1234 worker-job", "pkill -g 1234 worker-job",
                         "pkill -t ttys001 worker-job"):
@@ -182,6 +323,10 @@ class ClassifierTests(unittest.TestCase):
         # Only the exact value counts.
         self.assertEqual(guard.decide(
             f"TARTCI_ALLOW_RAW_LAUNCHCTL=0 launchctl kickstart -k gui/501/{LANE}")[0], 2)
+        code, message = guard.decide(
+            "TARTCI_ALLOW_RAW_LAUNCHCTL=1 kill $(pgrep -f tartci-launcher)")
+        self.assertEqual(code, 2)
+        self.assertIn("broad process kill", message)
 
 
 class HeredocTests(unittest.TestCase):

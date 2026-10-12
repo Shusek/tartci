@@ -2834,15 +2834,30 @@ replaces_launchd_labels=REPLACEMENT
                         self.assertEqual(set(order[:len(gate)]), gate)
                         self.assertEqual(set(order[len(gate):]), release)
         self.assertEqual(seen, 2 * len(HOST_CONFIGS))
-        release_rows = {
-            (row["profile"], row["lane"], row["class_label"])
-            for row in fleet.advertised_labels_snapshot(
-                list(HOST_CONFIGS.values()), None)["registrations"]
-            if (row["class_label"] or "").startswith("pulp-release-")
-        }
+        # Publication is an operational flag.  Use published copies of the
+        # profile fixtures so this declaration test always covers every host,
+        # including one temporarily withdrawn from production.
+        with tempfile.TemporaryDirectory() as td:
+            publication_paths = []
+            for config in HOST_CONFIGS.values():
+                body = config.read_text().replace(
+                    "published = false", "published = true", 1)
+                path = Path(td) / config.name
+                path.write_text(body)
+                publication_paths.append(path)
+            published_profiles = {
+                fleet.load(path)["name"] for path in publication_paths
+            }
+            release_rows = {
+                (row["profile"], row["lane"], row["class_label"])
+                for row in fleet.advertised_labels_snapshot(
+                    publication_paths, None)["registrations"]
+                if (row["class_label"] or "").startswith("pulp-release-")
+            }
         self.assertEqual(release_rows, {
             (f"{host}-macos-fleet", "pulp-gate", cls)
-            for host in ("m1", "m3", "m5")
+            for host in (profile.removesuffix("-macos-fleet")
+                         for profile in published_profiles)
             for cls in ("pulp-release-tagged", "pulp-release-pr-gate")
         } | {
             ("m5-macos-fleet", "pulp-release", cls)
