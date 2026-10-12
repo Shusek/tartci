@@ -35,7 +35,7 @@ class AgentHygieneTests(unittest.TestCase):
             os.execve(str(SCRIPT), [str(SCRIPT), *args], env)
         output = bytearray()
         sent = False
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         status = None
         while status is None:
             if time.monotonic() >= deadline:

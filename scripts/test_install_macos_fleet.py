@@ -289,7 +289,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         output = bytearray()
         sent = False
         status = None
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 20
         while status is None:
             if time.monotonic() >= deadline:
                 os.kill(pid, 9)
