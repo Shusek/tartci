@@ -2862,9 +2862,6 @@ replaces_launchd_labels=REPLACEMENT
             (f"{host}-macos-fleet", "pulp-gate", cls)
             for host in (profile.removesuffix("-macos-fleet")
                          for profile in published_profiles)
-=======
-            for host in ("m1", "m3", "m5", "m5studio")
->>>>>>> theirs
             for cls in ("pulp-release-tagged", "pulp-release-pr-gate")
         } | {
             ("m5-macos-fleet", "pulp-release", cls)
