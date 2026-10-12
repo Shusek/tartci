@@ -6,43 +6,37 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
+import contextlib
+import io
+import runpy
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import launchctl_guard as guard
-from test_launchctl_guard import ALLOWED, BLOCKED, BROAD_KILLS, PS_FIXTURE
+from test_launchctl_guard import PS_FIXTURE
 
 
-MUST_REFUSE = tuple(dict.fromkeys(
-    list(BLOCKED) + list(BROAD_KILLS) + [
-        "pkill -f runner.sh --loop", "pkill -f TartCILauncher",
-        "pkill -f 'zsh -c source'", "pkill -f shell-snapshots",
-        "pkill -f 'zsh -lc'", "pkill -f claude-proxy", "pkill -f subrouter",
-        "pkill -f tartci-launcher", "pkill -f 'codex resume'",
-        "pkill -f 'sr codex'", "pkill -f 'claude proxy'", "pkill -f 'login -flp'",
-        "pkill -f 'shipyard-daemon-launcher'", "pkill -f 'Runner.Listener'",
-        "ssh m3 'for p in $(pgrep -f codex); do kill $p; done'",
-        "ssh m3 \"kill $(pgrep -f 'sr codex')\"",
-        "ssh m3 'kill $(pgrep -f tartci-launcher)'",
-        "bash -c \"kill $(pgrep -f 'sr codex')\"",
-        "eval \"kill $(pgrep -f tartci-launcher)\"",
-        "pgrep -f 'sr codex' | xargs sh -c 'kill $0'",
-        "perl -e 'kill 9, grep(/sr codex/, qx(pgrep -f sr codex))'",
-        "python3 -c \"os.kill(1, 9) # pgrep -f sr codex\"",
-        "awk 'system(\"kill $(pgrep -f tartci-launcher)\")'",
-        "ps aux | grep tartci-launcher | awk '{print $2}' | xargs kill -9",
-        "kill $(ps aux | grep tartci-launcher | awk '{print $2}')",
-        "PAT=tartci-launcher; kill $(pgrep -f $PAT)",
-    ]
-))
+_probe_path = Path("/Volumes/Workshop/Code/agent-worktrees/infra-review3/tc487/probe5.py")
+_old_argv = sys.argv
+sys.argv = [str(_probe_path), str(Path(__file__).resolve().parent)]
+with contextlib.redirect_stdout(io.StringIO()):
+    _probe5 = runpy.run_path(str(_probe_path),
+                             init_globals={"UNSET_PATTERN": "UNSET_PATTERN", "NAME": "NAME"})
+sys.argv = _old_argv
 
-MUST_ALLOW = tuple(dict.fromkeys(list(ALLOWED) + [
-    "pgrep -f 'sr codex'", "pidof tartci-launcher",
-    "grep -i kill notes.txt | less", "grep pkill README.md | cat",
-    "ps aux | grep 'kill' | less", "grep -rn 'pkill -f' scripts/",
-]))
+_PROBE6_NEW = (
+    "ssh m3 '/usr/bin/kill $(pgrep -f \"sr codex\")'",
+    "ssh m3 'nice -n 5 kill $(pgrep -f tartci-launcher)'",
+    "ssh m3 'exec kill -9 $(pgrep -f \"sr codex\")'",
+    "ssh m3 'command kill $(pgrep -f tartci-launcher)'",
+    "pkill codex", "killall codex", "pkill tartci-launcher", "killall -m 'tartci.*'",
+    "pkill -x sr", "ssh m3 'killall -m \"tartci.*\"'", "ssh m3 pkill codex",
+    "kill -9 $(pgrep -x codex)", "kill $(pgrep codex)",
+)
+MUST_REFUSE = tuple(dict.fromkeys(list(_probe5["must_refuse"]) + list(_PROBE6_NEW)))
+MUST_ALLOW = tuple(_probe5["read_only"])
 
 
 def _rows(path: Path) -> list[guard.ProcessRow]:
@@ -55,11 +49,13 @@ def _rows(path: Path) -> list[guard.ProcessRow]:
 
 
 FULL_ROWS = _rows(PS_FIXTURE)
-PARTIAL_ROWS = FULL_ROWS[:40]
+PS_M5 = Path(__file__).resolve().parent / "fixtures" / "launchctl_guard_ps_m5.txt"
+M5_ROWS = _rows(PS_M5)
+PARTIAL_ROWS = M5_ROWS[:100]
 TABLE_STATES = {
     "m3": FULL_ROWS,
-    "m5": FULL_ROWS,
-    "partial-40": PARTIAL_ROWS,
+    "m5": M5_ROWS,
+    "partial-100": PARTIAL_ROWS,
     "no-table": None,
     "slow-ps": None,
 }

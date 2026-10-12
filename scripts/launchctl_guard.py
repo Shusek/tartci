@@ -108,6 +108,7 @@ BROAD_KILL_COMMAND_LINES = (
     "/Users/danielraffel/.local/bin/Runner.Listener --start",
     "/usr/bin/login -flp daniel",
     "sr codex resume 01a126fe-4702-7b62-9852-63e986e1379c",
+    "sr claude proxy --resume 08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb",
     "/usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh",
     "/Users/danielraffel/.local/bin/studio-pulp-gate",
     "/Users/danielraffel/.local/bin/claude proxy --resume",
@@ -187,6 +188,23 @@ def _protected_process_commands(rows: list[ProcessRow]) -> list[str]:
     return [by_pid[pid].command for pid in protected]
 
 
+def _protected_process_names(rows: list[ProcessRow] | None) -> set[str] | None:
+    if rows is None:
+        return None
+    names: set[str] = set()
+    for command in _protected_process_commands(rows):
+        words = command.split()
+        if words:
+            names.add(os.path.basename(words[0]))
+        for word in words:
+            base = os.path.basename(word)
+            if re.search(r"(?:tartci[-_]launcher|runner|codex|claude|subrouter|"
+                         r"login|bash|sh|zsh|shipyard-daemon|Runner\.Listener)",
+                         base, re.I):
+                names.add(base)
+    return names
+
+
 def _matches_live_protected(pattern: str, rows: list[ProcessRow] | None) -> bool | None:
     if rows is None:
         return None
@@ -214,17 +232,15 @@ RAW_KILL_VERB = re.compile(
     re.I,
 )
 RAW_PID_SOURCE = re.compile(r"\b(?:pgrep|pidof|ps|lsof)\b|(?:^|\s)-[A-Za-z]*[fx]\b", re.I)
+STATIC_NAME_HINT = re.compile(r"(?:tartci|codex|claude|runner|listener|shell|zsh|bash|login|shipyard)", re.I)
 
 
 def _has_raw_kill_verb(command: str) -> bool:
-    if RAW_KILL_VERB.search(command):
+    # Remove grep-like command segments first: kill words there are data.
+    masked = re.sub(r"\b(?:grep|egrep|rg|ag|git\s+grep|echo)\b[^;&|\n]*", "", command, flags=re.I)
+    if RAW_KILL_VERB.search(masked) or re.search(r"\b(?:kill|pkill|killall)\b", masked, re.I):
         return True
-    quoted_kill = re.search(r"[\"']\s*(?:(?:sudo|env|nohup|timeout)\s+)*(?:/[^\s/]+/)?kill\b",
-                            command, re.I)
-    if not quoted_kill:
-        return False
-    prefix = command[:quoted_kill.start()]
-    return not re.search(r"\b(?:grep|egrep|rg|git\s+grep)\b[^;|\n]*$", prefix, re.I)
+    return False
 
 
 def _raw_process_hits(command: str, rows: list[ProcessRow] | None) -> list[Hit]:
@@ -525,12 +541,17 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int,
                 skip = True
             elif not word.startswith("-"):
                 operands.append(word)
+        protected_names = _protected_process_names(process_rows)
         hits: list[Hit] = [
             Hit(head, target,
                 "bare-name kill would terminate every matching agent shell/process")
             for target in operands
             if (head not in ("pgrep", "pidof") or pid_source_kill)
-            and any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
+            and (any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
+                 or (head in ("pkill", "killall") and
+                     ((STATIC_NAME_HINT.search(target) and _matches_static_fallback(target))
+                      or protected_names is None
+                      or any(_matches(target, name, full=True) for name in protected_names))))
         ]
         # A standalone pgrep is observational.  A surrounding xargs/command
         # substitution is classified separately by the kill command it feeds.
