@@ -139,6 +139,11 @@ class Trigger(Case):
 
 
 class PreCloneCancellation(Case):
+    def test_verifying_check_never_reports_an_open_breaker(self):
+        vb.verify("post_update", now=T0)
+        result = self.check(T0 + 1, lane="probe-lane")
+        self.assertFalse(result["breaker_open"])
+
     def test_admission_error_after_granted_probe_is_not_unreported(self):
         # Today's outage sequence: verification starts, a probe is granted,
         # admission fails before clone, and no VM ever reaches DHCP reporting.
@@ -331,6 +336,16 @@ class Shell(Case):
         )
         self.assertIn("rc=75 backoff=1 open=1", out.stdout, out.stderr)
 
+    def test_verifying_backoff_exports_closed_flag_to_the_runner(self):
+        (self.tmp / "vm-dhcp" / "breaker.json").write_text(json.dumps(
+            {"state": "verifying", "probe_lane": "other-lane",
+             "probe_started_at": T0, "boot_time": T0 - 86400, "streak": []}))
+        out = self.run_lib(
+            "rc=0; tartci_vm_dhcp_check l || rc=$?; "
+            "echo \"rc=$rc backoff=$VM_DHCP_BACKOFF open=$VM_DHCP_BREAKER_OPEN\"\n",
+            {"TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400)})
+        self.assertIn("rc=75 backoff=1 open=0", out.stdout, out.stderr)
+
     def test_knob_off_reads_and_writes_nothing(self):
         before = (self.tmp / "vm-dhcp" / "breaker.json").read_text()
         out = self.run_lib("tartci_vm_dhcp_record l no_ip v1; tartci_vm_dhcp_record l no_ip v2\n"
@@ -364,6 +379,27 @@ class Shell(Case):
 
 
 class Wiring(unittest.TestCase):
+    def test_once_releases_a_probe_after_a_pre_clone_return(self):
+        body = RUNNER.read_text()
+        call = '  run_one 1 "$selected_labels" "$selected_tier" || run_rc=$?'
+        self.assertIn(call, body)
+        after = body[body.index(call) + len(call):]
+        cancel = after.index('tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone')
+        self.assertIn('[ "${VM_DHCP_PROBE:-0}" = 1 ]', after[:cancel])
+        self.assertIn('[ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]', after[:cancel])
+        broken = body.replace(
+            '  if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then\n'
+            '    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone\n'
+            '  fi\n', '', 1)
+        with self.assertRaises(AssertionError):
+            self.assertIn('once_pre_clone', broken)
+
+    def test_pre_clone_paths_keep_probe_cancellation_coverage(self):
+        body = RUNNER.read_text()
+        for reason in ('job_claim_covered', 'admission_precheck', 'warm_lease_denied',
+                       'demand_gone', 'lease_denied', 'pre_clone_error'):
+            self.assertIn(f'tartci_vm_dhcp_cancel "${{TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}}" {reason}', body)
+
     def test_shipped_loop_cancel_clears_a_real_probe_and_noop_lib_fails(self):
         import re
         source = RUNNER.read_text()

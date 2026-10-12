@@ -76,7 +76,7 @@ class ShippedAccounting:
         assert idle is not None, "the idle pass no longer clears the streak"
         self.idle = idle.group("block")
 
-    def run(self, entries: list[str]) -> dict:
+    def run(self, entries: list[str], phase: str = "admission-error") -> dict:
         """`entries` is a script of 'served', 'unserved' and 'idle' passes."""
         steps = []
         for entry in entries:
@@ -108,7 +108,7 @@ class ShippedAccounting:
             'SERVING_BLOCKED_SINCE=""\n'
             "SERVING_BLOCKED_STREAK=0\n"
             'SERVING_BLOCKED_LAST_PHASE=""\n'
-            'LAST_HEARTBEAT_PHASE="admission-error"\n'
+            'LAST_HEARTBEAT_PHASE="' + phase + '"\n'
             "CURRENT_SERVED=0\n"
             "q=1\n"
             + "\n".join(steps)
@@ -164,6 +164,29 @@ class ServeLessStreakTests(unittest.TestCase):
     def test_the_last_phase_travels_with_the_streak(self) -> None:
         value = self.accounting.run(["unserved"])
         self.assertEqual(value["last_phase"], "admission-error")
+
+    def test_admission_deferrals_are_not_labeled_as_failures(self) -> None:
+        for phase in ("admission-precheck-deferred", "admission-deferred"):
+            value = self.accounting.run(["unserved"], phase=phase)
+            self.assertEqual(value["streak"], 1)
+            self.assertEqual(value["last_phase"], phase)
+            # Execute the shipped accounting with the deferred phase and
+            # prove it emits the distinct non-outage cause.
+            block = self.accounting.accounting
+            script = (
+                "set -euo pipefail\n"
+                "tartci_boundary_proof_abandon(){ :; }\n"
+                "tartci_job_claim_release(){ :; }\n"
+                'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
+                'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
+                'LAST_HEARTBEAT_PHASE="%s"\nCURRENT_SERVED=0\n'
+                'JOB_CLAIM_CONTENDED=0\nPRE_CLONE_DEMAND_GONE=0\n'
+                'VM_DHCP_BACKOFF=0\nVM_DHCP_BREAKER_OPEN=0\nrun_rc=75\n'
+                '%s\nprintf "%%s\\n" "$SERVING_BLOCKED_CAUSE"\n'
+            ) % (phase, block)
+            result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                    text=True, check=True)
+            self.assertEqual(result.stdout.strip().splitlines()[-1], "admission deferred")
 
     def test_runner_loop_produces_dhcp_breaker_cause_only_for_a_real_open_breaker(self) -> None:
         block = self.accounting.accounting

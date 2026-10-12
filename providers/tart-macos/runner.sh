@@ -2029,6 +2029,11 @@ run_one(){
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
+  # Test harnesses can execute this function without sourcing the optional
+  # DHCP library. Production sources the real implementation before entering.
+  if ! declare -F tartci_vm_dhcp_cancel >/dev/null; then
+    tartci_vm_dhcp_cancel(){ :; }
+  fi
   # Before the first early return, not beside the other CURRENT_* resets: the
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
@@ -2074,6 +2079,7 @@ run_one(){
   tartci_job_claim_acquire "$vm" "$selected_labels" "$selected_tier" \
     "${CURRENT_SELECTED_QUEUED:-}" "$selected_runner_api_root" || claim_rc=$?
   if [ "$claim_rc" -eq 75 ]; then
+    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" job_claim_covered
     heartbeat job-claim-covered
     return 75
   fi
@@ -2117,6 +2123,7 @@ run_one(){
       heartbeat "$([ "$precheck_rc" -eq 3 ] && printf admission-precheck-deferred || printf admission-precheck-error)"
       event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
         "rc=$precheck_rc pre_clone=true $precheck_detail"
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" admission_precheck
       note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
       return "$precheck_rc"
     fi
@@ -2159,6 +2166,7 @@ run_one(){
       LAST_RUN_LEASE_DENIED=1
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" warm_lease_denied
       heartbeat vm-lease-denied
       return 75
     fi
@@ -2178,6 +2186,7 @@ run_one(){
     if tartci_assignment_v2_pre_clone_check_enabled \
        && tartci_assignment_v2_pre_clone_skip "$selected_tier" "$selected_labels"; then
       PRE_CLONE_DEMAND_GONE=1
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" demand_gone
       note "[$i] selected class demand is gone or a preferred class is waiting (${ASSIGNMENT_V2_PRE_MINT_BLOCKER}) — not cloning"
       return 75
     fi
@@ -2193,11 +2202,15 @@ run_one(){
       # can only see heartbeat age has no choice but to call it stale.
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" lease_denied
       heartbeat vm-lease-denied
       tartci_warm_note_lease_denial
       return "$lease_rc"
     fi
-    [ "$lease_rc" -eq 0 ] || return "$lease_rc"
+    if [ "$lease_rc" -ne 0 ]; then
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" pre_clone_error
+      return "$lease_rc"
+    fi
   fi
   ip="$CURRENT_IP"
   t_booted="$(now_epoch)"
@@ -2815,5 +2828,12 @@ else
   jit_admission_denied "$selected_group_id" "$selected_labels" \
     && die "JIT admission is blocked for this exact repository/group/class contract; inspect $JIT_DENIAL_FILE"
   note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$selected_labels workflow_tier=$selected_tier"
-  run_one 1 "$selected_labels" "$selected_tier"
+  run_rc=0
+  run_one 1 "$selected_labels" "$selected_tier" || run_rc=$?
+  # --once has no loop-tail accounting pass. Release a granted probe when the
+  # one-shot turn returned before cloning, exactly as loop mode does.
+  if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
+    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone
+  fi
+  exit "$run_rc"
 fi
