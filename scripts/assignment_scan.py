@@ -726,10 +726,11 @@ class AssignmentScanner:
         if self.require_head_repo:
             head = run.get("head_repository")
             head_name = head.get("full_name") if isinstance(head, dict) else None
-            # A fork run must never be admitted to a self-hosted lane. Missing
-            # provenance is an observation failure, not permission to run it.
+            # A fork run must never be admitted to a self-hosted lane. GitHub
+            # returns null when the fork was deleted; that run is not demand
+            # for this first-party lane and must not blind the whole scan.
             if not isinstance(head_name, str) or not head_name.strip():
-                raise ScanError(f"run {run_id} has no head_repository provenance")
+                return 0
             if head_name.strip().lower() != self.require_head_repo:
                 return 0
         # A run already proved stale is not fetched again. That fetch is not
