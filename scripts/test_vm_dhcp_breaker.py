@@ -138,6 +138,25 @@ class Trigger(Case):
         self.assertEqual(self.state()["state"], "closed")
 
 
+class PreCloneCancellation(Case):
+    def test_admission_error_after_granted_probe_is_not_unreported(self):
+        # Today's outage sequence: verification starts, a probe is granted,
+        # admission fails before clone, and no VM ever reaches DHCP reporting.
+        vb.verify("post_update", now=T0)
+        self.assertEqual(self.check(T0 + 1, lane="probe-lane")["action"], "probe")
+        cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="admission_error"),
+                               now=T0 + 2)
+        self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
+        state = self.state()
+        self.assertEqual(state["state"], "verifying")
+        self.assertIsNone(state.get("probe_lane"))
+        self.assertEqual(state.get("consecutive_unreported"), 0)
+        self.assertNotEqual(state.get("cause"), "probe_unreported")
+        # A later lane can take the still-required verification probe; the
+        # cancelled turn did not open the breaker or consume a VM.
+        self.assertEqual(self.check(T0 + 3, lane="next-lane")["action"], "probe")
+        self.assertEqual(self.state()["state"], "verifying")
+
 class Open(Case):
     def open(self) -> None:
         self.record("no_ip", T0)

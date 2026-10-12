@@ -534,6 +534,25 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         return {"action": "probe", "events": events}
 
 
+def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
+    """Release a probe that never cloned or reached the DHCP address wait."""
+    now = time.time() if now is None else now
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        lane = value.get("probe_lane")
+        if lane != args.lane or value.get("state") not in ("open", "verifying"):
+            return {"action": "noop", "events": []}
+        value["probe_lane"] = None
+        value["probe_started_at"] = None
+        # A cancelled admission/lease turn never cloned a VM and therefore is
+        # not an unanswered DHCP probe.  It must not contribute to either
+        # unreported streak or failed-probe accounting.
+        value["consecutive_unreported"] = 0
+        save(path, value)
+        return {"action": "cancelled", "events": [["vm_dhcp_probe_cancelled", fmt({
+            "lane": args.lane, "reason": getattr(args, "reason", "pre_clone"),
+        })]]}
+
 def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
     k = setting("TARTCI_VM_DHCP_K", K)
@@ -840,6 +859,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--outcome", choices=["ip", "no_ip"], required=True)
     r.add_argument("--lane", required=True)
     r.add_argument("--vm", default="")
+    x = sub.add_parser("cancel")
+    x.add_argument("--lane", required=True)
+    x.add_argument("--reason", default="pre_clone")
     sub.add_parser("probe-now")
     v = sub.add_parser("verify")
     v.add_argument("--reason", default="operator")
@@ -861,6 +883,8 @@ def main(argv: list[str] | None = None) -> int:
             result = probe_now()
         elif args.command == "verify":
             result = verify(args.reason)
+        elif args.command == "cancel":
+            result = cancel(args)
         else:
             result = check(args) if args.command == "check" else record(args)
     except Exception as exc:  # noqa: BLE001 - the caller fails open
