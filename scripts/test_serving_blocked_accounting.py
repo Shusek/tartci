@@ -163,6 +163,41 @@ class ServeLessStreakTests(unittest.TestCase):
         value = self.accounting.run(["unserved"])
         self.assertEqual(value["last_phase"], "admission-error")
 
+    def test_runner_loop_produces_dhcp_breaker_cause_only_for_a_real_open_breaker(self) -> None:
+        block = self.accounting.accounting
+
+        def run(*, open_breaker: int, backoff: int, phase: str,
+                block_source: str = block) -> dict[str, str | int]:
+            script = (
+                "set -euo pipefail\n"
+                'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
+                'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
+                'LAST_HEARTBEAT_PHASE="%s"\nCURRENT_SERVED=0\n'
+                'JOB_CLAIM_CONTENDED=0\nPRE_CLONE_DEMAND_GONE=0\n'
+                'VM_DHCP_BACKOFF=%d\nVM_DHCP_BREAKER_OPEN=%d\nrun_rc=75\n'
+                '%s\n'
+                'printf "{\\"streak\\":%%s,\\"cause\\":\\"%%s\\"}\\n" '
+                '"$SERVING_BLOCKED_STREAK" "$SERVING_BLOCKED_CAUSE"\n'
+            ) % (phase, backoff, open_breaker, block_source)
+            result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                    text=True, check=True)
+            return json.loads(result.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(run(open_breaker=1, backoff=0, phase="admission-precheck-error"),
+                         {"streak": 1, "cause": "dhcp_breaker"})
+        # Verification backoff is not an outage and must clear the streak.
+        self.assertEqual(run(open_breaker=0, backoff=1, phase="vm-dhcp-breaker-open"),
+                         {"streak": 0, "cause": ""})
+        broken_block = block.replace(
+            'elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then',
+            'elif false; then', 1)
+        self.assertNotEqual(
+            run(open_breaker=1, backoff=0, phase="admission-precheck-error",
+                block_source=broken_block),
+            {"streak": 1, "cause": "dhcp_breaker"},
+            "removing the runner-side DHCP cause producer must break this test",
+        )
+
     # -- the ratio property --------------------------------------------------
 
     def test_interleaved_service_never_accumulates(self) -> None:

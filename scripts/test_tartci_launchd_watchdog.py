@@ -12,8 +12,10 @@ Run:  python3 scripts/test_tartci_launchd_watchdog.py
 from __future__ import annotations
 
 import testing_support  # noqa: E402
+import json
 import os
 import plistlib
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -23,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
 
 FAILS: list[str] = []
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def check(cond: bool, msg: str) -> None:
@@ -835,6 +838,19 @@ check(wd.should_heal([NOW - 4000, NOW - 5000, NOW - 6000], NOW, WINDOW, MAXH),
 # heals_in_window prunes correctly.
 kept = wd.heals_in_window([NOW - 10, NOW - 4000], NOW, WINDOW)
 check(kept == [NOW - 10], f"heals_in_window prune: {kept}")
+
+# Smoke the real entrypoint after the serving-truth alert pass was removed;
+# #509 owns that function, so this must remain callable when the branches land
+# together and must not fail with a signature collision.
+proc = subprocess.run(
+    [sys.executable, str(ROOT / "scripts" / "tartci_launchd_watchdog.py"),
+     "--status", "--json"], capture_output=True, text=True, check=False, timeout=30,
+)
+check(proc.returncode == 0, f"watchdog status entrypoint failed: {proc.stderr}")
+try:
+    json.loads(proc.stdout)
+except ValueError as exc:
+    check(False, f"watchdog status did not emit JSON: {exc}")
 
 
 if FAILS:

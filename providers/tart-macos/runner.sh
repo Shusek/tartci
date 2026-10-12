@@ -2684,18 +2684,24 @@ if [ "$LOOP" = 1 ]; then
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
       if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
-         || [ "${VM_DHCP_BACKOFF:-0}" = 1 ] \
+         || { [ "${VM_DHCP_BACKOFF:-0}" = 1 ] && [ "${VM_DHCP_BREAKER_OPEN:-0}" != 1 ]; } \
          || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
         SERVING_BLOCKED_CAUSE=""
+      elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then
+        SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
+        SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        SERVING_BLOCKED_CAUSE="dhcp_breaker"
+        [ -n "$SERVING_BLOCKED_SINCE" ] \
+          || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       else
         SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
         SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
         case "$LAST_HEARTBEAT_PHASE" in
-          vm-dhcp-breaker-open) SERVING_BLOCKED_CAUSE="dhcp_breaker" ;;
-          admission-precheck-error|admission-precheck-deferred|admission-error|admission-deferred) SERVING_BLOCKED_CAUSE="admission failing" ;;
+          admission-precheck-error|admission-error) SERVING_BLOCKED_CAUSE="admission failing" ;;
+          admission-precheck-deferred|admission-deferred) SERVING_BLOCKED_CAUSE="admission deferred" ;;
           *) SERVING_BLOCKED_CAUSE="unserved" ;;
         esac
         [ -n "$SERVING_BLOCKED_SINCE" ] \

@@ -197,7 +197,8 @@ class Open(Case):
 
     def test_lanes_back_off_until_the_probe_cadence(self):
         self.open()
-        self.assertEqual(self.check(T0 + 61), {"action": "backoff", "events": []})
+        self.assertEqual(self.check(T0 + 61),
+                         {"action": "backoff", "breaker_open": True, "events": []})
         result = self.check(T0 + 60 + 300)
         self.assertEqual(result["action"], "probe")
         self.assertIn("trigger=cadence", result["events"][0][1])
@@ -205,7 +206,8 @@ class Open(Case):
     def test_one_probe_per_cadence_across_lanes(self):
         self.open()
         self.assertEqual(self.check(T0 + 400, lane="a")["action"], "probe")
-        self.assertEqual(self.check(T0 + 401, lane="b"), {"action": "backoff", "events": []})
+        self.assertEqual(self.check(T0 + 401, lane="b"),
+                         {"action": "backoff", "breaker_open": True, "events": []})
 
     def test_two_lanes_racing_for_the_probe_get_exactly_one(self):
         self.open()

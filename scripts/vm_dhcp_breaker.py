@@ -491,7 +491,7 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         value = load(path)
         events: list[list[str]] = []
         if value.get("_source") == "corrupt":
-            return {"action": "clone", "events": events}
+            return {"action": "clone", "breaker_open": False, "events": events}
         booted = boot_time()
         recorded = value.get("boot_time")
         if booted is not None and (recorded is None or abs(float(recorded) - booted) > 1):
@@ -500,11 +500,11 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if value["state"] == "verifying":
             action, more = verifying_check(value, args.lane, now)
             save(path, value)
-            return {"action": action, "events": events + more}
+            return {"action": action, "breaker_open": False, "events": events + more}
         if value["state"] != "open":
             if events:
                 save(path, value)
-            return {"action": "clone", "events": events}
+            return {"action": "clone", "breaker_open": False, "events": events}
         last = value.get("last_probe_at")
         if last is None:
             last = value.get("opened_at")
@@ -520,7 +520,7 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if not (due or moved or asked):
             if not isinstance(seen, dict) or moved:
                 save(path, value)
-            return {"action": "backoff", "events": events}
+            return {"action": "backoff", "breaker_open": True, "events": events}
         if value.get("probe_lane"):
             value["consecutive_unreported"] = int(value.get("consecutive_unreported") or 0) + 1
         value["probe_prev_probes"] = int(value.get("probes") or 0)
@@ -533,7 +533,7 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
             "lane": args.lane,
             "trigger": "operator" if asked else "chain_changed" if moved else "cadence",
             "probe": value["probes"]})])
-        return {"action": "probe", "events": events}
+        return {"action": "probe", "breaker_open": True, "events": events}
 
 
 def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
