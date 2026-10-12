@@ -95,6 +95,9 @@ BROAD_KILLS = [
     "pkill -f 'zsh -c source'",
     "pkill -f shell-snapshots",
     "pkill -f 'zsh -lc'",
+    "pkill -f claude-proxy",
+    "pkill -f subrouter",
+    "pkill -f /bin/sh",
     "pkill python3.12",
     "kill -9 -1",
     "kill -TERM -1",
@@ -112,6 +115,17 @@ BROAD_KILLS = [
 
 
 class ClassifierTests(unittest.TestCase):
+    def test_proxy_snapshot_and_sh_process_shapes_are_refused(self) -> None:
+        # These are command-line shapes captured from ``ps -axo command`` on
+        # the fleet.  ``pkill -f`` matches the complete command line, so each
+        # pattern must be checked against these real paths rather than only a
+        # process basename.
+        for command in ("pkill -f claude-proxy", "pkill -f subrouter", "pkill -f /bin/sh"):
+            with self.subTest(command=command):
+                code, message = guard.decide(command)
+                self.assertEqual(code, 2, command)
+                self.assertIn("tartci launchd heal", message)
+
     def test_every_raw_lane_mutation_is_blocked(self) -> None:
         for command in BLOCKED:
             with self.subTest(command=command):
