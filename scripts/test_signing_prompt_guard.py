@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -157,7 +158,25 @@ class PinnedKeychainTests(Host):
                                  r'\$\{keychain_args\[@\]\+"\$\{keychain_args\[@\]\}"\} --sign')
         source = (HERE / "fleet_self_update.py").read_text()
         body = source[source.index("def build_launcher("):]
-        self.assertIn('"--profile", str(profile), *pinned]', body[:body.index("\ndef ")])
+        self.assertIn(
+            '"--profile", str(profile),\n'
+            '                           "--python", launcher_python, *pinned]',
+            body[:body.index("\ndef ")],
+        )
+
+    def test_launcher_builder_resolves_a_real_interpreter_without_a_pin(self) -> None:
+        env = {**os.environ, "TARTCI_PYTHON": "", "TARTCI_RENDER_PYTHON": ""}
+        result = subprocess.run(
+            [str(HERE / "build_macos_launcher.sh"), "--support-root", str(HERE.parent),
+             "--print-render-python"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        resolved = Path(result.stdout.strip())
+        self.assertTrue(resolved.is_absolute())
+        self.assertTrue(resolved.is_file())
+        self.assertTrue(os.access(resolved, os.X_OK))
+        self.assertNotEqual(resolved.name, "python3")
 
 
 if __name__ == "__main__":
