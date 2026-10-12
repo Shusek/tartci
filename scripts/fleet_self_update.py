@@ -1924,11 +1924,6 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             "soaking": " (undeployed commits are still soaking)",
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
-    if apply and launch_helper(cfg) is not None:
-        _checkout(cfg, sys_, target)
-    if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
-                                   refresh=bool(refresh)):
-        return EXIT_OK
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
     receipt.value.update(requested_target=skew.get("requested_target"),
                          selected_target=skew.get("selected_target"),
@@ -1936,6 +1931,18 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
+    try:
+        if apply and launch_helper(cfg) is not None:
+            _checkout(cfg, sys_, target)
+        if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
+                                       refresh=bool(refresh)):
+            return EXIT_OK
+    except (FileNotFoundError, PermissionError) as exc:
+        reason = f"target dispatcher unavailable: {type(exc).__name__}: {exc}"
+        receipt.step("refused", reason, ok=False)
+        receipt.finish("refused", reason)
+        print(f"self-update: REFUSED {reason}", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         me = self_host_id(cfg)
         # Observe peers before any later gate can defer this run.  In

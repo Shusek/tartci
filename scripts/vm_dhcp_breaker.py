@@ -523,6 +523,8 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
             return {"action": "backoff", "events": events}
         if value.get("probe_lane"):
             value["consecutive_unreported"] = int(value.get("consecutive_unreported") or 0) + 1
+        value["probe_prev_probes"] = int(value.get("probes") or 0)
+        value["probe_prev_last_probe_at"] = value.get("last_probe_at")
         value["last_probe_at"] = now
         value["probe_lane"] = args.lane
         value["probes"] = int(value.get("probes") or 0) + 1
@@ -533,6 +535,32 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
             "probe": value["probes"]})])
         return {"action": "probe", "events": events}
 
+
+def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
+    """Release a probe that never cloned or reached the DHCP address wait."""
+    now = time.time() if now is None else now
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        lane = value.get("probe_lane")
+        if lane != args.lane or value.get("state") not in ("open", "verifying"):
+            return {"action": "noop", "events": []}
+        if value.get("state") == "open":
+            value["probes"] = int(value.get("probe_prev_probes") or 0)
+            previous_last = value.get("probe_prev_last_probe_at")
+            if previous_last is None:
+                value.pop("last_probe_at", None)
+            else:
+                value["last_probe_at"] = previous_last
+        value["probe_lane"] = None
+        value["probe_started_at"] = None
+        value.pop("probe_prev_probes", None)
+        value.pop("probe_prev_last_probe_at", None)
+        # A cancelled admission/lease turn never cloned a VM and therefore is
+        # not an unanswered DHCP probe. Preserve any earlier unreported streak.
+        save(path, value)
+        return {"action": "cancelled", "events": [["vm_dhcp_probe_cancelled", fmt({
+            "lane": args.lane, "reason": getattr(args, "reason", "pre_clone"),
+        })]]}
 
 def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
@@ -550,6 +578,8 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
                                                  "result": args.outcome})])
             value["probe_lane"] = None
             value["consecutive_unreported"] = 0
+            value.pop("probe_prev_probes", None)
+            value.pop("probe_prev_last_probe_at", None)
         if args.outcome == "ip":
             if verifying:
                 events.append(verified(value, now, args.lane, late=False))
@@ -840,6 +870,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--outcome", choices=["ip", "no_ip"], required=True)
     r.add_argument("--lane", required=True)
     r.add_argument("--vm", default="")
+    x = sub.add_parser("cancel")
+    x.add_argument("--lane", required=True)
+    x.add_argument("--reason", default="pre_clone")
     sub.add_parser("probe-now")
     v = sub.add_parser("verify")
     v.add_argument("--reason", default="operator")
@@ -861,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
             result = probe_now()
         elif args.command == "verify":
             result = verify(args.reason)
+        elif args.command == "cancel":
+            result = cancel(args)
         else:
             result = check(args) if args.command == "check" else record(args)
     except Exception as exc:  # noqa: BLE001 - the caller fails open

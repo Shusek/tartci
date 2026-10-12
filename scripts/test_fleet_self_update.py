@@ -625,6 +625,47 @@ class OrchestratorGenerationTests(Base):
 class TargetOrchestratorHandoffTests(Base):
     sealed = True
 
+    def test_handoff_executes_a_real_dispatcher_child(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            checkout = home / ".local/share/tartci/update-checkout"
+            checkout.mkdir(parents=True)
+            dispatcher = checkout / "tartci"
+            dispatcher.write_text("#!/bin/sh\nprintf 'HANDOFF_EXEC:%s\\n' \"$1\"\nexit 23\n")
+            dispatcher.chmod(0o755)
+            script = ("import fleet_self_update as su; from pathlib import Path; "
+                      f"cfg=su.Config(Path({str(home)!r})); "
+                      f"su.orchestrator_generation=lambda: {INSTALLED!r}; "
+                      "su.launch_helper=lambda cfg: {'path': 'sealed'}; "
+                      f"raise SystemExit(su.handoff_target_orchestrator(cfg, {T_OLD!r}, "
+                      "apply=True, scheduled=False, refresh=False) or 0)")
+            env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts")}
+            result = subprocess.run([sys.executable, "-c", script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("HANDOFF_EXEC:fleet-macos", result.stdout)
+
+    def test_missing_dispatcher_is_a_refused_receipt(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("target dispatcher unavailable", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_non_executable_dispatcher_is_a_refused_receipt(self) -> None:
+        dispatcher = self.cfg.checkout / "tartci"
+        dispatcher.write_text("#!/bin/sh\nexit 0\n")
+        dispatcher.chmod(0o644)
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("PermissionError", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
     def test_an_installed_orchestrator_hands_off_to_the_target_checkout(self) -> None:
         calls = []
         with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
