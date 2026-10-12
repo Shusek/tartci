@@ -314,6 +314,7 @@ class AssignmentScanner:
             str(self.observation_lock_path), self.args.observation_lock_timeout,
             self.args.repo, getattr(self.args, "observation_backoff_file", None),
             getattr(self.args, "observation_backoff_seconds", 30.0),
+            getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
         ).hold() as handle:
             self.deadline = time.monotonic() + self.args.scan_timeout
             self.observation_lock_fd = os.dup(handle.fileno())
@@ -941,6 +942,16 @@ def parse_args() -> argparse.Namespace:
         "--observation-lock-file",
         default=os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_FILE")
         or str(Path.home() / ".tartci/state/queue-observation.lock"),
+    )
+    parser.add_argument(
+        "--lane-id",
+        default=os.environ.get("TARTCI_QUEUE_LANE_ID")
+        or os.environ.get("TARTCI_RUNNER_SLOT")
+        or f"supervisor-{os.getppid()}",
+    )
+    parser.add_argument(
+        "--generation",
+        default=os.environ.get("TARTCI_GENERATION") or "unknown",
     )
     parser.add_argument(
         "--observation-lock-timeout",
