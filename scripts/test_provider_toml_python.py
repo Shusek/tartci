@@ -71,9 +71,12 @@ class StaticTests(unittest.TestCase):
             'tartci_toml_python_exec "$HERE/scripts/support_agents.py"',
             'tartci_toml_python_exec "$HERE/scripts/debug_hold.py"',
         }
-        self.assertEqual({line.strip().split(' "$@"')[0]
-                          for line in source.splitlines()
-                          if "tartci_toml_python_exec" in line}, expected)
+        actual = {
+            re.search(r'tartci_toml_python_exec\s+"[^"]+"', line).group(0)
+            for line in source.splitlines()
+            if "tartci_toml_python_exec" in line
+        }
+        self.assertEqual(actual, expected)
         self.assertNotIn("tartci_toml_python_exec", source.split("cmd_launchd", 1)[1].split(
             "# Print (never write)", 1)[0])
 
