@@ -127,3 +127,17 @@ class RealReplayTests(unittest.TestCase):
                 out = alarm.alert_pass(root / "state", events, [], now=BASE)
             self.assertTrue(out["shadow"])
             self.assertFalse(opened)
+
+class QueueAbsenceTests(unittest.TestCase):
+    def test_published_host_absence_trips_while_another_host_starts(self):
+        queued = [{"id": 1, "required": True, "host": "m3",
+                   "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1200, alarm.dt.timezone.utc).isoformat()}]
+        events = [row(BASE - 60, "job_assigned", host="m5")]
+        rules = alarm.classify(events, queued, now=BASE, window_seconds=900)
+        self.assertIn("host_queued_no_job_start", {t["rule"] for t in rules})
+
+    def test_whole_fleet_zero_starts_trips_when_demand_exists(self):
+        queued = [{"id": 1, "required": True,
+                   "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1200, alarm.dt.timezone.utc).isoformat()}]
+        rules = alarm.classify([], queued, now=BASE, window_seconds=900)
+        self.assertIn("queued_required_no_job_start", {t["rule"] for t in rules})

@@ -79,8 +79,25 @@ def classify(events:Iterable[dict[str,Any]],queued:Iterable[dict[str,Any]]=(),*,
     starts=_job_starts(rows,start,end); trips=[]
     required=[q for q in queued if isinstance(q,dict) and q.get("required") is True]
     qt=[_epoch(q.get("created_at") or q.get("queued_at")) for q in required]; qt=[x for x in qt if x is not None]
-    if required and qt and min(qt)<=start and not starts:
+    if required and qt and min(qt) <= start and not starts:
         trips.append({"rule":"queued_required_no_job_start","host":"fleet","since":dt.datetime.fromtimestamp(min(qt),dt.timezone.utc).isoformat(),"evidence":{"queued_required":required,"window_start":start,"window_end":end,"job_starts":starts}})
+    # A published host can be absent while another host is still serving.
+    # Queue adapters may attach the selected host in host/runner; retain the
+    # fleet-wide rule above for unassigned demand and add a per-host episode.
+    by_queue_host = {}
+    for q in required:
+        qh = q.get("host") or q.get("runner") or q.get("assigned_host")
+        if qh:
+            by_queue_host.setdefault(str(qh), []).append(q)
+    for qh, host_queue in by_queue_host.items():
+        qtimes = [_epoch(q.get("created_at") or q.get("queued_at")) for q in host_queue]
+        qtimes = [t for t in qtimes if t is not None]
+        host_starts = [r for r in starts if _host(r) == qh or r.get("runner") == qh]
+        if qtimes and min(qtimes) <= start and not host_starts:
+            trips.append({"rule":"host_queued_no_job_start","host":qh,
+                          "since":dt.datetime.fromtimestamp(min(qtimes),dt.timezone.utc).isoformat(),
+                          "evidence":{"queued_required":host_queue,"window_start":start,
+                                      "window_end":end,"job_starts":host_starts}})
     # Sustained admission errors only; scan errors are diagnostics, and any
     # successful precheck/admission breaks an episode.
     by={}
