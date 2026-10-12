@@ -247,7 +247,10 @@ def _has_raw_kill_verb(command: str) -> bool:
     # Remove grep-like command segments first: kill words there are data.
     parts = re.split(r"([;&|\n]+)", command)
     for index in range(0, len(parts), 2):
+        search_exec = (re.match(r"^\s*(?:rg|ag)\b", parts[index], re.I)
+                       and re.search(r"--(?:pre(?:-glob)?|pager)(?:=|\s)", parts[index], re.I))
         if (re.search(r"^\s*(?:grep|egrep|rg|ag|git\s+grep|echo)\b", parts[index], re.I)
+                and not search_exec
                 and not re.search(r"(?:^|\s)-O(?:\s|['\"]|$)|--open-files-in-pager(?:=|\s)",
                                   parts[index], re.I)):
             parts[index] = " "
@@ -291,7 +294,7 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
             return False
         if "-c" in args or any(arg.lower().startswith("-c=") for arg in args):
             return False
-        execution_options = ("--upload-pack", "--receive-pack", "-o", "-u",
+        execution_options = ("--upload-pack", "--receive-pack", "-o",
                              "--open-files-in-pager", "--exec")
         if any(arg == option or arg.startswith(option + "=")
                or (option == "-o" and arg.startswith("-o") and arg != "-o")
@@ -314,6 +317,9 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
                 continue
             break
         lowered = lowered[subcommand_index:]
+        if lowered and lowered[0] in {"fetch", "ls-remote", "clone", "archive"} \
+                and "-u" in lowered:
+            return False
         readonly = {"status", "log", "show", "diff", "rev-parse", "ls-files",
                     "ls-remote", "fetch", "blame", "grep", "describe", "merge-base",
                     "cat-file"}
