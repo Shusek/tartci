@@ -545,9 +545,7 @@ def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         value["probe_lane"] = None
         value["probe_started_at"] = None
         # A cancelled admission/lease turn never cloned a VM and therefore is
-        # not an unanswered DHCP probe.  It must not contribute to either
-        # unreported streak or failed-probe accounting.
-        value["consecutive_unreported"] = 0
+        # not an unanswered DHCP probe. Preserve any earlier unreported streak.
         save(path, value)
         return {"action": "cancelled", "events": [["vm_dhcp_probe_cancelled", fmt({
             "lane": args.lane, "reason": getattr(args, "reason", "pre_clone"),

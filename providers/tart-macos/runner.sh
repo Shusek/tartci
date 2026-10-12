@@ -1917,6 +1917,7 @@ boot_vm_to_ssh(){
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
     rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
     tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" no_ip "$vm"
+    VM_DHCP_PROBE_REPORTED=1
     discard_current_vm
     tartci_release_vm_lease
     return 1
@@ -1927,6 +1928,7 @@ boot_vm_to_ssh(){
   local clone_to_ip_s=$(( $(date +%s) - ${CLONE_STARTED_AT:-$(date +%s)} ))
   event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
+  VM_DHCP_PROBE_REPORTED=1
   tartci_lifecycle_mark ip
   rm -f "$boot_log"
   BOOT_SSH_HEARTBEAT_PHASE="$boot_phase"
@@ -2687,7 +2689,11 @@ if [ "$LOOP" = 1 ]; then
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       CURRENT_SELECTED_QUEUED="$q"
+      VM_DHCP_PROBE_REPORTED=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      # A verification probe is reserved before run_one.  Any pre-clone
+      # return (including a disk check) must release it exactly once unless
+      # the boot path recorded a DHCP outcome.
       # Every cause of clone-without-serve returns through here, so the streak
       # is counted here rather than at each cause. Counted per work ENTRY, not
       # per error: a lane that alternates a failure with a served job never
@@ -2704,6 +2710,9 @@ if [ "$LOOP" = 1 ]; then
         SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      fi
+      if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
+        tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone
       fi
       # Early returns (boot failure, yield, admission refusal) leave a proof
       # that nobody will consume.

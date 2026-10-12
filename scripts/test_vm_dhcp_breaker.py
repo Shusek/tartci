@@ -150,12 +150,29 @@ class PreCloneCancellation(Case):
         state = self.state()
         self.assertEqual(state["state"], "verifying")
         self.assertIsNone(state.get("probe_lane"))
-        self.assertEqual(state.get("consecutive_unreported"), 0)
+        self.assertIsNone(state.get("consecutive_unreported"))
         self.assertNotEqual(state.get("cause"), "probe_unreported")
         # A later lane can take the still-required verification probe; the
         # cancelled turn did not open the breaker or consume a VM.
         self.assertEqual(self.check(T0 + 3, lane="next-lane")["action"], "probe")
         self.assertEqual(self.state()["state"], "verifying")
+
+    def test_open_cancel_preserves_unreported_streak_and_probe_history(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.assertEqual(self.check(T0 + 400, lane="probe-lane")["action"], "probe")
+        path = self.tmp / "vm-dhcp" / "breaker.json"
+        state = json.loads(path.read_text())
+        state["consecutive_unreported"] = 1
+        path.write_text(json.dumps(state))
+        cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="disk_full"),
+                              now=T0 + 401)
+        self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
+        after = self.state()
+        self.assertEqual(after["consecutive_unreported"], 1)
+        self.assertEqual(after["probes"], state["probes"])
+        self.assertEqual(after["last_probe_at"], state["last_probe_at"])
+        self.assertIsNone(after.get("probe_lane"))
 
 class Open(Case):
     def open(self) -> None:
@@ -319,6 +336,34 @@ class Shell(Case):
 
 
 class Wiring(unittest.TestCase):
+    def test_loop_releases_a_probe_after_any_unreported_run_one(self):
+        body = RUNNER.read_text()
+        call = 'run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?'
+        self.assertIn(call, body)
+        after = body[body.index(call) + len(call):]
+        cancel = after.index('tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone')
+        accounting = after.index('if [ "$CURRENT_SERVED" = 1 ]')
+        self.assertGreater(cancel, accounting)
+        self.assertIn('[ "${VM_DHCP_PROBE:-0}" = 1 ]', after[accounting:cancel])
+        self.assertIn('[ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]', after[accounting:cancel])
+
+        # The guard is behavioral: remove the loop-level cancel and the
+        # structural assertion must fail, so wiring cannot silently regress.
+        broken = body.replace(
+            '      if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then\n'
+            '        tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone\n'
+            '      fi\n', '', 1)
+        with self.assertRaises(AssertionError):
+            self.assertIn('loop_pre_clone', broken)
+
+    def test_each_boot_outcome_marks_probe_reported(self):
+        body = RUNNER.read_text()
+        for outcome in ('no_ip', 'ip'):
+            at = body.index(
+                f'tartci_vm_dhcp_record "${{TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}}" '
+                f'{outcome} "$vm"'
+            )
+            self.assertIn('VM_DHCP_PROBE_REPORTED=1', body[at:at + 120])
     def test_the_breaker_is_checked_before_the_job_claim(self):
         body = RUNNER.read_text()
         run_one = body[body.index("run_one(){"):]
