@@ -165,13 +165,29 @@ class PreCloneCancellation(Case):
         state = json.loads(path.read_text())
         state["consecutive_unreported"] = 1
         path.write_text(json.dumps(state))
+        previous_probes = state["probe_prev_probes"]
+        previous_last = state["probe_prev_last_probe_at"]
         cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="disk_full"),
                               now=T0 + 401)
         self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
         after = self.state()
         self.assertEqual(after["consecutive_unreported"], 1)
-        self.assertEqual(after["probes"], state["probes"])
-        self.assertEqual(after["last_probe_at"], state["last_probe_at"])
+        self.assertEqual(after["probes"], previous_probes)
+        self.assertEqual(after["last_probe_at"], previous_last)
+        self.assertIsNone(after.get("probe_lane"))
+
+    def test_open_cancel_rolls_back_probe_counters(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.assertEqual(self.check(T0 + 400, lane="probe-lane")["action"], "probe")
+        before = self.state()
+        self.assertEqual(before["probes"], 1)
+        cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="disk_full"),
+                              now=T0 + 401)
+        self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
+        after = self.state()
+        self.assertEqual(after["probes"], 0)
+        self.assertEqual(after["last_probe_at"], before["opened_at"])
         self.assertIsNone(after.get("probe_lane"))
 
 class Open(Case):
@@ -336,6 +352,46 @@ class Shell(Case):
 
 
 class Wiring(unittest.TestCase):
+    def test_shipped_loop_cancel_clears_a_real_probe_and_noop_lib_fails(self):
+        import re
+        source = RUNNER.read_text()
+        match = re.search(
+            r'      if \[ "\$\{VM_DHCP_PROBE:-0\}" = 1 \].*?\n      fi\n',
+            source, re.DOTALL)
+        self.assertIsNotNone(match)
+        loop_cancel = match.group(0)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            real_lib = root / "vm-dhcp.lib.sh"
+            real_lib.write_text(LIB.read_text())
+            noop_lib = root / "vm-dhcp-noop.lib.sh"
+            noop_lib.write_text(re.sub(
+                r'tartci_vm_dhcp_cancel\(\)\{.*?\n\}',
+                'tartci_vm_dhcp_cancel(){ return 0; }',
+                LIB.read_text(), flags=re.DOTALL))
+            env = {**os.environ, "TARTCI_VM_DHCP_DIR": str(root / "breaker"),
+                   "TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400),
+                   "TARTCI_VM_DHCP_BREAKER": "1", "TARTCI_ROOT": str(ROOT)}
+            Path(env["TARTCI_VM_DHCP_DIR"]).mkdir()
+            (Path(env["TARTCI_VM_DHCP_DIR"]) / "breaker.json").write_text(json.dumps(
+                {"state": "verifying", "probe_lane": "lane-a", "probe_started_at": T0,
+                 "boot_time": T0 - 86400, "streak": []}))
+            driver = ("set -euo pipefail\n"
+                      "event(){ :; }\n"
+                      "TARTCI_QUEUE_LANE_ID=lane-a\n"
+                      f"source {real_lib!s}\nVM_DHCP_PROBE=1\nVM_DHCP_PROBE_REPORTED=0\n{loop_cancel}"
+                      f"python3 {BREAKER!s} status --json\n")
+            real = subprocess.run(["bash", "-c", driver], env=env,
+                                  capture_output=True, text=True, check=True)
+            self.assertIsNone(json.loads(real.stdout)["probe_lane"])
+            (Path(env["TARTCI_VM_DHCP_DIR"]) / "breaker.json").write_text(json.dumps(
+                {"state": "verifying", "probe_lane": "lane-a", "probe_started_at": T0,
+                 "boot_time": T0 - 86400, "streak": []}))
+            noop_driver = driver.replace(str(real_lib), str(noop_lib))
+            noop = subprocess.run(["bash", "-c", noop_driver], env=env,
+                                   capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(noop.stdout)["probe_lane"], "lane-a",
+                             "a no-op cancel must fail the shipped-loop test")
     def test_loop_releases_a_probe_after_any_unreported_run_one(self):
         body = RUNNER.read_text()
         call = 'run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?'

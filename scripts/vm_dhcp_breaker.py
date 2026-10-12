@@ -523,6 +523,8 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
             return {"action": "backoff", "events": events}
         if value.get("probe_lane"):
             value["consecutive_unreported"] = int(value.get("consecutive_unreported") or 0) + 1
+        value["probe_prev_probes"] = int(value.get("probes") or 0)
+        value["probe_prev_last_probe_at"] = value.get("last_probe_at")
         value["last_probe_at"] = now
         value["probe_lane"] = args.lane
         value["probes"] = int(value.get("probes") or 0) + 1
@@ -542,8 +544,17 @@ def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         lane = value.get("probe_lane")
         if lane != args.lane or value.get("state") not in ("open", "verifying"):
             return {"action": "noop", "events": []}
+        if value.get("state") == "open":
+            value["probes"] = int(value.get("probe_prev_probes") or 0)
+            previous_last = value.get("probe_prev_last_probe_at")
+            if previous_last is None:
+                value.pop("last_probe_at", None)
+            else:
+                value["last_probe_at"] = previous_last
         value["probe_lane"] = None
         value["probe_started_at"] = None
+        value.pop("probe_prev_probes", None)
+        value.pop("probe_prev_last_probe_at", None)
         # A cancelled admission/lease turn never cloned a VM and therefore is
         # not an unanswered DHCP probe. Preserve any earlier unreported streak.
         save(path, value)
@@ -567,6 +578,8 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
                                                  "result": args.outcome})])
             value["probe_lane"] = None
             value["consecutive_unreported"] = 0
+            value.pop("probe_prev_probes", None)
+            value.pop("probe_prev_last_probe_at", None)
         if args.outcome == "ip":
             if verifying:
                 events.append(verified(value, now, args.lane, late=False))
