@@ -78,7 +78,8 @@ bounds TERM-to-KILL cleanup inside launchd's 30-second exit window. It contains
 no scheduler, queue, GitHub, listener, or capacity policy.
 
 Build/sign the artifact on a controlled signing surface, never during fleet
-installation:
+installation. Set `TARTCI_PYTHON` to the pinned Python 3.11+ interpreter; the
+explicit option keeps this manual build aligned with the installed launchd path:
 
 ```sh
 scripts/build_macos_launcher.sh \
@@ -86,7 +87,9 @@ scripts/build_macos_launcher.sh \
   --approval-output /absolute/staging/TartCILauncher.sha256 \
   --identity '<Developer ID Application identity>' \
   --support-root /absolute/immutable/tartci-generation \
-  --profile profiles/m3-macos-fleet.toml   # or profiles/m5studio-macos-fleet.toml
+  --profile profiles/m3-macos-fleet.toml \
+  --python "${TARTCI_PYTHON:?set TARTCI_PYTHON to a Python 3.11+ interpreter}"
+# Use `profiles/m5studio-macos-fleet.toml` in both profile arguments when signing m5studio.
 scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
   --identifier com.danielraffel.tartci.launcher \
   --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256> \

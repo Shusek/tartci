@@ -68,35 +68,29 @@ fi
 PY="$ROOT/scripts/macos_fleet_lanes.py"
 POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # macOS's system Python can be 3.9; all TOML-aware installer helpers require
-# Python 3.11+ and its stdlib tomllib module.
-PYTHON_BIN=""
-if [ -n "${TARTCI_PYTHON:-}" ]; then
-  case "$TARTCI_PYTHON" in
-    */*) PYTHON_BIN="$TARTCI_PYTHON" ;;
-    *) PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)" ;;
-  esac
-else
-  for candidate in python3 python3.12 python3.11; do
-    candidate="$(command -v "$candidate" 2>/dev/null || true)"
-    if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-      PYTHON_BIN="$candidate"
-      break
+# Python 3.11+ and its stdlib tomllib module. Keep this order identical to the
+# launcher builder and the installed launchd helpers.
+# shellcheck disable=SC1091
+. "$ROOT/providers/common/toml-python.lib.sh"
+if [ -n "${TARTCI_PYTHON:-}" ] && [[ "$TARTCI_PYTHON" == */* ]]; then
+  python_probe="$TARTCI_PYTHON"
+  python_probe_hops=0
+  while [ -L "$python_probe" ]; do
+    python_probe_hops=$((python_probe_hops + 1))
+    if [ "$python_probe_hops" -gt 16 ]; then
+      echo "fleet install refused a symlink cycle while resolving Python: $TARTCI_PYTHON" >&2
+      exit 127
     fi
-  done
-  for candidate in \
-    /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
-    /opt/homebrew/bin/python3 \
-    /usr/local/bin/python3.12 /usr/local/bin/python3.11 \
-    /usr/local/bin/python3; do
-    if [ -z "$PYTHON_BIN" ] && [ -x "$candidate" ] \
-        && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-      PYTHON_BIN="$candidate"
-      break
-    fi
+    python_probe_target="$(readlink "$python_probe")"
+    case "$python_probe_target" in
+      /*) python_probe="$python_probe_target" ;;
+      *) python_probe="$(cd "$(dirname "$python_probe")" && pwd)/$python_probe_target" ;;
+    esac
   done
 fi
+PYTHON_BIN="$(tartci_toml_python_path)" || exit $?
 [ -n "$PYTHON_BIN" ] || {
-  echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+  echo "fleet install could not find a Python 3.11+ interpreter with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
 # Record the executable behind a Homebrew `python3` symlink.  Do this without

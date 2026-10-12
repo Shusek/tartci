@@ -26,6 +26,7 @@ import fleet_doctor as fd  # noqa: E402
 import fleet_self_update as su  # noqa: E402
 import keychain_unlock  # noqa: E402
 import signing_prompt_guard as guard  # noqa: E402
+import tartci_support_manifest as support_manifest  # noqa: E402
 
 
 class Host(unittest.TestCase):
@@ -77,6 +78,90 @@ class Host(unittest.TestCase):
 
     def status(self) -> dict:
         return guard.status(self.home, self.run_)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS launcher builder")
+class LauncherBuildTests(unittest.TestCase):
+    """Exercise the builder's actual render and lane pin validation."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        source = root / "source"
+        source.mkdir()
+        archive = subprocess.run(
+            ["git", "-C", str(HERE.parent), "archive", "HEAD"],
+            check=True, capture_output=True,
+        ).stdout
+        subprocess.run(["tar", "-x", "-C", str(source)], input=archive, check=True)
+        subprocess.run(["git", "-C", str(source), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "remote", "add", "origin",
+             "https://github.com/danielraffel/tartci.git"], check=True,
+        )
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "-c", "user.name=Test", "-c",
+             "user.email=test@example.invalid", "commit", "-qm", "fixture"],
+            check=True,
+        )
+        manifest = root / ".tartci-support-manifest.json"
+        support_manifest.write(source, manifest)
+        staged = support_manifest.stage_install(source, manifest, root / "generations")
+        self.support_root = Path(staged["root"])
+        self.profile = source / "profiles/m3-macos-fleet.toml"
+        self.identity = "Developer ID Application: Daniel Raffel (95CX6P84C4)"
+
+    def run_builder(self, output: Path, approval: Path, *, python: Path | None = None):
+        args = [str(HERE / "build_macos_launcher.sh"),
+                "--output", str(output), "--approval-output", str(approval),
+                "--identity", self.identity, "--support-root", str(self.support_root),
+                "--profile", str(self.profile)]
+        if python is not None:
+            args += ["--python", str(python)]
+        return subprocess.run(
+            args,
+            env={**os.environ, "TARTCI_PYTHON": "", "TARTCI_RENDER_PYTHON": ""},
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_real_render_without_pin_pins_every_lane(self) -> None:
+        root = Path(self.temp.name)
+        output, approval = root / "TartCILauncher.app", root / "approval.sha256"
+        result = self.run_builder(output, approval)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lanes = json.loads(
+            (output / "Contents/Resources/lanes.json").read_text()
+        )["lanes"]
+        self.assertTrue(lanes)
+        resolved = subprocess.run(
+            [str(HERE / "build_macos_launcher.sh"), "--support-root", str(self.support_root),
+             "--print-render-python"],
+            env={**os.environ, "TARTCI_PYTHON": "", "TARTCI_RENDER_PYTHON": ""},
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        expected = resolved.stdout.strip()
+        for lane in lanes.values():
+            environment = lane["environment"]
+            self.assertEqual(environment["TARTCI_PYTHON"], expected)
+            self.assertEqual(environment["SHIPYARD_GHAPP_PYTHON_BINARY"], expected)
+
+    def test_builder_refuses_a_render_that_drops_the_pin(self) -> None:
+        root = Path(self.temp.name)
+        wrapper = root / "unpin-python"
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            "if [[ \"$1\" == *macos_fleet_lanes.py && \"$2\" == render ]]; then\n"
+            "  unset TARTCI_PYTHON TARTCI_RENDER_PYTHON\n"
+            "fi\n"
+            f"exec {shutil.which('python3')!s} \"$@\"\n"
+        )
+        wrapper.chmod(0o755)
+        result = self.run_builder(root / "bad.app", root / "bad.sha256", python=wrapper)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lane helper interpreter is not pinned", result.stderr)
 
 
 class GuardTests(Host):
@@ -177,6 +262,15 @@ class PinnedKeychainTests(Host):
         self.assertTrue(resolved.is_file())
         self.assertTrue(os.access(resolved, os.X_OK))
         self.assertNotEqual(resolved.name, "python3")
+
+    def test_launcher_builder_reports_missing_interpreter(self) -> None:
+        result = subprocess.run(
+            [str(HERE / "build_macos_launcher.sh"), "--support-root", str(HERE.parent),
+             "--print-render-python", "--python", "/does/not/exist"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(result.stderr.strip())
 
 
 if __name__ == "__main__":
