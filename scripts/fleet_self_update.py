@@ -713,8 +713,9 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
     if not commits:
         skew["state"] = "unknown" if not installed_known else "current"
         return skew
-    skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
-    skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
+    if installed_known:
+        skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
+        skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
     if explicit:
         commits = [(sha, ts) for sha, ts in commits if sha == head_sha]
         if not commits:
@@ -1496,7 +1497,8 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
             "TARTCI_PYTHON") or sys.executable)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
-                           "--support-root", ".", "--profile", str(profile), *pinned],
+                           "--support-root", ".", "--profile", str(profile),
+                           "--python", launcher_python, *pinned],
                           cwd=str(cfg.checkout),
                           env={"TARTCI_RENDER_PYTHON": launcher_python,
                                "TARTCI_PYTHON": launcher_python},
