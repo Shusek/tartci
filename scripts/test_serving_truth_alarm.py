@@ -53,9 +53,14 @@ class ServingTruthTests(unittest.TestCase):
 
     def test_replay_outage_shapes_and_quiet_control(self) -> None:
         fixture = json.loads((Path(__file__).parent / "fixtures" / "serving_truth_replay.json").read_text())
+        replay_rules = {}
         for name, recorded in fixture["cases"].items():
             with self.subTest(case=name):
-                self.assertTrue(alarm.classify(recorded, fixture["queued"], now=fixture["now"]), name)
+                trips = alarm.classify(recorded, fixture["queued"], now=fixture["now"])
+                self.assertTrue(trips, name)
+                replay_rules[name] = {trip["rule"] for trip in trips}
+        self.assertIn("host_error_burst", replay_rules["XCODE-license-burst"])
+        self.assertIn("fleet_self_update_deferral_streak", replay_rules["O11-deferral-streak"])
         self.assertEqual(alarm.classify(fixture["quiet"], [], now=fixture["now"]), [])
 
         # O3/O9/O10/O11 all have the same serving truth: required work exists,
@@ -91,6 +96,13 @@ class ServingTruthTests(unittest.TestCase):
             self.assertTrue(first["receipts"])
             self.assertEqual(len(opened), 1)
             self.assertFalse(second["evented"])
+            lifecycle = json.loads((root / "state" / "serving-truth-lifecycle.json").read_text())
+            self.assertEqual(set(lifecycle), {"detected_at", "symptom_at"})
+            quiet = alarm.alert_pass(root / "state", events.with_name("quiet.json"), [], now=BASE + 3600,
+                                     issue=issue, close=lambda number: (0, "closed"))
+            self.assertTrue(quiet["closed"])
+            lifecycle = json.loads((root / "state" / "serving-truth-lifecycle.json").read_text())
+            self.assertIn("fixed_at", lifecycle)
 
 
 if __name__ == "__main__":

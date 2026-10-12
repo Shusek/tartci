@@ -23,6 +23,8 @@ import host_off
 
 WINDOW_SECONDS = 20 * 60
 ADMISSION_STREAK = 3
+BURST_WINDOW_SECONDS = 30 * 60
+DEFERRAL_WINDOW_SECONDS = 60 * 60
 TITLE = "[tartci] serving-truth alarm: {rule}"
 
 
@@ -75,6 +77,8 @@ def classify(
     now: float | None = None,
     window_seconds: int = WINDOW_SECONDS,
     admission_streak: int = ADMISSION_STREAK,
+    burst_window_seconds: int = BURST_WINDOW_SECONDS,
+    deferral_window_seconds: int = DEFERRAL_WINDOW_SECONDS,
 ) -> list[dict[str, Any]]:
     """Return deterministic trips with their complete input evidence.
 
@@ -85,6 +89,8 @@ def classify(
     rows = [r for r in events if isinstance(r, dict)]
     end = time.time() if now is None else float(now)
     start = end - window_seconds
+    burst_start = end - burst_window_seconds
+    deferral_start = end - deferral_window_seconds
     starts = _job_starts(rows, start, end)
     trips: list[dict[str, Any]] = []
 
@@ -116,6 +122,49 @@ def classify(
                           "since": streak[0].get("ts"),
                           "evidence": {"errors": streak, "job_starts": host_starts,
                                        "threshold": admission_streak}})
+
+    failures: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        ts = _time(row)
+        if ts is None or not burst_start <= ts <= end or row.get("event") not in {
+            "job_failed", "job_failure", "job_terminal_receipt",
+        }:
+            continue
+        head = str(row.get("pr_head") or row.get("head_sha") or row.get("head") or "")
+        first_error = str(row.get("first_error") or row.get("error") or row.get("detail") or "").splitlines()[0]
+        if head and first_error:
+            failures.setdefault((_host(row), first_error), []).append(row)
+    for (host, first_error), matching in failures.items():
+        heads = {str(r.get("pr_head") or r.get("head_sha") or r.get("head")) for r in matching}
+        times = [_time(r) for r in matching]
+        if len(heads) >= 3 and max(times) - min(times) <= burst_window_seconds:
+            trips.append({"rule": "host_error_burst", "host": host,
+                          "since": min(r.get("ts") for r in matching),
+                          "evidence": {"first_error": first_error, "heads": sorted(heads),
+                                       "failures": matching, "threshold": 3}})
+
+    deferrals: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        ts = _time(row)
+        if ts is None or not deferral_start <= ts <= end or row.get("event") not in {
+            "self_update_deferred", "fleet_update_deferred", "peer_deferred",
+        }:
+            continue
+        detail = str(row.get("detail") or "")
+        peer = str(row.get("peer") or row.get("deferred_peer") or "")
+        if not peer and "peer " in detail:
+            peer = detail.split("peer ", 1)[1].split()[0].strip("=,:;")
+        if peer:
+            deferrals.setdefault(peer, []).append(row)
+    for peer, matching in deferrals.items():
+        hosts = {_host(r) for r in matching}
+        times = [_time(r) for r in matching]
+        if len(hosts) >= 3 and min(times) <= end - deferral_window_seconds:
+            trips.append({"rule": "fleet_self_update_deferral_streak", "host": "fleet",
+                          "since": min(r.get("ts") for r in matching),
+                          "evidence": {"peer": peer, "hosts": sorted(hosts),
+                                       "deferrals": matching,
+                                       "threshold_seconds": deferral_window_seconds}})
 
     assigned: dict[str, dict[str, Any]] = {}
     for row in sorted(rows, key=lambda r: _time(r) or 0):
@@ -171,22 +220,45 @@ def trip_receipt(state: Path, trip: dict[str, Any], now: float | None = None) ->
 
 def alert_pass(state: Path, events_path: Path, queued: Iterable[dict[str, Any]], *,
                now: float | None = None,
-               issue: Callable[[str, str], tuple[int, str]] | None = None) -> dict[str, Any]:
+               issue: Callable[[str, str], tuple[int, str]] | None = None,
+               close: Callable[[str], tuple[int, str]] | None = None) -> dict[str, Any]:
     rows = classify(read_events(events_path), queued, now=now)
     receipts = [trip_receipt(state, trip, now=now) for trip in rows]
     # A single episode state makes repeated one-minute passes idempotent. The
     # receipt list remains append-only, so every trip is auditable.
     active = bool(rows)
     since = rows[0].get("since") if rows else None
+    lifecycle = state / "serving-truth-lifecycle.json"
+    lifecycle_data: dict[str, Any] = {}
+    if lifecycle.exists():
+        try:
+            value = json.loads(lifecycle.read_text(encoding="utf-8"))
+            lifecycle_data = value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            lifecycle_data = {}
+    observed_at = dt.datetime.fromtimestamp(time.time() if now is None else now,
+                                            dt.timezone.utc).isoformat()
+    if active:
+        lifecycle_data.update(symptom_at=since, detected_at=observed_at)
+        lifecycle_data.pop("fixed_at", None)
+    elif lifecycle_data.get("detected_at") and not lifecycle_data.get("fixed_at"):
+        lifecycle_data["fixed_at"] = observed_at
+    lifecycle.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle.write_text(json.dumps(lifecycle_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     def render() -> tuple[str, str]:
         body = "\n\n".join(json.dumps(t, sort_keys=True, indent=2) for t in rows)
-        return TITLE.format(rule=rows[0]["rule"]), "Serving-truth alarm tripped.\n\n" + body
+        return TITLE.format(rule=rows[0]["rule"]), (
+            "Serving-truth alarm tripped.\n\n"
+            f"symptom_at={lifecycle_data.get('symptom_at')}\n"
+            f"detected_at={lifecycle_data.get('detected_at')}\n"
+            f"fixed_at={lifecycle_data.get('fixed_at', 'pending')}\n\n" + body)
     out = host_off.episode_alert(state / "serving-truth-alert.json", active=active,
                                  resolved=not active, since=since,
                                  raise_event=lambda: host_off.event(
                                      state, "serving_truth_alarm", "rules tripped",
                                      {"receipts": [str(p) for p in receipts]}, now),
-                                 render=render, issue=issue, issues_enabled=True)
+                                 render=render, issue=issue, close=close, issues_enabled=True)
     return {"trips": rows, "receipts": [str(p) for p in receipts], **out}
 
 
