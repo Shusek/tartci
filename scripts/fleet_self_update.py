@@ -1884,6 +1884,12 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     receipt.value["refresh"] = refresh
     try:
         me = self_host_id(cfg)
+        # Observe peers before any later gate can defer this run.  In
+        # particular, capacity-floor and installer checks may refuse before
+        # the queue decision below; skipping the survey there meant a dead
+        # peer never accumulated its unreadable-read streak and every host
+        # could wait forever for a fresh report.  Plans remain read-only.
+        survey = survey_peers(cfg, sys_, me, record=apply)
         if apply:
             paused = scheduled_pause(cfg.state_dir)
             if paused:
@@ -1938,7 +1944,6 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        survey = survey_peers(cfg, sys_, me, record=apply)
         busy, waiting, off = survey.busy, survey.waiting, survey.off
         ticket = waiting_ticket(cfg)
         my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
