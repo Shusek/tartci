@@ -252,12 +252,13 @@ def _has_raw_kill_verb(command: str) -> bool:
 
 
 def _is_nonexecuting_data_segment(segment: str) -> bool:
-    """Return whether a command segment is a data-only ls/git/tar command."""
+    """Return whether a command segment is on the read-only data allowlist."""
     try:
         words = shlex.split(segment, posix=True)
     except ValueError:
         return False
     index = 0
+    assignments: list[str] = []
     while index < len(words):
         word = words[index]
         if word in {"sudo", "nohup"}:
@@ -265,7 +266,10 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
             continue
         if word == "env":
             index += 1
-            while index < len(words) and ("=" in words[index] or words[index].startswith("-")):
+            while index < len(words) and "=" in words[index]:
+                assignments.append(words[index])
+                index += 1
+            while index < len(words) and words[index].startswith("-"):
                 index += 1
             continue
         break
@@ -277,21 +281,20 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
         return True
     if command == "git":
         lowered = [arg.lower() for arg in args]
-        if any(arg in {"-x", "--exec"} or arg.startswith("--exec=") for arg in lowered):
+        if any(name.split("=", 1)[0].upper().startswith("GIT_") for name in assignments):
             return False
-        if len(lowered) >= 2 and lowered[0:2] == ["bisect", "run"]:
+        if "-c" in lowered or any(arg.startswith("-c=") for arg in lowered):
             return False
-        for position, arg in enumerate(lowered):
-            if arg == "-c" and position + 1 < len(lowered):
-                setting = lowered[position + 1]
-                if "core.pager=" in setting or ("alias." in setting and "=!" in setting):
-                    return False
+        readonly = {"status", "log", "show", "diff", "rev-parse", "ls-files",
+                    "ls-remote", "fetch", "blame", "grep", "describe", "merge-base",
+                    "cat-file"}
+        if not lowered or lowered[0] not in readonly:
+            if lowered[:2] != ["branch", "--list"] and lowered[:2] != ["remote", "-v"]:
+                return False
         return True
     if command == "tar":
-        execution_options = ("--to-command", "--use-compress-program", "-i")
         lowered_args = [arg.lower() for arg in args]
-        return not any(arg == option or arg.startswith(option + "=")
-                       for arg in lowered_args for option in execution_options)
+        return "-t" in lowered_args or "--list" in lowered_args
     return False
 
 
