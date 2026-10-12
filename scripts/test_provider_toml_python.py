@@ -44,6 +44,20 @@ def bare_calls(text: str, helper: str) -> list[int]:
 
 
 class StaticTests(unittest.TestCase):
+    @staticmethod
+    def _assert_exec_tail_positions(source: str) -> None:
+        fleet_start = source.index("cmd_fleet_macos() {")
+        fleet_end = source.index("\ncmd_support_manifest()", fleet_start)
+        fleet_lines = set(source[fleet_start:fleet_end].splitlines())
+        for line in source.splitlines():
+            if "tartci_toml_python_exec" not in line:
+                continue
+            if line in fleet_lines:
+                continue
+            if line.lstrip().startswith("held)"):
+                continue
+            raise AssertionError(f"exec helper outside a tail dispatcher: {line}")
+
     def test_no_provider_script_runs_a_toml_helper_with_a_bare_python3(self) -> None:
         helpers = toml_helpers()
         # Control: the two helpers this guards are found.
@@ -64,21 +78,19 @@ class StaticTests(unittest.TestCase):
 
     def test_exec_variant_is_used_only_by_tail_dispatchers(self) -> None:
         source = (ROOT / "tartci").read_text()
-        expected = {
-            'tartci_toml_python_exec "$HERE/scripts/macos_fleet_lanes.py"',
-            'tartci_toml_python_exec "$HERE/scripts/fleet_self_update.py"',
-            'tartci_toml_python_exec "$HERE/scripts/tool_freshness.py"',
-            'tartci_toml_python_exec "$HERE/scripts/support_agents.py"',
-            'tartci_toml_python_exec "$HERE/scripts/debug_hold.py"',
-        }
-        actual = {
-            re.search(r'tartci_toml_python_exec\s+"[^"]+"', line).group(0)
-            for line in source.splitlines()
-            if "tartci_toml_python_exec" in line
-        }
-        self.assertEqual(actual, expected)
-        self.assertNotIn("tartci_toml_python_exec", source.split("cmd_launchd", 1)[1].split(
-            "# Print (never write)", 1)[0])
+        self._assert_exec_tail_positions(source)
+
+    def test_exec_placement_guard_kills_pool_on_mutants(self) -> None:
+        source = (ROOT / "tartci").read_text()
+        probe = ('tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" \\\n'
+                 '              probe-launch-helper')
+        verify = ('tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" verify-loaded')
+        for old in (probe, verify):
+            with self.subTest(mutant=old):
+                mutant = source.replace(old, old.replace(
+                    "tartci_toml_python ", "tartci_toml_python_exec "), 1)
+                with self.assertRaises(AssertionError):
+                    self._assert_exec_tail_positions(mutant)
 
 
 class OperatorShellTests(unittest.TestCase):
