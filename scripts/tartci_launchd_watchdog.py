@@ -1394,14 +1394,18 @@ def serving_truth_pass(now: float | None = None) -> str | None:
     try:
         import serving_truth_alarm  # noqa: PLC0415 - sibling module
         state = Path(os.environ.get("TARTCI_HOME", os.path.join(os.path.expanduser("~"), ".tartci"))) / "state"
-        events = Path(os.environ.get("TARTCI_EVENT_LOG", str(state / "macos" / "events.jsonl")))
-        if not events.exists():
+        events_env = os.environ.get("TARTCI_EVENT_LOG")
+        events = [Path(events_env)] if events_env else sorted((state / "macos-fleet").glob("*/events.jsonl"))
+        # self-update deferrals are emitted by host_off beside the host state.
+        events += sorted(state.glob("**/events.jsonl"))
+        events = list(dict.fromkeys(p for p in events if p.exists()))
+        if not events:
             return None
         cli = os.environ.get("TARTCI_GH_CLI", "ghapp")
-        repo = os.environ.get("TARTCI_REPO", "danielraffel/tartci")
+        repo = os.environ.get("TARTCI_REPO")
         queued = serving_truth_alarm.fetch_required_queue(cli, repo)
         out = serving_truth_alarm.alert_pass(state / "serving-truth", events, queued,
-                                             now=utcnow())
+                                             now=utcnow(), shadow=os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "shadow").lower() != "on")
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return (f"{_iso(utcnow())} launchd-watchdog: WARN serving-truth check FAILED "
                 f"({type(exc).__name__}: {exc}); no serving alarm was raised")

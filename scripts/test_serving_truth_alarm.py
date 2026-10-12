@@ -108,3 +108,22 @@ class ServingTruthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RealReplayTests(unittest.TestCase):
+    def test_recorded_rows_are_used_and_quiet_has_no_admission_trip(self):
+        fixture = json.loads((Path(__file__).parent / "fixtures" / "serving_truth_real_replay.json").read_text())
+        self.assertGreaterEqual(sum(len(v) for k, v in fixture["cases"].items() if k != "quiet"), 1)
+        quiet = fixture["cases"]["quiet"]
+        self.assertFalse([t for t in alarm.classify(quiet, now=alarm._epoch(quiet[-1]["ts"])) if t["rule"] == "admission_error_streak"])
+        nested = {"ts": "2026-10-12T17:00:00Z", "event": "job_assigned", "runner": "m1-pulp-gate-01", "fields": {"job_id": "x"}}
+        self.assertEqual(alarm._host(nested), "m1")
+
+    def test_shadow_default_never_calls_issue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); events = root / "events.jsonl"
+            events.write_text(json.dumps(row(BASE - 300, "admission_error")) + "\n" + json.dumps(row(BASE - 200, "admission_error")) + "\n" + json.dumps(row(BASE - 100, "admission_error")) + "\n")
+            opened = []
+            with mock.patch.dict("os.environ", {}, clear=True):
+                out = alarm.alert_pass(root / "state", events, [], now=BASE)
+            self.assertTrue(out["shadow"])
+            self.assertFalse(opened)
