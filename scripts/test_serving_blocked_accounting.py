@@ -118,7 +118,7 @@ class ShippedAccounting:
             ' "$SERVING_BLOCKED_LAST_PHASE"\n'
         )
         result = subprocess.run(
-            ["/bin/bash", "-c", script], text=True, capture_output=True,
+            ["/bin/bash"], input=script, text=True, capture_output=True,
             check=False, timeout=120,
         )
         if result.returncode != 0:
