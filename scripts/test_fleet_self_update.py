@@ -703,8 +703,12 @@ class HappyPathTests(Base):
         joined = [" ".join(a) for a, _ in self.sys.calls]
         def first(pred):
             return next(i for i, c in enumerate(joined) if pred(c))
-        order = [first(lambda c, n=n: n in c) for n in (
-            "support-manifest write", "fleet-macos validate", "fleet-macos install", "ssh",
+        # Peer observation intentionally leads the procedure: a later gate
+        # may refuse before queue handling, but must not skip the unreadable
+        # streak that breaks a dead-peer deadlock.
+        order = [first(lambda c: c.startswith("ssh "))]
+        order += [first(lambda c, n=n: n in c) for n in (
+            "support-manifest write", "fleet-macos validate", "fleet-macos install",
             "capacity_floor.py", "pool drain", "pool off --plan")]
         order.append(first(lambda c: c.startswith("./tartci pool off") and "--plan" not in c))
         order += [first(lambda c, n=n: n in c) for n in ("--apply", "pool on")]
