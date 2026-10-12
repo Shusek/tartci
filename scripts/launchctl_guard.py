@@ -85,10 +85,13 @@ SHELL_SNAPSHOT = re.compile(
 # for the process families that the guard must protect; matching only the
 # executable basename lets path and snapshot patterns evade the guard.
 BROAD_KILL_COMMAND_LINES = (
-    "/bin/bash --noprofile --norc",
-    "/bin/sh -c runner.sh",
-    "/bin/zsh -l",
-    "zsh /usr/local/bin/snapshot-zsh --loop",
+    # Shapes captured from ps -axo command on the fleet hosts.
+    "/Users/danielraffel/.local/share/tartci-generations/aad356ca6bef941b2b675d695a0231acf89e4833-dbf3e8dbd7183aef/providers/tart-macos/runner.sh --loop",
+    "/Users/danielraffel/.local/libexec/TartCILauncher.app/Contents/MacOS/TartCILauncher --lane pulp-gate",
+    "/bin/zsh -c source /Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
+    "/Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
+    "/bin/zsh -lc tartci pool status",
+    "/bin/bash -lc runner.sh --loop",
     "/usr/bin/python3 -m tartci",
     "/usr/local/bin/python3.12 -m agent_cli",
     "/opt/homebrew/bin/node /Users/danielraffel/.local/bin/claude",
