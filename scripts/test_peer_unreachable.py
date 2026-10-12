@@ -272,6 +272,24 @@ class LifecycleTests(Fleet):
         self.assertEqual(su.survey_peers(self.cfg, self.sys, "m1", record=True).excluded, [])
         self.assertEqual(su.peer_streaks(self.cfg)["m5"]["reads"], 1)
 
+    def test_deferral_gate_records_dead_peer_before_it_can_refuse(self) -> None:
+        """A gate refusal must still advance the dark-peer convergence streak."""
+        self.dark("m5")
+        self.corroborate("m5", NOW)
+        # The installer gate refuses before the old implementation reached
+        # survey_peers; the observation must still be recorded now.
+        self.sys.dry_run_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        row = su.peer_streaks(self.cfg)["m5"]
+        self.assertEqual(row["reads"], 1)
+        for index in range(1, su.PEER_UNREACHABLE_MIN_READS):
+            self.sys.clock = NOW + index * (su.PEER_UNREACHABLE_EXCLUDE_SECONDS /
+                                            (su.PEER_UNREACHABLE_MIN_READS - 1))
+            self.corroborate("m5", NOW)
+            su.survey_peers(self.cfg, self.sys, "m1", record=True)
+        self.assertEqual(su.survey_peers(self.cfg, self.sys, "m1", record=True).excluded,
+                         ["m5"])
+
     def test_an_excluded_peer_still_dark_at_the_announce_re_read_is_skipped(self) -> None:
         self.exclude_m5()
         self.assertUpdated(self.apply())
