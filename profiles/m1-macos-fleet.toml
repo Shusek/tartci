@@ -5,10 +5,6 @@ name = "m1-macos-fleet"
 # changes the durable pool-off state nor loads a LaunchAgent.
 [host]
 id = "m1"
-# Temporarily remove m1 from the published fleet while it is unreachable and
-# blocks the self-update quorum. When m1 is back, set this to true and run:
-#   ./tartci fleet-macos advertised-labels --publish > fleet/advertised-labels.json
-published = false
 # The SSH alias other fleet hosts reach this one by (self-update peers).
 ssh = "m1"
 home = "/Users/danielraffel"
