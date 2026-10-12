@@ -28,6 +28,10 @@ data unless they feed a shell interpreter or ssh. Exit 0 otherwise, silently.
 TARTCI_ALLOW_RAW_LAUNCHCTL=1 written in the command itself is the explicit,
 auditable escape hatch (exit 0 with a warning). Malformed input exits 0 with
 a note: a broken hook must not break the agent's shell.
+
+The same hook refuses broad process kills: bare-name pkill/killall of an
+agent shell or interpreter, shell-snapshot -f patterns, and kill -9 -1.
+Use the tree's top PID or tartci launchd heal for targeted recovery.
 """
 
 from __future__ import annotations
@@ -72,6 +76,43 @@ SSH_ARG_OPTS = frozenset({"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
                           "-S", "-W", "-w"})
 XARGS_ARG_OPTS = frozenset({"-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s", "-a", "-d"})
 MAX_DEPTH = 8
+BROAD_KILL_NAMES = frozenset({"bash", "sh", "zsh", "python", "python3", "node"})
+WHOLE_USER_SELECTOR_OPTS = frozenset({"-u", "--user", "-U", "-G", "-g", "-t"})
+SHELL_SNAPSHOT = re.compile(
+    r"(?:snapshot[-_.]?(?:bash|sh|zsh)|(?:bash|sh|zsh)[-_.]?snapshot)", re.I
+)
+# pkill -f matches the complete command line.  Keep representative lines
+# for the process families that the guard must protect; matching only the
+# executable basename lets path and snapshot patterns evade the guard.
+BROAD_KILL_COMMAND_LINES = (
+    # Shapes captured from ps -axo command on the fleet hosts.
+    "/Users/danielraffel/.local/share/tartci-generations/aad356ca6bef941b2b675d695a0231acf89e4833-dbf3e8dbd7183aef/providers/tart-macos/runner.sh --loop",
+    "/Users/danielraffel/.local/libexec/TartCILauncher.app/Contents/MacOS/TartCILauncher --lane pulp-gate",
+    "/bin/zsh -c source /Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
+    "/Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
+    "/bin/zsh -lc tartci pool status",
+    "/bin/bash -lc runner.sh --loop",
+    "/usr/bin/python3 -m tartci",
+    "/usr/local/bin/python3.12 -m agent_cli",
+    "/opt/homebrew/bin/node /Users/danielraffel/.local/bin/claude",
+    "/Users/danielraffel/.local/bin/claude --dangerously-skip-permissions",
+    "/Users/danielraffel/.local/bin/codex --full-auto",
+)
+
+
+def _matches(pattern: str, value: str, *, full: bool = False) -> bool:
+    """Match a kill operand without letting malformed regex escape the hook."""
+    try:
+        return (re.fullmatch if full else re.search)(pattern, value, re.IGNORECASE) is not None
+    except re.error:
+        return True
+
+
+def _matches_broad_name(pattern: str, name: str) -> bool:
+    return _matches(pattern, name, full=True) or (
+        name in {"python", "python3"}
+        and _matches(r"python3(?:\.\d+)?", pattern, full=True)
+    )
 
 
 class Hit(NamedTuple):
@@ -301,6 +342,68 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
     head = os.path.basename(_expand(argv[0], variables))
     if head == "launchctl":
         return _launchctl_hits(argv[1:], from_stdin, variables, depth)
+    if head in ("pkill", "killall"):
+        words = [_expand(word, variables) for word in argv[1:]]
+        operands: list[str] = []
+        patterns: list[str] = []
+        selector_arg = False
+        has_user_selector = False
+        skip = False
+        for word in words:
+            if skip:
+                # -f consumes a pattern; selector options consume a value.
+                if selector_arg:
+                    selector_arg = False
+                else:
+                    patterns.append(word)
+                skip = False
+            elif word == "-f":
+                skip = True
+            elif word in WHOLE_USER_SELECTOR_OPTS:
+                has_user_selector = True
+                selector_arg = True
+                skip = True
+            elif not word.startswith("-"):
+                operands.append(word)
+        hits: list[Hit] = [
+            Hit(head, target,
+                "bare-name kill would terminate every matching agent shell/process")
+            for target in operands
+            if any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
+        ]
+        hits.extend(
+            Hit(head, target,
+                "-f matches a shell snapshot and can kill every agent session")
+            for target in patterns
+            if SHELL_SNAPSHOT.search(target) or any(
+                _matches(target, command_line)
+                for command_line in BROAD_KILL_COMMAND_LINES
+            )
+        )
+        if has_user_selector and not operands:
+            hits.append(Hit(head, "-u", "whole-user selector has no process operand"))
+        return hits
+    if head == "kill":
+        words = [_expand(word, variables) for word in argv[1:]]
+        signal_index = 0
+        if words[:1] in (["-s"], ["--signal"]):
+            signal_index = 2
+        elif words and words[0] == "-1" and len(words) > 1:
+            signal_index = 1
+        elif words and words[0].startswith("-") and words[0] != "-1":
+            signal_index = 1
+        targets = words[signal_index:]
+        broadcast = "-1" in targets or (words == ["-1"])
+        if broadcast:
+            signal = words[0] if words and words[0] != "-1" else "default"
+            return [Hit("kill", f"{signal} -1",
+                        "broadcast signal can terminate every agent and supervisor")]
+        return []
+    if head == "agent-hygiene":
+        if "--reap" in argv[1:]:
+            return [Hit(head, "--reap",
+                        "age-based agent reaping is human-only and unsafe from an agent")]
+        return []
     if head == "export":
         for word in argv[1:]:
             match = ASSIGNMENT.match(word)
@@ -348,9 +451,12 @@ def classify(command: str, depth: int = 0,
 
 
 def block_message(command: str, hits: list[Hit]) -> str:
-    lines = ["BLOCKED by tartci launchd guard: raw launchctl against a CI lane.", ""]
+    broad = any(hit.verb in {"pkill", "killall", "kill", "agent-hygiene"} for hit in hits)
+    heading = ("BLOCKED by tartci launchd guard: broad process kill."
+               if broad else "BLOCKED by tartci launchd guard: raw launchctl against a CI lane.")
+    lines = [heading, ""]
     for hit in hits:
-        lines.append(f"  launchctl {hit.verb} {hit.target}: {hit.why}")
+        lines.append(f"  {hit.verb} {hit.target}: {hit.why}")
     lines += [
         "",
         "Why: kickstart re-runs launchd's CACHED job spec (never the plist on",
@@ -364,10 +470,20 @@ def block_message(command: str, hits: list[Hit]) -> str:
         "                                  the plist; refuses while the lane is",
         "                                  mid-job (--dry-run shows the plan)",
         "  tartci pool drain               stop taking work; running jobs finish",
-        "",
-        "If you really mean it, put TARTCI_ALLOW_RAW_LAUNCHCTL=1 in the command",
-        "itself (e.g. TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...).",
     ]
+    if broad:
+        lines += [
+            "  Targeted recovery: kill the tree top by its PID, or run",
+            "  tartci launchd heal             bounded launchd recovery with a receipt",
+        ]
+    lines += [""]
+    if broad:
+        lines.append("Broad process kills have no escape hatch; target the tree by PID or run tartci launchd heal.")
+    else:
+        lines += [
+            "If you really mean it, put TARTCI_ALLOW_RAW_LAUNCHCTL=1 in the command",
+            "itself (e.g. TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...).",
+        ]
     return "\n".join(lines)
 
 
@@ -375,7 +491,8 @@ def decide(command: str) -> tuple[int, str]:
     hits = classify(command)
     if not hits:
         return 0, ""
-    if ESCAPE.search(command):
+    broad = any(hit.verb in {"pkill", "killall", "kill", "agent-hygiene"} for hit in hits)
+    if ESCAPE.search(command) and not broad:
         return 0, ("tartci launchd guard: TARTCI_ALLOW_RAW_LAUNCHCTL=1 given; allowing "
                    + "; ".join(f"launchctl {h.verb} {h.target}" for h in hits))
     return 2, block_message(command, hits)

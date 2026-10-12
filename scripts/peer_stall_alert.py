@@ -58,6 +58,8 @@ PRIMARY_MISSES = 2
 SEPARATOR = "--- guard ---"
 RESOLVER_SEPARATOR = "--- resolver ---"
 LAST_SEPARATOR = "--- peer-stall ---"
+VITALS_SEPARATOR = "--- host-vitals ---"
+HOST_VITALS_STALE_SECS = 5 * 60
 # Printed by the peer: its clock, its guard receipt, then its own last
 # peer-stall pass (each empty when absent).
 PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
@@ -66,7 +68,9 @@ PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
              'cat "${TARTCI_HOME:-$HOME/.tartci}/state/resolver-health/state.json" '
              '2>/dev/null || true; echo; echo "' + LAST_SEPARATOR + '"; '
              'cat "${TARTCI_PEER_STALL_DIR:-${TARTCI_HOME:-$HOME/.tartci}/state/peer-stall}'
-             '/last-read.json" 2>/dev/null || true')
+             '/last-read.json" 2>/dev/null || true; echo "' + VITALS_SEPARATOR + '"; '
+             'cat "${TARTCI_HOST_VITALS_STATE:-$HOME/.local/state/pulp/host_vitals.json}" '
+             '2>/dev/null || true')
 
 Runner = Callable[[List[str]], Tuple[int, str, str]]
 
@@ -114,6 +118,7 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
     clock = int(first.strip())
     _, _, body = rest.partition(SEPARATOR)
     body, _, last_text = body.partition(LAST_SEPARATOR)
+    last_text, _, vitals_text = last_text.partition(VITALS_SEPARATOR)
     guard_text, _, resolver_text = body.partition(RESOLVER_SEPARATOR)
     try:
         last = json.loads(last_text) if last_text.strip() else None
@@ -133,8 +138,13 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
         resolver = json.loads(resolver_text) if resolver_text else None
     except ValueError:
         resolver = None
+    try:
+        vitals = json.loads(vitals_text) if vitals_text.strip() else None
+    except ValueError:
+        vitals = None
     return {"readable": True, "clock": clock, "last": last if isinstance(last, dict) else None,
             "resolver": resolver if isinstance(resolver, dict) else None,
+            "vitals": vitals if isinstance(vitals, dict) else None,
             "guard": launchd_interval_guard.classify(
                 receipt, float(clock),
                 receipt_path=f"{target}:launchd-interval-guard/status.json"),
@@ -229,6 +239,42 @@ def resolver_alert_text(peer: str, target: str, me: str,
         f"Read by {me} over SSH at {iso(now)}. The peer path raised this because the host "
         "cannot reliably alert through GitHub by name while its resolver is wedged.",
     ]))
+
+
+VITALS_TITLE = "[tartci] {peer} host-vitals stalled since {since}"
+
+
+def vitals_judge(info: Dict[str, Any], threshold: int,
+                 episode_since: Optional[str] = None) -> Dict[str, Any]:
+    """Judge the peer's host-vitals receipt on the peer's own clock."""
+    value = info.get("vitals") or {}
+    sampled = value.get("sampled_at")
+    clock = info.get("clock")
+    if not isinstance(sampled, (int, float)) or not isinstance(clock, (int, float)):
+        return {"active": False, "resolved": False, "since": None, "age_seconds": None,
+                "state": "unknown"}
+    age = max(0.0, float(clock) - float(sampled))
+    since = iso(float(sampled))
+    began = _epoch(episode_since) if episode_since else None
+    return {"active": age >= threshold,
+            "resolved": age < threshold and (began is None or float(sampled) > began),
+            "since": since if age >= threshold else None,
+            "age_seconds": round(age, 1),
+            "state": "stale" if age >= threshold else "ok"}
+
+
+def vitals_alert_text(peer: str, target: str, me: str,
+                      verdict: Dict[str, Any], now: float) -> Tuple[str, str]:
+    title = VITALS_TITLE.format(peer=peer, since=verdict["since"])
+    body = "\n".join([
+        f"{peer}'s host-vitals receipt is {verdict['age_seconds']} s old, beyond the "
+        f"{setting('TARTCI_HOST_VITALS_ALERT_SECS', HOST_VITALS_STALE_SECS)} s limit.",
+        f"Run: ssh {target} 'tartci launchd heal'",
+        "Fix: run `tartci launchd heal` on the host; this is an out-of-band peer alert "
+        "because the stalled launchd watchdog cannot alert for its own timer stall.",
+        f"Read by {me} over SSH at {iso(now)}.",
+    ])
+    return title, body
 
 
 def _scratch(directory: pathlib.Path) -> bool:
@@ -398,6 +444,25 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         result[peer]["resolver"] = {**resolver_verdict, "acting": acting,
                                      "issue": resolver_out.get("issue"),
                                      "closed": bool(resolver_out.get("closed"))}
+        vitals_threshold = setting("TARTCI_HOST_VITALS_ALERT_SECS", HOST_VITALS_STALE_SECS)
+        vitals_path = directory / f"{peer}.host-vitals.json"
+        previous_vitals = host_off._read_json(vitals_path) or {}
+        vitals_verdict = vitals_judge(info, vitals_threshold, previous_vitals.get("since"))
+        vitals_out: Dict[str, Any] = {}
+        if acting or previous_vitals:
+            vitals_out = host_off.episode_alert(
+                vitals_path, active=vitals_verdict["active"] and acting,
+                resolved=vitals_verdict["resolved"], since=vitals_verdict["since"],
+                raise_event=lambda peer=peer, verdict=vitals_verdict: host_off.event(
+                    directory, "peer_host_vitals_stalled",
+                    f"{peer}: host-vitals stale since {verdict['since']}",
+                    {"peer": peer, "reader": me}, now),
+                render=lambda peer=peer, target=target, verdict=vitals_verdict:
+                    vitals_alert_text(peer, target, me or "a peer", verdict, now),
+                issue=issue or _open_or_adopt, close=close, issues_enabled=enabled)
+        result[peer]["host_vitals"] = {**vitals_verdict, "acting": acting,
+                                        "issue": vitals_out.get("issue"),
+                                        "closed": bool(vitals_out.get("closed"))}
     host_off._write_json(last_path, {"ts": now, "peers": result,
                                      "primary_misses": next_misses})
     return {"skipped": False, "peers": result}
