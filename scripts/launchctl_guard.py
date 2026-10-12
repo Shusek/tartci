@@ -92,6 +92,8 @@ BROAD_KILL_COMMAND_LINES = (
     "/Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
     "/bin/zsh -lc tartci pool status",
     "/bin/bash -lc runner.sh --loop",
+    "/bin/sh -c source /Users/danielraffel/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-20261011.sh",
+    "/Users/danielraffel/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-20261011.sh",
     "/usr/bin/python3 -m tartci",
     "/usr/local/bin/python3.12 -m agent_cli",
     "/opt/homebrew/bin/node /Users/danielraffel/.local/bin/claude",
