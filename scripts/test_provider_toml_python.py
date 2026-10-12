@@ -102,6 +102,26 @@ class StaticTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_required(mutant)
 
+    def test_grouped_tail_site_check_is_case_bounded_and_kills_g6(self) -> None:
+        source = (ROOT / "tartci").read_text()
+
+        def assert_grouped_tail(text: str) -> None:
+            fleet_start = text.index("cmd_fleet_macos() {")
+            fleet_end = text.index("\ncmd_support_manifest()", fleet_start)
+            fleet = text[fleet_start:fleet_end]
+            case_start = fleet.index("validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift|verify-supply|config-verdicts)")
+            case_end = fleet.index(";;", case_start)
+            self.assertIn("tartci_toml_python_exec", fleet[case_start:case_end])
+
+        assert_grouped_tail(source)
+        mutant = source.replace(
+            "validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift|verify-supply|config-verdicts)\n      tartci_toml_python_exec",
+            "validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift|verify-supply|config-verdicts)\n      tartci_toml_python",
+            1,
+        )
+        with self.assertRaises(AssertionError):
+            assert_grouped_tail(mutant)
+
     def test_exec_placement_guard_kills_pool_on_mutants(self) -> None:
         source = (ROOT / "tartci").read_text()
         probe = ('tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" \\\n'
