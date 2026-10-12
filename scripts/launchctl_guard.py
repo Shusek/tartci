@@ -105,6 +105,7 @@ BROAD_KILL_COMMAND_LINES = (
     "/Users/danielraffel/.local/bin/codex --full-auto",
     "/usr/local/bin/tartci-launcher --lane pulp-gate",
     "/usr/local/bin/shipyard-daemon-launcher --lane pulp-gate",
+    "/Users/danielraffel/.local/bin/Runner.Listener --start",
     "/usr/bin/login -flp daniel",
     "sr codex resume 01a126fe-4702-7b62-9852-63e986e1379c",
     "/usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh",
@@ -203,7 +204,9 @@ def _matches_static_fallback(pattern: str) -> bool:
 
 
 RAW_KILL_VERB = re.compile(
-    r"(?:^|[;&|]\s*|[\"']\s*)(?:sudo\s+)?(?:kill|killall|pkill)\b|"
+    r"(?:^|[;&|]\s*|\b(?:do|then|else)\s+|[({]\s*)(?:"
+    r"(?:sudo|env|nohup|timeout(?:\s+\S+)?|xargs)\s+)*(?:/[^\s/]+/)?"
+    r"(?:kill|killall|pkill)\b|"
     r"\b(?:os\.kill|Process\.kill|signal\.SIG(?:KILL|TERM))\b|"
     r"\blaunchctl\s+(?:kill|bootout|remove)\b|"
     r"\bxargs\b[^;|\n]*\bkill\b|"
@@ -213,9 +216,20 @@ RAW_KILL_VERB = re.compile(
 RAW_PID_SOURCE = re.compile(r"\b(?:pgrep|pidof|ps|lsof)\b|(?:^|\s)-[A-Za-z]*[fx]\b", re.I)
 
 
+def _has_raw_kill_verb(command: str) -> bool:
+    if RAW_KILL_VERB.search(command):
+        return True
+    quoted_kill = re.search(r"[\"']\s*(?:(?:sudo|env|nohup|timeout)\s+)*(?:/[^\s/]+/)?kill\b",
+                            command, re.I)
+    if not quoted_kill:
+        return False
+    prefix = command[:quoted_kill.start()]
+    return not re.search(r"\b(?:grep|egrep|rg|git\s+grep)\b[^;|\n]*$", prefix, re.I)
+
+
 def _raw_process_hits(command: str, rows: list[ProcessRow] | None) -> list[Hit]:
     """Apply the raw-text PID-source and kill co-occurrence rule."""
-    if not RAW_KILL_VERB.search(command) or not RAW_PID_SOURCE.search(command):
+    if not _has_raw_kill_verb(command) or not RAW_PID_SOURCE.search(command):
         return []
     assignments = dict(re.findall(r"\b([A-Za-z_]\w*)=([^\s;&|]+)", command))
     quoted = re.findall(r"['\"]([^'\"]+)['\"]", command)

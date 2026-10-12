@@ -323,6 +323,10 @@ class ClassifierTests(unittest.TestCase):
         # Only the exact value counts.
         self.assertEqual(guard.decide(
             f"TARTCI_ALLOW_RAW_LAUNCHCTL=0 launchctl kickstart -k gui/501/{LANE}")[0], 2)
+        code, message = guard.decide(
+            "TARTCI_ALLOW_RAW_LAUNCHCTL=1 kill $(pgrep -f tartci-launcher)")
+        self.assertEqual(code, 2)
+        self.assertIn("broad process kill", message)
 
 
 class HeredocTests(unittest.TestCase):
