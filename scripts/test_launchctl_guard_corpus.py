@@ -66,6 +66,9 @@ MUST_REFUSE = tuple(dict.fromkeys(
         "tar --new-volume-script='kill $(pgrep -f tartci-launcher)' -tf archive.tar",
         "tar --rsh-command='kill $(pgrep -f tartci-launcher)' -tf archive.tar",
         "tar -F 'kill $(pgrep -f tartci-launcher)' -tf archive.tar",
+        "rg --pre 'sh -c \"kill \\$(pgrep -f tartci-launcher)\"' pattern .",
+        "rg --pre='kill $(pgrep -f \"sr codex\")' x .",
+        "ag --pager='kill $(pgrep -f tartci-launcher)' pattern",
     ]
 ))
 MUST_ALLOW = tuple(['pgrep -f codex', "pgrep -fl 'sr codex'", "pgrep -f 'sr codex' | wc -l", 'pgrep -f codex && echo found', 'ps aux | grep codex', "ps -axo pid,ppid,command | grep 'sr codex'", 'tail -f ~/Library/Logs/tartci/tartci-self-update.log', 'ps aux | grep -i kill', 'ps aux | grep pkill', "ps aux | grep 'kill'", 'ps aux | grep "pkill -f"', "grep -rn 'pkill -f' scripts/", "rg -n 'kill' scripts/launchctl_guard.py", 'rg -n "os.kill" scripts/', "git grep -n 'kill -9' -- scripts", 'git log --oneline | grep -i kill', "grep -n 'xargs kill' scripts/*.py", 'python3 -m unittest -f scripts.test_launchctl_guard', 'pytest -x scripts/test_kill_guard.py', 'lsof -t -i :8080', 'launchctl list | grep tartci', "echo 'do not kill the lane' && tartci pool status -f", "ls -lf /bin/kill", "tar -xf kill-switch.tar", "git commit -F msg.txt -m 'guard: refuse broad kill'", "sed -n '/kill/p' run.log", "cat docs/kill.md", "man kill", "which pkill", "gh pr view 487 --json body -q .body | less", "env FOO=bar ls -lf /bin/kill", "sudo git commit -F msg.txt -m 'guard: refuse broad kill'", "nohup tar -xf kill-switch.tar", "tar -tf archive.tar", "tar -tzf archive.tar", "sudo tar -tf archive.tar", "git -C /tmp/x log", "git -C /tmp/x log --oneline -S 'pkill -f'",])
