@@ -231,7 +231,7 @@ RAW_KILL_VERB = re.compile(
     r"\b(?:system|qx)\s*\([^)]*\bkill\b",
     re.I,
 )
-RAW_PID_SOURCE = re.compile(r"\b(?:pgrep|pidof|ps|lsof)\b|(?:^|\s)-[A-Za-z]*[fx]\b", re.I)
+RAW_PID_SOURCE = re.compile(r"\b(?:pgrep|pidof|ps|lsof)\b|(?:^|\s)-[a-z]*[fx]\b")
 STATIC_NAME_HINT = re.compile(r"(?:tartci|codex|claude|runner|listener|shell|zsh|bash|login|shipyard)", re.I)
 
 
@@ -285,6 +285,27 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
             return False
         if "-c" in lowered or any(arg.startswith("-c=") for arg in lowered):
             return False
+        execution_options = ("--upload-pack", "--receive-pack", "-o",
+                             "--open-files-in-pager", "--exec")
+        if any(arg == option or arg.startswith(option + "=")
+               for arg in lowered for option in execution_options):
+            return False
+        subcommand_index = 0
+        while subcommand_index < len(lowered):
+            option = lowered[subcommand_index]
+            if option == "-c" or option.startswith("-c="):
+                return False
+            if option in {"--git-dir", "--work-tree", "-c"}:
+                subcommand_index += 2
+                continue
+            if option.startswith("--git-dir=") or option.startswith("--work-tree="):
+                subcommand_index += 1
+                continue
+            if option == "-C":
+                subcommand_index += 2
+                continue
+            break
+        lowered = lowered[subcommand_index:]
         readonly = {"status", "log", "show", "diff", "rev-parse", "ls-files",
                     "ls-remote", "fetch", "blame", "grep", "describe", "merge-base",
                     "cat-file"}
@@ -294,7 +315,18 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
         return True
     if command == "tar":
         lowered_args = [arg.lower() for arg in args]
-        return "-t" in lowered_args or "--list" in lowered_args
+        if any(arg in {"-i", "--to-command", "--use-compress-program", "--checkpoint-action"}
+               or arg.startswith(("--to-command=", "--use-compress-program=", "--checkpoint-action="))
+               for arg in lowered_args):
+            return False
+        if any(arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]
+               for arg in lowered_args):
+            return False
+        # Tar operands and filenames are data; only its command-executing
+        # options keep the segment visible.  Listing forms are the explicit
+        # read-only cases, while ordinary extraction remains safe when its
+        # arguments merely contain the word kill.
+        return True
     return False
 
 
