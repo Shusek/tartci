@@ -41,7 +41,9 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
+from pathlib import Path
 from typing import NamedTuple
 
 DANGEROUS_VERBS = frozenset({
@@ -100,6 +102,14 @@ BROAD_KILL_COMMAND_LINES = (
     "/Users/danielraffel/.local/bin/claude --dangerously-skip-permissions",
     "/Users/danielraffel/.local/bin/codex --full-auto",
 )
+PROCESS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*)$")
+PROTECTED_PROCESS = re.compile(
+    r"(?:tartci[-_]launcher|TartCILauncher|runner\.sh\s+--loop|"
+    r"(?:^|\s)sr\s+(?:codex|claude)\b|(?:^|\s)(?:codex|claude)\b|"
+    r"claude[- ]proxy|subrouter|shell-snapshots|(?:^|/)login\s+-flp\b|"
+    r"(?:^|/)(?:bash|sh|zsh|dash|ksh)\b)",
+    re.I,
+)
 
 
 def _matches(pattern: str, value: str, *, full: bool = False) -> bool:
@@ -121,6 +131,67 @@ class Hit(NamedTuple):
     verb: str
     target: str
     why: str
+
+
+class ProcessRow(NamedTuple):
+    pid: int
+    ppid: int
+    command: str
+
+
+def _process_table() -> list[ProcessRow] | None:
+    """Read the host process table, or return None when it is unavailable.
+
+    Tests may point this at a captured ``ps`` receipt. Production always uses
+    the host's read-only ``ps`` output; a static pattern list is used only if
+    that read fails.
+    """
+    snapshot = os.environ.get("TARTCI_GUARD_PS_SNAPSHOT")
+    try:
+        if snapshot:
+            text = Path(snapshot).read_text(encoding="utf-8")
+        else:
+            text = subprocess.run(
+                ["ps", "-axo", "pid=,ppid=,command="],
+                check=True, capture_output=True, text=True, timeout=1,
+            ).stdout
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    rows: list[ProcessRow] = []
+    for line in text.splitlines():
+        match = PROCESS_ROW.match(line)
+        if match:
+            rows.append(ProcessRow(int(match.group(1)), int(match.group(2)), match.group(3)))
+    return rows or None
+
+
+def _protected_process_commands(rows: list[ProcessRow]) -> list[str]:
+    by_pid = {row.pid: row for row in rows}
+    protected = {row.pid for row in rows if PROTECTED_PROCESS.search(row.command)}
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            if row.pid not in protected and row.ppid in protected:
+                protected.add(row.pid)
+                changed = True
+    return [by_pid[pid].command for pid in protected]
+
+
+def _matches_live_protected(pattern: str, rows: list[ProcessRow] | None) -> bool | None:
+    if rows is None:
+        return None
+    try:
+        expression = re.compile(pattern, re.I)
+    except re.error:
+        return True
+    return any(expression.search(command) for command in _protected_process_commands(rows))
+
+
+def _matches_static_fallback(pattern: str) -> bool:
+    return SHELL_SNAPSHOT.search(pattern) is not None or any(
+        _matches(pattern, command_line) for command_line in BROAD_KILL_COMMAND_LINES
+    )
 
 
 def _tokens(command: str) -> list[str]:
@@ -291,13 +362,13 @@ def _label_of(target: str) -> str:
 
 
 def _launchctl_hits(args: list[str], from_stdin: bool, variables: dict[str, str],
-                    depth: int) -> list[Hit]:
+                    depth: int, process_rows: list[ProcessRow] | None) -> list[Hit]:
     words = [_expand(word, variables) for word in args]
     if not words:
         return []
     verb = words[0]
     if verb == "asuser" and len(words) > 2:
-        return _classify_argv(words[2:], variables, depth + 1)
+        return _classify_argv(words[2:], variables, depth + 1, process_rows)
     if verb not in DANGEROUS_VERBS:
         return []
     operands: list[str] = []
@@ -337,14 +408,15 @@ def _launchctl_hits(args: list[str], from_stdin: bool, variables: dict[str, str]
     return hits
 
 
-def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> list[Hit]:
+def _classify_argv(argv: list[str], variables: dict[str, str], depth: int,
+                   process_rows: list[ProcessRow] | None) -> list[Hit]:
     argv, from_stdin = _strip_wrappers(list(argv), variables)
     if not argv:
         return []
     head = os.path.basename(_expand(argv[0], variables))
     if head == "launchctl":
-        return _launchctl_hits(argv[1:], from_stdin, variables, depth)
-    if head in ("pkill", "killall"):
+        return _launchctl_hits(argv[1:], from_stdin, variables, depth, process_rows)
+    if head in ("pkill", "killall", "pgrep"):
         words = [_expand(word, variables) for word in argv[1:]]
         operands: list[str] = []
         patterns: list[str] = []
@@ -373,15 +445,13 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
             for target in operands
             if any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
         ]
-        hits.extend(
-            Hit(head, target,
-                "-f matches a shell snapshot and can kill every agent session")
-            for target in patterns
-            if SHELL_SNAPSHOT.search(target) or any(
-                _matches(target, command_line)
-                for command_line in BROAD_KILL_COMMAND_LINES
-            )
-        )
+        for target in patterns:
+            live_match = _matches_live_protected(target, process_rows)
+            matched = (_matches_static_fallback(target)
+                       if live_match is None else live_match)
+            if matched:
+                hits.append(Hit(head, target,
+                                "-f matches a protected process or agent session"))
         if has_user_selector and not operands:
             hits.append(Hit(head, "-u", "whole-user selector has no process operand"))
         return hits
@@ -415,32 +485,38 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
     if head in SHELLS:
         for index, word in enumerate(argv[1:], start=1):
             if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word) and index + 1 < len(argv):
-                return classify(argv[index + 1], depth + 1, dict(variables))
+                return classify(argv[index + 1], depth + 1, dict(variables), process_rows)
         return []
     if head == "eval":
-        return classify(" ".join(argv[1:]), depth + 1, variables)
+        return classify(" ".join(argv[1:]), depth + 1, variables, process_rows)
     if head in ("ssh", "autossh"):
         i = 1
         while i < len(argv) and argv[i].startswith("-"):
             i += 2 if argv[i] in SSH_ARG_OPTS else 1
         remote = argv[i + 1:]
-        return classify(" ".join(remote), depth + 1, {}) if remote else []
+        return classify(" ".join(remote), depth + 1, {}, process_rows) if remote else []
     return []
 
 
+_PROCESS_ROWS_UNSET = object()
+
+
 def classify(command: str, depth: int = 0,
-             variables: dict[str, str] | None = None) -> list[Hit]:
+             variables: dict[str, str] | None = None,
+             process_rows: list[ProcessRow] | None | object = _PROCESS_ROWS_UNSET) -> list[Hit]:
     """Every dangerous launchctl invocation COMMAND would run."""
     if depth > MAX_DEPTH:
         return [Hit("?", command[:80], "nesting too deep to classify")]
     variables = {} if variables is None else variables
+    if process_rows is _PROCESS_ROWS_UNSET:
+        process_rows = _process_table()
     hits: list[Hit] = []
     command, shell_bodies = _split_heredocs(command)
     for body in shell_bodies:
-        hits.extend(classify(body, depth + 1, dict(variables)))
+        hits.extend(classify(body, depth + 1, dict(variables), process_rows))
     flattened, bodies = _extract_substitutions(command)
     for body in bodies:
-        hits.extend(classify(body, depth + 1, dict(variables)))
+        hits.extend(classify(body, depth + 1, dict(variables), process_rows))
     try:
         tokens = _tokens(flattened)
     except ValueError:
@@ -448,12 +524,12 @@ def classify(command: str, depth: int = 0,
         # mutation is still seen.
         tokens = flattened.split()
     for argv in _simple_commands(tokens):
-        hits.extend(_classify_argv(argv, variables, depth))
+        hits.extend(_classify_argv(argv, variables, depth, process_rows))
     return hits
 
 
 def block_message(command: str, hits: list[Hit]) -> str:
-    broad = any(hit.verb in {"pkill", "killall", "kill", "agent-hygiene"} for hit in hits)
+    broad = any(hit.verb in {"pkill", "killall", "pgrep", "kill", "agent-hygiene"} for hit in hits)
     heading = ("BLOCKED by tartci launchd guard: broad process kill."
                if broad else "BLOCKED by tartci launchd guard: raw launchctl against a CI lane.")
     lines = [heading, ""]
@@ -493,7 +569,7 @@ def decide(command: str) -> tuple[int, str]:
     hits = classify(command)
     if not hits:
         return 0, ""
-    broad = any(hit.verb in {"pkill", "killall", "kill", "agent-hygiene"} for hit in hits)
+    broad = any(hit.verb in {"pkill", "killall", "pgrep", "kill", "agent-hygiene"} for hit in hits)
     if ESCAPE.search(command) and not broad:
         return 0, ("tartci launchd guard: TARTCI_ALLOW_RAW_LAUNCHCTL=1 given; allowing "
                    + "; ".join(f"launchctl {h.verb} {h.target}" for h in hits))

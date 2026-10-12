@@ -17,6 +17,7 @@ import launchctl_guard as guard
 
 ROOT = Path(__file__).resolve().parents[1]
 SHIM = ROOT / "hooks" / "claude-pretooluse-launchctl.sh"
+PS_FIXTURE = ROOT / "scripts" / "fixtures" / "launchctl_guard_ps_m3.txt"
 LANE = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate"
 RUNNER = "actions.runner.Generous-Corp-pulp.pulp-preamble-m5"
 LEGACY = "com.danielraffel.pulp.tart-runner-macos-release"
@@ -115,6 +116,18 @@ BROAD_KILLS = [
 
 
 class ClassifierTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._old_ps_snapshot = os.environ.get("TARTCI_GUARD_PS_SNAPSHOT")
+        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(PS_FIXTURE)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._old_ps_snapshot is None:
+            os.environ.pop("TARTCI_GUARD_PS_SNAPSHOT", None)
+        else:
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = cls._old_ps_snapshot
+
     def test_proxy_snapshot_and_sh_process_shapes_are_refused(self) -> None:
         # These are command-line shapes captured from ``ps -axo command`` on
         # the fleet.  ``pkill -f`` matches the complete command line, so each
@@ -147,12 +160,38 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(guard.decide(f"launchctl kickstart -k gui/501/{LANE}")[0], 2)
 
     def test_broad_process_kills_are_refused_and_targeted_recovery_is_named(self) -> None:
-        for command in BROAD_KILLS:
+        # The static list is only the fail-closed path when ps is unavailable.
+        old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
+        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(ROOT / "missing-ps-snapshot")
+        try:
+            for command in BROAD_KILLS:
+                with self.subTest(command=command):
+                    code, message = guard.decide(command)
+                    self.assertEqual(code, 2, command)
+                    self.assertIn("tartci launchd heal", message)
+                    self.assertIn("tree top", message)
+        finally:
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
+
+    def test_live_process_table_refuses_real_agent_and_lane_shapes(self) -> None:
+        patterns = (
+            "pkill -f tartci-launcher",
+            "pkill -f resume",
+            "pkill -f 'codex resume'",
+            "pkill -f 'sr codex'",
+            "pkill -f 'claude proxy'",
+            "pkill -f 'login -flp'",
+            "pkill -f '^/Users/danielraffel/.subrouter/codex/claude-proxy'",
+            "pgrep -f 'sr codex' | xargs kill",
+        )
+        for command in patterns:
             with self.subTest(command=command):
                 code, message = guard.decide(command)
                 self.assertEqual(code, 2, command)
                 self.assertIn("tartci launchd heal", message)
-                self.assertIn("tree top", message)
+
+    def test_live_process_table_allows_pattern_matching_no_protected_process(self) -> None:
+        self.assertEqual(guard.decide("pkill -f '^/Users/example/harmless-worker$'"), (0, ""))
 
     def test_benign_kills_are_the_control(self) -> None:
         for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",
