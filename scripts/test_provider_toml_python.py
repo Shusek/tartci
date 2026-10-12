@@ -62,6 +62,21 @@ class StaticTests(unittest.TestCase):
                 '/usr/bin/python3 "${PIN}" m\n')
         self.assertEqual(bare_calls(text, "pulp-source-pin.py"), [2, 3, 5])
 
+    def test_exec_variant_is_used_only_by_tail_dispatchers(self) -> None:
+        source = (ROOT / "tartci").read_text()
+        expected = {
+            'tartci_toml_python_exec "$HERE/scripts/macos_fleet_lanes.py"',
+            'tartci_toml_python_exec "$HERE/scripts/fleet_self_update.py"',
+            'tartci_toml_python_exec "$HERE/scripts/tool_freshness.py"',
+            'tartci_toml_python_exec "$HERE/scripts/support_agents.py"',
+            'tartci_toml_python_exec "$HERE/scripts/debug_hold.py"',
+        }
+        self.assertEqual({line.strip().split(' "$@"')[0]
+                          for line in source.splitlines()
+                          if "tartci_toml_python_exec" in line}, expected)
+        self.assertNotIn("tartci_toml_python_exec", source.split("cmd_launchd", 1)[1].split(
+            "# Print (never write)", 1)[0])
+
 
 class OperatorShellTests(unittest.TestCase):
     """`provision.sh pulp-readiness` under a PATH whose python3 lacks tomllib."""
@@ -96,6 +111,15 @@ class OperatorShellTests(unittest.TestCase):
         self.assertIn('"pulp_commit"', result.stdout)
         self.assertIn('"status": "unready"', result.stdout)
 
+    def test_shared_wrapper_returns_to_a_pool_on_shaped_script(self) -> None:
+        script = (f"source {COMMON / 'toml-python.lib.sh'}\n"
+                  f"TARTCI_PYTHON={sys.executable} tartci_toml_python -c 'print(\"child\")'\n"
+                  "printf 'continued\\n'\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["child", "continued"])
+
     def test_no_toml_python_names_the_fix(self) -> None:
         result = self.run_readiness("")
         if Path("/opt/homebrew/bin/python3").exists() or Path("/usr/local/bin/python3").exists():
@@ -119,7 +143,7 @@ class OperatorShellTests(unittest.TestCase):
             wrapper = root / "wrapper.sh"
             wrapper.write_text("#!/bin/bash\n"
                               f"source {COMMON / 'toml-python.lib.sh'}\n"
-                              f"TARTCI_PYTHON={fake} tartci_toml_python ignored\n")
+                              f"TARTCI_PYTHON={fake} tartci_toml_python_exec ignored\n")
             wrapper.chmod(0o755)
             process = subprocess.Popen([str(wrapper)], stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True,

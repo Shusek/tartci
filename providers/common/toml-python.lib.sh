@@ -51,5 +51,13 @@ tartci_toml_python_path() {
 tartci_toml_python() {
   local python
   python="$(tartci_toml_python_path)" || return 127
+  "$python" "$@"
+}
+
+# Replace the current shell only when the caller is at a dispatcher tail.
+# Mid-flow tartci helpers must return so pool-on and verification can continue.
+tartci_toml_python_exec() {
+  local python
+  python="$(tartci_toml_python_path)" || return 127
   exec "$python" "$@"
 }
