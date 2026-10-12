@@ -289,6 +289,7 @@ class QueueScanner:
                 str(self.observation_lock_path), self.args.observation_lock_timeout,
                 self.args.repo, getattr(self.args, "observation_backoff_file", None),
                 getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
             ).hold() as handle:
                 self.observation_lock_fd = os.dup(handle.fileno())
                 os.set_inheritable(self.observation_lock_fd, True)
@@ -669,6 +670,7 @@ def parse_args() -> argparse.Namespace:
         or os.environ.get("TARTCI_RUNNER_SLOT")
         or f"supervisor-{os.getppid()}",
     )
+    parser.add_argument("--generation", default=os.environ.get("TARTCI_GENERATION") or "unknown")
     parser.add_argument("--gh-cli", default=os.environ.get("TARTCI_GH_CLI") or "gh")
     parser.add_argument("--gh-timeout", type=int, default=int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--max-run-pages", type=int, default=int(os.environ.get("TARTCI_QUEUE_RUN_PAGES", "2")))
