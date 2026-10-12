@@ -286,8 +286,8 @@ class InstallMacosFleetTests(unittest.TestCase):
         pid, master = pty.fork()
         if pid == 0:
             os.execve(str(wrapper), [str(wrapper), "--reap", "2", "--yes"], env)
-        os.write(master, b"n\n")
         output = bytearray()
+        sent = False
         status = None
         deadline = time.monotonic() + 5
         while status is None:
@@ -301,6 +301,9 @@ class InstallMacosFleetTests(unittest.TestCase):
                     chunk = os.read(master, 4096)
                     if chunk:
                         output.extend(chunk)
+                        if not sent and b"terminate these process groups" in output:
+                            os.write(master, b"n\n")
+                            sent = True
                 except OSError:
                     pass
             waited, status = os.waitpid(pid, os.WNOHANG)

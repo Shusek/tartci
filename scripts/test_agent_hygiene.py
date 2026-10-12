@@ -33,8 +33,8 @@ class AgentHygieneTests(unittest.TestCase):
         pid, master = pty.fork()
         if pid == 0:
             os.execve(str(SCRIPT), [str(SCRIPT), *args], env)
-        os.write(master, b"n\n")
         output = bytearray()
+        sent = False
         deadline = time.monotonic() + 5
         status = None
         while status is None:
@@ -48,6 +48,9 @@ class AgentHygieneTests(unittest.TestCase):
                     chunk = os.read(master, 4096)
                     if chunk:
                         output.extend(chunk)
+                        if not sent and b"terminate these process groups" in output:
+                            os.write(master, b"n\n")
+                            sent = True
                 except OSError:
                     pass
             waited, status = os.waitpid(pid, os.WNOHANG)
