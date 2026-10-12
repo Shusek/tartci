@@ -150,6 +150,7 @@ if state.get("release_pr"):
 
 def runs_page(run_id, name):
     runs = ([{"id": run_id, "name": name, "status": status,
+              "head_repository": {"full_name": "Generous-Corp/pulp"},
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
     # The ghost: a merge_group run whose queue entry is long gone. Nothing in
@@ -159,6 +160,7 @@ def runs_page(run_id, name):
     if run_id == 101 and state.get("ghost") and status == "queued":
         runs.append({"id": 103, "name": name, "status": status,
                      "event": "merge_group",
+                     "head_repository": {"full_name": "Generous-Corp/pulp"},
                      "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
                      "created_at": "2026-08-18T00:00:00Z",
                      "updated_at": "2026-08-18T00:00:00Z"})

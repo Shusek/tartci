@@ -145,7 +145,7 @@ tartci_assignment_v2_tier_demand(){
     if SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
       python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
         --repo "$REPO" --runner-group-id "$group_id" --gh-cli "${JIT_GH_CLI:-$GH_CLI}" \
-        2>"$access_error"; then
+        >/dev/null 2>"$access_error"; then
       access_rc=0
     else
       access_rc=$?
