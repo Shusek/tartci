@@ -80,6 +80,28 @@ class StaticTests(unittest.TestCase):
         source = (ROOT / "tartci").read_text()
         self._assert_exec_tail_positions(source)
 
+    def test_tail_dispatchers_require_exec_variant(self) -> None:
+        source = (ROOT / "tartci").read_text()
+
+        def assert_required(text: str) -> None:
+            fleet = text[text.index("cmd_fleet_macos() {"):text.index("\ncmd_support_manifest()", text.index("cmd_fleet_macos() {"))]
+            self.assertRegex(fleet, r"validate\|render\|write-receipt\|verify-installed\|verify-loaded\|advertised-labels\|profile-drift\|verify-supply\|config-verdicts\)[\s\S]*?tartci_toml_python_exec")
+            for sub in ("self-update", "tool-freshness", "support-agents"):
+                start = fleet.index(f"{sub})")
+                end = fleet.index(";;", start)
+                self.assertIn("tartci_toml_python_exec", fleet[start:end])
+            held = text[text.index("held) shift;"):text.index(";;", text.index("held) shift;"))]
+            self.assertIn("tartci_toml_python_exec", held)
+
+        assert_required(source)
+        mutant = source.replace(
+            'self-update)\n      tartci_toml_python_exec',
+            'self-update)\n      tartci_toml_python',
+            1,
+        )
+        with self.assertRaises(AssertionError):
+            assert_required(mutant)
+
     def test_exec_placement_guard_kills_pool_on_mutants(self) -> None:
         source = (ROOT / "tartci").read_text()
         probe = ('tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" \\\n'
