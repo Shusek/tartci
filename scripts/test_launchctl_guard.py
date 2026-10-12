@@ -233,6 +233,24 @@ class ClassifierTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(guard.decide(command)[0], 2)
 
+    def test_unquoted_pid_source_operands_and_assignments_are_checked(self) -> None:
+        commands = (
+            "ps aux | grep tartci-launcher | awk '{print $2}' | xargs kill -9",
+            "kill $(ps aux | grep tartci-launcher | awk '{print $2}')",
+            "PAT=tartci-launcher; kill $(pgrep -f $PAT)",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
+        code, message = guard.decide("kill $(pgrep -f $UNKNOWN)")
+        self.assertEqual(code, 2)
+        self.assertIn("<unresolved>", message)
+
+    def test_read_only_grep_for_kill_words_is_allowed(self) -> None:
+        for command in ("grep -i kill notes.txt | less", "grep pkill README.md | cat"):
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command), (0, ""))
+
     def test_raw_read_only_wrappers_remain_allowed(self) -> None:
         for command in ("ssh m3 \"pgrep -f 'sr codex'\"",
                         "bash -c \"pgrep -f tartci-launcher\"",

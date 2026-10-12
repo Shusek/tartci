@@ -109,6 +109,7 @@ BROAD_KILL_COMMAND_LINES = (
     "sr codex resume 01a126fe-4702-7b62-9852-63e986e1379c",
     "/usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh",
     "/Users/danielraffel/.local/bin/studio-pulp-gate",
+    "/Users/danielraffel/.local/bin/claude proxy --resume",
 )
 PROCESS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*)$")
 PROTECTED_PROCESS = re.compile(
@@ -202,10 +203,12 @@ def _matches_static_fallback(pattern: str) -> bool:
 
 
 RAW_KILL_VERB = re.compile(
-    r"(?:\bkill(?:all)?\b|\bpkill\b|\bos\.kill\b|"
-    r"\bsignal\.SIG(?:KILL|TERM)\b|\bProcess\.kill\b|"
+    r"(?:^|[;&|]\s*|[\"']\s*)(?:sudo\s+)?(?:kill|killall|pkill)\b|"
+    r"\b(?:os\.kill|Process\.kill|signal\.SIG(?:KILL|TERM))\b|"
     r"\blaunchctl\s+(?:kill|bootout|remove)\b|"
-    r"\bxargs\b[^;|\n]*\bkill\b)", re.I,
+    r"\bxargs\b[^;|\n]*\bkill\b|"
+    r"\b(?:system|qx)\s*\([^)]*\bkill\b",
+    re.I,
 )
 RAW_PID_SOURCE = re.compile(r"\b(?:pgrep|pidof|ps|lsof)\b|(?:^|\s)-[A-Za-z]*[fx]\b", re.I)
 
@@ -214,14 +217,31 @@ def _raw_process_hits(command: str, rows: list[ProcessRow] | None) -> list[Hit]:
     """Apply the raw-text PID-source and kill co-occurrence rule."""
     if not RAW_KILL_VERB.search(command) or not RAW_PID_SOURCE.search(command):
         return []
+    assignments = dict(re.findall(r"\b([A-Za-z_]\w*)=([^\s;&|]+)", command))
     quoted = re.findall(r"['\"]([^'\"]+)['\"]", command)
     flagged = re.findall(r"(?:^|\s)-[A-Za-z]*[fx]\s+([^\s;&|()]+)", command, re.I)
-    patterns = list(dict.fromkeys(quoted + flagged))
+    flagged = [word.strip("(){}") for word in flagged]
+    operands: list[str] = []
+    for match in re.finditer(r"\b(?:grep|egrep|pgrep|pkill|pidof)\b([^;|]*)", command, re.I):
+        for word in re.findall(r"[^\s]+", match.group(1)):
+            if not word.startswith("-"):
+                operands.append(word.strip("(){}"))
+    patterns = list(dict.fromkeys(quoted + flagged + operands))
+    resolved: list[str] = []
+    for pattern in patterns:
+        variable = re.fullmatch(r"\$(?:\{)?([A-Za-z_]\w*)\}?", pattern)
+        resolved.append(assignments.get(variable.group(1), "<unresolved>")
+                        if variable else pattern)
+    patterns = list(dict.fromkeys(resolved))
     if not patterns:
         return [Hit("process-source", "<unresolved>",
                     "a PID source and kill verb occur together")]
     hits: list[Hit] = []
     for pattern in patterns:
+        if pattern == "<unresolved>":
+            hits.append(Hit("process-source", pattern,
+                            "the PID pattern is unresolved and cannot be shown safe"))
+            continue
         live = _matches_live_protected(pattern, rows)
         if _matches_static_fallback(pattern) or live is True or live is None:
             hits.append(Hit("process-source", pattern,
@@ -595,7 +615,7 @@ def classify(command: str, depth: int = 0,
 
 
 def block_message(command: str, hits: list[Hit]) -> str:
-    broad = any(hit.verb in {"pkill", "killall", "pgrep", "kill", "agent-hygiene"} for hit in hits)
+    broad = any(hit.verb in {"pkill", "killall", "pgrep", "kill", "agent-hygiene", "process-source"} for hit in hits)
     heading = ("BLOCKED by tartci launchd guard: broad process kill."
                if broad else "BLOCKED by tartci launchd guard: raw launchctl against a CI lane.")
     lines = [heading, ""]
@@ -635,7 +655,7 @@ def decide(command: str) -> tuple[int, str]:
     hits = classify(command)
     if not hits:
         return 0, ""
-    broad = any(hit.verb in {"pkill", "killall", "pgrep", "kill", "agent-hygiene"} for hit in hits)
+    broad = any(hit.verb in {"pkill", "killall", "pgrep", "kill", "agent-hygiene", "process-source"} for hit in hits)
     if ESCAPE.search(command) and not broad:
         return 0, ("tartci launchd guard: TARTCI_ALLOW_RAW_LAUNCHCTL=1 given; allowing "
                    + "; ".join(f"launchctl {h.verb} {h.target}" for h in hits))
