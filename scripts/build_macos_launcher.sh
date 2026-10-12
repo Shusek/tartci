@@ -27,8 +27,8 @@ support_root="$(cd "$support_root" && pwd -P)"
 # TOML-capable interpreter by its ordered PATH/absolute candidates, then
 # canonicalise symlinks so the installer and sealed lanes record one identity.
 resolve_render_python() {
-  local candidate configured="${1:-${TARTCI_RENDER_PYTHON:-${TARTCI_PYTHON:-}}}"
-  # shellcheck source=providers/common/toml-python.lib.sh
+  local candidate="${1:-${TARTCI_RENDER_PYTHON:-${TARTCI_PYTHON:-}}}"
+  # shellcheck disable=SC1091 # support_root is an explicit checkout argument
   . "$support_root/providers/common/toml-python.lib.sh"
   if [[ -n "$candidate" ]]; then
     TARTCI_PYTHON="$candidate" tartci_toml_python_path
