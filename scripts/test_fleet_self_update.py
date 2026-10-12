@@ -648,7 +648,7 @@ class TargetOrchestratorHandoffTests(Base):
         with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
             rc = self.apply()
         self.assertEqual(rc, su.EXIT_REFUSED)
-        receipt = self.last()
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
         self.assertEqual(receipt["status"], "refused")
         self.assertIn("target dispatcher unavailable", receipt["error"])
         self.assertEqual(self.sys.mutations(), [])
@@ -660,7 +660,7 @@ class TargetOrchestratorHandoffTests(Base):
         with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
             rc = self.apply()
         self.assertEqual(rc, su.EXIT_REFUSED)
-        receipt = self.last()
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
         self.assertEqual(receipt["status"], "refused")
         self.assertIn("PermissionError", receipt["error"])
         self.assertEqual(self.sys.mutations(), [])
