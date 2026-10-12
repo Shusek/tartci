@@ -29,9 +29,9 @@ TARTCI_ALLOW_RAW_LAUNCHCTL=1 written in the command itself is the explicit,
 auditable escape hatch (exit 0 with a warning). Malformed input exits 0 with
 a note: a broken hook must not break the agent's shell.
 
-The same hook refuses broad process kills: bare-name `pkill`/`killall` of an
-agent shell or interpreter, shell-snapshot `-f` patterns, and `kill -9 -1`.
-Use the tree's top PID or `tartci launchd heal` for targeted recovery.
+The same hook refuses broad process kills: bare-name pkill/killall of an
+agent shell or interpreter, shell-snapshot -f patterns, and kill -9 -1.
+Use the tree's top PID or tartci launchd heal for targeted recovery.
 """
 
 from __future__ import annotations
@@ -464,7 +464,7 @@ def block_message(command: str, hits: list[Hit]) -> str:
     else:
         lines += [
             "If you really mean it, put TARTCI_ALLOW_RAW_LAUNCHCTL=1 in the command",
-            "itself (e.g. `TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...`).",
+            "itself (e.g. TARTCI_ALLOW_RAW_LAUNCHCTL=1 launchctl ...).",
         ]
     return "\n".join(lines)
 
