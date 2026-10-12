@@ -31,6 +31,19 @@ def _rows(snapshot: dict, lane: str, profile: str | None = None) -> list[dict]:
 
 
 class SnapshotShapeTests(unittest.TestCase):
+    def test_unpublished_profile_contributes_no_registrations_or_peer(self) -> None:
+        data = fleet.load(M3)
+        data["host"]["published"] = False
+        self.assertEqual(fleet.advertised_registrations(data), [])
+        self.assertEqual(fleet.persistent_runners(data), [])
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / M3.name
+            path.write_text(M3.read_text().replace('[host]\n',
+                                                    '[host]\npublished = false\n', 1))
+            snapshot = fleet.advertised_labels_snapshot([path], None)
+        self.assertEqual(snapshot["registrations"], [])
+        self.assertEqual(snapshot["hosts"], [])
+
     def test_schema_and_provenance(self) -> None:
         snapshot = fleet.advertised_labels_snapshot([M3], "a" * 40)
         self.assertEqual(snapshot["schema"], "tartci.advertised-labels/v1")

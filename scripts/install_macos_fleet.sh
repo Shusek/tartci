@@ -121,22 +121,7 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
 # through that exact executable before writing any LaunchAgent; a PATH python3
 # may be a newly linked Homebrew build that is blocked by the host firewall.
 if [ "${TARTCI_TESTING:-0}" != 1 ]; then
-  if ! /usr/bin/python3 - "$PYTHON_BIN" <<'PY'
-import subprocess
-import sys
-
-interpreter = sys.argv[1]
-code = ("import urllib.request; "
-        "urllib.request.urlopen('https://api.github.com', timeout=2).read(1)")
-try:
-    result = subprocess.run([interpreter, "-c", code], text=True,
-                            capture_output=True, timeout=3, check=False)
-except subprocess.TimeoutExpired:
-    raise SystemExit(f"interpreter GitHub probe timed out after 3s: {interpreter}")
-if result.returncode != 0:
-    detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["unknown error"]
-    raise SystemExit(f"interpreter GitHub probe failed ({interpreter}): {detail[0]}")
-PY
+  if ! /usr/bin/python3 "$SUPPORT_SOURCE/scripts/probe_interpreter_github.py" "$PYTHON_BIN"
   then
     echo "fleet install requires the pinned interpreter to reach api.github.com: $PYTHON_BIN" >&2
     exit 127
