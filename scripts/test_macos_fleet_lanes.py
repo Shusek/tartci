@@ -28,6 +28,7 @@ HOST_CONFIGS = {
     "m1": ROOT / "profiles" / "m1-macos-fleet.toml",
     "studio": ROOT / "profiles" / "m3-macos-fleet.toml",
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
+    "m5studio": ROOT / "profiles" / "m5studio-macos-fleet.toml",
 }
 # The Pulp gate classes each host's pulp-gate serves.
 GATE_CLASSES = {}
@@ -700,6 +701,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             "m1": ("/Users/danielraffel/VMs", "vellum-host-m1", False),
             "studio": ("/Volumes/Workshop/VMs", "vellum-host-m3", False),
             "m5": ("/Users/danielraffel/VMs", "vellum-host-m5", False),
+            "m5studio": ("/Volumes/Atelier/VMs", "vellum-host-m5studio", False),
         }
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
@@ -762,7 +764,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertNotIn("priority", pulp_lane)
                 self.assertEqual(
                     pulp_lane.get("vm_cores"),
-                    7 if host_id == "studio" else None,
+                    7 if host_id == "studio" else (8 if host_id == "m5studio" else None),
                 )
                 self.assertEqual(
                     pulp_lane["supervisors"], 2
@@ -906,7 +908,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "Generous-Corp/pulp": None,
                             "danielraffel/spectr": "vm" if host_id == "m1" else "gate",
                             "Generous-Corp/forge": "gate",
-                            "Generous-Corp/vellum": "gate",
+                            "Generous-Corp/vellum": "vm",
                         },
                     )
                     for value in values:
@@ -915,7 +917,12 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "7"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
-                            else None
+                            else (
+                                "8"
+                                if host_id == "m5studio"
+                                and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+                                else None
+                            )
                         )
                         self.assertEqual(
                             env.get("TARTCI_MACOS_VM_CORES"),
@@ -1975,7 +1982,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         """Only the trial hosts' profiles declare the retarget, and only on
         their pulp-gate slots; every other shipped host and lane is unaffected."""
         env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
-        canary = {"m1": "120", "studio": "120", "m5": "120"}
+        canary = {"m1": "120", "studio": "120", "m5": "120", "m5studio": "120"}
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(shipped=host_id):
                 rendered = fleet.rendered_plists(fleet.load(config))
@@ -2025,6 +2032,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                                           "pulp-release-tagged,pulp-release-pr-gate"),
         ".m5.pulp-gate.plist": None,
         ".m5.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
+        ".m5studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
+        ".m5studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
+                                             "pulp-release-tagged,pulp-release-pr-gate"),
     }
 
     def test_m5studio_slot2_prefers_merge_group_before_pr_head(self) -> None:

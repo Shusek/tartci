@@ -66,12 +66,14 @@ if failure:
     raise SystemExit(1)
 
 parsed = urlparse("https://example.invalid/" + path)
+head_repository = json.loads(os.environ.get("HEAD_REPOSITORY", '{"full_name":"owner/repo"}'))
 jobs = [{"id": 201, "status": "queued", "labels": LABELS + ["pulp-build-merge-group"]}]
 if parsed.path.endswith("/actions/workflows"):
     print(json.dumps({"total_count": 1,
                       "workflows": [{"id": 99, "name": "Build and Test"}]}))
 elif "/actions/workflows/99/runs" in parsed.path:
     runs = ([{"id": 101, "name": "Build and Test", "status": "queued",
+              "head_repository": head_repository,
               "created_at": "2026-08-25T00:00:00Z",
               "updated_at": "2026-08-25T00:00:00Z"}]
             if "status=queued" in path else [])
@@ -111,6 +113,7 @@ class ScannerHarness(unittest.TestCase):
         core_limit: int,
         queue_failure: str = "",
         probe_refusal: str = "",
+        head_repository: str = '{"full_name":"owner/repo"}',
     ) -> dict[str, str]:
         base = [
             directory
@@ -125,6 +128,7 @@ class ScannerHarness(unittest.TestCase):
             "CORE_REMAINING": "0",
             "QUEUE_FAILURE": queue_failure,
             "PROBE_REFUSAL": probe_refusal,
+            "HEAD_REPOSITORY": head_repository,
         }
 
     def _scan(
@@ -132,6 +136,7 @@ class ScannerHarness(unittest.TestCase):
         core_limit: int,
         queue_failure: str = "",
         probe_refusal: str = "",
+        head_repository: str = '{"full_name":"owner/repo"}',
     ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
@@ -140,11 +145,12 @@ class ScannerHarness(unittest.TestCase):
                 "--workflow", "Build and Test",
                 "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
                 "--require-label", "pulp-build-merge-group",
+                "--require-head-repo", "owner/repo",
                 "--gh-cli", str(self.gh),
                 "--observation-lock-file", str(self.root / "observation.lock"),
             ],
             capture_output=True, text=True, check=False,
-            env=self._env(core_limit, queue_failure, probe_refusal),
+            env=self._env(core_limit, queue_failure, probe_refusal, head_repository),
         )
 
     def _calls(self) -> list[str]:
@@ -215,6 +221,11 @@ class ScanAuthPreflight(ScannerHarness):
             "a transient fault is still retried; only the authentication "
             "fault stops on the first attempt",
         )
+
+    def test_null_head_repository_is_not_lane_demand(self) -> None:
+        result = self._scan(15000, head_repository="null")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "0")
 
 
 class ProbeRefusalDoesNotBlindALane(ScannerHarness):
@@ -298,6 +309,7 @@ class ReasonReachesTheSupervisor(unittest.TestCase):
             "TARTCI_RUNNER_LABELS": ",".join(BASE + ["pulp-gate-fast"]),
             "TARTCI_RUNNER_WORKFLOW_TIERS": "pulp-build-merge-group|Build and Test",
             "TARTCI_RUNNER_ASSIGNMENT_MODE": "event-class-v2",
+            "HEAD_REPOSITORY": '{"full_name":"Generous-Corp/pulp"}',
         }
         return subprocess.run(
             ["bash", str(RUNNER), "--print-selection"],
