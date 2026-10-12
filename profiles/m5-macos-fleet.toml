@@ -259,10 +259,14 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
-priority = "gate"
+# Vellum is advisory to Pulp's required gate: vm=60, while Pulp
+# event-class leases derive 100 (PR head) / 110 (merge group).
+priority = "vm"
+supervisors = 1
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
-workflows = ["Locked macOS GPU proof", "README clean release proof"]
+workflows = ["Locked macOS GPU proof"]
+runner_idle_timeout_seconds = 60
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
