@@ -1,0 +1,14 @@
+{
+  "now": 1799983800,
+  "queued": [
+    {"id": 114426391754, "required": true, "created_at": "2027-01-15T03:00:00+00:00"}
+  ],
+  "cases": {
+    "O3": [{"ts": "2027-01-15T03:15:00Z", "event": "admission_error", "runner": "m5s"}, {"ts": "2027-01-15T03:16:00Z", "event": "admission_error", "runner": "m5s"}, {"ts": "2027-01-15T03:17:00Z", "event": "admission_error", "runner": "m5s"}],
+    "O9": [{"ts": "2027-01-15T03:20:00Z", "event": "job_assigned", "runner": "m3", "job_id": "o9"}, {"ts": "2027-01-15T03:20:10Z", "event": "supervisor_signal", "runner": "m3", "detail": "INT/TERM quarantine=signal_teardown_unknown", "job_id": "o9"}],
+    "O10": [{"ts": "2027-01-15T03:15:00Z", "event": "admission_error", "runner": "m5s"}, {"ts": "2027-01-15T03:16:00Z", "event": "admission_error", "runner": "m5s"}, {"ts": "2027-01-15T03:17:00Z", "event": "admission_error", "runner": "m5s"}],
+    "O11": [{"ts": "2027-01-15T03:15:00Z", "event": "admission_precheck_error", "runner": "m3"}, {"ts": "2027-01-15T03:16:00Z", "event": "admission_precheck_error", "runner": "m3"}, {"ts": "2027-01-15T03:17:00Z", "event": "admission_precheck_error", "runner": "m3"}],
+    "2026-10-12-admission-roll": [{"ts": "2027-01-15T03:15:00Z", "event": "admission_error", "runner": "m1"}, {"ts": "2027-01-15T03:16:00Z", "event": "admission_error", "runner": "m1"}, {"ts": "2027-01-15T03:17:00Z", "event": "admission_error", "runner": "m1"}]
+  },
+  "quiet": [{"ts": "2027-01-15T03:19:00Z", "event": "clone_start", "runner": "m5"}, {"ts": "2027-01-15T03:20:00Z", "event": "boot_ip", "runner": "m5"}]
+}

@@ -65,6 +65,7 @@ import glob
 import json
 import os
 import plistlib
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -1380,6 +1381,36 @@ def host_off_pass(status_only: bool = False, now: float | None = None) -> str | 
     return None
 
 
+def serving_truth_pass(now: float | None = None) -> str | None:
+    """Run the rules-only fleet serving monitor once per watchdog tick.
+
+    The monitor is advisory and fail-open for the watchdog itself: an API or
+    local event read failure is reported, never converted into a host action.
+    ``TARTCI_SERVING_TRUTH_ALARM=0`` disables the optional pass for legacy
+    generations while they are being rolled out.
+    """
+    if os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "1") == "0":
+        return None
+    try:
+        import serving_truth_alarm  # noqa: PLC0415 - sibling module
+        state = Path(os.environ.get("TARTCI_HOME", os.path.join(os.path.expanduser("~"), ".tartci"))) / "state"
+        events = Path(os.environ.get("TARTCI_EVENT_LOG", str(state / "macos" / "events.jsonl")))
+        if not events.exists():
+            return None
+        cli = os.environ.get("TARTCI_GH_CLI", "ghapp")
+        repo = os.environ.get("TARTCI_REPO", "danielraffel/tartci")
+        queued = serving_truth_alarm.fetch_required_queue(cli, repo)
+        out = serving_truth_alarm.alert_pass(state / "serving-truth", events, queued,
+                                             now=utcnow())
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN serving-truth check FAILED "
+                f"({type(exc).__name__}: {exc}); no serving alarm was raised")
+    if out.get("trips"):
+        return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN "
+                f"serving-truth: {len(out['trips'])} rule trip(s), evidence recorded")
+    return None
+
+
 # ── rate limiting ────────────────────────────────────────────────────────────
 
 def _state_file() -> str:
@@ -1553,6 +1584,9 @@ def main(argv: list[str] | None = None) -> int:
         resolver_line = resolver_health_pass()
         if resolver_line:
             print(resolver_line)
+        serving_line = serving_truth_pass()
+        if serving_line:
+            print(serving_line)
         hold_line = debug_hold_pass()
         if hold_line:
             print(hold_line)
