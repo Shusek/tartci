@@ -33,6 +33,7 @@ import network_profile
 import pulp_reapers
 import schedule_backstop_mode
 import support_agents
+import debug_hold
 import reuse_canary
 import power_status
 
@@ -50,7 +51,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary",
+    "reuse_canary", "debug_hold", "launchd_watchdog",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -90,7 +91,7 @@ WORKTREE_CLEANUP_KEYS = {
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
 }
 LANE_KEYS = {
-    "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
+    "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "ccache_write_isolation",
@@ -102,7 +103,8 @@ LANE_KEYS = {
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
-    "warm_vm", "warm_vm_max_park_seconds",
+    "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
+    "v2_gate_classes",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -464,6 +466,16 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    watchdog = data.get("launchd_watchdog")
+    if watchdog is not None:
+        # The watchdog's frozen-lane threshold, rendered into its plist by the
+        # support-agents step; it lived only on hand-edited plists (#195).
+        if not isinstance(watchdog, dict) or set(watchdog) - {"stale_log_seconds"}:
+            fail("launchd_watchdog must be a table with only stale_log_seconds")
+        stale = watchdog.get("stale_log_seconds")
+        if stale is not None and (type(stale) is not int or not 600 <= stale <= 14400):
+            fail("launchd_watchdog.stale_log_seconds must be an integer from 600 "
+                 "through 14400")
     disagreement = data.get("build_disagreement")
     if disagreement is not None:
         if not isinstance(disagreement, dict):
@@ -473,7 +485,7 @@ def load(path: Path) -> dict:
             fail(f"unknown build_disagreement keys: {sorted(unknown)}")
         if type(disagreement.get("enabled", False)) is not bool:
             fail("build_disagreement.enabled must be a boolean")
-    # Opt-in: run Pulp's own build-directory reapers from `tartci reclaim`
+    # Opt-in: run Pulp's own build-directory reapers from tartci reclaim
     # (scripts/pulp_reapers.py). One validator for install time and run time,
     # so a profile that installs is a profile the reclaim pass acts on.
     reclaim = data.get("reclaim")
@@ -491,6 +503,12 @@ def load(path: Path) -> dict:
     canary = data.get(reuse_canary.TABLE)
     if canary is not None:
         problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Whether this host keeps failed gate VMs for debugging (off by default).
+    hold = data.get(debug_hold.TABLE)
+    if hold is not None:
+        problems = debug_hold.validate_table(hold)
         if problems:
             fail("; ".join(problems))
     # Which support LaunchAgents this host carries (checked after the agents'
@@ -648,6 +666,12 @@ def load(path: Path) -> dict:
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
+        vm_cores_from = lane.get("vm_cores_from")
+        if vm_cores_from is not None:
+            if vm_cores_from != "gate-reserve":
+                fail(f"lane {lane_id}: vm_cores_from must be \"gate-reserve\"")
+            if vm_cores is not None:
+                fail(f"lane {lane_id}: set vm_cores or vm_cores_from, not both")
         priority = lane.get("priority")
         if priority is not None and (
                 not isinstance(priority, str) or priority not in LEASE_PRIORITIES):
@@ -761,6 +785,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: warm_vm_max_park_seconds must be an integer "
                 "from 300 through 14400 beside warm_vm = true"
+            )
+        guest_stale = lane.get("guest_heartbeat_stale_seconds")
+        if guest_stale is not None and (
+                type(guest_stale) is not int or not 120 <= guest_stale <= 3600):
+            fail(
+                f"lane {lane_id}: guest_heartbeat_stale_seconds must be an "
+                "integer from 120 through 3600"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -906,7 +937,8 @@ def load(path: Path) -> dict:
                 )
             tier_group_by_label[label] = group_id
         if assignment_mode == "event-class-v2":
-            validate_v2_tiers(lane_id, lane["repo"], tiers)
+            validate_v2_tiers(lane_id, lane["repo"], tiers,
+                              v2_gate_classes(lane_id, lane.get("v2_gate_classes")))
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
             if any(group_id != 1 for group_id in tier_groups):
@@ -990,30 +1022,53 @@ def load(path: Path) -> dict:
     return data
 
 
-def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict]) -> None:
+def v2_gate_classes(lane_id: str, declared: object) -> tuple[str, ...]:
+    """The gate classes an event-class-v2 lane serves; both unless it says so.
+
+    A lane may drop a gate class only by naming the ones it keeps, in the
+    canonical order, so an omitted tier is a stated decision and never a
+    typo. m1 serves PR-head only: its 3-core guest ran merge_group jobs in
+    33-35 min against 15-22 min elsewhere.
+    """
+    if declared is None:
+        return V2_GATE_CLASSES
+    if (not isinstance(declared, list) or not declared
+            or len(set(declared)) != len(declared)
+            or any(item not in V2_GATE_CLASSES for item in declared)
+            or list(declared) != [c for c in V2_GATE_CLASSES if c in declared]):
+        fail(
+            f"lane {lane_id}: v2_gate_classes must be a non-empty subset of "
+            f"{list(V2_GATE_CLASSES)} in that order"
+        )
+    return tuple(declared)
+
+
+def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
+                      gate_classes: tuple[str, ...] = V2_GATE_CLASSES) -> None:
     """The event-class-v2 tier contract: gate classes first, then extras.
 
-    The two gate classes lead, one workflow row each. Any further rows belong to
-    declared extra classes: each must be a known class, listed contiguously,
-    with exactly that class's workflows in order and never twice.
+    The lane's gate classes (both, unless `v2_gate_classes` names fewer) lead,
+    one workflow row each. Any further rows belong to declared extra classes:
+    each must be a known class, listed contiguously, with exactly that class's
+    workflows in order and never twice.
     """
     labels = [tier["label"] for tier in tiers]
-    if labels[:2] != list(V2_GATE_CLASSES) or len(set(labels[:2])) != 2:
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    if any(label in V2_GATE_CLASSES for label in labels[2:]):
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    extras = list(dict.fromkeys(labels[2:]))
+    n = len(gate_classes)
+    expected = " then ".join(
+        {"pulp-build-merge-group": "merge-group", "pulp-build-pr-head": "PR-head"}[c]
+        for c in gate_classes)
+    if labels[:n] != list(gate_classes):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    if any(label in V2_GATE_CLASSES for label in labels[n:]):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    extras = list(dict.fromkeys(labels[n:]))
     if not extras:
         return
     if repo != "Generous-Corp/pulp":
         fail(f"lane {lane_id}: extra event classes are Pulp classes")
-    grouped = [label for label in extras for _ in range(labels[2:].count(label))]
-    if grouped != labels[2:]:
-        fail(f"lane {lane_id}: event class {labels[2:]} rows must be contiguous and unique")
+    grouped = [label for label in extras for _ in range(labels[n:].count(label))]
+    if grouped != labels[n:]:
+        fail(f"lane {lane_id}: event class {labels[n:]} rows must be contiguous and unique")
     for label in extras:
         expected = V2_EXTRA_CLASS_WORKFLOWS.get(label)
         if expected is None:
@@ -1201,7 +1256,24 @@ def write_receipt(
     data = load(config)
     support_root = support_root.resolve()
     launch_entrypoint = launch_entrypoint.resolve()
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                installed_env = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {})
+            except (OSError, plistlib.InvalidFileException):
+                continue
+            pinned = installed_env.get("TARTCI_PYTHON")
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     digests: dict[str, str] = {}
     for name, body in expected.items():
         installed = agents_dir / name
@@ -1230,8 +1302,14 @@ def write_receipt(
         entrypoint_source, entrypoint, support_root
     )
     launch = support_manifest.launch_record(launch_entrypoint, support_root)
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    interpreter = Path(os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3"))
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter must be a regular non-symlink file")
     interpreter_record = {
@@ -1370,8 +1448,19 @@ def verify_receipt(
         != support.get("launch_entrypoint")
     ):
         fail("installed TartCI launch entrypoint does not match its receipt")
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    recorded_interpreter = support.get("interpreter")
+    interpreter = Path(
+        recorded_interpreter["path"]
+        if isinstance(recorded_interpreter, dict) and recorded_interpreter.get("path")
+        else os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3")
+    )
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     interpreter_record = {
         "path": str(interpreter),
         "mode": stat.S_IMODE(interpreter_info.st_mode),
@@ -1387,7 +1476,7 @@ def verify_receipt(
                 f"{INTERPRETER_CHANGED_BY_OS_UPDATE}: the OS-managed {interpreter} changed "
                 f"with a macOS update ({evidence}), so the receipt no longer describes it; "
                 "remedy: reinstall the same generation to refresh the receipt "
-                "(`tartci fleet-macos self-update --apply` does this at the next idle window)")
+                "(tartci fleet-macos self-update --apply does this at the next idle window)")
         fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
@@ -1395,7 +1484,26 @@ def verify_receipt(
     recorded_persistent = receipt.get("persistent_plists", {})
     if recorded_persistent != expected_persistent:
         fail("installed persistent runner plist set does not match the profile receipt")
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    # Render with the same rule as write_receipt: pin only when the installed
+    # plist cohort carries TARTCI_PYTHON. Unpinned source renders must verify
+    # as unpinned rather than being silently rewritten during verification.
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                pinned = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {}).get("TARTCI_PYTHON")
+            except (OSError, plistlib.InvalidFileException):
+                pinned = None
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
         fail("install receipt plist set does not match the profile")
@@ -1416,18 +1524,18 @@ def verify_receipt(
             installed_body = _verified_network_overlay(installed, body, config)
         if recorded.get(name) != digest or installed_body is None:
             fail(f"installed fleet plist failed receipt verification: {installed}")
-    expected_retired = replacements(data)
-    if receipt.get("retired_launchd_labels") != expected_retired:
-        fail("install receipt retired-label set does not match the profile")
-    for label in expected_retired:
-        if (agents_dir / f"{label}.plist").exists():
-            fail(f"declared legacy LaunchAgent became installable again: {label}")
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
         source_commit=verified_support["source_commit"],
         manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     )
+    expected_retired = replacements(data)
+    if receipt.get("retired_launchd_labels") != expected_retired:
+        fail("install receipt retired-label set does not match the profile")
+    for label in expected_retired:
+        if (agents_dir / f"{label}.plist").exists():
+            fail(f"declared legacy LaunchAgent became installable again: {label}")
     return receipt
 
 
@@ -1903,7 +2011,10 @@ def fleet_readiness(
                 "blocked_seconds_threshold": blocked_serving_seconds,
             },
             "problems": [{"code": INTERPRETER_CHANGED_BY_OS_UPDATE
-                          if isinstance(exc, InterpreterChangedByOSUpdate) else "receipt_mismatch",
+                          if isinstance(exc, InterpreterChangedByOSUpdate)
+                          else ("lane_python_unavailable"
+                                if "interpreter unavailable" in str(exc)
+                                else "receipt_mismatch"),
                           "detail": str(exc)}],
             "config": config_verdicts(config, support_root),
         }
@@ -2281,7 +2392,7 @@ def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
     """The SSH target a fallback lane reaches a preferred host by.
 
     The same rule self-update uses for its peers: the host's published
-    `host.ssh` from its checked-in profile, else the `tartci-<host_id>` alias
+    host.ssh from its checked-in profile, else the tartci-<host_id> alias
     convention. Resolved at render time, so the LaunchAgent carries the exact
     target and the supervisor never re-reads profiles.
     """
@@ -2340,6 +2451,14 @@ def lane_plist(
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    # The installer resolves and probes one interpreter before rendering. Keep
+    # that exact path in every LaunchAgent so TartCILauncher and ghapp cannot
+    # follow a later PATH relink.
+    pinned_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if pinned_python:
+        env["TARTCI_PYTHON"] = pinned_python
+        env["SHIPYARD_GHAPP_PYTHON_BINARY"] = pinned_python
+        env["PATH"] = f"{Path(pinned_python).parent}:{env['PATH']}"
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"] and lane["id"] == "pulp-gate":
         env.update({
@@ -2382,6 +2501,12 @@ def lane_plist(
         env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
+    if "vm_cores_from" in lane:
+        # Derived at lease time from this host's live gate reserve
+        # (gate_reserve_fit.share_cores), so the rendered plist names the rule
+        # and the slot count, never a size measured on another machine.
+        env["TARTCI_MACOS_VM_CORES_FROM"] = lane["vm_cores_from"]
+        env["TARTCI_MACOS_VM_CORES_SLOTS"] = str(lane.get("supervisors", 1))
     if lane.get("tier"):
         env["TARTCI_RUNNER_WORKFLOW_TIERS"] = "\n".join(
             f"{row['label']}|{row['workflow']}" for row in lane["tier"]
@@ -2451,6 +2576,8 @@ def lane_plist(
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)
+    if "guest_heartbeat_stale_seconds" in lane:
+        env["TARTCI_GUEST_HEARTBEAT_STALE_SECS"] = str(lane["guest_heartbeat_stale_seconds"])
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
@@ -2682,7 +2809,7 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         # Additive to v1: runners a host owns whose labels tartci does not set.
         "persistent_runners": persistent,
         # Additive to v1: how fleet hosts reach each other (self-update's
-        # one-at-a-time check). ssh null means the alias `tartci-<host_id>`.
+        # one-at-a-time check). ssh null means the alias tartci-<host_id>.
         "hosts": hosts,
     }
 
@@ -3341,7 +3468,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     if current != body:
                         print(f"fleet-macos: {args.check} is stale; regenerate with "
-                              "`tartci fleet-macos advertised-labels --publish > "
+                              "tartci fleet-macos advertised-labels --publish > "
                               "fleet/advertised-labels.json`", file=sys.stderr)
                         return 1
                     print(f"up to date: {args.check}")

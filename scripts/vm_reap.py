@@ -25,7 +25,9 @@ import sys
 import time
 from typing import Any
 
+import debug_hold  # sibling module; owns the held- prefix
 import runner_census
+import tart_home as tart_home_resolver
 from bounded_subprocess import ObservationError, require_success, run_bounded
 
 
@@ -131,6 +133,11 @@ def is_protected_name(name: str, protected: list[str]) -> bool:
     if name.startswith("bench-") or name.endswith("-bench") or "-bench-" in name:
         return True
     if name.endswith(":latest"):
+        return True
+    if debug_hold.is_held(name):
+        # A failed VM kept for debugging (scripts/debug_hold.py): it has no
+        # state file and no runner by design, and is deleted only by its TTL,
+        # its PR closing, or an operator.
         return True
     return False
 
@@ -557,7 +564,8 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             prefixes.append(derived)
     lane_runners = {lane.runner_name for lane in lanes or [] if lane.runner_name}
     leases_seen = lease_references() if lane_runners else set()
-    tart_home = pathlib.Path(os.environ.get("TART_HOME") or pathlib.Path.home() / ".tart").expanduser()
+    store = ensure_tart_home()
+    tart_home = pathlib.Path(store["path"])
     protected = [p for p in args.protected_names.split(",") if p]
     tart_providers = {"", "tart-macos", "tart-linux"}
 
@@ -916,6 +924,10 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "tart_timeout_secs": args.tart_timeout_secs,
             "github_timeout_secs": args.github_timeout_secs,
             "observation_timeout_secs": args.observation_timeout_secs,
+            # Which Tart store this pass read. A pass over ssh without the
+            # lanes' TART_HOME read Tart's default store and saw no gate VM.
+            "tart_home": {"path": store["path"], "source": store["source"],
+                          "warning": store.get("warning")},
         },
         "capacity": capacity,
         # Lane VMs whose supervisor is gone: what this pass deletes (or, in a
@@ -1018,6 +1030,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def ensure_tart_home() -> dict[str, Any]:
+    """Resolve the Tart store and export it, so every `tart` child reads it.
+
+    The dispatcher already exports the fleet profile's store; this covers a
+    direct `python3 scripts/vm_reap.py` from a shell with no TART_HOME.
+    """
+    store = tart_home_resolver.resolve()
+    if store["source"] == "profile":
+        os.environ["TART_HOME"] = store["path"]
+    return store
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     digest, rc = build_digest(args)
@@ -1025,6 +1049,10 @@ def main(argv: list[str]) -> int:
         print(json.dumps(digest, indent=2, sort_keys=True))
     else:
         print(f"tartci reap — host={digest['host']} problems={len(digest['problems'])} fixed={len(digest['fixed'])}")
+        store = (digest.get("config") or {}).get("tart_home") or {}
+        if store:
+            print(f"  tart store: {store.get('path')} (from {store.get('source')})"
+                  + (f" WARNING: {store['warning']}" if store.get("warning") else ""))
         for problem in digest["problems"]:
             print(f"  problem: {problem}")
         for item in digest["fixed"]:

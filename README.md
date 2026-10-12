@@ -51,6 +51,23 @@ bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
 and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
 needs no tartci update to be read.
 
+**Where a VM's slot time went** is the report's `lifecycle` block. A macOS
+lane writes one `vm_lifecycle` event per VM that reached a runner, at teardown
+(`providers/tart-macos/lifecycle.lib.sh`), with each phase in seconds:
+`pre_clone` (admission, job claim, lease wait; no VM yet), `clone`, `boot_ip`
+(clone done to an address), `ip_ssh`, `prep` (SSH to JIT mint: preflights and
+the admission boundary), `register` (mint to "Listening for Jobs"), `idle`
+(listening to "Running job:", or to the runner's exit when unserved), `job`,
+`teardown` and `total`, plus `served`, `warm` and `rc`. A warm handoff has no
+clone or boot phases. The report gives per phase the VMs, total and median
+seconds, the job share of VM seconds (clone through teardown) and the overhead
+per served job, per host and fleet-wide. The runner log is read every 5 s, so
+`register` and `idle` are host-observed to within 5 s. VMs discarded before a
+runner write no event and stay in the discard counts; a host on a tartci
+without the event reports none rather than zero overhead. With
+`TARTCI_RUNTIME_MEASURE=1` the same phases are also `lc_*` rows in the VM's
+`timing.tsv`.
+
 The support LaunchAgents a host carries (reclaimer, artifact-cache refresher,
 keychain unlocker, schedule backstop, reuse canary, launchd watchdog, reaper)
 are declared in its fleet profile's `[support_agents]` table and compared after
@@ -165,7 +182,8 @@ git clone <this-repo> tartci && cd tartci
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
 ./tartci up macos --src /path/to/pulp     # ephemeral macOS build+test clone (host caches mounted)
-./tartci up windows       # ephemeral Windows build+test (CoW overlay→build→ctest→discard)
+./tartci up windows       # ephemeral Windows build+test (GPU-off default)
+./tartci up windows --gpu # same bounded run with the published Windows Skia slice + plugin scan
 ./tartci serve linux      # serve the GitHub Actions pool: ephemeral per-job runner(s)
 ./tartci serve macos --once --labels self-hosted,macOS,ARM64,pulp-build-vm
 ./tartci serve windows --loop   # keep serving Windows jobs (throwaway overlay each)
@@ -182,7 +200,9 @@ other agents to answer where CI should run from machine-readable config.
 Pool-serving VM runners acquire host-core leases before booting guests. The
 lease size defaults to the host profile's `vm_pool_cores`; override per host
 with `TARTCI_MACOS_VM_CORES`, `TARTCI_LINUX_VM_CORES`, or
-`TARTCI_WIN_VM_CORES`. Set `TARTCI_VM_LEASES=0` only for operator-controlled
+`TARTCI_WIN_VM_CORES`. A fleet-macos lane can instead set `vm_cores_from =
+"gate-reserve"` to size its VMs so all of its slots fit the host's gate
+reserve. Set `TARTCI_VM_LEASES=0` only for operator-controlled
 break-glass debugging. Tart-backed macOS/Linux runners apply the lease size with
 `tart set --cpu` after cloning and before boot; QEMU Windows passes the leased
 size through `-smp`.
@@ -209,22 +229,23 @@ fail-closed `exit 75` restart. A live guardian or a refused teardown still
 restarts immediately.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
-builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]
+builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke] [--gpu]
 [--keep]` makes a per-job CoW overlay off the Windows golden on a dynamic SSH
-port (concurrent-safe), builds GPU-off under MSVC arm64, then discards the
-overlay (see `providers/`). `tartci up macos --src <checkout>` clones the
+port (concurrent-safe), builds under MSVC arm64, optionally links the immutable
+Windows Skia slice, scans produced CLAP/VST3 artifacts, then discards the overlay
+(see `providers/`). `tartci up macos --src <checkout>` clones the
 macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 `~/build`, runs ctest, and discards the clone. See
 `docs/runbook.md` for the from-scratch, gotcha-by-gotcha guide and
 `docs/new-repo-agent-guide.md` to onboard a new repo.
 
 **The fleet is not Macs-only.** A Proxmox host (`macpro`, an x86_64 Xeon Mac
-Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux, and
-Windows x64 later. `tart-linux` provisions **arm64** guests and `qemu-windows` is
-Windows-on-**ARM**, so routing an x64 build at either is an architecture change,
-not a relocation. See [`docs/proxmox-macpro.md`](docs/proxmox-macpro.md); it is not
-TartCI-managed. Its Proxmox/systemd runner service is a separate execution
-provider that Shipyard coordinates alongside TartCI. Native Intel macOS/Metal
+Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux and
+non-blocking Windows x64 validation. `tart-linux` provisions **arm64** guests
+and `qemu-windows` is Windows-on-**ARM**, so routing an x64 build at either is an
+architecture change, not a relocation. See
+[`docs/proxmox-macpro.md`](docs/proxmox-macpro.md) and
+[`docs/proxmox-windows.md`](docs/proxmox-windows.md). Native Intel macOS/Metal
 checks similarly run directly on `macmini`, not inside TartCI.
 
 ### Serve the GitHub Actions pool
@@ -905,3 +926,15 @@ Bring-up proven on a Mac Studio (2026-06): Linux build+test+cache green; Windows
 24H2-ARM build green + tests pass. See `docs/runbook.md` for the recipe and the
 hard-won gotchas (ISO 512-byte alignment, ramfb vs virtio-gpu, all-USB install
 media, MSVC partial-install nuke, BOOTAA64 auto-boot, …).
+
+### Agent session hygiene
+
+The fleet installer stages `scripts/agent-hygiene` with each immutable support
+cohort and installs `~/.local/bin/agent-hygiene` as its wrapper. `--reap` is
+human-only: it refuses non-interactive and agent contexts, ignores `--yes`, and
+selects candidates from transcript modification time (`AH_TRANSCRIPT_DIRS`,
+which defaults to the Claude and Codex transcript roots), never process age.
+Roots with live `subagent` or `teammate` descendants are protected. Confirmed
+victims are recorded in `${AH_VICTIMS_LOG:-~/.local/state/agent-hygiene/victims.log}`
+with a resume command. The command is guarded by the launchd PreToolUse policy
+when invoked from an agent.

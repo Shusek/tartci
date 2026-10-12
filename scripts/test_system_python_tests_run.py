@@ -63,6 +63,11 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_vm_boot_alert.py",
+     "Alert.test_the_host_and_ssh_target_come_from_the_profile"):
+        ("3.11-only: vm_boot_alert._alert_host() reads the host id and ssh target from the "
+         "fleet profile with tomllib; without it the alert still runs and names the host by "
+         "its node name (test_without_a_profile_the_node_name_names_it)"),
     ("test_boot_usage.py",
      "Run.test_profile_thresholds_apply"):
         reads_profile("boot_usage.run()"),
@@ -117,9 +122,21 @@ ALLOWED = {
     ("test_gate_ccache_trim.py",
      "Run"):
         reads_profile("gate_ccache_trim.load_settings()"),
-    ("test_gate_reserve_fit.py",
-     "FitTests.test_m3_and_m5studio_fit_and_m1_and_m5_overcommit_cores"):
+    ("test_gate_ccache_trim.py",
+     "Settings.test_every_macos_fleet_profile_opts_in_with_the_default_window"):
         SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "FitTests.test_m3_m5studio_and_m5_fit_and_m1_overcommits_cores"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "FitTests.test_control_m5_without_the_reserve_share_overcommits_cores"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "FitTests.test_m5_slots_are_four_cores_each"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "M5DoctorTests"):
+        LANES,
     ("test_gate_reserve_fit.py",
      "NoReserveTests.test_summary_and_doctor_say_not_applicable_not_fits"):
         LANES,
@@ -133,7 +150,10 @@ ALLOWED = {
      "RatchetTests.test_a_smaller_overcommit_passes_and_reports_smaller"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
-     "RatchetTests.test_m1_and_m5_report_on_every_update_and_never_block"):
+     "RatchetTests.test_m1_and_the_old_m5_report_on_every_update_and_never_block"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "RatchetTests.test_m5_moving_to_the_reserve_share_is_accepted_and_fits"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
      "RatchetTests.test_the_373_sizing_is_refused_against_the_installed_profile"):

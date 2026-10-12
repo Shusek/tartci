@@ -4,9 +4,9 @@
 A dialog appears when a process in the GUI session touches a non-login
 keychain that is locked in that session: securityd starts SecurityAgent and
 asks for that keychain's password, which only keychain.env holds. On
-2026-10-02 the legacy `pulp-signing.keychain-db` sat on m3's and m5studio's
-user search list beside its `-unattended` replacement. A bare
-`codesign --sign` walks that list, so every unpinned signer was one lock away
+2026-10-02 the legacy pulp-signing.keychain-db sat on m3's and m5studio's
+user search list beside its -unattended replacement. A bare
+codesign --sign walks that list, so every unpinned signer was one lock away
 from a dialog asking Daniel for a password he does not have.
 
 status() reports, without ever prompting:
@@ -14,7 +14,7 @@ status() reports, without ever prompting:
     signing keychain (a legacy or leftover keychain is what a search walks
     into);
   - whether the dedicated keychain unlocks with keychain.env's password
-    (`unlock-keychain -p` never prompts; a refusal means the recorded
+    (unlock-keychain -p never prompts; a refusal means the recorded
     password has drifted);
   - after that unlock, so reading settings cannot prompt, whether the keychain
     re-locks on its own (an inactivity timeout or lock-on-sleep);
@@ -22,7 +22,7 @@ status() reports, without ever prompting:
     succeeded recently. macOS locks the keychain again at every login, and
     that agent is what unlocks it in the GUI session, the only session the
     dialogs come from. Nothing here can read the GUI session's lock state
-    without risking a dialog: even `show-keychain-info` on a locked keychain
+    without risking a dialog: even show-keychain-info on a locked keychain
     raises one, so it is only ever run right after a successful unlock.
 
 States: ok | risk | not_applicable (no keychain.env) | unknown.
@@ -41,6 +41,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_self_update as su  # noqa: E402
 import keychain_unlock  # noqa: E402
+import secret_files  # noqa: E402
 
 # The agent runs every 15 minutes; two missed runs is a stopped agent.
 UNLOCK_STALE_SECS = 2 * keychain_unlock.INTERVAL_SECS + 300
@@ -87,10 +88,34 @@ def status(home: Path | None = None, run: Runner = _run,
     secrets = su.signing_secrets(home)
     dedicated = su.signing_keychain(home)
     password = secrets.get("PULP_SIGN_KEYCHAIN_PW")
+    problem = su.signing_secrets_problem(home)
+    if problem and (not dedicated or not password):
+        return {"state": "risk", "risks": [problem]}
     if not dedicated or not password:
         return {"state": "not_applicable", "risks": [],
                 "detail": "no dedicated signing keychain in keychain.env"}
-    rc, out = run(["security", "list-keychains", "-d", "user"])
+    return _redacted(_status(home, run, now, dedicated, password), home)
+
+
+def _redacted(value: Any, home: Path) -> Any:
+    """value with every secrets-file value removed from its strings."""
+    if isinstance(value, str):
+        return secret_files.redact(value, home)
+    if isinstance(value, list):
+        return [_redacted(v, home) for v in value]
+    if isinstance(value, dict):
+        return {k: _redacted(v, home) for k, v in value.items()}
+    return value
+
+
+def _status(home: Path, run: Runner, now: float | None, dedicated: str,
+            password: str) -> dict[str, Any]:
+    def call(argv: list[str]) -> tuple[int, str]:
+        # Redact before any slicing: a truncated secret no longer matches.
+        rc, out = run(argv)
+        return rc, secret_files.redact(out, home)
+
+    rc, out = call(["security", "list-keychains", "-d", "user"])
     if rc != 0:
         return {"state": "unknown", "risks": [], "detail": f"search list unreadable: {out[:200]}"}
     risks = []
@@ -100,15 +125,15 @@ def status(home: Path | None = None, run: Runner = _run,
         risks.append(f"{path} is on the user search list beside the dedicated "
                      f"{Path(dedicated).name}; an unpinned codesign that walks into it while "
                      "it is locked raises a password dialog")
-    rc, out = run(["security", "unlock-keychain", "-p", password, dedicated])
+    rc, out = call(["security", "unlock-keychain", "-p", password, dedicated])
     if rc != 0:
         risks.append(f"{dedicated} does not unlock with keychain.env's password "
-                     f"({out.strip()[:120]}); run `pulp ship doctor`")
+                     f"({out.strip()[:120]}); run pulp ship doctor")
     else:
-        rc, out = run(["security", "show-keychain-info", dedicated])
+        rc, out = call(["security", "show-keychain-info", dedicated])
         if rc == 0 and (re.search(r"timeout=\d+", out) or "lock-on-sleep" in out):
             risks.append(f"{dedicated} re-locks on its own ({out.strip()[:120]}); "
-                         "`pulp ship doctor` sets it to no-timeout")
+                         "pulp ship doctor sets it to no-timeout")
     agent = unlock_agent_risk(home, now)
     if agent:
         risks.append(agent)
