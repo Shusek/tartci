@@ -51,5 +51,5 @@ tartci_toml_python_path() {
 tartci_toml_python() {
   local python
   python="$(tartci_toml_python_path)" || return 127
-  "$python" "$@"
+  exec "$python" "$@"
 }

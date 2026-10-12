@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,34 @@ class OperatorShellTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("FAKE-PY39", result.stderr)
         self.assertIn("set TARTCI_PYTHON", result.stderr)
+
+    def test_sigterm_to_wrapper_pid_reaches_the_python_child(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            marker = root / "handled"
+            fake = root / "python3.12"
+            fake.write_text("#!/bin/sh\n"
+                            "if [ \"$1\" = -c ]; then exit 0; fi\n"
+                            f"trap 'printf handled > {marker}; exit 42' TERM\n"
+                            "printf ready\n"
+                            "while :; do sleep 1; done\n")
+            fake.chmod(0o755)
+            wrapper = root / "wrapper.sh"
+            wrapper.write_text("#!/bin/bash\n"
+                              f"source {COMMON / 'toml-python.lib.sh'}\n"
+                              f"TARTCI_PYTHON={fake} tartci_toml_python ignored\n")
+            wrapper.chmod(0o755)
+            process = subprocess.Popen([str(wrapper)], stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True,
+                                       start_new_session=True)
+            try:
+                self.assertEqual(process.stdout.read(5), "ready")
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=5), 42)
+                self.assertEqual(marker.read_text(), "handled")
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
 
 
 if __name__ == "__main__":
