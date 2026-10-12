@@ -321,6 +321,16 @@ class Shell(Case):
         self.assertIn("rc=75 backoff=1", out.stdout, out.stderr)
         self.assertIn("vm_dhcp_unanswered", (self.tmp / "events").read_text())
 
+    def test_open_breaker_exports_open_flag_to_the_runner(self):
+        out = self.run_lib(
+            "tartci_vm_dhcp_record l no_ip v1; "
+            "tartci_vm_dhcp_record l no_ip v2; "
+            "rc=0; tartci_vm_dhcp_check l || rc=$?; "
+            "echo \"rc=$rc backoff=$VM_DHCP_BACKOFF open=$VM_DHCP_BREAKER_OPEN\"\n",
+            {"TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400)},
+        )
+        self.assertIn("rc=75 backoff=1 open=1", out.stdout, out.stderr)
+
     def test_knob_off_reads_and_writes_nothing(self):
         before = (self.tmp / "vm-dhcp" / "breaker.json").read_text()
         out = self.run_lib("tartci_vm_dhcp_record l no_ip v1; tartci_vm_dhcp_record l no_ip v2\n"

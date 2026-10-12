@@ -2678,6 +2678,11 @@ if [ "$LOOP" = 1 ]; then
       CURRENT_SELECTED_QUEUED="$q"
       VM_DHCP_PROBE_REPORTED=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      # Release per-turn ownership proofs immediately after run_one, before
+      # the serving accounting grows. This keeps every early-return proof
+      # within the loop's bounded post-run window.
+      tartci_boundary_proof_abandon
+      tartci_job_claim_release
       # Every cause of clone-without-serve returns through here, so the streak
       # is counted here rather than at each cause. Counted per work ENTRY, not
       # per error: a lane that alternates a failure with a served job never
@@ -2714,10 +2719,6 @@ if [ "$LOOP" = 1 ]; then
       # run_one predates this work-entry result and cannot carry the new
       # cause or streak to readiness readers.
       heartbeat "${LAST_HEARTBEAT_PHASE:-waiting}"
-      # Early returns (boot failure, yield, admission refusal) leave a proof
-      # that nobody will consume.
-      tartci_boundary_proof_abandon
-      tartci_job_claim_release
       # A lane denied its lease keeps waiting for it; any other outcome
       # (served, covered by a sibling, admission deferred) stops wanting one.
       [ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw

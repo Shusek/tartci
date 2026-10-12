@@ -58,7 +58,7 @@ tartci_vm_dhcp_check(){
     probe) VM_DHCP_PROBE=1 ;;
     *) return 0 ;;
   esac
-  if [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("breaker_open") else 0' 2>/dev/null)" = 1 ]; then
+  if [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("breaker_open") else 0)' 2>/dev/null)" = 1 ]; then
     VM_DHCP_BREAKER_OPEN=1
   fi
   [ "$action" = backoff ] && return 75

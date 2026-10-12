@@ -99,6 +99,8 @@ class ShippedAccounting:
         self.clock_paths.append(clock.name)
         script = (
             "set -euo pipefail\n"
+            "tartci_boundary_proof_abandon(){ :; }\n"
+            "tartci_job_claim_release(){ :; }\n"
             f"CLOCK_FILE='{clock.name}'\n"
             'date(){ local n; n=$(( $(cat "$CLOCK_FILE") + 1 )); '
             'printf \'%s\' "$n" > "$CLOCK_FILE"; '
@@ -170,6 +172,8 @@ class ServeLessStreakTests(unittest.TestCase):
                 block_source: str = block) -> dict[str, str | int]:
             script = (
                 "set -euo pipefail\n"
+                "tartci_boundary_proof_abandon(){ :; }\n"
+                "tartci_job_claim_release(){ :; }\n"
                 'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
                 'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
                 'LAST_HEARTBEAT_PHASE="%s"\nCURRENT_SERVED=0\n'
@@ -183,7 +187,7 @@ class ServeLessStreakTests(unittest.TestCase):
                                     text=True, check=True)
             return json.loads(result.stdout.strip().splitlines()[-1])
 
-        self.assertEqual(run(open_breaker=1, backoff=0, phase="admission-precheck-error"),
+        self.assertEqual(run(open_breaker=1, backoff=1, phase="admission-precheck-error"),
                          {"streak": 1, "cause": "dhcp_breaker"})
         # Verification backoff is not an outage and must clear the streak.
         self.assertEqual(run(open_breaker=0, backoff=1, phase="vm-dhcp-breaker-open"),
