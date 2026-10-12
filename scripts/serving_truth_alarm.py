@@ -61,7 +61,7 @@ def _value(r,*keys):
     return None
 
 def _job_starts(rows,start,end):
-    return [r for r in rows if start<=(_time(r) or -1)<=end and r.get("event") in {"job_assigned","job_started","in_progress","admission_precheck"}]
+    return [r for r in rows if start<=(_time(r) or -1)<=end and r.get("event") in {"job_assigned","job_started","in_progress"}]
 
 def _head(r):
     v=_value(r,"pr_head","head_sha","head","sha")
@@ -112,7 +112,7 @@ def classify(events:Iterable[dict[str,Any]],queued:Iterable[dict[str,Any]]=(),*,
     for h,items in by.items():
         streak=[]
         for t,ev,r in items:
-            if ev in {"admission_check","admission_success","job_assigned","job_started","in_progress"}: streak=[]
+            if ev in {"admission_precheck","admission_check","admission_success","job_assigned","job_started","in_progress"}: streak=[]
             else: streak.append(r)
         if len(streak)>=admission_streak:
             trips.append({"rule":"admission_error_streak","host":h,"since":streak[0].get("ts"),"evidence":{"errors":streak,"threshold":admission_streak}})
@@ -169,11 +169,15 @@ def fetch_required_queue(cli,repo=None):
         for run in payload.get("workflow_runs",[]) if isinstance(payload,dict) else []:
             if not isinstance(run,dict):continue
             # Requiredness is explicit configuration, never an absent API key.
-            if run.get("required") is True or run.get("required_context") or run.get("required_labels"):
-                out.append({**run,"source_repo":r})
-            elif repo == "danielraffel/tartci" and "TARTCI_SERVED_REPOS" not in os.environ and "required" not in run:
-                # Compatibility for the pre-U1 unit fixture; production never uses this repo.
-                out.append(run)
+            jobs = run.get("jobs") if isinstance(run.get("jobs"), list) else []
+            labels = {str(label).lower() for job in jobs if isinstance(job, dict)
+                      for label in (job.get("labels") or [])}
+            macos_gate = "self-hosted" in labels and "macos" in labels
+            names = {x.strip().lower() for x in os.environ.get(
+                "TARTCI_REQUIRED_WORKFLOW_NAMES", "Build and Test,Required gate liveness").split(",")}
+            named_gate = str(run.get("name") or run.get("display_title") or "").lower() in names
+            if run.get("required") is True or run.get("required_context") or run.get("required_labels") or macos_gate or named_gate:
+                out.append({**run,"source_repo":r,"required":True})
     return out
 
 def trip_receipt(state,trip,now=None):

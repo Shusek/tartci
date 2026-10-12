@@ -19,12 +19,12 @@ def row(ts: float, event: str, host: str = "m5", **extra: object) -> dict:
 
 class ServingTruthTests(unittest.TestCase):
     def test_queue_fetch_uses_one_paginated_api_read_and_keeps_required_rows(self) -> None:
-        payload = {"workflow_runs": [{"id": 1}, {"id": 2, "required": False}]}
+        payload = {"workflow_runs": [{"id": 1, "required_context": "pulp-build-pr-head"}, {"id": 2, "required": False}]}
         with mock.patch.object(alarm.subprocess, "run", return_value=mock.Mock(
                 returncode=0, stdout=json.dumps(payload), stderr="")) as run:
-            self.assertEqual(alarm.fetch_required_queue("ghapp", "danielraffel/tartci"), [{"id": 1}])
+            self.assertEqual([r["id"] for r in alarm.fetch_required_queue("ghapp", "Generous-Corp/pulp")], [1])
         run.assert_called_once_with(
-            ["ghapp", "api", "repos/danielraffel/tartci/actions/runs?status=queued&per_page=100"],
+            ["ghapp", "api", "repos/Generous-Corp/pulp/actions/runs?status=queued&per_page=100"],
             capture_output=True, text=True, timeout=45, check=False)
 
     def test_clone_is_not_a_job_start_and_queued_work_trips_at_20_minutes(self) -> None:
@@ -141,3 +141,33 @@ class QueueAbsenceTests(unittest.TestCase):
                    "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1200, alarm.dt.timezone.utc).isoformat()}]
         rules = alarm.classify([], queued, now=BASE, window_seconds=900)
         self.assertIn("queued_required_no_job_start", {t["rule"] for t in rules})
+
+class ReviewerMutantTests(unittest.TestCase):
+    def test_signal_quarantine_and_terminal_clear(self):
+        rows = [row(BASE-100, "job_assigned", host="m3"), row(BASE-90, "supervisor_signal", host="m3", detail="TERM quarantine=none")]
+        self.assertFalse(alarm.classify(rows, now=BASE))
+        rows.append(row(BASE-80, "job_terminal_receipt", host="m3", detail="conclusion success"))
+        rows.append(row(BASE-70, "supervisor_signal", host="m3", detail="TERM quarantine=signal_teardown_unknown"))
+        self.assertFalse(alarm.classify(rows, now=BASE))
+
+    def test_admission_precheck_resets_error_streak(self):
+        rows = [row(BASE-300, "admission_error"), row(BASE-250, "admission_error"), row(BASE-200, "admission_precheck"), row(BASE-100, "admission_error")]
+        self.assertFalse(alarm.classify(rows, now=BASE))
+
+    def test_burst_requires_three_heads(self):
+        rows = [row(BASE-100, "job_failed", host="m3", head_sha="a"*40, error="license error")]
+        self.assertFalse(alarm.classify(rows, now=BASE))
+
+    def test_deferral_requires_three_hosts(self):
+        rows = [row(BASE-3599, "self_update_starved", host="m3", peer="m1")]
+        self.assertFalse(alarm.classify(rows, now=BASE))
+
+    def test_lifecycle_second_tick_does_not_reopen_episode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); events=root/"events.jsonl"
+            events.write_text("\n".join(json.dumps(row(BASE-i*10,"admission_error")) for i in (3,2,1))+"\n")
+            opened=[]
+            issue=lambda title,body:(opened.append(title) or (0,"1"))
+            alarm.alert_pass(root/"state",events,[],now=BASE,issue=issue)
+            alarm.alert_pass(root/"state",events,[],now=BASE+60,issue=issue)
+            self.assertEqual(len(opened),1)
