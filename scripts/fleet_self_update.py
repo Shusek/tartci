@@ -1688,6 +1688,36 @@ def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900,
                     timeout=timeout)
 
 
+def handoff_target_orchestrator(cfg: Config, sys_: System, target: str, *,
+                                apply: bool, scheduled: bool) -> int | None:
+    """Run the target checkout's orchestration code before sealed builds.
+
+    A sealed launcher starts the self-update script copied into its installed
+    generation.  That copy may predate a launcher verification fix and can
+    therefore reject the target's corrected bundle forever.  Once the
+    authenticated checkout is detached at the selected target, hand off to
+    its own dispatcher.  The environment marker prevents the target copy from
+    handing off to itself again.
+    """
+    if not apply or os.environ.get("TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR") == "1":
+        return None
+    if orchestrator_generation() is None:
+        return None
+    if launch_helper(cfg) is None:
+        return None
+    _checkout(cfg, sys_, target)
+    args = ["./tartci", "fleet-macos", "self-update", "--apply",
+            "--target", target, "--home", str(cfg.home)]
+    if scheduled:
+        args.append("--scheduled")
+    result = sys_.run(args, cwd=str(cfg.checkout),
+                      env={"TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"},
+                      timeout=1800)
+    if result.text:
+        print(result.text)
+    return result.rc
+
+
 def installed_tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
     """The INSTALLED shim, run from $HOME (never a checkout)."""
     return sys_.run([str(cfg.shim), *args], cwd=str(cfg.home), env=census_env(),
@@ -1875,6 +1905,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             "soaking": " (undeployed commits are still soaking)",
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
+    handed_off = handoff_target_orchestrator(cfg, sys_, target, apply=apply,
+                                             scheduled=scheduled)
+    if handed_off is not None:
+        return handed_off
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
     receipt.value.update(requested_target=skew.get("requested_target"),
                          selected_target=skew.get("selected_target"),
@@ -2005,6 +2039,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         receipt.finish("refused", str(exc))
         return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
     except Refused as exc:
+        # A pre-drain refusal must not retain an old queue ticket forever.
+        # Leave the turn available to peers; the next scheduled attempt gets
+        # a fresh ticket and naturally backs off behind any active holder.
+        if apply:
+            clear_waiting(cfg)
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))
         return EXIT_REFUSED

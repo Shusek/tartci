@@ -113,6 +113,8 @@ class FakeSystem(su.System):
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
         self.launchd_print = None
+        self.target_orchestrator_rc = 0
+        self.target_orchestrator_calls: list[list[str]] = []
 
     def now(self) -> float:
         return self.clock
@@ -269,6 +271,10 @@ class FakeSystem(su.System):
 
     # ── fakes for tartci subcommands ────────────────────────────────────
     def _tartci(self, args):
+        if args[:2] == ["fleet-macos", "self-update"]:
+            self.target_orchestrator_calls.append(list(args))
+            return su.Result(self.target_orchestrator_rc, "target orchestrator", ""
+                             if self.target_orchestrator_rc == 0 else "target refused")
         if args[:2] == ["support-manifest", "write"]:
             manifest = self.home / ".local/share/tartci/update-checkout/.tartci-support-manifest.json"
             (manifest.parent / "scripts").mkdir(parents=True, exist_ok=True)
@@ -613,6 +619,24 @@ class OrchestratorGenerationTests(Base):
         gen.mkdir(parents=True)
         self.assertEqual(su.orchestrator_generation(gen / "fleet_self_update.py"), "c" * 40)
         self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
+
+
+class TargetOrchestratorHandoffTests(Base):
+    sealed = True
+
+    def test_an_installed_orchestrator_hands_off_to_the_target_checkout(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = su.handoff_target_orchestrator(self.cfg, self.sys, T_OLD,
+                                                apply=True, scheduled=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.sys.checked_out, T_OLD)
+        self.assertEqual(self.sys.target_orchestrator_calls, [[
+            "fleet-macos", "self-update", "--apply", "--target", T_OLD,
+            "--home", str(self.home), "--scheduled"]])
+        handoff = next((env for argv, env in zip(
+            [call for call, _ in self.sys.calls], self.sys.env_calls)
+            if argv[:3] == ["./tartci", "fleet-macos", "self-update"]), None)
+        self.assertEqual(handoff.get("TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR"), "1")
 
 
 class ReserveCheckTests(Base):
@@ -1025,6 +1049,19 @@ class UpdateQueueTests(Base):
                          and "self_update_starved" in (self.cfg.state_dir / "events.jsonl").read_text())
         self.assertIsNone(su.summary(self.home)["problem"])
         self.assertEqual(self.issues, [])
+
+
+class RefusedTurnTests(Base):
+    sealed = True
+
+    def test_a_pre_drain_refusal_releases_an_old_queue_ticket(self) -> None:
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "target": T_OLD, "since": NOW - 3 * 3600,
+            "ts": NOW - 60, "reason": "previous refusal",
+        })
+        self.sys.codesign_verify_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertIsNone(su.waiting_ticket(self.cfg))
 
 
 class AnnounceOrderTests(Base):
