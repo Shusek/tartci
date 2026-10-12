@@ -87,12 +87,16 @@ BROAD_KILLS = [
     "pkill -f snapshot-zsh",
     "pkill -f zsh-snapshot",
     "pkill -f SNAPSHOT-ZSH",
+    "pkill -f /bin/zsh",
+    "pkill -f bin/bash",
+    "pkill -f 'zsh.*snapshot'",
     "pkill python3.12",
     "kill -9 -1",
     "kill -TERM -1",
     "kill -s KILL -1",
     "kill -1",
     "kill -s TERM -1",
+    "kill -- -1",
     "pkill -U 1234",
     "pkill -G 1234",
     "pkill -g 1234",
@@ -132,10 +136,10 @@ class ClassifierTests(unittest.TestCase):
 
     def test_benign_kills_are_the_control(self) -> None:
         for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",
-                        "kill -1 1234", "pkill a", "pkill -f bin/bash",
+                        "kill -1 1234", "pkill a",
                         "pkill -u $USER worker-job", "pkill -U 1234 worker-job",
                         "pkill -G 1234 worker-job", "pkill -g 1234 worker-job",
-                        "pkill -t ttys001 worker-job", "pkill -f bin/bash"):
+                        "pkill -t ttys001 worker-job"):
             with self.subTest(command=command):
                 self.assertEqual(guard.decide(command), (0, ""))
 

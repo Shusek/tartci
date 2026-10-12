@@ -81,6 +81,20 @@ WHOLE_USER_SELECTOR_OPTS = frozenset({"-u", "--user", "-U", "-G", "-g", "-t"})
 SHELL_SNAPSHOT = re.compile(
     r"(?:snapshot[-_.]?(?:bash|sh|zsh)|(?:bash|sh|zsh)[-_.]?snapshot)", re.I
 )
+# ``pkill -f`` matches the complete command line.  Keep representative lines
+# for the process families that the guard must protect; matching only the
+# executable basename lets path and snapshot patterns evade the guard.
+BROAD_KILL_COMMAND_LINES = (
+    "/bin/bash --noprofile --norc",
+    "/bin/sh -c runner.sh",
+    "/bin/zsh -l",
+    "zsh /usr/local/bin/snapshot-zsh --loop",
+    "/usr/bin/python3 -m tartci",
+    "/usr/local/bin/python3.12 -m agent_cli",
+    "/opt/homebrew/bin/node /Users/danielraffel/.local/bin/claude",
+    "/Users/danielraffel/.local/bin/claude --dangerously-skip-permissions",
+    "/Users/danielraffel/.local/bin/codex --full-auto",
+)
 
 
 def _matches(pattern: str, value: str, *, full: bool = False) -> bool:
@@ -359,7 +373,8 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int) -> li
                 "-f matches a shell snapshot and can kill every agent session")
             for target in patterns
             if SHELL_SNAPSHOT.search(target) or any(
-                _matches(target, name) for name in BROAD_KILL_NAMES
+                _matches(target, command_line)
+                for command_line in BROAD_KILL_COMMAND_LINES
             )
         )
         if has_user_selector and not operands:
