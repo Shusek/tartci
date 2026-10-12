@@ -54,21 +54,21 @@
     "O11-deferral-streak": [
       {
         "detail": "peer m1 not serving",
-        "event": "self_update_deferred",
+        "event": "self_update_starved",
         "peer": "m1",
         "runner": "m3",
         "ts": "2027-01-15T02:30:00Z"
       },
       {
         "detail": "peer m1 not serving",
-        "event": "self_update_deferred",
+        "event": "self_update_starved",
         "peer": "m1",
         "runner": "m5",
         "ts": "2027-01-15T02:30:00Z"
       },
       {
         "detail": "peer m1 not serving",
-        "event": "self_update_deferred",
+        "event": "self_update_starved",
         "peer": "m1",
         "runner": "m5s",
         "ts": "2027-01-15T02:30:00Z"

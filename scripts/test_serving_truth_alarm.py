@@ -99,7 +99,8 @@ class ServingTruthTests(unittest.TestCase):
             lifecycle = json.loads((root / "state" / "serving-truth-lifecycle.json").read_text())
             self.assertEqual(set(lifecycle), {"detected_at", "symptom_at"})
             quiet = alarm.alert_pass(root / "state", events.with_name("quiet.json"), [], now=BASE + 3600,
-                                     issue=issue, close=lambda number: (0, "closed"))
+                                     issue=issue, close=lambda number: (0, "closed"),
+                                     update=lambda number, body: (0, "updated"))
             self.assertTrue(quiet["closed"])
             lifecycle = json.loads((root / "state" / "serving-truth-lifecycle.json").read_text())
             self.assertIn("fixed_at", lifecycle)

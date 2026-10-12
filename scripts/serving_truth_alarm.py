@@ -147,7 +147,7 @@ def classify(
     for row in rows:
         ts = _time(row)
         if ts is None or not deferral_start <= ts <= end or row.get("event") not in {
-            "self_update_deferred", "fleet_update_deferred", "peer_deferred",
+            "self_update_deferred", "self_update_starved", "fleet_update_deferred", "peer_deferred",
         }:
             continue
         detail = str(row.get("detail") or "")
@@ -221,7 +221,8 @@ def trip_receipt(state: Path, trip: dict[str, Any], now: float | None = None) ->
 def alert_pass(state: Path, events_path: Path, queued: Iterable[dict[str, Any]], *,
                now: float | None = None,
                issue: Callable[[str, str], tuple[int, str]] | None = None,
-               close: Callable[[str], tuple[int, str]] | None = None) -> dict[str, Any]:
+               close: Callable[[str], tuple[int, str]] | None = None,
+               update: Callable[[str, str], tuple[int, str]] | None = None) -> dict[str, Any]:
     rows = classify(read_events(events_path), queued, now=now)
     receipts = [trip_receipt(state, trip, now=now) for trip in rows]
     # A single episode state makes repeated one-minute passes idempotent. The
@@ -246,6 +247,25 @@ def alert_pass(state: Path, events_path: Path, queued: Iterable[dict[str, Any]],
     lifecycle.parent.mkdir(parents=True, exist_ok=True)
     lifecycle.write_text(json.dumps(lifecycle_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    alert_state = state / "serving-truth-alert.json"
+    if update is None:
+        def update_issue(number: str, body: str) -> tuple[int, str]:
+            return host_off._ghapp(
+                ["api", "-X", "PATCH", f"repos/{host_off.ISSUE_REPO}/issues/{number}",
+                 "-f", f"body={body}"], host_off._update_checkout())
+        update = update_issue
+    if not active and lifecycle_data.get("fixed_at") and update is not None and alert_state.exists():
+        try:
+            alert_record = json.loads(alert_state.read_text(encoding="utf-8"))
+            number = alert_record.get("issue")
+            if number:
+                update(str(number), "Serving-truth alarm lifecycle updated.\n\n"
+                       f"symptom_at={lifecycle_data.get('symptom_at')}\n"
+                       f"detected_at={lifecycle_data.get('detected_at')}\n"
+                       f"fixed_at={lifecycle_data['fixed_at']}\n")
+        except (OSError, ValueError):
+            pass
+
     def render() -> tuple[str, str]:
         body = "\n\n".join(json.dumps(t, sort_keys=True, indent=2) for t in rows)
         return TITLE.format(rule=rows[0]["rule"]), (
@@ -253,7 +273,7 @@ def alert_pass(state: Path, events_path: Path, queued: Iterable[dict[str, Any]],
             f"symptom_at={lifecycle_data.get('symptom_at')}\n"
             f"detected_at={lifecycle_data.get('detected_at')}\n"
             f"fixed_at={lifecycle_data.get('fixed_at', 'pending')}\n\n" + body)
-    out = host_off.episode_alert(state / "serving-truth-alert.json", active=active,
+    out = host_off.episode_alert(alert_state, active=active,
                                  resolved=not active, since=since,
                                  raise_event=lambda: host_off.event(
                                      state, "serving_truth_alarm", "rules tripped",
