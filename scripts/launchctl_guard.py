@@ -241,13 +241,57 @@ def _has_raw_kill_verb(command: str) -> bool:
     # kill (for example: git status, then ssh ... kill ...).
     segments = re.split(r"([;&|\n]+)", command)
     for index in range(0, len(segments), 2):
-        if re.match(r"^\s*(?:ls|git|tar)\b", segments[index], re.I):
+        if _is_nonexecuting_data_segment(segments[index]):
             segments[index] = " "
     command = "".join(segments)
     # Remove grep-like command segments first: kill words there are data.
     masked = re.sub(r"\b(?:grep|egrep|rg|ag|git\s+grep|echo)\b[^;&|\n]*", "", command, flags=re.I)
     if RAW_KILL_VERB.search(masked) or re.search(r"\b(?:kill|pkill|killall)\b", masked, re.I):
         return True
+    return False
+
+
+def _is_nonexecuting_data_segment(segment: str) -> bool:
+    """Return whether a command segment is a data-only ls/git/tar command."""
+    try:
+        words = shlex.split(segment, posix=True)
+    except ValueError:
+        return False
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in {"sudo", "nohup"}:
+            index += 1
+            continue
+        if word == "env":
+            index += 1
+            while index < len(words) and ("=" in words[index] or words[index].startswith("-")):
+                index += 1
+            continue
+        break
+    if index >= len(words):
+        return False
+    command = os.path.basename(words[index]).lower()
+    args = words[index + 1:]
+    if command == "ls":
+        return True
+    if command == "git":
+        lowered = [arg.lower() for arg in args]
+        if any(arg in {"-x", "--exec"} or arg.startswith("--exec=") for arg in lowered):
+            return False
+        if len(lowered) >= 2 and lowered[0:2] == ["bisect", "run"]:
+            return False
+        for position, arg in enumerate(lowered):
+            if arg == "-c" and position + 1 < len(lowered):
+                setting = lowered[position + 1]
+                if "core.pager=" in setting or ("alias." in setting and "=!" in setting):
+                    return False
+        return True
+    if command == "tar":
+        execution_options = ("--to-command", "--use-compress-program", "-i")
+        lowered_args = [arg.lower() for arg in args]
+        return not any(arg == option or arg.startswith(option + "=")
+                       for arg in lowered_args for option in execution_options)
     return False
 
 
@@ -258,7 +302,7 @@ def _raw_process_hits(command: str, rows: list[ProcessRow] | None) -> list[Hit]:
     assignments = dict(re.findall(r"\b([A-Za-z_]\w*)=([^\s;&|]+)", command))
     quoted = re.findall(r"['\"]([^'\"]+)['\"]", command)
     flagged = re.findall(r"(?:^|\s)-[A-Za-z]*[fx]\s+([^\s;&|()]+)", command, re.I)
-    flagged = [word.strip("(){}") for word in flagged]
+    flagged = [word.strip("(){}'\"") for word in flagged]
     operands: list[str] = []
     for match in re.finditer(r"\b(?:grep|egrep|pgrep|pkill|pidof)\b([^;|]*)", command, re.I):
         for word in re.findall(r"[^\s]+", match.group(1)):
