@@ -14,7 +14,11 @@ import urllib.request
 try:
     urllib.request.urlopen('https://api.github.com', timeout=2).read(1)
 except urllib.error.HTTPError:
+    # Any HTTP status, including 403/429 rate limiting, proves network reachability.
     pass
+except urllib.error.URLError:
+    # DNS, refused connections, and other transport failures are not reachable.
+    raise
 """.strip()
 
 
