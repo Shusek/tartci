@@ -114,6 +114,18 @@ def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
             if type(stale) is int else {})
 
 
+def _disk_watch_paths(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The volumes the disk watchdog probes: the Tart store and the cache root.
+
+    Rendered into the agent so its pass needs no tomllib. Absent both, the
+    placeholder stays and the watchdog drops it (it probes nothing).
+    """
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    paths = [host.get(key) for key in ("tart_home", "cache_root")]
+    paths = [p for i, p in enumerate(paths) if isinstance(p, str) and p and p not in paths[:i]]
+    return {"DISK_WATCH_PATHS": ":".join(paths)} if paths else {}
+
+
 def _backstop_env(profile: Dict[str, Any]) -> Dict[str, str]:
     mode, _ = schedule_backstop_mode.mode_of(profile)
     return dict(schedule_backstop_mode.ENVIRONMENT.get(mode or "", {}))
@@ -158,6 +170,9 @@ REGISTRY: Dict[str, Agent] = {
                               kickstart=True, settings=_tart_home,
                               environment=_watchdog_env),
     "reap": Agent("com.danielraffel.tartci.reap", None, kickstart=True, settings=_tart_home),
+    # Write-latency watchdog for the Tart store and cache volumes (outage O10).
+    "disk-watchdog": Agent("com.danielraffel.tartci.disk-watchdog", None, kickstart=True,
+                           settings=_disk_watch_paths),
 }
 
 # Agents in the scanned prefixes that another codified path installs or
