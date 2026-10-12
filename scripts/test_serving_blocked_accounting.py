@@ -285,6 +285,7 @@ class ServeLessStreakTests(unittest.TestCase):
                 'SERVING_BLOCKED_SINCE="2026-09-20T00:00:00Z"',
                 "SERVING_BLOCKED_STREAK=143",
                 'SERVING_BLOCKED_LAST_PHASE="admission-error"',
+                'SERVING_BLOCKED_CAUSE="admission failing"',
                 "heartbeat waiting",
             ])
             result = subprocess.run(
@@ -297,6 +298,7 @@ class ServeLessStreakTests(unittest.TestCase):
         self.assertEqual(state["serving_blocked_streak"], 143)
         self.assertIsInstance(state["serving_blocked_streak"], int)
         self.assertEqual(state["serving_blocked_last_phase"], "admission-error")
+        self.assertEqual(state["serving_blocked_cause"], "admission failing")
         self.assertEqual(state["phase"], "waiting")
 
     def test_the_heartbeat_records_the_phase_the_streak_will_quote(self) -> None:
@@ -310,6 +312,7 @@ class ServeLessStreakTests(unittest.TestCase):
             'SERVING_BLOCKED_SINCE=""',
             "SERVING_BLOCKED_STREAK=0",
             'SERVING_BLOCKED_LAST_PHASE=""',
+            'SERVING_BLOCKED_CAUSE=""',
             "CURRENT_SERVED=0",
             'LAST_HEARTBEAT_PHASE=""',
         ):
@@ -377,6 +380,34 @@ class PoolStatusRenderingTests(unittest.TestCase):
         self.assertIn("serving: BLOCKED (disk: disk_capacity_insufficient", out)
         self.assertIn("cause=disk reason=disk_capacity_insufficient", out)
         self.assertNotIn("serving: ok", out)
+
+    def test_admission_failure_prints_not_serving_and_cause(self) -> None:
+        fleet = self._fleet({
+            "blocked": True, "blocked_lanes": [{
+                "label": "studio.pulp-gate", "blocked_seconds": 600,
+                "streak": 6, "last_phase": "admission-precheck-error",
+                "cause": "admission failing", "reason": "admission failing",
+            }], "unmeasurable_lanes": [],
+        })
+        fleet["fleet_ready"] = False
+        out = self.render(fleet)
+        self.assertIn("fleet ready: NO", out)
+        self.assertIn("serving: NOT SERVING (admission failing", out)
+        self.assertIn("cause=admission failing", out)
+
+    def test_dhcp_breaker_prints_not_serving_and_cause(self) -> None:
+        fleet = self._fleet({
+            "blocked": True, "blocked_lanes": [{
+                "label": "studio.pulp-gate", "blocked_seconds": 10,
+                "streak": 1, "last_phase": "vm-dhcp-breaker-open",
+                "cause": "dhcp_breaker", "reason": "DHCP breaker open",
+            }], "unmeasurable_lanes": [],
+        })
+        fleet["fleet_ready"] = False
+        out = self.render(fleet)
+        self.assertIn("fleet ready: NO", out)
+        self.assertIn("serving: NOT SERVING (DHCP breaker open", out)
+        self.assertIn("cause=dhcp_breaker", out)
 
     def test_a_serving_lane_prints_ok(self) -> None:
         out = self.render(self._fleet({

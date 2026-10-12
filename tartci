@@ -1338,15 +1338,22 @@ if fleet["managed"]:
     if blocked is None:
         print("serving: unknown (not checked from here)")
     elif blocked:
+        dhcp = [lane for lane in lanes if lane.get("cause") == "dhcp_breaker"]
+        admission = [lane for lane in lanes if lane.get("cause") == "admission failing"]
         disk = [lane for lane in lanes if lane.get("cause") == "disk"]
-        if disk:
+        if dhcp:
+            print(f"serving: NOT SERVING (DHCP breaker open; {len(dhcp)} lane(s))")
+        elif admission:
+            print(f"serving: NOT SERVING (admission failing; {len(admission)} lane(s))")
+        elif disk:
             reasons = ",".join(sorted({str(lane.get("reason") or "denied") for lane in disk}))
             print(f"serving: BLOCKED (disk: {reasons}; {len(disk)} lane(s) refused a VM lease)")
         else:
             print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
         for lane in lanes:
             streak = lane.get("streak")
-            extra = f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk" else ""
+            extra = (f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk"
+                     else f" cause={lane.get('cause')}" if lane.get("cause") else "")
             print(
                 f"  lane {lane['label']}: blocked_seconds={lane['blocked_seconds']} "
                 f"streak={'unknown' if streak is None else streak} "

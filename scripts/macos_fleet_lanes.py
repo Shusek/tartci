@@ -2254,6 +2254,21 @@ def fleet_readiness(
                     # disk inside the current blocked streak, the lane is
                     # blocked now. Without this, a full disk read as
                     # "serving: ok" for the first 90 minutes of an outage.
+                    blocked_cause = str(matching_state.get("serving_blocked_cause", "") or "")
+                    # DHCP breaker open is a host-local hard stop: report the
+                    # lane NOT SERVING immediately, without waiting for the
+                    # generic transient streak threshold.
+                    if blocked_cause == "dhcp_breaker":
+                        serving_blocked_lanes.append({
+                            "label": label,
+                            "blocked_seconds": int(blocked_for),
+                            "streak": streak,
+                            "last_phase": str(matching_state.get("serving_blocked_last_phase", "") or ""),
+                            "cause": "dhcp_breaker",
+                            "reason": "DHCP breaker open",
+                        })
+                        verified_running += 1
+                        continue
                     disk_reason = disk_denial_during_streak(
                         (plist.get("EnvironmentVariables") or {}).get(
                             "TARTCI_DISK_DENIAL_RECEIPT_DIR", ""),
@@ -2280,9 +2295,14 @@ def fleet_readiness(
                     # TRANSIENCE gate, so an upstream blip cannot raise a
                     # fleet-wide alarm. A pre-streak generation has only the
                     # duration gate, which is the behaviour it already had.
-                    if blocked_for > blocked_serving_seconds and (
+                    admission_block = blocked_cause == "admission failing" and (
+                        (streak is not None and streak >= blocked_serving_streak)
+                        or blocked_for > blocked_serving_seconds
+                    )
+                    generic_block = blocked_for > blocked_serving_seconds and (
                         streak is None or streak >= blocked_serving_streak
-                    ):
+                    )
+                    if admission_block or generic_block:
                         serving_blocked_lanes.append({
                             "label": label,
                             "blocked_seconds": int(blocked_for),
@@ -2290,7 +2310,8 @@ def fleet_readiness(
                             "last_phase": str(
                                 matching_state.get("serving_blocked_last_phase", "") or ""
                             ),
-                            "cause": "unserved",
+                            "cause": blocked_cause or "unserved",
+                            "reason": ("admission failing" if blocked_cause == "admission failing" else ""),
                         })
                 verified_running += 1
 
@@ -2356,6 +2377,8 @@ def fleet_readiness(
             and verified_running == len(labels)
             and persistent_verified == len(persistent_labels)
             and not problems
+            and not any(lane.get("cause") in {"dhcp_breaker", "admission failing"}
+                        for lane in serving_blocked_lanes)
         ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),

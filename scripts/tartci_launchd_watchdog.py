@@ -1261,6 +1261,40 @@ def _pool_on() -> tuple[int, str]:
     return proc.returncode, (proc.stderr or proc.stdout).strip()
 
 
+def serving_truth_pass(agents: list[tuple[str, str]], now: float | None = None) -> str | None:
+    """Report lanes that are alive but demonstrably NOT SERVING.
+
+    The pool/readiness command owns the structured verdict. This watchdog line
+    keeps the alert stream truthful when a supervisor heartbeat is fresh while
+    repeated admission failures or an open DHCP breaker prevent every clone.
+    """
+    now = time.time() if now is None else now
+    rows: list[str] = []
+    for label, plist_path in agents:
+        try:
+            with open(plist_path, "rb") as fh:
+                env = (plistlib.load(fh).get("EnvironmentVariables") or {})
+            state_dir = env.get("TARTCI_STATE_DIR")
+            if not isinstance(state_dir, str) or not state_dir:
+                continue
+            for state_path in glob.glob(os.path.join(state_dir, "*.state.json")):
+                try:
+                    with open(state_path, encoding="utf-8") as fh:
+                        state = json.load(fh)
+                except (OSError, ValueError):
+                    continue
+                cause = str(state.get("serving_blocked_cause") or "")
+                streak = int(state.get("serving_blocked_streak") or 0)
+                if cause == "dhcp_breaker" or (cause == "admission failing" and streak >= 6):
+                    detail = "DHCP breaker open" if cause == "dhcp_breaker" else "admission failing"
+                    rows.append(f"{label}/{state.get('runner') or os.path.basename(state_path)}: NOT SERVING ({detail}; streak={streak})")
+        except (OSError, ValueError, TypeError):
+            continue
+    if not rows:
+        return None
+    return f"{_iso(utcnow())} launchd-watchdog: WARN serving: " + "; ".join(sorted(rows))
+
+
 def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | None:
     """Tell someone, once per outage, that this host cannot boot VMs.
 
@@ -1477,6 +1511,9 @@ def main(argv: list[str] | None = None) -> int:
         print(vm_boot_line)
 
     agents = discover_agents(args.launch_agents_dir)
+    serving_line = serving_truth_pass(agents)
+    if serving_line:
+        print(serving_line)
     # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and
     # deliberately imprecise in the safe direction: neither wedge signature fires
     # while anything is building, so a busy host defers a heal to its next idle
