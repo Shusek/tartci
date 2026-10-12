@@ -142,8 +142,7 @@
         "vellum-host-m1"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -277,8 +276,7 @@
         "vellum-host-m3"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -449,8 +447,7 @@
         "vellum-host-m5"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -584,8 +581,7 @@
         "vellum-host-m5studio"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     }
   ],

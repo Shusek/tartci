@@ -661,7 +661,10 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
 
     The target is the newest first-parent main commit that is past the soak
     AND whose check runs are green. An explicit --target must itself be on
-    main's first-parent chain and meet both.
+    main's first-parent chain and meet both. If the recorded install is not
+    in the checkout, an explicit target may still recover the host, but skew
+    counts remain unknown rather than pretending the whole main history is
+    undeployed.
     """
     git = ["git", "-C", str(cfg.checkout)]
     skew: dict[str, Any] = {"installed": installed, "measured_at": _iso(now),
@@ -684,15 +687,18 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
             skew.update(state="unknown", selected_target=None, selection_reason="not on first-parent chain",
                         reason=f"--target {target_ref} is not on origin/main's first-parent chain")
             return skew
-    if sys_.run([*git, "cat-file", "-e", f"{installed}^{{commit}}"]).rc != 0:
+    installed_known = sys_.run([*git, "cat-file", "-e", installed + "^{commit}"]).rc == 0
+    if not installed_known and not explicit:
         skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
         return skew
-    if sys_.run([*git, "merge-base", "--is-ancestor", installed, skew["main"]]).rc != 0:
+    if installed_known and sys_.run(
+        [*git, "merge-base", "--is-ancestor", installed, skew["main"]]
+    ).rc != 0:
         skew.update(state="diverged",
                     reason=f"installed {installed[:12]} is not an ancestor of origin/main")
         return skew
-    log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct",
-                    f"{installed}..{skew['main']}"])
+    log_ref = f"{installed}..{skew['main']}" if installed_known else skew["main"]
+    log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct", log_ref])
     if log.rc != 0:
         skew["reason"] = f"git log failed: {log.text}"
         return skew
@@ -701,12 +707,15 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
         parts = line.split()
         if len(parts) == 2 and SHA.fullmatch(parts[0]) and parts[1].isdigit():
             commits.append((parts[0], int(parts[1])))
-    skew["behind"] = len(commits)
+    skew["behind"] = None if not installed_known else len(commits)
+    if not installed_known:
+        skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
     if not commits:
-        skew["state"] = "current"
+        skew["state"] = "unknown" if not installed_known else "current"
         return skew
-    skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
-    skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
+    if installed_known:
+        skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
+        skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
     if explicit:
         commits = [(sha, ts) for sha, ts in commits if sha == head_sha]
         if not commits:
@@ -751,6 +760,11 @@ def render_skew(skew: dict | None) -> str:
         return f"tartci: current with main (measured {skew.get('measured_at')})"
     if state == "not_applicable":
         return f"tartci: skew n/a ({skew.get('reason')})"
+    if state in ("behind", "soaking", "unverified") and skew.get("behind") is None:
+        requested = skew.get("requested_target")
+        selection = (f"; selected {skew.get('selected_target') or 'none'} (requested {requested}; "
+                     f"{skew.get('selection_reason', 'same')})" if requested else "")
+        return f"tartci: skew UNKNOWN ({skew.get('reason') or 'unknown installed commit'})" + selection
     if state in ("behind", "soaking", "unverified"):
         flag = " STALE" if skew.get("stale") else ""
         requested = skew.get("requested_target")
@@ -1910,11 +1924,6 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             "soaking": " (undeployed commits are still soaking)",
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
-    if apply and launch_helper(cfg) is not None:
-        _checkout(cfg, sys_, target)
-    if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
-                                   refresh=bool(refresh)):
-        return EXIT_OK
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
     receipt.value.update(requested_target=skew.get("requested_target"),
                          selected_target=skew.get("selected_target"),
@@ -1922,6 +1931,18 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
+    try:
+        if apply and launch_helper(cfg) is not None:
+            _checkout(cfg, sys_, target)
+        if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
+                                       refresh=bool(refresh)):
+            return EXIT_OK
+    except (FileNotFoundError, PermissionError) as exc:
+        reason = f"target dispatcher unavailable: {type(exc).__name__}: {exc}"
+        receipt.step("refused", reason, ok=False)
+        receipt.finish("refused", reason)
+        print(f"self-update: REFUSED {reason}", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         me = self_host_id(cfg)
         # Observe peers before any later gate can defer this run.  In

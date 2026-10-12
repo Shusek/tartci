@@ -150,6 +150,7 @@ if state.get("release_pr"):
 
 def runs_page(run_id, name):
     runs = ([{"id": run_id, "name": name, "status": status,
+              "head_repository": {"full_name": "Generous-Corp/pulp"},
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
     # The ghost: a merge_group run whose queue entry is long gone. Nothing in
@@ -159,6 +160,7 @@ def runs_page(run_id, name):
     if run_id == 101 and state.get("ghost") and status == "queued":
         runs.append({"id": 103, "name": name, "status": status,
                      "event": "merge_group",
+                     "head_repository": {"full_name": "Generous-Corp/pulp"},
                      "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
                      "created_at": "2026-08-18T00:00:00Z",
                      "updated_at": "2026-08-18T00:00:00Z"})
@@ -2472,6 +2474,19 @@ class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
             "assignment demand is compared against a non-zero magnitude, which "
             "revokes the licence for the scanner's first-witness early exit: "
             f"{offenders}",
+        )
+
+    def test_admission_scan_requires_first_party_head_repository(self) -> None:
+        source = self.LIB.read_text()
+        self.assertIn(
+            '--require-head-repo "$REPO"',
+            source,
+            "assignment admission must exclude fork head repositories",
+        )
+        self.assertIn(
+            "assignment_group_unservable",
+            source,
+            "unservable runner-group demand must not boot a VM",
         )
 
     def test_arithmetic_on_the_count_only_happens_where_it_is_bought(self) -> None:

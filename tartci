@@ -293,19 +293,19 @@ cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift|verify-supply|config-verdicts)
-      tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
+      tartci_toml_python_exec "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
       ;;
     self-update)
-      tartci_toml_python "$HERE/scripts/fleet_self_update.py" "$@"
+      tartci_toml_python_exec "$HERE/scripts/fleet_self_update.py" "$@"
       ;;
     tool-freshness)
-      tartci_toml_python "$HERE/scripts/tool_freshness.py" "$@"
+      tartci_toml_python_exec "$HERE/scripts/tool_freshness.py" "$@"
       ;;
     support-agents)
-      tartci_toml_python "$HERE/scripts/support_agents.py" "$@"
+      tartci_toml_python_exec "$HERE/scripts/support_agents.py" "$@"
       ;;
     *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update|tool-freshness|support-agents> ..."; return 2 ;;
   esac
@@ -1453,7 +1453,7 @@ case "${1:-help}" in
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
   retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;
   vm-dhcp) shift; tartci_verified_python_run "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
-  held) shift; tartci_toml_python "$HERE/scripts/debug_hold.py" "$@"; exit $? ;;
+  held) shift; tartci_toml_python_exec "$HERE/scripts/debug_hold.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;

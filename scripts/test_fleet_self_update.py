@@ -93,6 +93,7 @@ class FakeSystem(su.System):
 
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
+        self.cat_file_rc = 0
         self.relay = {"ok": True, "probe": "relay authenticated"}
         self.status_after_on = {"state": "on", "participating": True,
                                 "fleet": {"managed": True, "fleet_ready": True,
@@ -192,7 +193,7 @@ class FakeSystem(su.System):
                 ref = a[-1].split("^")[0]
                 return ok((ref if su.SHA.fullmatch(ref) else T_NEW) + "\n")
             if "cat-file" in a:
-                return ok()
+                return su.Result(self.cat_file_rc, "", "missing commit" if self.cat_file_rc else "")
             if "merge-base" in a:
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
@@ -623,6 +624,47 @@ class OrchestratorGenerationTests(Base):
 
 class TargetOrchestratorHandoffTests(Base):
     sealed = True
+
+    def test_handoff_executes_a_real_dispatcher_child(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            checkout = home / ".local/share/tartci/update-checkout"
+            checkout.mkdir(parents=True)
+            dispatcher = checkout / "tartci"
+            dispatcher.write_text("#!/bin/sh\nprintf 'HANDOFF_EXEC:%s\\n' \"$1\"\nexit 23\n")
+            dispatcher.chmod(0o755)
+            script = ("import fleet_self_update as su; from pathlib import Path; "
+                      f"cfg=su.Config(Path({str(home)!r})); "
+                      f"su.orchestrator_generation=lambda: {INSTALLED!r}; "
+                      "su.launch_helper=lambda cfg: {'path': 'sealed'}; "
+                      f"raise SystemExit(su.handoff_target_orchestrator(cfg, {T_OLD!r}, "
+                      "apply=True, scheduled=False, refresh=False) or 0)")
+            env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts")}
+            result = subprocess.run([sys.executable, "-c", script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("HANDOFF_EXEC:fleet-macos", result.stdout)
+
+    def test_missing_dispatcher_is_a_refused_receipt(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("target dispatcher unavailable", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_non_executable_dispatcher_is_a_refused_receipt(self) -> None:
+        dispatcher = self.cfg.checkout / "tartci"
+        dispatcher.write_text("#!/bin/sh\nexit 0\n")
+        dispatcher.chmod(0o644)
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("PermissionError", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
 
     def test_an_installed_orchestrator_hands_off_to_the_target_checkout(self) -> None:
         calls = []
@@ -2045,6 +2087,45 @@ class RecordTests(Base):
 
 
 class ChecksAndTargetTests(Base):
+    def test_explicit_target_recovers_an_off_history_install(self) -> None:
+        self.sys.cat_file_rc = 1
+        scheduled = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW)
+        self.assertEqual(scheduled["state"], "unknown")
+        self.assertIn("not in the tartci history", scheduled["reason"])
+        explicit = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_OLD, explicit=True)
+        self.assertEqual((explicit["state"], explicit["behind"], explicit["target"],
+                          explicit["selected_target"]), ("behind", None, T_OLD, T_OLD))
+        self.assertIn("not in the tartci history", explicit["reason"])
+        self.assertIsNone(explicit["oldest_undeployed"])
+        self.assertNotIn("stale", explicit)
+        self.assertIn("skew UNKNOWN", su.render_skew(explicit))
+
+    def test_off_history_explicit_target_still_soaking_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_red_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 9000)}\n{T_OLD} {int(NOW - 10000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_off_chain_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, "d" * 40, explicit=True)
+        self.assertEqual(skew["state"], "unknown")
+        self.assertIn("first-parent", skew["reason"])
+
     def test_red_newest_soaked_commit_falls_back_to_an_older_green_one(self) -> None:
         older = "c" * 40
         self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
