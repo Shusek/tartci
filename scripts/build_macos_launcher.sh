@@ -1,25 +1,60 @@
 #!/bin/bash
 set -euo pipefail
 usage(){ echo "usage: $0 --output PATH.app --approval-output PATH --identity STRING --support-root PATH --profile PATH [--python PATH] [--keychain PATH]" >&2; exit 64; }
-output="" approval_output="" identity="" support_root="" profile="" keychain="" render_python=""
+output="" approval_output="" identity="" support_root="" profile="" keychain="" render_python="" print_render_python=0
 while [[ $# -gt 0 ]]; do case "$1" in
   --output) output="${2:-}"; shift 2;; --identity) identity="${2:-}"; shift 2;;
   --approval-output) approval_output="${2:-}"; shift 2;;
   --support-root) support_root="${2:-}"; shift 2;;
   --profile) profile="${2:-}"; shift 2;;
   --python) render_python="${2:-}"; shift 2;;
+  --print-render-python) print_render_python=1; shift;;
   --keychain) keychain="${2:-}"; shift 2;; *) usage;; esac; done
 # Name the keychain when given: a bare --sign walks the search list, and a
 # locked keychain there raises a password dialog in the GUI session.
 keychain_args=(); [[ -n "$keychain" ]] && keychain_args=(--keychain "$keychain")
-[[ -n "$output" && -n "$approval_output" && -n "$identity" && -n "$support_root" && -n "$profile" ]] || usage
-[[ "$output" = /* && "$output" == *.app && "$approval_output" = /* ]] || { echo "output and approval-output must be absolute, with output ending in .app" >&2; exit 64; }
-[[ ! -e "$output" && ! -L "$output" && ! -e "$approval_output" && ! -L "$approval_output" ]] || { echo "refusing to replace existing output" >&2; exit 73; }
-root="$(cd "$(dirname "$0")/.." && pwd -P)"; support_root="$(cd "$support_root" && pwd -P)"; profile="$(cd "$(dirname "$profile")" && pwd -P)/$(basename "$profile")"
-if [[ -z "$render_python" ]]; then
-  render_python="${TARTCI_RENDER_PYTHON:-${TARTCI_PYTHON:-python3}}"
+if [[ "$print_render_python" = 0 ]]; then
+  [[ -n "$output" && -n "$approval_output" && -n "$identity" && -n "$support_root" && -n "$profile" ]] || usage
 fi
-[[ -x "$render_python" ]] || { echo "launcher render interpreter is not executable: $render_python" >&2; exit 78; }
+if [[ "$print_render_python" = 0 ]]; then
+  [[ "$output" = /* && "$output" == *.app && "$approval_output" = /* ]] || { echo "output and approval-output must be absolute, with output ending in .app" >&2; exit 64; }
+  [[ ! -e "$output" && ! -L "$output" && ! -e "$approval_output" && ! -L "$approval_output" ]] || { echo "refusing to replace existing output" >&2; exit 73; }
+fi
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+[[ -n "$support_root" ]] || usage
+support_root="$(cd "$support_root" && pwd -P)"
+# Keep the fallback identical to the old installed orchestrator: resolve a
+# TOML-capable interpreter by its ordered PATH/absolute candidates, then
+# canonicalise symlinks so the installer and sealed lanes record one identity.
+resolve_render_python() {
+  local candidate configured="${1:-${TARTCI_RENDER_PYTHON:-${TARTCI_PYTHON:-}}}"
+  # shellcheck source=providers/common/toml-python.lib.sh
+  . "$support_root/providers/common/toml-python.lib.sh"
+  if [[ -n "$candidate" ]]; then
+    TARTCI_PYTHON="$candidate" tartci_toml_python_path
+  else
+    tartci_toml_python_path
+  fi
+}
+canonical_python() {
+  local value="$1" hops=0 target
+  while [[ -L "$value" ]]; do
+    ((hops += 1))
+    [[ "$hops" -le 16 ]] || { echo "launcher render interpreter symlink cycle: $value" >&2; return 78; }
+    target="$(readlink "$value")"
+    [[ "$target" = /* ]] || target="$(dirname "$value")/$target"
+    value="$target"
+  done
+  [[ -x "$value" ]] || { echo "launcher render interpreter is not executable: $value" >&2; return 78; }
+  (cd "$(dirname "$value")" && printf '%s/%s\n' "$PWD" "$(basename "$value")")
+}
+render_python="$(canonical_python "$(resolve_render_python "$render_python")")" || exit $?
+if [[ "$print_render_python" = 1 ]]; then
+  [[ -z "$output" && -z "$approval_output" && -z "$identity" && -z "$profile" ]] || usage
+  printf '%s\n' "$render_python"
+  exit 0
+fi
+profile="$(cd "$(dirname "$profile")" && pwd -P)/$(basename "$profile")"
 export TARTCI_RENDER_PYTHON="$render_python" TARTCI_PYTHON="$render_python"
 "$render_python" "$support_root/scripts/tartci_support_manifest.py" verify "$support_root/.tartci-support-manifest.json" --root "$support_root" --immutable >/dev/null
 parent="$(dirname "$output")"; mkdir -p "$parent"; stage="$(mktemp -d "$parent/.tartci-launcher-app.XXXXXX")"; trap 'rm -rf "$stage"' EXIT
