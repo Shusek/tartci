@@ -32,7 +32,11 @@ class AgentHygieneTests(unittest.TestCase):
     def run_tty(self, *args, env):
         pid, master = pty.fork()
         if pid == 0:
-            os.execve(str(SCRIPT), [str(SCRIPT), *args], env)
+            try:
+                os.execve(str(SCRIPT), [str(SCRIPT), *args], env)
+            except OSError:
+                os._exit(127)
+            os._exit(127)
         output = bytearray()
         sent = False
         deadline = time.monotonic() + 20
@@ -90,25 +94,25 @@ class AgentHygieneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             snapshot = root / "ps"
-            snapshot.write_text("100 1 00-00:01 10 /Users/test/.local/bin/claude\n")
+            snapshot.write_text("999991 1 00-00:01 10 /Users/test/.local/bin/claude\n")
             transcripts = root / "transcripts"
             transcripts.mkdir()
-            transcript = transcripts / "session-100.jsonl"
+            transcript = transcripts / "session-999991.jsonl"
             transcript.write_text("recent")
             old = time.time() - 3 * 86400
             os.utime(transcript, (old, old))
             result = self.run_script("--report", snapshot=snapshot, transcripts=transcripts)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("100 3d", result.stdout)
+            self.assertIn("999991 3d", result.stdout)
 
     def test_reap_refuses_agent_context_and_does_not_use_process_etime(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             snapshot = root / "ps"
-            snapshot.write_text("100 1 00-00:01 10 /Users/test/.local/bin/claude\n")
+            snapshot.write_text("999991 1 00-00:01 10 /Users/test/.local/bin/claude\n")
             transcripts = root / "transcripts"
             transcripts.mkdir()
-            transcript = transcripts / "session-100.jsonl"
+            transcript = transcripts / "session-999991.jsonl"
             transcript.write_text("recent")
             old = time.time() - 3 * 86400
             os.utime(transcript, (old, old))
@@ -131,10 +135,10 @@ class AgentHygieneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             snapshot = root / "ps"
-            snapshot.write_text("100 1 00-00:01 10 /Users/test/.local/bin/claude\n101 100 00-00:01 10 subagent --resume\n")
+            snapshot.write_text("999991 1 00-00:01 10 /Users/test/.local/bin/claude\n999992 999991 00-00:01 10 subagent --resume\n")
             transcripts = root / "transcripts"
             transcripts.mkdir()
-            transcript = transcripts / "session-100.jsonl"
+            transcript = transcripts / "session-999991.jsonl"
             transcript.write_text("old")
             old = time.time() - 3 * 86400
             os.utime(transcript, (old, old))

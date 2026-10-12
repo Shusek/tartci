@@ -285,7 +285,11 @@ class InstallMacosFleetTests(unittest.TestCase):
     def run_agent_wrapper_tty(self, wrapper: Path, env: dict[str, str]) -> tuple[int, str]:
         pid, master = pty.fork()
         if pid == 0:
-            os.execve(str(wrapper), [str(wrapper), "--reap", "2", "--yes"], env)
+            try:
+                os.execve(str(wrapper), [str(wrapper), "--reap", "2", "--yes"], env)
+            except OSError:
+                os._exit(127)
+            os._exit(127)
         output = bytearray()
         sent = False
         status = None
@@ -452,6 +456,8 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("action=dry-run", result.stdout)
 
     def test_installed_agent_hygiene_wrapper_keeps_human_only_gate(self) -> None:
+        if shutil.which("zsh") is None:
+            self.skipTest("agent-hygiene is a macOS zsh entry point")
         result = self.run_installer("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
         wrapper = self.bin / "agent-hygiene"
