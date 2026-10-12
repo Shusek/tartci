@@ -32,6 +32,8 @@ a note: a broken hook must not break the agent's shell.
 The same hook refuses broad process kills: bare-name pkill/killall of an
 agent shell or interpreter, shell-snapshot -f patterns, and kill -9 -1.
 Use the tree's top PID or tartci launchd heal for targeted recovery.
+
+This is a best-effort guard against agent mistakes, not a security boundary.
 """
 
 from __future__ import annotations
@@ -89,7 +91,7 @@ SHELL_SNAPSHOT = re.compile(
 BROAD_KILL_COMMAND_LINES = (
     # Shapes captured from ps -axo command on the fleet hosts.
     "/Users/danielraffel/.local/share/tartci-generations/aad356ca6bef941b2b675d695a0231acf89e4833-dbf3e8dbd7183aef/providers/tart-macos/runner.sh --loop",
-    "/Users/danielraffel/.local/libexec/TartCILauncher.app/Contents/MacOS/TartCILauncher --lane pulp-gate",
+    "/Users/danielraffel/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-pulp-gate",
     "/bin/zsh -c source /Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
     "/Users/danielraffel/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
     "/bin/zsh -lc tartci pool status",
@@ -104,9 +106,9 @@ BROAD_KILL_COMMAND_LINES = (
     "/usr/local/bin/tartci-launcher --lane pulp-gate",
     "/usr/local/bin/shipyard-daemon-launcher --lane pulp-gate",
     "/usr/bin/login -flp daniel",
-    "/Users/danielraffel/.local/bin/codex resume 1234",
-    "/Users/danielraffel/.local/bin/sr codex",
-    "/Users/danielraffel/.local/bin/claude proxy",
+    "sr codex resume 01a126fe-4702-7b62-9852-63e986e1379c",
+    "/usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh",
+    "/Users/danielraffel/.local/bin/studio-pulp-gate",
 )
 PROCESS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*)$")
 PROTECTED_PROCESS = re.compile(
@@ -197,6 +199,34 @@ def _matches_static_fallback(pattern: str) -> bool:
     return SHELL_SNAPSHOT.search(pattern) is not None or any(
         _matches(pattern, command_line) for command_line in BROAD_KILL_COMMAND_LINES
     )
+
+
+RAW_KILL_VERB = re.compile(
+    r"(?:\bkill(?:all)?\b|\bpkill\b|\bos\.kill\b|"
+    r"\bsignal\.SIG(?:KILL|TERM)\b|\bProcess\.kill\b|"
+    r"\blaunchctl\s+(?:kill|bootout|remove)\b|"
+    r"\bxargs\b[^;|\n]*\bkill\b)", re.I,
+)
+RAW_PID_SOURCE = re.compile(r"\b(?:pgrep|pidof|ps|lsof)\b|(?:^|\s)-[A-Za-z]*[fx]\b", re.I)
+
+
+def _raw_process_hits(command: str, rows: list[ProcessRow] | None) -> list[Hit]:
+    """Apply the raw-text PID-source and kill co-occurrence rule."""
+    if not RAW_KILL_VERB.search(command) or not RAW_PID_SOURCE.search(command):
+        return []
+    quoted = re.findall(r"['\"]([^'\"]+)['\"]", command)
+    flagged = re.findall(r"(?:^|\s)-[A-Za-z]*[fx]\s+([^\s;&|()]+)", command, re.I)
+    patterns = list(dict.fromkeys(quoted + flagged))
+    if not patterns:
+        return [Hit("process-source", "<unresolved>",
+                    "a PID source and kill verb occur together")]
+    hits: list[Hit] = []
+    for pattern in patterns:
+        live = _matches_live_protected(pattern, rows)
+        if _matches_static_fallback(pattern) or live is True or live is None:
+            hits.append(Hit("process-source", pattern,
+                            "a PID source feeds a kill-capable command"))
+    return hits
 
 
 def _tokens(command: str) -> list[str]:
@@ -543,6 +573,7 @@ def classify(command: str, depth: int = 0,
         process_rows = _process_table()
     hits: list[Hit] = []
     command, shell_bodies = _split_heredocs(command)
+    hits.extend(_raw_process_hits(command, process_rows))
     pid_source_kill = pid_source_kill or _contains_kill_verb(command)
     for body in shell_bodies:
         hits.extend(classify(body, depth + 1, dict(variables), process_rows,

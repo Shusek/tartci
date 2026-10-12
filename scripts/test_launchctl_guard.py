@@ -218,6 +218,28 @@ class ClassifierTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(guard.decide(command)[0], 2)
 
+    def test_raw_wrappers_and_interpreters_are_checked(self) -> None:
+        commands = (
+            "ssh m3 \"kill $(pgrep -f 'sr codex')\"",
+            "ssh m3 'kill $(pgrep -f tartci-launcher)'",
+            "bash -c \"kill $(pgrep -f 'sr codex')\"",
+            "eval \"kill $(pgrep -f tartci-launcher)\"",
+            "pgrep -f 'sr codex' | xargs sh -c 'kill $0'",
+            "perl -e 'kill 9, grep(/sr codex/, qx(pgrep -f sr codex))'",
+            "python3 -c \"import os; os.kill(int(next(iter([]))), 9) # pgrep -f sr codex\"",
+            "awk 'system(\"kill $(pgrep -f tartci-launcher)\")'",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
+
+    def test_raw_read_only_wrappers_remain_allowed(self) -> None:
+        for command in ("ssh m3 \"pgrep -f 'sr codex'\"",
+                        "bash -c \"pgrep -f tartci-launcher\"",
+                        "eval \"pidof tartci-launcher\""):
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command), (0, ""))
+
     def test_descendant_of_protected_lane_is_refused(self) -> None:
         rows = "\n".join([
             "1 0 /sbin/launchd",
@@ -232,8 +254,7 @@ class ClassifierTests(unittest.TestCase):
 
     def test_static_protection_is_added_to_live_table(self) -> None:
         rows = [guard.ProcessRow(i, 1, f"/usr/bin/idle-{i}") for i in range(1, 42)]
-        self.assertEqual(guard.classify("pkill -f tartci-launcher", process_rows=rows)[0].verb,
-                         "pkill")
+        self.assertTrue(guard.classify("pkill -f tartci-launcher", process_rows=rows))
 
     def test_partial_table_fails_closed(self) -> None:
         partial = "\n".join(f"{i} 1 /usr/bin/idle-{i}" for i in range(1, 41))
