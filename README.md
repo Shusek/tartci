@@ -926,3 +926,15 @@ Bring-up proven on a Mac Studio (2026-06): Linux build+test+cache green; Windows
 24H2-ARM build green + tests pass. See `docs/runbook.md` for the recipe and the
 hard-won gotchas (ISO 512-byte alignment, ramfb vs virtio-gpu, all-USB install
 media, MSVC partial-install nuke, BOOTAA64 auto-boot, …).
+
+### Agent session hygiene
+
+The fleet installer stages `scripts/agent-hygiene` with each immutable support
+cohort and installs `~/.local/bin/agent-hygiene` as its wrapper. `--reap` is
+human-only: it refuses non-interactive and agent contexts, ignores `--yes`, and
+selects candidates from transcript modification time (`AH_TRANSCRIPT_DIRS`,
+which defaults to the Claude and Codex transcript roots), never process age.
+Roots with live `subagent` or `teammate` descendants are protected. Confirmed
+victims are recorded in `${AH_VICTIMS_LOG:-~/.local/state/agent-hygiene/victims.log}`
+with a resume command. The command is guarded by the launchd PreToolUse policy
+when invoked from an agent.

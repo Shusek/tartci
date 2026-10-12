@@ -5,11 +5,14 @@ import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
 import json
 import os
+import pty
+import select
 import plistlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import threading
 import unittest
@@ -279,6 +282,40 @@ class InstallMacosFleetTests(unittest.TestCase):
             text=True, capture_output=True, check=False, env=effective,
         )
 
+    def run_agent_wrapper_tty(self, wrapper: Path, env: dict[str, str]) -> tuple[int, str]:
+        pid, master = pty.fork()
+        if pid == 0:
+            try:
+                os.execve(str(wrapper), [str(wrapper), "--reap", "2", "--yes"], env)
+            except OSError:
+                os._exit(127)
+            os._exit(127)
+        output = bytearray()
+        sent = False
+        status = None
+        deadline = time.monotonic() + 20
+        while status is None:
+            if time.monotonic() >= deadline:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+                self.fail("installed agent-hygiene wrapper timed out")
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    chunk = os.read(master, 4096)
+                    if chunk:
+                        output.extend(chunk)
+                        if not sent and b"terminate these process groups" in output:
+                            os.write(master, b"n\n")
+                            sent = True
+                except OSError:
+                    pass
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == 0:
+                status = None
+        os.close(master)
+        return os.waitstatus_to_exitcode(status), output.decode(errors="replace")
+
     def configure_persistent_runner(self) -> tuple[str, Path]:
         label = "actions.runner.Generous-Corp-pulp.pulp-preamble-test"
         self.config.write_text(
@@ -417,6 +454,30 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("action=dry-run", result.stdout)
+
+    def test_installed_agent_hygiene_wrapper_keeps_human_only_gate(self) -> None:
+        if shutil.which("zsh") is None:
+            self.skipTest("agent-hygiene is a macOS zsh entry point")
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = self.bin / "agent-hygiene"
+        self.assertTrue(wrapper.is_file())
+        snapshot = self.root / "agent-ps"
+        snapshot.write_text("999991 1 00-00:01 10 /Users/test/.local/bin/claude\n")
+        transcripts = self.root / "agent-transcripts"
+        transcripts.mkdir()
+        transcript = transcripts / "session-999991.jsonl"
+        transcript.write_text("old")
+        old = time.time() - 3 * 86400
+        os.utime(transcript, (old, old))
+        env = self.env.copy()
+        env.update(AH_PS_SNAPSHOT_FILE=str(snapshot), AH_TRANSCRIPT_DIRS=str(transcripts),
+                   AH_STALE_DAYS="2", AH_PROC_PCT="1000", AH_SWAP_PCT="1000")
+        code, output = self.run_agent_wrapper_tty(wrapper, env)
+        self.assertEqual(code, 0, output)
+        self.assertIn("--yes is ignored", output)
+        self.assertIn("terminate these process groups", output)
+        self.assertNotIn("done; victims log", output)
 
     def test_dry_run_bound_legacy_repository_resolves_and_reports_slug(self) -> None:
         result = self.run_installer(GH_REPO="danielraffel/tartci")
