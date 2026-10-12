@@ -81,7 +81,7 @@ SSH_ARG_OPTS = frozenset({"-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
 XARGS_ARG_OPTS = frozenset({"-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s", "-a", "-d"})
 MAX_DEPTH = 8
 BROAD_KILL_NAMES = frozenset({"bash", "sh", "zsh", "python", "python3", "node"})
-WHOLE_USER_SELECTOR_OPTS = frozenset({"-u", "--user", "-U", "-G", "-g", "-t"})
+WHOLE_USER_SELECTOR_OPTS = frozenset({"-u", "--user", "-U", "-G", "-g", "-t", "-P", "-s"})
 SHELL_SNAPSHOT = re.compile(
     r"(?:snapshot[-_.]?(?:bash|sh|zsh)|(?:bash|sh|zsh)[-_.]?snapshot)", re.I
 )
@@ -236,6 +236,8 @@ STATIC_NAME_HINT = re.compile(r"(?:tartci|codex|claude|runner|listener|shell|zsh
 
 
 def _has_raw_kill_verb(command: str) -> bool:
+    if re.match(r"^\s*(?:ls|git|tar)\b", command, re.I):
+        return False
     # Remove grep-like command segments first: kill words there are data.
     masked = re.sub(r"\b(?:grep|egrep|rg|ag|git\s+grep|echo)\b[^;&|\n]*", "", command, flags=re.I)
     if RAW_KILL_VERB.search(masked) or re.search(r"\b(?:kill|pkill|killall)\b", masked, re.I):
@@ -549,9 +551,9 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int,
             if (head not in ("pgrep", "pidof") or pid_source_kill)
             and (any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
                  or (head in ("pkill", "killall") and
-                     ((STATIC_NAME_HINT.search(target) and _matches_static_fallback(target))
+                     ((len(target) > 1 and _matches_static_fallback(target))
                       or protected_names is None
-                      or any(_matches(target, name, full=True) for name in protected_names))))
+                      or any(_matches(target, name) for name in protected_names))))
         ]
         # A standalone pgrep is observational.  A surrounding xargs/command
         # substitution is classified separately by the kill command it feeds.

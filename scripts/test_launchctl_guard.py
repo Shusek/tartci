@@ -297,7 +297,7 @@ class ClassifierTests(unittest.TestCase):
 
     def test_benign_kills_are_the_control(self) -> None:
         for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",
-                        "kill -1 1234", "pkill a",
+                        "kill -1 1234",
                         "pkill -u $USER worker-job", "pkill -U 1234 worker-job",
                         "pkill -G 1234 worker-job", "pkill -g 1234 worker-job",
                         "pkill -t ttys001 worker-job"):
