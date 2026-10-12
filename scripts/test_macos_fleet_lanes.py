@@ -2834,6 +2834,14 @@ replaces_launchd_labels=REPLACEMENT
                         self.assertEqual(set(order[:len(gate)]), gate)
                         self.assertEqual(set(order[len(gate):]), release)
         self.assertEqual(seen, 2 * len(HOST_CONFIGS))
+        # Publication is an operational profile flag.  Derive the expected
+        # registered hosts from the test profiles instead of assuming every
+        # configured host is currently published.
+        published_profiles = {
+            fleet.load(config)["name"]
+            for config in HOST_CONFIGS.values()
+            if fleet.load(config)["host"].get("published", True)
+        }
         release_rows = {
             (row["profile"], row["lane"], row["class_label"])
             for row in fleet.advertised_labels_snapshot(
@@ -2842,7 +2850,8 @@ replaces_launchd_labels=REPLACEMENT
         }
         self.assertEqual(release_rows, {
             (f"{host}-macos-fleet", "pulp-gate", cls)
-            for host in ("m1", "m3", "m5")
+            for host in (profile.removesuffix("-macos-fleet")
+                         for profile in published_profiles)
             for cls in ("pulp-release-tagged", "pulp-release-pr-gate")
         } | {
             ("m5-macos-fleet", "pulp-release", cls)

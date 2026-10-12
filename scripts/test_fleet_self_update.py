@@ -2146,7 +2146,13 @@ class ScaleTests(Base):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copytree(ROOT / "profiles", root / "profiles")
-            text = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            original = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            # This test exercises profile-to-publication alias derivation for
+            # every profile.  Keep its fixture published even when production
+            # temporarily withdraws a host from the fleet.
+            (root / "profiles/m1-macos-fleet.toml").write_text(
+                original.replace("published = false", "published = true", 1))
+            text = original.replace("published = false", "published = true", 1)
             text = text.replace('name = "m1-macos-fleet"', 'name = "x9-macos-fleet"')
             text = text.replace('id = "m1"', 'id = "x9"', 1).replace('ssh = "m1"\n', "")
             (root / "profiles/x9-macos-fleet.toml").write_text(text)
