@@ -202,6 +202,21 @@ class ClassifierTests(unittest.TestCase):
 
     def test_read_only_pgrep_is_allowed(self) -> None:
         self.assertEqual(guard.decide("pgrep -f 'sr codex'"), (0, ""))
+        self.assertEqual(guard.decide("pidof tartci-launcher"), (0, ""))
+
+    def test_pid_source_patterns_are_checked_when_any_kill_is_present(self) -> None:
+        commands = (
+            "kill $(pgrep -f 'sr codex')",
+            "kill -9 $(pgrep -f tartci-launcher)",
+            "kill `pgrep -f 'sr codex'`",
+            "pgrep -f tartci-launcher | sudo xargs kill",
+            "while read pid; do kill $pid; done < <(pgrep -f 'sr codex')",
+            "for p in $(pgrep -f tartci-launcher); do kill $p; done",
+            "kill $(pidof tartci-launcher)",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
 
     def test_descendant_of_protected_lane_is_refused(self) -> None:
         rows = "\n".join([
@@ -215,17 +230,22 @@ class ClassifierTests(unittest.TestCase):
         ]):
             self.assertEqual(guard.decide("pkill -f safe-child")[0], 2)
 
+    def test_static_protection_is_added_to_live_table(self) -> None:
+        rows = [guard.ProcessRow(i, 1, f"/usr/bin/idle-{i}") for i in range(1, 42)]
+        self.assertEqual(guard.classify("pkill -f tartci-launcher", process_rows=rows)[0].verb,
+                         "pkill")
+
     def test_partial_table_fails_closed(self) -> None:
         partial = "\n".join(f"{i} 1 /usr/bin/idle-{i}" for i in range(1, 41))
-        path = ROOT / "scripts" / "fixtures" / "launchctl_guard_partial.txt"
-        path.write_text(partial + "\n", encoding="utf-8")
-        old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
-        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(path)
-        try:
-            self.assertEqual(guard.decide("pkill -f harmless-worker")[0], 2)
-        finally:
-            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
-            path.unlink()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial-ps.txt"
+            path.write_text(partial + "\n", encoding="utf-8")
+            old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(path)
+            try:
+                self.assertEqual(guard.decide("pkill -f harmless-worker")[0], 2)
+            finally:
+                os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
 
     def test_slow_ps_fails_closed(self) -> None:
         with mock.patch.object(guard.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):

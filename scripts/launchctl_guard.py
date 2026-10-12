@@ -101,6 +101,12 @@ BROAD_KILL_COMMAND_LINES = (
     "/opt/homebrew/bin/node /Users/danielraffel/.local/bin/claude",
     "/Users/danielraffel/.local/bin/claude --dangerously-skip-permissions",
     "/Users/danielraffel/.local/bin/codex --full-auto",
+    "/usr/local/bin/tartci-launcher --lane pulp-gate",
+    "/usr/local/bin/shipyard-daemon-launcher --lane pulp-gate",
+    "/usr/bin/login -flp daniel",
+    "/Users/danielraffel/.local/bin/codex resume 1234",
+    "/Users/danielraffel/.local/bin/sr codex",
+    "/Users/danielraffel/.local/bin/claude proxy",
 )
 PROCESS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*)$")
 PROTECTED_PROCESS = re.compile(
@@ -191,9 +197,6 @@ def _matches_static_fallback(pattern: str) -> bool:
     return SHELL_SNAPSHOT.search(pattern) is not None or any(
         _matches(pattern, command_line) for command_line in BROAD_KILL_COMMAND_LINES
     )
-
-
-EXPLICIT_PATTERN_ALLOWLIST = frozenset({"^/Users/example/harmless-worker$", "worker-job"})
 
 
 def _tokens(command: str) -> list[str]:
@@ -410,15 +413,32 @@ def _launchctl_hits(args: list[str], from_stdin: bool, variables: dict[str, str]
     return hits
 
 
+def _contains_kill_verb(command: str) -> bool:
+    try:
+        words = _tokens(command)
+    except ValueError:
+        words = command.split()
+    for index, word in enumerate(words):
+        base = os.path.basename(word)
+        if base in {"kill", "killall", "pkill"}:
+            return True
+        if base == "launchctl" and index + 1 < len(words) and words[index + 1] in {
+            "kill", "bootout", "stop", "remove", "disable"
+        }:
+            return True
+    return False
+
+
 def _classify_argv(argv: list[str], variables: dict[str, str], depth: int,
-                   process_rows: list[ProcessRow] | None) -> list[Hit]:
+                   process_rows: list[ProcessRow] | None,
+                   pid_source_kill: bool = False) -> list[Hit]:
     argv, from_stdin = _strip_wrappers(list(argv), variables)
     if not argv:
         return []
     head = os.path.basename(_expand(argv[0], variables))
     if head == "launchctl":
         return _launchctl_hits(argv[1:], from_stdin, variables, depth, process_rows)
-    if head in ("pkill", "killall", "pgrep"):
+    if head in ("pkill", "killall", "pgrep", "pidof"):
         words = [_expand(word, variables) for word in argv[1:]]
         operands: list[str] = []
         patterns: list[str] = []
@@ -445,15 +465,18 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int,
             Hit(head, target,
                 "bare-name kill would terminate every matching agent shell/process")
             for target in operands
-            if any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
+            if (head not in ("pgrep", "pidof") or pid_source_kill)
+            and any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
         ]
         # A standalone pgrep is observational.  A surrounding xargs/command
         # substitution is classified separately by the kill command it feeds.
-        for target in (() if head == "pgrep" else patterns):
+        source_patterns = patterns if head != "pidof" else operands
+        for target in (() if head in ("pgrep", "pidof") and not pid_source_kill
+                       else source_patterns):
             live_match = _matches_live_protected(target, process_rows)
             static_match = _matches_static_fallback(target)
             if live_match is None:
-                matched = static_match or target not in EXPLICIT_PATTERN_ALLOWLIST
+                matched = True
             else:
                 matched = static_match or live_match
             if matched:
@@ -510,7 +533,8 @@ _PROCESS_ROWS_UNSET = object()
 
 def classify(command: str, depth: int = 0,
              variables: dict[str, str] | None = None,
-             process_rows: list[ProcessRow] | None | object = _PROCESS_ROWS_UNSET) -> list[Hit]:
+             process_rows: list[ProcessRow] | None | object = _PROCESS_ROWS_UNSET,
+             pid_source_kill: bool = False) -> list[Hit]:
     """Every dangerous launchctl invocation COMMAND would run."""
     if depth > MAX_DEPTH:
         return [Hit("?", command[:80], "nesting too deep to classify")]
@@ -519,11 +543,14 @@ def classify(command: str, depth: int = 0,
         process_rows = _process_table()
     hits: list[Hit] = []
     command, shell_bodies = _split_heredocs(command)
+    pid_source_kill = pid_source_kill or _contains_kill_verb(command)
     for body in shell_bodies:
-        hits.extend(classify(body, depth + 1, dict(variables), process_rows))
+        hits.extend(classify(body, depth + 1, dict(variables), process_rows,
+                             pid_source_kill=pid_source_kill))
     flattened, bodies = _extract_substitutions(command)
     for body in bodies:
-        hits.extend(classify(body, depth + 1, dict(variables), process_rows))
+        hits.extend(classify(body, depth + 1, dict(variables), process_rows,
+                             pid_source_kill=pid_source_kill))
     try:
         tokens = _tokens(flattened)
     except ValueError:
@@ -531,11 +558,8 @@ def classify(command: str, depth: int = 0,
         # mutation is still seen.
         tokens = flattened.split()
     for argv in _simple_commands(tokens):
-        hits.extend(_classify_argv(argv, variables, depth, process_rows))
-    if re.search(r"\bpgrep\b[^|]*\|\s*(?:xargs\b[^|]*\bkill\b|kill\b)", flattened,
-                 re.I):
-        hits.append(Hit("pgrep", "<pipeline>",
-                        "read-only process lookup feeds a kill command"))
+        hits.extend(_classify_argv(argv, variables, depth, process_rows,
+                                   pid_source_kill=pid_source_kill))
     return hits
 
 
