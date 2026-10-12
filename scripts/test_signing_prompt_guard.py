@@ -269,8 +269,11 @@ class PinnedKeychainTests(Host):
              "--print-render-python", "--python", "/does/not/exist"],
             capture_output=True, text=True, check=False,
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(result.stderr.strip())
+        self.assertEqual(result.returncode, 127)
+        self.assertIn(
+            "launcher build requires a Python 3.11+ interpreter with tomllib",
+            result.stderr,
+        )
 
 
 if __name__ == "__main__":
