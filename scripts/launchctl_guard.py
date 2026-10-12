@@ -81,7 +81,7 @@ WHOLE_USER_SELECTOR_OPTS = frozenset({"-u", "--user", "-U", "-G", "-g", "-t"})
 SHELL_SNAPSHOT = re.compile(
     r"(?:snapshot[-_.]?(?:bash|sh|zsh)|(?:bash|sh|zsh)[-_.]?snapshot)", re.I
 )
-# ``pkill -f`` matches the complete command line.  Keep representative lines
+# pkill -f matches the complete command line.  Keep representative lines
 # for the process families that the guard must protect; matching only the
 # executable basename lets path and snapshot patterns evade the guard.
 BROAD_KILL_COMMAND_LINES = (
