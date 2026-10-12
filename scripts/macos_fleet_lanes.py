@@ -67,7 +67,7 @@ BUILD_DISAGREEMENT_KEYS = {
     "timeout_seconds", "realert_hours",
 }
 HOST_KEYS = {
-    "id", "home", "tart_home", "cache_root", "log_root",
+    "id", "home", "tart_home", "cache_root", "log_root", "published",
     "github_api_timeout_seconds", "persistent_runner_labels",
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
@@ -342,6 +342,8 @@ def load(path: Path) -> dict:
     if ssh is not None and (not isinstance(ssh, str)
                             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}", ssh)):
         fail("host.ssh must be an SSH host alias or user@host other fleet hosts use to reach this one")
+    if "published" in host and type(host["published"]) is not bool:
+        fail("host.published must be a boolean")
     github_api_timeout = host.get("github_api_timeout_seconds")
     if github_api_timeout is not None and (
             type(github_api_timeout) is not int
@@ -2715,6 +2717,8 @@ def registrations_from_env(env: dict[str, str]) -> list[dict]:
 
 def advertised_registrations(data: dict) -> list[dict]:
     """Every JIT registration a loaded profile's lanes can mint."""
+    if data["host"].get("published", True) is False:
+        return []
     host_id = data["host"]["id"]
     profile = data.get("name") or host_id
     rows: list[dict] = []
@@ -2774,6 +2778,8 @@ def persistent_runners(data: dict) -> list[dict]:
     are set at registration outside tartci, so only the name is declared.
     """
     host_id = data["host"]["id"]
+    if data["host"].get("published", True) is False:
+        return []
     rows = []
     for label in data["host"].get("persistent_runner_labels", []) or []:
         match = _PERSISTENT_RUNNER_NAME.fullmatch(label)
@@ -2795,9 +2801,10 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         data = load(path)
         registrations.extend(advertised_registrations(data))
         persistent.extend(persistent_runners(data))
-        hosts.append({"profile": data.get("name") or data["host"]["id"],
-                      "host_id": data["host"]["id"],
-                      "ssh": data["host"].get("ssh")})
+        if data["host"].get("published", True):
+            hosts.append({"profile": data.get("name") or data["host"]["id"],
+                          "host_id": data["host"]["id"],
+                          "ssh": data["host"].get("ssh")})
     return {
         "schema": ADVERTISED_LABELS_SCHEMA,
         "generated_from": {
