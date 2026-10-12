@@ -388,7 +388,7 @@ class FakeSystem(su.System):
         profile = Path(a[a.index("--profile") + 1])
         rendered = out.parent / "render"
         render_env = {**os.environ, **(env or {})}
-        render_env.setdefault("TARTCI_RENDER_PYTHON", sys.executable)
+        render_env["TARTCI_RENDER_PYTHON"] = a[a.index("--python") + 1]
         subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), "render",
                         str(profile), "--output", str(rendered)], check=True,
                        capture_output=True, env=render_env)
@@ -1428,6 +1428,8 @@ class SealedTests(Base):
                            if args[:2] == ["bash", "scripts/build_macos_launcher.sh"])
         build_env = self.sys.env_calls[build_index]
         self.assertEqual(build_env["TARTCI_RENDER_PYTHON"], os.path.realpath(pinned))
+        build = self.sys.calls[build_index][0]
+        self.assertEqual(build[build.index("--python") + 1], os.path.realpath(pinned))
 
     def test_install_failure_restores_the_pin(self) -> None:
         self.sys.install_rcs = [1]
