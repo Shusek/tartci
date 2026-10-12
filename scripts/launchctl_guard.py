@@ -245,7 +245,13 @@ def _has_raw_kill_verb(command: str) -> bool:
             segments[index] = " "
     command = "".join(segments)
     # Remove grep-like command segments first: kill words there are data.
-    masked = re.sub(r"\b(?:grep|egrep|rg|ag|git\s+grep|echo)\b[^;&|\n]*", "", command, flags=re.I)
+    parts = re.split(r"([;&|\n]+)", command)
+    for index in range(0, len(parts), 2):
+        if (re.search(r"^\s*(?:grep|egrep|rg|ag|git\s+grep|echo)\b", parts[index], re.I)
+                and not re.search(r"(?:^|\s)-O(?:\s|['\"]|$)|--open-files-in-pager(?:=|\s)",
+                                  parts[index], re.I)):
+            parts[index] = " "
+    masked = "".join(parts)
     if RAW_KILL_VERB.search(masked) or re.search(r"\b(?:kill|pkill|killall)\b", masked, re.I):
         return True
     return False
@@ -283,22 +289,24 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
         lowered = [arg.lower() for arg in args]
         if any(name.split("=", 1)[0].upper().startswith("GIT_") for name in assignments):
             return False
-        if "-c" in lowered or any(arg.startswith("-c=") for arg in lowered):
+        if "-c" in args or any(arg.lower().startswith("-c=") for arg in args):
             return False
-        execution_options = ("--upload-pack", "--receive-pack", "-o",
+        execution_options = ("--upload-pack", "--receive-pack", "-o", "-u",
                              "--open-files-in-pager", "--exec")
         if any(arg == option or arg.startswith(option + "=")
+               or (option == "-o" and arg.startswith("-o") and arg != "-o")
                for arg in lowered for option in execution_options):
             return False
         subcommand_index = 0
-        while subcommand_index < len(lowered):
-            option = lowered[subcommand_index]
-            if option == "-c" or option.startswith("-c="):
+        while subcommand_index < len(args):
+            option = args[subcommand_index]
+            option_lower = option.lower()
+            if option == "-c" or option_lower.startswith("-c="):
                 return False
-            if option in {"--git-dir", "--work-tree", "-c"}:
+            if option_lower in {"--git-dir", "--work-tree"}:
                 subcommand_index += 2
                 continue
-            if option.startswith("--git-dir=") or option.startswith("--work-tree="):
+            if option_lower.startswith("--git-dir=") or option_lower.startswith("--work-tree="):
                 subcommand_index += 1
                 continue
             if option == "-C":
@@ -315,9 +323,13 @@ def _is_nonexecuting_data_segment(segment: str) -> bool:
         return True
     if command == "tar":
         lowered_args = [arg.lower() for arg in args]
-        if any(arg in {"-i", "--to-command", "--use-compress-program", "--checkpoint-action"}
-               or arg.startswith(("--to-command=", "--use-compress-program=", "--checkpoint-action="))
+        if any(arg in {"-i", "--to-command", "--use-compress-program", "--checkpoint-action",
+                       "--info-script", "--new-volume-script", "--rsh-command", "--rmt-command"}
+               or arg.startswith(("--to-command=", "--use-compress-program=", "--checkpoint-action=",
+                                  "--info-script=", "--new-volume-script=", "--rsh-command=", "--rmt-command="))
                for arg in lowered_args):
+            return False
+        if "-F" in args:
             return False
         if any(arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]
                for arg in lowered_args):
