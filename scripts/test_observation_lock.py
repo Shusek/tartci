@@ -324,6 +324,26 @@ with FairObservationLock(lock, 5, "owner/repo", lane="lane-exec", generation="ge
                 detail = item._owner_detail()
             self.assertIn("owner_pid=111", detail)
 
+    def test_fifo_pids_and_lsof_use_real_holder_shapes(self):
+        import observation_lock as module
+        if module._lsof_path() is None:
+            self.skipTest("requires lsof")
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "observation.lock"
+            queue = Path(str(lock) + ".fifo")
+            queue.mkdir()
+            with lock.open("a+") as handle:
+                child = subprocess.Popen(["/bin/sleep", "3"],
+                                         pass_fds=(handle.fileno(),))
+                try:
+                    holders = module._live_lock_holders(lock)
+                    self.assertIn(child.pid, holders)
+                    (queue / f"00000000000000000007.{child.pid}").write_text("ticket")
+                    (queue / "not-a-ticket").write_text("ignored")
+                    self.assertEqual(module._fifo_pids(lock), {child.pid})
+                finally:
+                    child.terminate()
+                    child.wait(timeout=3)
     def test_unavailable_holder_probe_is_reported(self):
         import observation_lock as module
         with tempfile.TemporaryDirectory() as td:
