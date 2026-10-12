@@ -6,9 +6,6 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
-import contextlib
-import io
-import runpy
 from pathlib import Path
 from unittest import mock
 
@@ -18,26 +15,19 @@ import launchctl_guard as guard
 from test_launchctl_guard import PS_FIXTURE
 
 
-_probe_path = Path("/Volumes/Workshop/Code/agent-worktrees/infra-review3/tc487/probe5.py")
-_old_argv = sys.argv
-sys.argv = [str(_probe_path), str(Path(__file__).resolve().parent)]
-with contextlib.redirect_stdout(io.StringIO()):
-    _probe5 = runpy.run_path(str(_probe_path),
-                             init_globals={"UNSET_PATTERN": "UNSET_PATTERN", "NAME": "NAME"})
-sys.argv = _old_argv
-
-_PROBE6_NEW = (
-    "ssh m3 '/usr/bin/kill $(pgrep -f \"sr codex\")'",
-    "ssh m3 'nice -n 5 kill $(pgrep -f tartci-launcher)'",
-    "ssh m3 'exec kill -9 $(pgrep -f \"sr codex\")'",
-    "ssh m3 'command kill $(pgrep -f tartci-launcher)'",
-    "pkill codex", "killall codex", "pkill tartci-launcher", "killall -m 'tartci.*'",
-    "pkill -x sr", "ssh m3 'killall -m \"tartci.*\"'", "ssh m3 pkill codex",
-    "kill -9 $(pgrep -x codex)", "kill $(pgrep codex)",
-)
-MUST_REFUSE = tuple(dict.fromkeys(list(_probe5["must_refuse"]) + list(_PROBE6_NEW)))
-MUST_ALLOW = tuple(_probe5["read_only"])
-
+# Copied from the reviewer-owned probe5.py/probe6.py shape lists.
+MUST_REFUSE = tuple(dict.fromkeys(
+    ["ps aux | grep tartci-launcher | awk '{print $2}' | xargs kill -9", "kill $(ps -axo pid=,command= | grep tartci-launcher | awk '{print $1}')", 'PAT=tartci-launcher; kill $(pgrep -f $PAT)', 'kill $(pgrep -f $UNSET_PATTERN)', 'kill $(pgrep -f "${NAME}")', "pkill -f 'claude proxy --resume'", "kill $(pgrep -f 'sr codex')", 'kill -9 $(pgrep -f tartci-launcher)', 'kill -9 `pgrep -f codex`', 'pgrep -f codex | sudo xargs kill', 'pgrep -f codex | while read p; do kill $p; done', "for p in $(pgrep -f 'sr codex'); do kill $p; done", 'ssh m3 \'kill $(pgrep -f "sr codex")\'', "ssh m3 'kill $(pgrep -f tartci-launcher)'", "ssh m3 'for p in $(pgrep -f codex); do kill $p; done'", 'ssh m3 "kill \\$(pgrep -f \'sr codex\')"', 'bash -c "kill \\$(pgrep -f \'sr codex\')"', 'eval "kill \\$(pgrep -f \'sr codex\')"', "pgrep -f 'sr codex' | xargs -I{} sh -c 'kill {}'", "pgrep -f 'sr codex' | perl -ne 'kill 9, $_'", "pgrep -f 'sr codex' | python3 -c 'import os,sys; [os.kill(int(p),9) for p in sys.stdin]'", 'pgrep -f \'sr codex\' | awk \'{system("kill " $1)}\'', 'PAT=\'sr codex\'; kill $(pgrep -f "$PAT")', "ps -axo pid=,command= | grep 'sr codex' | awk '{print $1}' | xargs kill", 'kill $(lsof -t -c codex)', "P=$(pgrep -f 'sr codex'); kill $P", "launchctl kill SIGKILL pid/$(pgrep -f 'sr codex')", "pkill -f 'sr codex resume'", "pkill -f 'login -flp danielraffel'", "pkill -f 'MacOS/tartci-launcher --lane'", 'pkill -f studio-pulp-gate', 'pkill -f tartci-launcher', 'pkill -f claude-proxy', 'pkill -f /bin/sh', "/bin/kill $(pgrep -f 'sr codex')", 'ssh m3 \'/bin/kill $(pgrep -f "sr codex")\'', "ssh m3 'pgrep -f codex | while read p; do kill $p; done'", "ssh m3 'if pgrep -f tartci-launcher >/dev/null; then kill $(pgrep -f tartci-launcher); fi'", "ssh m3 'timeout 5 kill $(pgrep -f tartci-launcher)'", 'ssh m3 \'env kill -9 $(pgrep -f "sr codex")\'', 'timeout 5 kill $(pgrep -f tartci-launcher)', "nohup kill $(pgrep -f 'sr codex')", 'ssh m3 \'ps aux | grep tartci-launcher | awk "{print \\$2}" | xargs kill\'', "TARTCI_ALLOW_RAW_LAUNCHCTL=1 kill $(pgrep -f 'sr codex')", "TARTCI_ALLOW_RAW_LAUNCHCTL=1 ssh m3 'kill $(pgrep -f tartci-launcher)'"] + [
+        "ssh m3 '/usr/bin/kill $(pgrep -f \"sr codex\")'",
+        "ssh m3 'nice -n 5 kill $(pgrep -f tartci-launcher)'",
+        "ssh m3 'exec kill -9 $(pgrep -f \"sr codex\")'",
+        "ssh m3 'command kill $(pgrep -f tartci-launcher)'",
+        "pkill codex", "killall codex", "pkill tartci-launcher", "killall -m 'tartci.*'",
+        "pkill -x sr", "ssh m3 'killall -m \"tartci.*\"'", "ssh m3 pkill codex",
+        "kill -9 $(pgrep -x codex)", "kill $(pgrep codex)",
+    ]
+))
+MUST_ALLOW = tuple(['pgrep -f codex', "pgrep -fl 'sr codex'", "pgrep -f 'sr codex' | wc -l", 'pgrep -f codex && echo found', 'ps aux | grep codex', "ps -axo pid,ppid,command | grep 'sr codex'", 'tail -f ~/Library/Logs/tartci/tartci-self-update.log', 'ps aux | grep -i kill', 'ps aux | grep pkill', "ps aux | grep 'kill'", 'ps aux | grep "pkill -f"', "grep -rn 'pkill -f' scripts/", "rg -n 'kill' scripts/launchctl_guard.py", 'rg -n "os.kill" scripts/', "git grep -n 'kill -9' -- scripts", 'git log --oneline | grep -i kill', "grep -n 'xargs kill' scripts/*.py", 'python3 -m unittest -f scripts.test_launchctl_guard', 'pytest -x scripts/test_kill_guard.py', 'lsof -t -i :8080', 'launchctl list | grep tartci', "echo 'do not kill the lane' && tartci pool status -f"])
 
 def _rows(path: Path) -> list[guard.ProcessRow]:
     result = []
