@@ -236,8 +236,14 @@ STATIC_NAME_HINT = re.compile(r"(?:tartci|codex|claude|runner|listener|shell|zsh
 
 
 def _has_raw_kill_verb(command: str) -> bool:
-    if re.match(r"^\s*(?:ls|git|tar)\b", command, re.I):
-        return False
+    # Non-kill commands may contain words such as kill as data.  Mask
+    # only those command segments; a later segment can still contain a real
+    # kill (for example: git status, then ssh ... kill ...).
+    segments = re.split(r"([;&|\n]+)", command)
+    for index in range(0, len(segments), 2):
+        if re.match(r"^\s*(?:ls|git|tar)\b", segments[index], re.I):
+            segments[index] = " "
+    command = "".join(segments)
     # Remove grep-like command segments first: kill words there are data.
     masked = re.sub(r"\b(?:grep|egrep|rg|ag|git\s+grep|echo)\b[^;&|\n]*", "", command, flags=re.I)
     if RAW_KILL_VERB.search(masked) or re.search(r"\b(?:kill|pkill|killall)\b", masked, re.I):

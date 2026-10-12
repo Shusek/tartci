@@ -28,9 +28,16 @@ MUST_REFUSE = tuple(dict.fromkeys(
         "pkill launcher", "pkill odex", "pkill laude", "pkill daemon-launcher",
         "ssh m3 'pkill launcher'", "pkill -P 1", "ssh m3 'pkill -P 1'",
         "pkill -g 1", "pkill -s 1",
+        "git status && ssh m3 'kill $(pgrep -f \"sr codex\")'",
+        "git fetch -q; ssh m3 'kill $(pgrep -f tartci-launcher)'",
+        "ls >/dev/null; bash -c \"kill \\$(pgrep -f 'sr codex')\"",
+        "tar --version >/dev/null && pgrep -f 'sr codex' | perl -ne 'kill 9, $_'",
+        "git log -1 && pgrep -f 'sr codex' | python3 -c 'import os,sys; [os.kill(int(p),9) for p in sys.stdin]'",
+        "git status; eval \"kill \\$(pgrep -f 'sr codex')\"",
+        "pkill -9 launcher", "pkill -9 -P 1", "pkill -i CODEX", "killall -m '.*'",
     ]
 ))
-MUST_ALLOW = tuple(['pgrep -f codex', "pgrep -fl 'sr codex'", "pgrep -f 'sr codex' | wc -l", 'pgrep -f codex && echo found', 'ps aux | grep codex', "ps -axo pid,ppid,command | grep 'sr codex'", 'tail -f ~/Library/Logs/tartci/tartci-self-update.log', 'ps aux | grep -i kill', 'ps aux | grep pkill', "ps aux | grep 'kill'", 'ps aux | grep "pkill -f"', "grep -rn 'pkill -f' scripts/", "rg -n 'kill' scripts/launchctl_guard.py", 'rg -n "os.kill" scripts/', "git grep -n 'kill -9' -- scripts", 'git log --oneline | grep -i kill', "grep -n 'xargs kill' scripts/*.py", 'python3 -m unittest -f scripts.test_launchctl_guard', 'pytest -x scripts/test_kill_guard.py', 'lsof -t -i :8080', 'launchctl list | grep tartci', "echo 'do not kill the lane' && tartci pool status -f"])
+MUST_ALLOW = tuple(['pgrep -f codex', "pgrep -fl 'sr codex'", "pgrep -f 'sr codex' | wc -l", 'pgrep -f codex && echo found', 'ps aux | grep codex', "ps -axo pid,ppid,command | grep 'sr codex'", 'tail -f ~/Library/Logs/tartci/tartci-self-update.log', 'ps aux | grep -i kill', 'ps aux | grep pkill', "ps aux | grep 'kill'", 'ps aux | grep "pkill -f"', "grep -rn 'pkill -f' scripts/", "rg -n 'kill' scripts/launchctl_guard.py", 'rg -n "os.kill" scripts/', "git grep -n 'kill -9' -- scripts", 'git log --oneline | grep -i kill', "grep -n 'xargs kill' scripts/*.py", 'python3 -m unittest -f scripts.test_launchctl_guard', 'pytest -x scripts/test_kill_guard.py', 'lsof -t -i :8080', 'launchctl list | grep tartci', "echo 'do not kill the lane' && tartci pool status -f", "ls -lf /bin/kill", "tar -xf kill-switch.tar", "git commit -F msg.txt -m 'guard: refuse broad kill'", "sed -n '/kill/p' run.log", "cat docs/kill.md", "man kill", "which pkill", "gh pr view 487 --json body -q .body | less"])
 
 def _rows(path: Path) -> list[guard.ProcessRow]:
     result = []
