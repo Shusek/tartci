@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -119,6 +120,8 @@ class ClassifierTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._old_ps_snapshot = os.environ.get("TARTCI_GUARD_PS_SNAPSHOT")
+        cls._old_testing = os.environ.get("TARTCI_GUARD_TESTING")
+        os.environ["TARTCI_GUARD_TESTING"] = "1"
         os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(PS_FIXTURE)
 
     @classmethod
@@ -127,6 +130,10 @@ class ClassifierTests(unittest.TestCase):
             os.environ.pop("TARTCI_GUARD_PS_SNAPSHOT", None)
         else:
             os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = cls._old_ps_snapshot
+        if cls._old_testing is None:
+            os.environ.pop("TARTCI_GUARD_TESTING", None)
+        else:
+            os.environ["TARTCI_GUARD_TESTING"] = cls._old_testing
 
     def test_proxy_snapshot_and_sh_process_shapes_are_refused(self) -> None:
         # These are command-line shapes captured from ``ps -axo command`` on
@@ -192,6 +199,42 @@ class ClassifierTests(unittest.TestCase):
 
     def test_live_process_table_allows_pattern_matching_no_protected_process(self) -> None:
         self.assertEqual(guard.decide("pkill -f '^/Users/example/harmless-worker$'"), (0, ""))
+
+    def test_read_only_pgrep_is_allowed(self) -> None:
+        self.assertEqual(guard.decide("pgrep -f 'sr codex'"), (0, ""))
+
+    def test_descendant_of_protected_lane_is_refused(self) -> None:
+        rows = "\n".join([
+            "1 0 /sbin/launchd",
+            "10 1 /Users/danielraffel/bin/tartci-launcher --lane pulp-gate",
+            "11 10 /usr/bin/helper --safe-child",
+        ] + [f"{100 + i} 1 /usr/bin/idle-{i}" for i in range(41)])
+        with mock.patch.object(guard, "_process_table", return_value=[
+            guard.ProcessRow(int(a), int(b), c)
+            for a, b, c in (line.split(" ", 2) for line in rows.splitlines())
+        ]):
+            self.assertEqual(guard.decide("pkill -f safe-child")[0], 2)
+
+    def test_partial_table_fails_closed(self) -> None:
+        partial = "\n".join(f"{i} 1 /usr/bin/idle-{i}" for i in range(1, 41))
+        path = ROOT / "scripts" / "fixtures" / "launchctl_guard_partial.txt"
+        path.write_text(partial + "\n", encoding="utf-8")
+        old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
+        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(path)
+        try:
+            self.assertEqual(guard.decide("pkill -f harmless-worker")[0], 2)
+        finally:
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
+            path.unlink()
+
+    def test_slow_ps_fails_closed(self) -> None:
+        with mock.patch.object(guard.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            old = os.environ.pop("TARTCI_GUARD_PS_SNAPSHOT", None)
+            try:
+                self.assertEqual(guard.decide("pkill -f harmless-worker")[0], 2)
+            finally:
+                if old is not None:
+                    os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
 
     def test_benign_kills_are_the_control(self) -> None:
         for command in ("pkill -f worker-job", "killall fseventsd", "kill -TERM 1234",

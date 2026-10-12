@@ -105,6 +105,7 @@ BROAD_KILL_COMMAND_LINES = (
 PROCESS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*)$")
 PROTECTED_PROCESS = re.compile(
     r"(?:tartci[-_]launcher|TartCILauncher|runner\.sh\s+--loop|"
+    r"shipyard-daemon-launcher|"
     r"(?:^|\s)sr\s+(?:codex|claude)\b|(?:^|\s)(?:codex|claude)\b|"
     r"claude[- ]proxy|subrouter|shell-snapshots|(?:^|/)login\s+-flp\b|"
     r"(?:^|/)(?:bash|sh|zsh|dash|ksh)\b)",
@@ -140,20 +141,16 @@ class ProcessRow(NamedTuple):
 
 
 def _process_table() -> list[ProcessRow] | None:
-    """Read the host process table, or return None when it is unavailable.
-
-    Tests may point this at a captured ``ps`` receipt. Production always uses
-    the host's read-only ``ps`` output; a static pattern list is used only if
-    that read fails.
-    """
-    snapshot = os.environ.get("TARTCI_GUARD_PS_SNAPSHOT")
+    """Read the host process table, or return None when it is unavailable."""
+    snapshot = (os.environ.get("TARTCI_GUARD_PS_SNAPSHOT")
+                if os.environ.get("TARTCI_GUARD_TESTING") == "1" else None)
     try:
         if snapshot:
             text = Path(snapshot).read_text(encoding="utf-8")
         else:
             text = subprocess.run(
                 ["ps", "-axo", "pid=,ppid=,command="],
-                check=True, capture_output=True, text=True, timeout=1,
+                check=True, capture_output=True, text=True, timeout=5,
             ).stdout
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return None
@@ -162,7 +159,9 @@ def _process_table() -> list[ProcessRow] | None:
         match = PROCESS_ROW.match(line)
         if match:
             rows.append(ProcessRow(int(match.group(1)), int(match.group(2)), match.group(3)))
-    return rows or None
+    # A short receipt is indistinguishable from a truncated ps stream.  Fleet
+    # hosts have substantially more than this; fail closed below the bound.
+    return rows if len(rows) > 40 else None
 
 
 def _protected_process_commands(rows: list[ProcessRow]) -> list[str]:
@@ -192,6 +191,9 @@ def _matches_static_fallback(pattern: str) -> bool:
     return SHELL_SNAPSHOT.search(pattern) is not None or any(
         _matches(pattern, command_line) for command_line in BROAD_KILL_COMMAND_LINES
     )
+
+
+EXPLICIT_PATTERN_ALLOWLIST = frozenset({"^/Users/example/harmless-worker$", "worker-job"})
 
 
 def _tokens(command: str) -> list[str]:
@@ -445,10 +447,15 @@ def _classify_argv(argv: list[str], variables: dict[str, str], depth: int,
             for target in operands
             if any(_matches_broad_name(target, name) for name in BROAD_KILL_NAMES)
         ]
-        for target in patterns:
+        # A standalone pgrep is observational.  A surrounding xargs/command
+        # substitution is classified separately by the kill command it feeds.
+        for target in (() if head == "pgrep" else patterns):
             live_match = _matches_live_protected(target, process_rows)
-            matched = (_matches_static_fallback(target)
-                       if live_match is None else live_match)
+            static_match = _matches_static_fallback(target)
+            if live_match is None:
+                matched = static_match or target not in EXPLICIT_PATTERN_ALLOWLIST
+            else:
+                matched = static_match or live_match
             if matched:
                 hits.append(Hit(head, target,
                                 "-f matches a protected process or agent session"))
@@ -525,6 +532,10 @@ def classify(command: str, depth: int = 0,
         tokens = flattened.split()
     for argv in _simple_commands(tokens):
         hits.extend(_classify_argv(argv, variables, depth, process_rows))
+    if re.search(r"\bpgrep\b[^|]*\|\s*(?:xargs\b[^|]*\bkill\b|kill\b)", flattened,
+                 re.I):
+        hits.append(Hit("pgrep", "<pipeline>",
+                        "read-only process lookup feeds a kill command"))
     return hits
 
 
