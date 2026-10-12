@@ -157,7 +157,11 @@ class PinnedKeychainTests(Host):
                                  r'\$\{keychain_args\[@\]\+"\$\{keychain_args\[@\]\}"\} --sign')
         source = (HERE / "fleet_self_update.py").read_text()
         body = source[source.index("def build_launcher("):]
-        self.assertIn('"--profile", str(profile), *pinned]', body[:body.index("\ndef ")])
+        self.assertIn(
+            '"--profile", str(profile),\n'
+            '                           "--python", launcher_python, *pinned]',
+            body[:body.index("\ndef ")],
+        )
 
 
 if __name__ == "__main__":
