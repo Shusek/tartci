@@ -127,11 +127,22 @@ class OperatorShellTests(unittest.TestCase):
         self.assertIn('"status": "unready"', result.stdout)
 
     def test_shared_wrapper_returns_to_a_pool_on_shaped_script(self) -> None:
-        script = (f"source {COMMON / 'toml-python.lib.sh'}\n"
-                  f"TARTCI_PYTHON={sys.executable} tartci_toml_python -c 'print(\"child\")'\n"
-                  "printf 'continued\\n'\n")
-        result = subprocess.run(["bash", "-c", script], capture_output=True,
-                                text=True, check=False)
+        # Use a stand-in so this contract is exercised on the Python 3.9 CI
+        # lane too; the real 3.9 interpreter is correctly rejected because it
+        # has no tomllib.
+        with tempfile.TemporaryDirectory() as td:
+            fake = Path(td) / "python-tomllib"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "case \"$2\" in *'import tomllib'*) exit 0;; esac\n"
+                "case \"$2\" in *'print(\"child\")'*) printf 'child\\n';; esac\n"
+            )
+            fake.chmod(0o755)
+            script = (f"source {COMMON / 'toml-python.lib.sh'}\n"
+                      f"TARTCI_PYTHON={fake} tartci_toml_python -c 'print(\"child\")'\n"
+                      "printf 'continued\\n'\n")
+            result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                    text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["child", "continued"])
 
