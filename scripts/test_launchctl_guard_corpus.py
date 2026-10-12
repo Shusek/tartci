@@ -40,9 +40,35 @@ MUST_REFUSE = tuple(dict.fromkeys(
         "git bisect run sh -c 'pkill -f tartci-launcher'",
         "git -c core.pager='sh -c \"kill \\$(pgrep -f tartci-launcher)\"' log",
         "tar -cf /dev/null --to-command='kill $(pgrep -f tartci-launcher)' x",
+        "git -c core.sshCommand='ssh m3 pkill -f tartci-launcher' fetch",
+        "env GIT_SSH_COMMAND='ssh m3 pkill -f tartci-launcher' git fetch",
+        "git submodule foreach 'pkill -f tartci-launcher'",
+        "git filter-branch --tree-filter 'pkill -f tartci-launcher'",
+        "git config alias.z '!pkill -f tartci-launcher'",
+        "git z pkill -f tartci-launcher",
+        "tar -xI 'pkill -f tartci-launcher'",
+        "tar -I 'pkill -f tartci-launcher' -tf archive.tar",
+        "tar --use-compress-program='pkill -f tartci-launcher' -tf archive.tar",
+        "tar --checkpoint-action=exec='pkill -f tartci-launcher' -tf archive.tar",
+        "git --upload-pack='pkill -f tartci-launcher' fetch",
+        "git --receive-pack='pkill -f tartci-launcher' push",
+        "git -O 'pkill -f tartci-launcher' log",
+        "git --open-files-in-pager='pkill -f tartci-launcher' log",
+        "git --exec='pkill -f tartci-launcher' log",
+        "git grep -O'sh -c \"kill \\$(pgrep -f tartci-launcher)\"' main",
+        "git grep --open-files-in-pager='kill $(pgrep -f \"sr codex\")' x",
+        "git grep -O'kill $(pgrep -f tartci-launcher)' x",
+        "git -C /tmp/x grep -O'kill $(pgrep -f tartci-launcher)' x",
+        "git fetch --upload-pack='sh -c \"kill \\$(pgrep -f tartci-launcher)\"' .",
+        "git ls-remote --upload-pack='kill $(pgrep -f \"sr codex\")' .",
+        "git ls-remote -u 'kill $(pgrep -f \"sr codex\")' .",
+        "tar --info-script='kill $(pgrep -f tartci-launcher)' -tf archive.tar",
+        "tar --new-volume-script='kill $(pgrep -f tartci-launcher)' -tf archive.tar",
+        "tar --rsh-command='kill $(pgrep -f tartci-launcher)' -tf archive.tar",
+        "tar -F 'kill $(pgrep -f tartci-launcher)' -tf archive.tar",
     ]
 ))
-MUST_ALLOW = tuple(['pgrep -f codex', "pgrep -fl 'sr codex'", "pgrep -f 'sr codex' | wc -l", 'pgrep -f codex && echo found', 'ps aux | grep codex', "ps -axo pid,ppid,command | grep 'sr codex'", 'tail -f ~/Library/Logs/tartci/tartci-self-update.log', 'ps aux | grep -i kill', 'ps aux | grep pkill', "ps aux | grep 'kill'", 'ps aux | grep "pkill -f"', "grep -rn 'pkill -f' scripts/", "rg -n 'kill' scripts/launchctl_guard.py", 'rg -n "os.kill" scripts/', "git grep -n 'kill -9' -- scripts", 'git log --oneline | grep -i kill', "grep -n 'xargs kill' scripts/*.py", 'python3 -m unittest -f scripts.test_launchctl_guard', 'pytest -x scripts/test_kill_guard.py', 'lsof -t -i :8080', 'launchctl list | grep tartci', "echo 'do not kill the lane' && tartci pool status -f", "ls -lf /bin/kill", "tar -xf kill-switch.tar", "git commit -F msg.txt -m 'guard: refuse broad kill'", "sed -n '/kill/p' run.log", "cat docs/kill.md", "man kill", "which pkill", "gh pr view 487 --json body -q .body | less", "sudo git commit -F msg.txt -m 'guard: refuse broad kill'", "env FOO=bar ls -lf /bin/kill", "nohup tar -xf kill-switch.tar"])
+MUST_ALLOW = tuple(['pgrep -f codex', "pgrep -fl 'sr codex'", "pgrep -f 'sr codex' | wc -l", 'pgrep -f codex && echo found', 'ps aux | grep codex', "ps -axo pid,ppid,command | grep 'sr codex'", 'tail -f ~/Library/Logs/tartci/tartci-self-update.log', 'ps aux | grep -i kill', 'ps aux | grep pkill', "ps aux | grep 'kill'", 'ps aux | grep "pkill -f"', "grep -rn 'pkill -f' scripts/", "rg -n 'kill' scripts/launchctl_guard.py", 'rg -n "os.kill" scripts/', "git grep -n 'kill -9' -- scripts", 'git log --oneline | grep -i kill', "grep -n 'xargs kill' scripts/*.py", 'python3 -m unittest -f scripts.test_launchctl_guard', 'pytest -x scripts/test_kill_guard.py', 'lsof -t -i :8080', 'launchctl list | grep tartci', "echo 'do not kill the lane' && tartci pool status -f", "ls -lf /bin/kill", "tar -xf kill-switch.tar", "git commit -F msg.txt -m 'guard: refuse broad kill'", "sed -n '/kill/p' run.log", "cat docs/kill.md", "man kill", "which pkill", "gh pr view 487 --json body -q .body | less", "env FOO=bar ls -lf /bin/kill", "sudo git commit -F msg.txt -m 'guard: refuse broad kill'", "nohup tar -xf kill-switch.tar", "tar -tf archive.tar", "tar -tzf archive.tar", "sudo tar -tf archive.tar", "git -C /tmp/x log", "git -C /tmp/x log --oneline -S 'pkill -f'",])
 
 def _rows(path: Path) -> list[guard.ProcessRow]:
     result = []
