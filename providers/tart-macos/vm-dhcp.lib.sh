@@ -58,6 +58,17 @@ tartci_vm_dhcp_check(){
   esac
 }
 
+# Release a granted probe when the lane returns before cloning (for example
+# admission or lease refusal). Such a turn never had a VM to report and must
+# not become probe_unreported.
+tartci_vm_dhcp_cancel(){
+  local lane="$1" reason="${2:-pre_clone}" out
+  tartci_vm_dhcp_enabled || return 0
+  out="$(python3 "$TARTCI_ROOT/scripts/vm_dhcp_breaker.py" cancel \
+    --lane "$lane" --reason "$reason" 2>/dev/null)" || return 0
+  _tartci_vm_dhcp_emit "$out"
+}
+
 # Record a boot's DHCP outcome: ip or no_ip.
 tartci_vm_dhcp_record(){
   local lane="$1" outcome="$2" vm="${3:-}" out
