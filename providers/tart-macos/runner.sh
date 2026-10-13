@@ -292,6 +292,7 @@ CLEANED_UP=0
 SERVING_BLOCKED_SINCE=""
 SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
+SERVING_BLOCKED_CAUSE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
 # 1 when the last work entry declined to clone because the opt-in pre-clone
@@ -825,7 +826,7 @@ heartbeat(){
   find "$STATE_DIR" -type f -name "$RUNNER_NAME.state.json.tmp.*" -mtime +1 -delete 2>/dev/null || true
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","serving_blocked_cause":"$(json_sanitize "$SERVING_BLOCKED_CAUSE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -2029,8 +2030,7 @@ run_one(){
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
   # Test harnesses can execute this function without sourcing the optional
-  # DHCP library. Keep the pre-clone cancellation fail-open in that topology;
-  # production sources the real implementation before entering the loop.
+  # DHCP library. Production sources the real implementation before entering.
   if ! declare -F tartci_vm_dhcp_cancel >/dev/null; then
     tartci_vm_dhcp_cancel(){ :; }
   fi
@@ -2691,33 +2691,47 @@ if [ "$LOOP" = 1 ]; then
       CURRENT_SELECTED_QUEUED="$q"
       VM_DHCP_PROBE_REPORTED=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
-      # A verification probe is reserved before run_one.  Any pre-clone
-      # return (including a disk check) must release it exactly once unless
-      # the boot path recorded a DHCP outcome.
+      # Release per-turn ownership proofs immediately after run_one, before
+      # the serving accounting grows. This keeps every early-return proof
+      # within the loop's bounded post-run window.
+      tartci_boundary_proof_abandon
+      tartci_job_claim_release
       # Every cause of clone-without-serve returns through here, so the streak
       # is counted here rather than at each cause. Counted per work ENTRY, not
       # per error: a lane that alternates a failure with a served job never
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
       if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
-         || [ "${VM_DHCP_BACKOFF:-0}" = 1 ] \
+         || { [ "${VM_DHCP_BACKOFF:-0}" = 1 ] && [ "${VM_DHCP_BREAKER_OPEN:-0}" != 1 ]; } \
          || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
+        SERVING_BLOCKED_CAUSE=""
+      elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then
+        SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
+        SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        SERVING_BLOCKED_CAUSE="dhcp_breaker"
+        [ -n "$SERVING_BLOCKED_SINCE" ] \
+          || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       else
         SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
         SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        case "$LAST_HEARTBEAT_PHASE" in
+          admission-precheck-error|admission-error) SERVING_BLOCKED_CAUSE="admission failing" ;;
+          admission-precheck-deferred|admission-deferred) SERVING_BLOCKED_CAUSE="admission deferred" ;;
+          *) SERVING_BLOCKED_CAUSE="unserved" ;;
+        esac
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       fi
       if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
         tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone
       fi
-      # Early returns (boot failure, yield, admission refusal) leave a proof
-      # that nobody will consume.
-      tartci_boundary_proof_abandon
-      tartci_job_claim_release
+      # Publish the updated serving verdict immediately. The state write inside
+      # run_one predates this work-entry result and cannot carry the new
+      # cause or streak to readiness readers.
+      heartbeat "${LAST_HEARTBEAT_PHASE:-waiting}"
       # A lane denied its lease keeps waiting for it; any other outcome
       # (served, covered by a sibling, admission deferred) stops wanting one.
       [ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw
@@ -2776,6 +2790,7 @@ if [ "$LOOP" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
+        SERVING_BLOCKED_CAUSE=""
       else
         # Demand this lane could not place (no VM slot): a parked warm VM on
         # this host, if any, yields to it.
@@ -2813,5 +2828,12 @@ else
   jit_admission_denied "$selected_group_id" "$selected_labels" \
     && die "JIT admission is blocked for this exact repository/group/class contract; inspect $JIT_DENIAL_FILE"
   note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$selected_labels workflow_tier=$selected_tier"
-  run_one 1 "$selected_labels" "$selected_tier"
+  run_rc=0
+  run_one 1 "$selected_labels" "$selected_tier" || run_rc=$?
+  # --once has no loop-tail accounting pass. Release a granted probe when the
+  # one-shot turn returned before cloning, exactly as loop mode does.
+  if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
+    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone
+  fi
+  exit "$run_rc"
 fi

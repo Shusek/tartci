@@ -14,6 +14,7 @@
 # it: no reads, no writes, no events.
 VM_DHCP_BACKOFF=0
 VM_DHCP_PROBE=0
+VM_DHCP_BREAKER_OPEN=0
 
 tartci_vm_dhcp_enabled(){
   [ "${TARTCI_VM_DHCP_BREAKER:-1}" = 1 ]
@@ -47,15 +48,21 @@ tartci_vm_dhcp_check(){
   local lane="$1" out action
   VM_DHCP_BACKOFF=0
   VM_DHCP_PROBE=0
+  VM_DHCP_BREAKER_OPEN=0
   tartci_vm_dhcp_enabled || return 0
   out="$(python3 "$TARTCI_ROOT/scripts/vm_dhcp_breaker.py" check --lane "$lane" 2>/dev/null)" || return 0
   _tartci_vm_dhcp_emit "$out"
   action="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action",""))' 2>/dev/null)"
   case "$action" in
-    backoff) VM_DHCP_BACKOFF=1; return 75 ;;
-    probe) VM_DHCP_PROBE=1; return 0 ;;
+    backoff) VM_DHCP_BACKOFF=1 ;;
+    probe) VM_DHCP_PROBE=1 ;;
     *) return 0 ;;
   esac
+  if [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("breaker_open") else 0)' 2>/dev/null)" = 1 ]; then
+    VM_DHCP_BREAKER_OPEN=1
+  fi
+  [ "$action" = backoff ] && return 75
+  return 0
 }
 
 # Release a granted probe when the lane returns before cloning (for example

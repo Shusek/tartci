@@ -3150,6 +3150,30 @@ class ServingBlockedTests(unittest.TestCase):
         self.assertEqual(value["verified_running_supervisors"], 1)
         self.assertTrue(value["fleet_ready"])
 
+    def test_repeated_admission_failure_names_cause_and_clears_fleet_ready(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(600),
+            "serving_blocked_streak": 6,
+            "serving_blocked_last_phase": "admission-precheck-error",
+            "serving_blocked_cause": "admission failing",
+        })
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertFalse(value["fleet_ready"])
+        self.assertEqual(lane["cause"], "admission failing")
+        self.assertEqual(lane["reason"], "admission failing")
+
+    def test_open_dhcp_breaker_is_immediately_not_serving(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10),
+            "serving_blocked_streak": 1,
+            "serving_blocked_last_phase": "vm-dhcp-breaker-open",
+            "serving_blocked_cause": "dhcp_breaker",
+        })
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertFalse(value["fleet_ready"])
+        self.assertEqual(lane["cause"], "dhcp_breaker")
+        self.assertEqual(lane["reason"], "DHCP breaker open")
+
     def test_a_host_set_to_sleep_is_a_host_condition_not_a_readiness_problem(self) -> None:
         # m5 (AC sleep 1) rolled back every self-update once its idle sleep
         # was a readiness problem: verification requires fleet_ready.
