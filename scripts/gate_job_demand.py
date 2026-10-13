@@ -32,6 +32,17 @@ PAGE = 100
 
 Fetch = Callable[[str], dict]
 
+# Machine nicknames for hosts whose advertised host_id differs. Registrations,
+# profiles and runner names all use the host_id; operators and older tools say
+# m3 and m5s. Every reader that takes a host name goes through canonical_host.
+HOST_ALIASES = {"m3": "studio", "m5s": "m5studio"}
+
+
+def canonical_host(name: object) -> str:
+    """The advertised host_id for a host name or one of its nicknames."""
+    value = str(name or "").strip()
+    return HOST_ALIASES.get(value.lower(), value)
+
 
 def epoch(value: object) -> Optional[float]:
     if isinstance(value, (int, float)):
@@ -51,7 +62,7 @@ def registrations(advertised: object, host_id: Optional[str] = None) -> List[dic
     for reg in rows if isinstance(rows, list) else []:
         if not isinstance(reg, dict):
             continue
-        if host_id is not None and str(reg.get("host_id")) != host_id:
+        if host_id is not None and canonical_host(reg.get("host_id")) != canonical_host(host_id):
             continue
         out.append(reg)
     return out
@@ -73,7 +84,7 @@ def serving_hosts(job: dict, repo: str, workflow: str, regs: Iterable[dict]) -> 
         if workflow.lower() not in _lower(reg.get("workflows")):
             continue
         if wanted <= _lower(reg.get("labels")):
-            host = str(reg.get("host_id"))
+            host = canonical_host(reg.get("host_id"))
             if host not in hosts:
                 hosts.append(host)
     return sorted(hosts)
@@ -166,9 +177,10 @@ def gh_fetcher(cli: str, timeout: float = 30) -> Fetch:
 def jobs_for(jobs: Iterable[dict], host_id: str, now: float,
              max_age: float = MAX_JOB_AGE_SECONDS) -> List[dict]:
     """The jobs a host serves that are still young enough to be demand."""
+    host_id = canonical_host(host_id)
     out = []
     for job in jobs:
-        if not isinstance(job, dict) or host_id not in (job.get("hosts") or []):
+        if not isinstance(job, dict) or host_id not in {canonical_host(h) for h in job.get("hosts") or []}:
             continue
         queued_at = epoch(job.get("created_at"))
         if queued_at is not None and now - queued_at <= max_age:

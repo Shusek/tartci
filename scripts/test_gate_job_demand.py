@@ -99,11 +99,26 @@ class GateJobDemandTests(unittest.TestCase):
     def test_a_host_only_counts_jobs_it_serves(self) -> None:
         jobs, _ = demand.queued_jobs(Recorder(), pulp_registrations(), NOW)
         self.assertEqual(len(demand.jobs_for(jobs, "studio", NOW)), 1)
-        self.assertEqual(demand.jobs_for(jobs, "m3", NOW), [])
+        self.assertEqual(demand.jobs_for(jobs, "m9", NOW), [])
         # Only m1's registrations: m1 still serves it, and only m1 is named.
         m1_jobs, _ = demand.queued_jobs(Recorder(), [r for r in pulp_registrations()
                                                      if r["host_id"] == "m1"], NOW)
         self.assertEqual(m1_jobs[0]["hosts"], ["m1"])
+
+    def test_machine_nicknames_resolve_to_the_advertised_host_id(self) -> None:
+        # m3 is registered as studio and m5s as m5studio; a reader given the
+        # nickname must see that host's registrations and jobs, not nothing.
+        self.assertEqual(demand.canonical_host("m3"), "studio")
+        self.assertEqual(demand.canonical_host("M5S"), "m5studio")
+        self.assertEqual(demand.canonical_host("m5"), "m5")
+        self.assertEqual(demand.canonical_host("studio"), "studio")
+        for nickname, host_id in (("m3", "studio"), ("m5s", "m5studio")):
+            self.assertTrue(demand.registrations(ADVERTISED, host_id))
+            self.assertEqual(demand.registrations(ADVERTISED, nickname),
+                             demand.registrations(ADVERTISED, host_id))
+        jobs, _ = demand.queued_jobs(Recorder(), pulp_registrations(), NOW)
+        self.assertEqual(demand.jobs_for(jobs, "m3", NOW), demand.jobs_for(jobs, "studio", NOW))
+        self.assertTrue(demand.jobs_for(jobs, "m3", NOW))
 
     def test_a_failed_read_is_an_error_not_no_demand(self) -> None:
         jobs, errors = demand.queued_jobs(Recorder(fail="status=queued"),

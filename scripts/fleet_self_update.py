@@ -176,7 +176,8 @@ EXIT_REFUSED = 3       # a precondition refused; the host was not touched
 # A peer was busy or had waited longer, so this host deferred its turn. That is
 # the protocol working, so it exits 0 and launchd's last exit stays clean;
 # waiting.json and `pool status` carry it, and it becomes EXIT_REFUSED plus a
-# self_update_starved event once it has lasted STARVED_AFTER_SECONDS (about one hour).
+# self_update_starved event once it has lasted STARVED_AFTER_SECONDS (4 h) with
+# queued gate demand, or STARVED_FALLBACK_SECONDS (6 h) without it.
 EXIT_DEFERRED = 0
 # tartci pool off exits these when a precondition refuses before it stops
 # anything: 11 the capacity floor (including an unreadable census), 12 a lane
@@ -1154,13 +1155,18 @@ def starvation_body(cfg: Config, me: str, ticket: dict, waited: float, reason: s
     since = _iso(float(ticket["since"]))
     demand = ticket.get("demand") or []
     dark = _read_json(cfg.state_dir / PEER_UNREADABLE_NAME) or {}
+    if demand:
+        bound = (f"while gate jobs it serves were queued. The bound with queued gate demand "
+                 f"is {STARVED_AFTER_SECONDS // 3600} h: one hour past the "
+                 f"{PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h after which a dark peer stops "
+                 "holding the turn.")
+    else:
+        bound = (f"with no queued gate demand read for it"
+                 f"{' (the demand read failed)' if ticket.get('demand_error') else ''}. "
+                 f"The bound without demand is {STARVED_FALLBACK_SECONDS // 3600} h.")
     lines = [
         f"**What happened.** {me} has had no tartci self-update turn for "
-        f"{waited / 3600:.1f} h (in the update queue since {since}), while gate jobs it "
-        f"serves were queued. The bound with queued gate demand is "
-        f"{STARVED_AFTER_SECONDS // 3600} h: one hour past the "
-        f"{PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h after which a dark peer stops "
-        "holding the turn.",
+        f"{waited / 3600:.1f} h (in the update queue since {since}), {bound}",
         "",
         "**Evidence.**",
         f"- Deferral reason: {reason[:300]}",
@@ -1301,7 +1307,9 @@ def _gate_queue_path_in(state_dir: Path) -> Path:
 
 
 def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
-    """Record the deferral; become loud after the one-hour starvation bound."""
+    """Record the deferral; become loud past the starvation bound: one hour
+    after the dark-peer exclusion when gate jobs this host serves are queued,
+    STARVED_FALLBACK_SECONDS otherwise or when the demand read failed."""
     ticket = note_waiting(cfg, me, target, reason, now)
     waited = max(0.0, now - float(ticket["since"]))
     refresh_gate_demand(cfg, me, now)
