@@ -446,6 +446,30 @@ and its evidence directory. The agent is a support agent: declare
 `disk-watchdog` in the host profile's `[support_agents] declared` list to
 install it through `support_agents`.
 
+## Pool-status log
+
+`com.danielraffel.tartci.pool-log.plist.template` runs `tartci pool log` every
+300 s. `tartci pool status` says what a host is doing now and keeps no
+history, so a watcher that reads it could only be judged live; this log lets
+host signals be scored against what actually happened. Each pass:
+
+- reads this generation's `tartci pool status --json` in a child it waits on
+  for at most 60 s, and nothing else (no ssh, no GitHub);
+- condenses it to what a host reader classifies: `host`, `state`,
+  `participating` and `problems` (each `fleet.config` section's problem, first
+  500 characters);
+- appends one record to `~/.tartci/state/pool-log/events.jsonl` when that
+  changed, a `"heartbeat": true` record once an hour when it did not (so a gap
+  means the agent was down), and `{"at", "error"}` once per distinct read
+  failure;
+- rotates the log at 2 MiB (`TARTCI_POOL_LOG_MAX_BYTES`) to `events.jsonl.1`,
+  so a host keeps at most two files.
+
+`tartci pool log --status [--json]` prints the log's sizes, its last record and
+the age of the last write. Declare `pool-log` in the host profile's
+`[support_agents] declared` list to install it through `support_agents`;
+dropping the declaration boots it out and keeps the log.
+
 ## GitHub-hosted queue-saturation detector
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
