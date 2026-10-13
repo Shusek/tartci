@@ -456,8 +456,12 @@ class Base(unittest.TestCase):
         # never call ghapp.
         import host_off
         self.issues: list[tuple[str, str]] = []
-        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t)) or (0, "77")),
-                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed"))):
+        self.bodies: list[str] = []
+        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t))
+                            or self.bodies.append(b) or (0, "77")),
+                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed")),
+                           ("_patch_issue_body", lambda n, b: self.issues.append(("patch", n))
+                            or self.bodies.append(b) or (0, n))):
             original = getattr(host_off, name)
             setattr(host_off, name, fake)
             self.addCleanup(setattr, host_off, name, original)
@@ -1043,6 +1047,50 @@ class UpdateQueueTests(Base):
         value.update(fields)
         su._write_json(self.cfg.state_dir / "waiting.json", value)
 
+    def gate_queue(self, *, drop: tuple = (), fail: bool = False) -> list[str]:
+        """Serve the gate-demand read from the answers captured from
+        Generous-Corp/pulp at 2026-10-13 16:48 UTC
+        (scripts/fixtures/gate_job_demand/), with every time moved so that
+        capture time is the test clock. `drop` removes runs from both run
+        listings; `fail` makes every read fail. Returns the paths read."""
+        fixtures = Path(__file__).resolve().parent / "fixtures" / "gate_job_demand"
+        fleet = self.cfg.checkout / "fleet"
+        fleet.mkdir(parents=True, exist_ok=True)
+        shutil.copy(fixtures / "advertised-labels.json", fleet / "advertised-labels.json")
+        shift = NOW - su.gate_job_demand.epoch("2026-10-13T16:48:10Z")
+
+        def moved(value):
+            if isinstance(value, dict):
+                return {key: (su._iso(su.gate_job_demand.epoch(item) + shift)
+                              if key.endswith("_at") and isinstance(item, str) and item
+                              else moved(item)) for key, item in value.items()}
+            if isinstance(value, list):
+                return [moved(item) for item in value]
+            return value
+
+        paths: list[str] = []
+
+        def fetch(path: str) -> dict:
+            paths.append(path)
+            if fail:
+                raise RuntimeError("gh: Server Error (HTTP 502)")
+            if "/actions/runs?status=" in path:
+                if not path.startswith("repos/Generous-Corp/pulp/"):
+                    return {"total_count": 0, "workflow_runs": []}
+                status = path.split("status=", 1)[1].split("&", 1)[0]
+                answer = json.loads((fixtures / f"pulp-runs-{status}.json").read_text())
+                answer["workflow_runs"] = [run for run in answer["workflow_runs"]
+                                           if run["id"] not in drop]
+                answer["total_count"] = len(answer["workflow_runs"])
+                return moved(answer)
+            run = path.split("/actions/runs/", 1)[1].split("/", 1)[0]
+            return moved(json.loads((fixtures / f"pulp-jobs-{run}.json").read_text()))
+
+        original = su._demand_fetch
+        su._demand_fetch = lambda: fetch
+        self.addCleanup(setattr, su, "_demand_fetch", original)
+        return paths
+
     def test_a_peer_that_has_waited_longer_goes_first(self) -> None:
         # m3 on 2026-09-30: refused at every attempt while a peer took each turn.
         self.ticket(since=NOW - 1800)
@@ -1115,6 +1163,7 @@ class UpdateQueueTests(Base):
 
     def test_deferral_past_the_bound_is_starvation_and_loud_once(self) -> None:
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -1126,6 +1175,7 @@ class UpdateQueueTests(Base):
     def test_starvation_opens_one_issue_and_the_next_turn_closes_it(self) -> None:
         # 2026-10-01: three hosts starved for 7-9 h and wrote events nobody read.
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -1136,9 +1186,189 @@ class UpdateQueueTests(Base):
         self.assertUpdated(self.apply())
         self.assertEqual(self.issues[-1], ("close", "77"))
 
+    def test_with_gate_demand_starvation_trips_an_hour_past_the_dark_peer_bound(self) -> None:
+        # Real apply entry point. A queued macOS job in a running Build and
+        # Test run is demand; the bound is one hour past the 3 h exclusion.
+        self.assertEqual(su.STARVED_AFTER_SECONDS, su.PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("self_update_starved", events)
+        self.assertIn("115420876725", events)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+
+    def test_a_dark_peer_does_not_trip_starvation_before_it_is_excluded(self) -> None:
+        # Past the old one-hour bound and past the 3 h exclusion, but inside
+        # the hour after it: quiet, with demand queued.
+        self.ticket(since=NOW - su.PEER_UNREACHABLE_EXCLUDE_SECONDS - 1800)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [])
+
+    def test_the_zombie_run_alone_is_not_demand(self) -> None:
+        # The 2026-08-19 merge_group run is still queued, with no jobs. With
+        # only it (and runs whose macOS jobs are running), the bound stays 6 h.
+        paths = self.gate_queue(drop=(38433042640,))
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [])
+        self.assertFalse(any("/runs/32218602754/" in path for path in paths), paths)
+        self.assertEqual(su.waiting_ticket(self.cfg)["demand"], [])
+
+    def test_a_failed_demand_read_falls_back_to_six_hours_and_says_so(self) -> None:
+        self.gate_queue(fail=True)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertIn("gate demand unread", out.getvalue())
+        self.assertIn("HTTP 502", su.waiting_ticket(self.cfg)["demand_error"])
+        self.assertEqual(self.issues, [])
+        # Past the fallback it still trips, and the event carries the failure.
+        self.ticket(since=NOW - su.STARVED_FALLBACK_SECONDS - 60)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("HTTP 502", events)
+        # The issue says which bound applied and why, not "gate jobs queued".
+        self.assertIn("The bound without demand is 6 h", self.bodies[-1])
+        self.assertIn("(the demand read failed)", self.bodies[-1])
+        self.assertNotIn("while gate jobs it serves were queued", self.bodies[-1])
+
+    def test_the_starvation_issue_says_what_why_how_to_fix_and_verify(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        body = self.bodies[0]
+        for needle in ("**What happened.** m1 has had no tartci self-update turn",
+                       "Queued gate job 115420876725 (Generous-Corp/pulp Build and Test: macos)",
+                       "**Likely cause and fix.**", "is not serving normally",
+                       "`tartci pool status`", "Safe to auto-apply: no",
+                       "**Verify.**", "`tartci fleet-macos self-update --plan`"):
+            self.assertIn(needle, body)
+        self.assertIn("while gate jobs it serves were queued", body)
+        marker = su.tartci_incident.parse(body)
+        self.assertEqual(marker["host"], "m1")
+        self.assertEqual(marker["class"], "self_update_starved")
+        self.assertEqual(marker["symptom_at"], su._iso(NOW - su.STARVED_AFTER_SECONDS - 60))
+        self.assertEqual(marker["detected_at"], su._iso(NOW))
+        self.assertIsNone(marker["fixed_at"])
+
+    def test_the_turn_records_fixed_at_on_the_marker_then_closes(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close"])
+        patched = self.bodies[-1]
+        self.assertEqual(patched.count("tartci-incident"), 1)
+        fixed = su.tartci_incident.parse(patched)["fixed_at"]
+        self.assertIsNotNone(fixed)
+        self.assertGreaterEqual(su.gate_job_demand.epoch(fixed), NOW)
+
+    def test_a_failed_patch_keeps_the_fix_time_and_retries_before_closing(self) -> None:
+        # A transient API error on the PATCH must not close the issue with a
+        # marker still saying fixed_at null: nothing would ever correct it.
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n, b: self.issues.append(("patch-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_patch_issue_body", failing):
+            self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed"])
+        pending = json.loads((self.cfg.state_dir / su.PENDING_FIX_NAME).read_text())["fixes"]
+        self.assertEqual([fix["issue"] for fix in pending], ["77"])
+        fixed_at = pending[0]["fixed_at"]
+        self.assertIn("HTTP 502", pending[0]["error"])
+        # The next run PATCHes the recorded fix time, then closes.
+        self.apply()
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed", "patch", "close"])
+        self.assertEqual(su.tartci_incident.parse(self.bodies[-1])["fixed_at"], fixed_at)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def test_a_failed_close_is_retried_without_patching_again(self) -> None:
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n: self.issues.append(("close-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_close_issue", failing):
+            self.assertUpdated(self.apply())
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertTrue(su.finish_pending_fixes(self.cfg))
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close-failed", "close"])
+
+    def test_a_deferred_run_still_retries_a_pending_fix(self) -> None:
+        # A run that defers never clears a ticket, so the retry has to happen
+        # at entry: the fix recorded by an earlier run still lands.
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": "41", "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+        self.ticket(since=NOW - 1800)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [("patch", "41"), ("close", "41")])
+        self.assertEqual(self.bodies[-1], body)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def fresh_demand(self, observed: float) -> None:
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {
+            "observed_at": su._iso(observed), "host_id": "m1", "errors": [],
+            "jobs": [{"id": 1, "hosts": ["m1"], "repo": "Generous-Corp/pulp",
+                      "workflow": "Build and Test", "name": "macos",
+                      "created_at": su._iso(NOW - 600)}]})
+
+    def test_a_stale_demand_snapshot_is_no_demand(self) -> None:
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        jobs, errors = su.gate_demand(self.cfg, "m1", NOW)
+        self.assertEqual(jobs, [])
+        self.assertTrue(any("stale" in error for error in errors), errors)
+        # Control, same instrument: the same snapshot, fresh, is demand.
+        self.fresh_demand(NOW - 60)
+        self.assertEqual([job["id"] for job in su.gate_demand(self.cfg, "m1", NOW)[0]], [1])
+
+    def test_defer_on_a_stale_snapshot_keeps_the_six_hour_bound(self) -> None:
+        # A refresh that wrote nothing leaves an old snapshot behind; it is
+        # not demand, so 4 h in the queue is still only a deferral.
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        with mock.patch.object(su, "refresh_gate_demand", lambda *args: {}):
+            self.assertDeferred(self.apply())
+            self.assertEqual(self.issues, [])
+            # Control: a fresh snapshot of the same job trips the 4 h bound.
+            self.fresh_demand(NOW - 60)
+            self.assertEqual(self.apply(), su.EXIT_REFUSED)
+
+    def test_waiting_line_uses_the_demand_bound(self) -> None:
+        # 4.5 h in the queue: starved when gate jobs this host serves are
+        # queued, still only deferred without them.
+        self.ticket(since=NOW - 4.5 * 3600)
+        self.fresh_demand(NOW - 60)
+        self.assertIn("STARVED", su.waiting_line(self.cfg.state_dir, NOW))
+        (self.cfg.state_dir / "gate-queue.json").unlink()
+        self.assertIn("deferred", su.waiting_line(self.cfg.state_dir, NOW))
+
     def test_a_short_deferral_is_quiet(self) -> None:
-        # Control for the bound: the same deferral an hour in is not a problem.
-        self.ticket(since=NOW - 3600)
+        # Control for the bound: a deferral just under it, with demand queued,
+        # is not a problem.
+        self.gate_queue()
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS + 60)
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
         self.assertFalse((self.cfg.state_dir / "events.jsonl").exists()
