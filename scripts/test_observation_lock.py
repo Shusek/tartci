@@ -71,6 +71,59 @@ class ObservationLockTests(unittest.TestCase):
                  "--scan-timeout", "0.1", "--gh-timeout", "5"], td)
             self.assertIn("spectr/deadline", values)
 
+    def test_hold_past_budget_publishes_an_overrun_record(self):
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "observation.lock"
+            with mock.patch.dict(os.environ, {"TARTCI_QUEUE_OBSERVATION_HOLD_BUDGET_SECS": "0.2"}):
+                lock = FairObservationLock(str(lock_path), 5, "owner/repo", lane="lane-a")
+            with mock.patch("sys.stderr") as stderr:
+                with lock.hold():
+                    time.sleep(0.4)
+            record = json.loads(lock_path.with_name("observation.lock.overrun.json").read_text())
+            self.assertEqual(record["lane"], "lane-a")
+            self.assertEqual(record["repo"], "owner/repo")
+            self.assertGreaterEqual(record["held_seconds"], 0.4)
+            self.assertEqual(record["budget_seconds"], 0.2)
+            written = "".join(call.args[0] for call in stderr.write.call_args_list)
+            self.assertIn("over the", written)
+
+    def test_hold_within_budget_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "observation.lock"
+            lock = FairObservationLock(str(lock_path), 5, "owner/repo", lane="lane-a")
+            self.assertEqual(lock.hold_budget, 5)
+            with lock.hold():
+                pass
+            self.assertFalse(lock_path.with_name("observation.lock.overrun.json").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/sbin/taskpolicy").exists(),
+                         "darwinbg band is a macOS scheduler property")
+    def test_holder_in_darwinbg_band_is_named_loudly(self):
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1])\n"
+            "from observation_lock import FairObservationLock\n"
+            "with FairObservationLock(sys.argv[2], 5, 'o/r', lane='lane-bg').hold():\n"
+            "    pass\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            here = str(Path(__file__).parent)
+            throttled = subprocess.run(
+                ["/usr/sbin/taskpolicy", "-b", sys.executable, "-c", script, here, lock],
+                text=True, capture_output=True, check=False,
+            )
+            normal = subprocess.run(
+                [sys.executable, "-c", script, here, lock],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(throttled.returncode, 0, throttled.stderr)
+        self.assertIn("darwinbg band", throttled.stderr)
+        self.assertIn("lane=lane-bg", throttled.stderr)
+        # The control: the same hold at normal priority says nothing.
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        self.assertNotIn("darwinbg", normal.stderr)
+
     def test_fifo_order_honors_older_ticket(self):
         with tempfile.TemporaryDirectory() as td:
             lock = Path(td) / "observation.lock"

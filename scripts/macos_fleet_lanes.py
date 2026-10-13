@@ -42,11 +42,18 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-# launchd.plist(5) documents exactly these ProcessType values. A supervisor
-# left Background is throttled by the system for latency-insensitive work,
-# which lengthens every GitHub API call its queue scan makes.
+# launchd.plist(5) documents exactly these ProcessType values.
 PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
-DEFAULT_PROCESS_TYPE = "Background"
+# Every fleet supervisor takes the host-global queue observation lock, so a
+# supervisor in the darwinbg band is a priority inversion for the whole host:
+# its GitHub calls run several times slower (confined to efficiency cores and
+# throttled) while it holds the lock every other lane waits on. Background
+# puts a job in that band unconditionally and Adaptive does so whenever the
+# job holds no XPC transaction, which a supervisor never does. Measured on a
+# loaded host, the same exhaustive scan held the lock for 154 s in the band
+# and 18 s out of it, past the 120 s lock wait, so every lane went blind.
+SUPERVISOR_PROCESS_TYPES = ("Standard", "Interactive")
+DEFAULT_PROCESS_TYPE = "Standard"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
@@ -686,6 +693,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: process_type must be one of "
                 f"{list(PROCESS_TYPES)}"
+            )
+        if process_type is not None and process_type not in SUPERVISOR_PROCESS_TYPES:
+            fail(
+                f"lane {lane_id}: process_type {process_type!r} runs the "
+                "supervisor in the darwinbg band while it holds the host "
+                "queue observation lock; use one of "
+                f"{list(SUPERVISOR_PROCESS_TYPES)}"
             )
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
@@ -2258,6 +2272,28 @@ def fleet_readiness(
                     # DHCP breaker open is a host-local hard stop: report the
                     # lane NOT SERVING immediately, without waiting for the
                     # generic transient streak threshold.
+                    # A lane that cannot read its queue serves nothing. The
+                    # streak gate keeps a single blind blip quiet; past it the
+                    # lane is NOT SERVING. Losing this host's own observation
+                    # lock is host-local and host-fixable, so it also clears
+                    # fleet readiness; a blind scan of unknown cause may be
+                    # upstream and is reported without gating the fleet.
+                    if blocked_cause in {"scan_blind", "scan_blind_host_lock"}:
+                        if streak is not None and streak >= blocked_serving_streak:
+                            serving_blocked_lanes.append({
+                                "label": label,
+                                "blocked_seconds": int(blocked_for),
+                                "streak": streak,
+                                "last_phase": str(matching_state.get("serving_blocked_last_phase", "") or ""),
+                                "cause": blocked_cause,
+                                "reason": (
+                                    "queue scan blind: host observation lock"
+                                    if blocked_cause == "scan_blind_host_lock"
+                                    else "queue scan blind"
+                                ),
+                            })
+                        verified_running += 1
+                        continue
                     if blocked_cause == "dhcp_breaker":
                         serving_blocked_lanes.append({
                             "label": label,
@@ -2377,8 +2413,9 @@ def fleet_readiness(
             and verified_running == len(labels)
             and persistent_verified == len(persistent_labels)
             and not problems
-            and not any(lane.get("cause") in {"dhcp_breaker", "admission failing"}
-                        for lane in serving_blocked_lanes)
+            and not any(lane.get("cause") in {
+                "dhcp_breaker", "admission failing", "scan_blind_host_lock",
+            } for lane in serving_blocked_lanes)
         ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),

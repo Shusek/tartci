@@ -225,6 +225,60 @@ class ServeLessStreakTests(unittest.TestCase):
             "removing the runner-side DHCP cause producer must break this test",
         )
 
+    def _blind_run(self, script_body: str) -> dict:
+        source = self.source
+        functions = (
+            function_source(source, "tartci_serving_mark_scan_blind") + "\n"
+            + function_source(source, "tartci_serving_clear_scan_blind") + "\n"
+        )
+        script = (
+            "set -euo pipefail\n"
+            'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
+            'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
+            + functions + script_body + "\n"
+            'printf "{\\"streak\\":%s,\\"cause\\":\\"%s\\",\\"since\\":\\"%s\\"}\\n" '
+            '"$SERVING_BLOCKED_STREAK" "$SERVING_BLOCKED_CAUSE" "$SERVING_BLOCKED_SINCE"\n'
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=True)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_blind_polls_accumulate_a_not_serving_streak(self) -> None:
+        value = self._blind_run(
+            "for i in 1 2 3 4 5 6; do tartci_serving_mark_scan_blind "
+            "'assignment scan failed closed: lock_contention: host queue observation lock timed out'; done"
+        )
+        self.assertEqual(value["streak"], 6)
+        self.assertEqual(value["cause"], "scan_blind_host_lock")
+        self.assertNotEqual(value["since"], "")
+        upstream = self._blind_run(
+            "tartci_serving_mark_scan_blind 'timeout: the observation ran out of time'"
+        )
+        self.assertEqual(upstream["cause"], "scan_blind")
+
+    def test_a_recovered_scan_clears_only_a_blind_streak(self) -> None:
+        cleared = self._blind_run(
+            "tartci_serving_mark_scan_blind x; tartci_serving_clear_scan_blind"
+        )
+        self.assertEqual((cleared["streak"], cleared["cause"]), (0, ""))
+        kept = self._blind_run(
+            'SERVING_BLOCKED_STREAK=4; SERVING_BLOCKED_CAUSE="admission failing"; '
+            "tartci_serving_clear_scan_blind"
+        )
+        self.assertEqual((kept["streak"], kept["cause"]), (4, "admission failing"))
+
+    def test_the_loop_counts_a_blind_poll_and_clears_on_recovery(self) -> None:
+        loop = self.source[self.source.index('    if ! printf \'%s\' "$q" | grep -qxE \'[0-9]+\'; then\n      blind=$((blind + 1))'):]
+        blind_branch = loop[:loop.index("      sleep \"$POLL\"; continue\n    fi\n")]
+        self.assertIn('tartci_serving_mark_scan_blind "$scan_detail"', blind_branch)
+        self.assertLess(
+            blind_branch.index("tartci_serving_mark_scan_blind"),
+            blind_branch.index("heartbeat scan_blind"),
+            "the heartbeat must publish the streak this poll just counted",
+        )
+        recovered = loop[loop.index('note "scan recovered after'):]
+        self.assertIn("tartci_serving_clear_scan_blind", recovered[:400])
+
     # -- the ratio property --------------------------------------------------
 
     def test_interleaved_service_never_accumulates(self) -> None:
@@ -456,6 +510,22 @@ class PoolStatusRenderingTests(unittest.TestCase):
         self.assertIn("fleet ready: NO", out)
         self.assertIn("serving: NOT SERVING (admission failing", out)
         self.assertIn("cause=admission failing", out)
+
+    def test_host_lock_scan_blind_prints_not_serving(self) -> None:
+        fleet = self._fleet({
+            "blocked": True, "blocked_lanes": [{
+                "label": "m5studio.pulp-gate", "blocked_seconds": 900,
+                "streak": 9, "last_phase": "scan_blind",
+                "cause": "scan_blind_host_lock",
+                "reason": "queue scan blind: host observation lock",
+            }], "unmeasurable_lanes": [],
+        })
+        fleet["fleet_ready"] = False
+        out = self.render(fleet)
+        self.assertIn("fleet ready: NO", out)
+        self.assertIn("serving: NOT SERVING (queue scan blind: host observation lock", out)
+        self.assertIn("cause=scan_blind_host_lock", out)
+        self.assertNotIn("serving: ok", out)
 
     def test_dhcp_breaker_prints_not_serving_and_cause(self) -> None:
         fleet = self._fleet({

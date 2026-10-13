@@ -1561,20 +1561,27 @@ consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
 debugging.
 
 A lane may also declare `process_type`, which sets the rendered LaunchAgent's
-`ProcessType`. The accepted values are the four `launchd.plist(5)` documents:
-`Background`, `Standard`, `Adaptive`, `Interactive`. A lane that omits the key
-renders `Background`, which is what every lane had before the key existed. The
-key matters because launchd throttles a `Background` job: the exhaustive
-event-class queue scan is a long chain of short GitHub API calls, and the
-per-call latency -- not the `assignment_scan_timeout_seconds` budget -- is what
-decides whether the scan finishes. A supervisor cannot lift its own
-classification (`taskpolicy -B` on itself does not restore the latency), so the
-value has to be in the plist, which is rendered from the profile: editing an
-installed plist by hand is reverted by the next render. Pulp's gate lanes
-declare `Adaptive`; release lanes stay `Background`. Promotion out of the
-background band is a launchd heuristic, so treat a declared `Adaptive` as a
-request, and confirm what the host actually did with
-`launchctl print gui/$(id -u)/<label> | grep 'spawn type'`.
+`ProcessType`. A fleet supervisor accepts only `Standard` (the default) or
+`Interactive`; the validator refuses `Background` and `Adaptive`. Every lane's
+queue scan holds the host-global observation lock, so a supervisor in the
+darwinbg band is a priority inversion for the whole host: launchd puts a
+`Background` job there always, and an `Adaptive` job whenever it holds no XPC
+transaction, which a supervisor never does. In that band the task runs at
+scheduling priority 4 on efficiency cores, each `ghapp` call costs 4-22 s
+instead of about 2 s, and one exhaustive scan held the lock for 154 s on a
+loaded host (18 s for the same scan at `Standard`) -- past the 120 s every other
+lane waits, so every lane on the host went SCAN BLIND. `taskpolicy -B` cannot
+lift launchd's role from outside or inside the job; the value has to be in the
+plist, which is rendered from the profile (a hand edit is reverted by the next
+render). Confirm a host with `ps -o pri= -p <supervisor pid>`: 20 or above is
+out of the band, 4 is in it.
+
+The lock also publishes holds that outlast what other lanes wait for it
+(`TARTCI_QUEUE_OBSERVATION_HOLD_BUDGET_SECS`, default the lock-wait timeout) to
+`queue-observation.lock.overrun.json` beside the lock, and a holder that finds
+itself in the darwinbg band says so on stderr. A lane whose scans stay blind is
+reported `serving: NOT SERVING` after the serving streak threshold; when the
+cause is this host's own observation lock it also clears `fleet ready`.
 
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
