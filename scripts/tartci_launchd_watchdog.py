@@ -1424,6 +1424,7 @@ def serving_truth_pass(now: float | None = None) -> str | None:
         if not events:
             return None
         me = _serving_truth_host_id()
+        me = gate_job_demand.canonical_host(me) if me else me
         if not me:
             return (f"{stamp} launchd-watchdog: WARN serving-truth skipped: this host's host_id is "
                     "unknown (set TARTCI_HOST_ID or install a fleet profile with host.id)")

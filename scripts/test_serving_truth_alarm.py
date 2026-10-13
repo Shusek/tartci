@@ -100,6 +100,21 @@ class HostIdentityTests(unittest.TestCase):
         nested = {"event": "job_assigned", "fields": {"runner": "m5studio-forge-gate-01"}}
         self.assertEqual(alarm.host_of(nested), "m5studio")
 
+    def test_nicknames_m3_and_m5s_judge_the_advertised_host(self) -> None:
+        # The mapping is the one shared table (gate_job_demand.HOST_ALIASES):
+        # a host configured as m3 or m5s judges studio or m5studio, never a
+        # host no registration names.
+        self.assertEqual(alarm.host_of({"host": "m3"}), "studio")
+        self.assertEqual(alarm.host_of({"runner": "m5s-pulp-gate-01"}), "m5studio")
+        jobs = [gate_job(BASE - 43 * 60)]
+        for nickname, host in (("m3", "studio"), ("m5s", "m5studio")):
+            with self.subTest(host=host):
+                silent = alarm.classify([], jobs, me=nickname, regs=REGS, now=BASE)
+                self.assertEqual([(t["rule"], t["host"]) for t in silent],
+                                 [("host_queued_no_job_start", host)])
+                started = [row(BASE - 120, "job_assigned", runner=f"{host}-pulp-gate-01")]
+                self.assertEqual(alarm.classify(started, jobs, me=nickname, regs=REGS, now=BASE), [])
+
     def test_every_host_that_just_started_a_job_is_quiet(self) -> None:
         # The review's repro: all four hosts assigned a job 2 min ago, while a
         # job they all serve has waited 43 min. Nobody trips.

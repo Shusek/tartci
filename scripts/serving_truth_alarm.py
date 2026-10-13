@@ -91,12 +91,13 @@ def host_of(row: dict) -> str:
     Fleet runners are named `<host_id>-<identity>-<pid>-<boot>`, so the host is
     the runner name up to its first dash: `studio-pulp-gate-01` is `studio`,
     `m5studio-pulp-gate-01` is `m5studio`. An explicit `host` field wins.
+    Nicknames (m3, m5s) resolve through gate_job_demand.canonical_host.
     """
     explicit = row.get("host") or _fields(row).get("host")
     if explicit:
-        return str(explicit)
+        return demand.canonical_host(explicit)
     runner = _runner(row)
-    return runner.split("-", 1)[0] if runner else ""
+    return demand.canonical_host(runner.split("-", 1)[0]) if runner else ""
 
 
 def _value(row: dict, *keys: str) -> Any:
@@ -235,6 +236,7 @@ def classify(events: Iterable[dict], jobs: Iterable[dict] = (), *, me: str,
     `regs` (advertised registrations) maps a job to the lanes here that serve
     it, so a host whose serving lanes are all running jobs is not flagged.
     """
+    me = demand.canonical_host(me)
     end = time.time() if now is None else float(now)
     start = end - window_seconds
     rows = sorted((row for row in events if isinstance(row, dict) and host_of(row) == me
@@ -528,6 +530,7 @@ def alert_pass(state: Path, rows: List[dict], jobs: List[dict], *, me: str,
     closed. A failed open, PATCH or close is retried on the next tick.
     """
     end = time.time() if now is None else float(now)
+    me = demand.canonical_host(me)
     trips = classify(rows, jobs, me=me, regs=regs, now=end)
     path = state / STATE_NAME
     data = _read_state(path)
@@ -619,7 +622,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.jobs_json:
         jobs, errors = json.loads(args.jobs_json.read_text()).get("jobs", []), []
     else:
-        jobs, errors = fetch_demand(args.gh_cli, advertised, args.host_id, now)
+        jobs, errors = fetch_demand(args.gh_cli, advertised, demand.canonical_host(args.host_id), now)
     rows = read_event_paths(args.events, now - LOOKBACK_SECONDS)
     out = alert_pass(args.state, rows, jobs, me=args.host_id,
                      regs=demand.registrations(advertised), now=now,
