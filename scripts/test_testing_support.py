@@ -44,6 +44,19 @@ class CiLaneTests(unittest.TestCase):
         self.assertNotIn("! python3 -c 'import tomllib'", job)
         self.assertIn("python3 -m unittest discover -s scripts -p 'test_*.py'", job)
 
+    def test_only_pull_request_runs_are_superseded(self) -> None:
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        # A shared group would drop pending main runs even without
+        # cancel-in-progress, so non-PR events must key on the run id.
+        self.assertIn(
+            "group: ${{ github.workflow }}-${{ github.event_name == 'pull_request'"
+            " && github.ref || github.run_id }}",
+            text,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
