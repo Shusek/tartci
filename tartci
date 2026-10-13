@@ -58,6 +58,8 @@
 #                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
 #                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
 #   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
+#   tartci disk <watch|status> [--json]  # write-latency watchdog for the cache/VM volumes
+#                              # (one pass; the disk-watchdog LaunchAgent runs it every 60 s)
 #   tartci hooks print         # print (never write) Claude/Codex hook settings
 #   tartci help
 #
@@ -426,6 +428,12 @@ cmd_runtime() {
 
 cmd_reclaim() {
   tartci_toml_exec_or_python3 "$HERE/scripts/disk_reclaim.py" "$@"
+}
+
+# A create+fsync+unlink probe of each cache/VM volume, with evidence and an
+# issue when a write stalls. Runs without tomllib: the agent renders its paths.
+cmd_disk() {
+  tartci_toml_exec_or_python3 "$HERE/scripts/disk_watchdog.py" "$@"
 }
 
 # The host artifact cache macOS guests mount read-only; see scripts/artifact-cache.sh.
@@ -1456,6 +1464,7 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  disk)    shift; cmd_disk "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
   retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;
