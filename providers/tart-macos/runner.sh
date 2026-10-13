@@ -1870,43 +1870,11 @@ boot_vm_to_ssh(){
   fi
   tartci_lifecycle_mark clone_start "${CLONE_STARTED_AT:-0}"
   tartci_lifecycle_mark cloned
-  local lane_cache_refusal=""
-  # A lane-owned cache root is checked before anything is created or trimmed
-  # through it (lane-cache-root.lib.sh).
-  if ! lane_cache_refusal="$(tartci_lane_cache_root_refusal "$CACHE_ROOT" "$HOST_CACHE_ROOT")"; then
-    note "[$i] $lane_cache_refusal; refusing to boot"
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  tartci_ccache_guard "$CACHE_ROOT/ccache"
-  if ! tartci_prepare_disk_root "$FETCHCONTENT_SOURCE_ROOT"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  # Pulp's configure-check replay (tools/cmake/PulpConfigureCheckCache.cmake)
-  # keys SDL3's ~180 try_compile results on the SDK, compiler and flags and
-  # writes them atomically (tmp + rename), so one host directory can serve
-  # every VM on the host. Without a mount the cache lives in the disposable
-  # guest and every gate configure re-runs all 192 try_compiles.
-  if ! tartci_prepare_disk_root "$CACHE_ROOT/configure-checks"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  # Again after preparation, now that every mounted directory exists.
-  if ! lane_cache_refusal="$(tartci_lane_cache_root_refusal "$CACHE_ROOT" "$HOST_CACHE_ROOT")"; then
-    note "[$i] $lane_cache_refusal; refusing to boot"
+  # Every directory the VM mounts from the cache root is checked and prepared
+  # before boot (lane-cache-root.lib.sh); a refusal or a failed preparation
+  # stops the boot.
+  if ! tartci_prepare_lane_cache_mounts "$CACHE_ROOT" "$HOST_CACHE_ROOT" "$FETCHCONTENT_SOURCE_ROOT"; then
+    [ -z "$TARTCI_LANE_CACHE_REFUSAL" ] || note "[$i] $TARTCI_LANE_CACHE_REFUSAL; refusing to boot"
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"

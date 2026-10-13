@@ -48,3 +48,27 @@ tartci_lane_cache_root_refusal() {
   esac
   return 0
 }
+
+# Checks and prepares every directory a VM mounts from the cache root, in the
+# order the boot needs: refuse an unsafe lane root before anything is created
+# or trimmed through it, prepare ccache (then quarantine bad manifests), the
+# FetchContent source root and configure-checks, then refuse again now that
+# every mounted directory exists. On a refusal TARTCI_LANE_CACHE_REFUSAL holds
+# the reason; a failed preparation leaves it empty. Returns 1 either way.
+# shellcheck disable=SC2034 # TARTCI_LANE_CACHE_REFUSAL is read by runner.sh
+tartci_prepare_lane_cache_mounts() {
+  local root="$1" host="${2:-}" fetchcontent="$3"
+  TARTCI_LANE_CACHE_REFUSAL=""
+  TARTCI_LANE_CACHE_REFUSAL="$(tartci_lane_cache_root_refusal "$root" "$host")" || return 1
+  tartci_prepare_disk_root "$root/ccache" || return 1
+  tartci_ccache_guard "$root/ccache"
+  tartci_prepare_disk_root "$fetchcontent" || return 1
+  # Pulp's configure-check replay (tools/cmake/PulpConfigureCheckCache.cmake)
+  # keys SDL3's ~180 try_compile results on the SDK, compiler and flags and
+  # writes them atomically (tmp + rename), so one host directory can serve
+  # every VM on the host. Without a mount the cache lives in the disposable
+  # guest and every gate configure re-runs all 192 try_compiles.
+  tartci_prepare_disk_root "$root/configure-checks" || return 1
+  TARTCI_LANE_CACHE_REFUSAL="$(tartci_lane_cache_root_refusal "$root" "$host")" || return 1
+  return 0
+}
