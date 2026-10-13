@@ -48,7 +48,15 @@ canonical_python() {
   [[ -x "$value" ]] || { echo "launcher render interpreter is not executable: $value" >&2; return 78; }
   (cd "$(dirname "$value")" && printf '%s/%s\n' "$PWD" "$(basename "$value")")
 }
-render_python="$(canonical_python "$(resolve_render_python "$render_python")")" || exit $?
+resolved_render_python="$(resolve_render_python "$render_python")" || {
+  echo "launcher build requires a Python 3.11+ interpreter with tomllib; set TARTCI_PYTHON or pass --python" >&2
+  exit 127
+}
+[[ -n "$resolved_render_python" ]] || {
+  echo "launcher build could not find a Python 3.11+ interpreter with tomllib; set TARTCI_PYTHON or pass --python" >&2
+  exit 127
+}
+render_python="$(canonical_python "$resolved_render_python")" || exit $?
 if [[ "$print_render_python" = 1 ]]; then
   [[ -z "$output" && -z "$approval_output" && -z "$identity" && -z "$profile" ]] || usage
   printf '%s\n' "$render_python"
