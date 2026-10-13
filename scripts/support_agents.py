@@ -173,6 +173,9 @@ REGISTRY: Dict[str, Agent] = {
     # Write-latency watchdog for the Tart store and cache volumes (outage O10).
     "disk-watchdog": Agent("com.danielraffel.tartci.disk-watchdog", None, kickstart=True,
                            settings=_disk_watch_paths),
+    # A bounded history of this host's pool status, so host signals can be
+    # scored against what happened rather than only live.
+    "pool-log": Agent("com.danielraffel.tartci.pool-log", None, kickstart=True),
 }
 
 # Agents in the scanned prefixes that another codified path installs or

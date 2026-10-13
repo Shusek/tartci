@@ -46,7 +46,7 @@ SELF_DECLARED = "3.9-safe"
 # to which tests must run on 3.9.
 EXPECTED_SELF_DECLARED = frozenset({
     "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
-    "state_age", "vm_dhcp_breaker",
+    "pool_log", "state_age", "vm_dhcp_breaker",
 })
 
 LANES = ("3.11-only: asserts a macos_fleet_lanes surface (pool status, validate, render), "
