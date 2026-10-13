@@ -116,6 +116,11 @@ def _timed_out(error: BaseException) -> bool:
     return False
 
 
+def timed_out(error: BaseException) -> bool:
+    """Public timeout classification for lock-free scanner failure paths."""
+    return _timed_out(error)
+
+
 class FairObservationLock:
     def __init__(self, lock_file: str, timeout: float, repo: str,
                  backoff_file: str | None = None, backoff_seconds: float = 30.0,
@@ -171,6 +176,15 @@ class FairObservationLock:
             values[self.repo] = time.time() + self.backoff_seconds
             self._write_backoff(values)
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def mark_timeout(self) -> None:
+        """Record a failed observation without taking the host observation flock.
+
+        Scanners perform network reads lock-free.  A timeout still needs to
+        contribute to the repository backoff, but that state has its own small
+        file lock and must never reacquire the host queue lock.
+        """
+        self._mark_timeout()
 
     def _clear_backoff(self) -> None:
         with self.backoff_lock_path.open("a+", encoding="utf-8") as lock:

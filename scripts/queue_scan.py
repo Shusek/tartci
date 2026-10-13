@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
@@ -131,6 +131,9 @@ class QueueScanner:
         self.discovery_lock_path = self.discovery_path.with_suffix(
             f"{self.discovery_path.suffix}.lock"
         )
+        self.discovery_fetch_path = self.discovery_path.with_suffix(
+            f"{self.discovery_path.suffix}.fetching"
+        )
         self.observation_lock_path = Path(args.observation_lock_file)
         self.lock_deadline = time.monotonic() + args.observation_lock_timeout
         self.state: dict[str, Any] = {}
@@ -187,13 +190,15 @@ class QueueScanner:
                 f"GitHub API call budget exhausted ({self.args.max_api_calls})"
             )
         self.api_calls += 1
+        started = time.monotonic()
         result = run_bounded(
             [self.args.gh_cli, "api", path],
-            timeout=self.args.gh_timeout,
+            timeout=min(self.args.gh_timeout, max(0.1, self.args.observation_lock_timeout / 2)),
             operation="queue_scan_github_api",
-            pass_fds=(self.observation_lock_fd,)
-            if self.observation_lock_fd is not None
-            else (),
+        )
+        print(
+            f"queue-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+            file=os.sys.stderr,
         )
         if getattr(result, "timed_out", False):
             raise ObservationTimeout(
@@ -208,6 +213,16 @@ class QueueScanner:
         if not isinstance(payload, dict):
             raise ValueError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff without reacquiring the host observation flock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
 
     @staticmethod
     def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -291,13 +306,10 @@ class QueueScanner:
                 getattr(self.args, "observation_backoff_seconds", 30.0),
                 getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
             ).hold() as handle:
-                self.observation_lock_fd = os.dup(handle.fileno())
-                os.set_inheritable(self.observation_lock_fd, True)
-                try:
-                    yield
-                finally:
-                    os.close(self.observation_lock_fd)
-                    self.observation_lock_fd = None
+                # Do not inherit the host lock into gh/ssh descendants. If a
+                # scanner is killed, a slow child must not hold the lock and
+                # starve every other lane; the parent flock is the authority.
+                yield
         except (TimeoutError, ObservationBackoff) as error:
             raise RuntimeError(str(error)) from error
 
@@ -490,49 +502,103 @@ class QueueScanner:
         return [*latency, *selected], [int(run["id"]) for run in selected]
 
     def _discover(self) -> list[dict[str, Any]]:
-        with self._discovery_lock():
-            discovery = self._load_json(
-                self.discovery_path,
-                {"cursor_run_id": None, "run_page_cursor": {}},
-            )
-            fetched_at = int(discovery.get("fetched_at", 0))
-            cached_runs = discovery.get("runs")
-            if (
-                not self.args.force_refresh
-                and isinstance(cached_runs, list)
-                and self.now - fetched_at < self.args.discovery_ttl
-            ):
-                return cached_runs
+        # Claim a single flight under the short discovery lock.  The marker is
+        # deliberately separate from that lock: the owner releases the lock
+        # before doing any GitHub work, while other lanes wait lock-free for the
+        # published snapshot.
+        while True:
+            with self._discovery_lock():
+                discovery = self._load_json(
+                    self.discovery_path,
+                    {"cursor_run_id": None, "run_page_cursor": {}},
+                )
+                fetched_at = int(discovery.get("fetched_at", 0))
+                cached_runs = discovery.get("runs")
+                if (
+                    not self.args.force_refresh
+                    and isinstance(cached_runs, list)
+                    and self.now - fetched_at < self.args.discovery_ttl
+                ):
+                    return cached_runs
+                try:
+                    fd = os.open(
+                        self.discovery_fetch_path,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                except FileExistsError:
+                    fd = -1
+                if fd >= 0:
+                    # The owner's pid lets a waiter tell a fetch in flight
+                    # from one whose owner was killed.
+                    os.write(fd, str(os.getpid()).encode())
+                    os.close(fd)
+                    break
+                try:
+                    stale = time.time() - self.discovery_fetch_path.stat().st_mtime
+                except OSError:
+                    stale = 0
+                if (
+                    stale > self.args.observation_lock_timeout
+                    or self._fetch_owner_gone()
+                ):
+                    try:
+                        self.discovery_fetch_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+            if time.monotonic() >= self.lock_deadline:
+                raise RuntimeError("queue discovery fetch did not complete before observation deadline")
+            time.sleep(0.05)
 
-            # Namespace locks coalesce identical scans. This host-global lock
-            # additionally prevents distinct repos/workflows from launching
-            # simultaneous gh/ghapp bursts. On slower hosts those bursts can
-            # all exceed their subprocess deadline and make healthy lanes look
-            # scan-blind. A bounded wait fails closed instead of hanging the
-            # supervisor or publishing a partial snapshot.
+        # GitHub calls happen outside both the shared discovery lock and the
+        # host-global observation flock. Only the final snapshot publication is
+        # serialized, so a slow fetch cannot block another lane's claim.
+        self.now = int(time.time())
+        self.api_calls = 0
+        try:
+            self._preflight_identity()
+            runs = self._runs(discovery)
+            candidates, backlog_ids = self._candidate_runs(runs, discovery)
+            discovered: list[dict[str, Any]] = []
+            for run in candidates[: self.args.max_job_fetches]:
+                run_id = int(run["id"])
+                jobs = self._gh(
+                    f"repos/{self.args.repo}/actions/runs/{run_id}"
+                    "/jobs?filter=latest&per_page=100"
+                ).get("jobs", [])
+                if not isinstance(jobs, list):
+                    raise ValueError(f"jobs is not a list for run {run_id}")
+                discovered.append({**run, "_jobs": jobs})
+
+            discovery["fetched_at"] = int(time.time())
+            discovery["runs"] = discovered
             with self._observation_lock():
-                self.now = int(time.time())
-                self.api_calls = 0
-                # Inside the lock, so the identity probe is serialized,
-                # budgeted and bounded exactly like every other call.
-                self._preflight_identity()
-                runs = self._runs(discovery)
-                candidates, backlog_ids = self._candidate_runs(runs, discovery)
-                discovered: list[dict[str, Any]] = []
-                for run in candidates[: self.args.max_job_fetches]:
-                    run_id = int(run["id"])
-                    jobs = self._gh(
-                        f"repos/{self.args.repo}/actions/runs/{run_id}"
-                        "/jobs?filter=latest&per_page=100"
-                    ).get("jobs", [])
-                    if not isinstance(jobs, list):
-                        raise ValueError(f"jobs is not a list for run {run_id}")
-                    discovered.append({**run, "_jobs": jobs})
-
-                discovery["fetched_at"] = int(time.time())
-                discovery["runs"] = discovered
                 self._save_json(self.discovery_path, discovery)
-                return discovered
+            return discovered
+        finally:
+            try:
+                self.discovery_fetch_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _fetch_owner_gone(self) -> bool:
+        """Whether the single-flight marker names a process that no longer
+        exists. A marker with no readable pid (an older writer, or one killed
+        between creating and writing it) is judged by age alone."""
+        try:
+            pid = int(self.discovery_fetch_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return False
+        if pid <= 0 or pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
 
     def _scan_locked(self) -> int:
         runs = self._discover()
@@ -782,6 +848,8 @@ def main() -> int:
         scanner = QueueScanner(args)
         count = scanner.scan()
     except AuthPreflightError as exc:
+        if scanner is not None:
+            scanner.record_timeout(exc)
         print(f"queue scan failed ({args.provider}): {exc}", file=os.sys.stderr)
         return 1
     except (
@@ -791,6 +859,8 @@ def main() -> int:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
+        if scanner is not None:
+            scanner.record_timeout(exc)
         probed = scanner.identity if scanner is not None else None
         print(
             f"queue scan failed ({args.provider}): "
