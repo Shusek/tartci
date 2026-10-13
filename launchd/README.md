@@ -415,6 +415,37 @@ Use the GitHub App wrapper for API and registration-token calls so a stripped
 SSH shell or personal-token quota cannot create a false diagnosis. If GitHub
 reports busy or returns unknown state, stop; do not replace the registration.
 
+## Disk write-latency watchdog
+
+`com.danielraffel.tartci.disk-watchdog.plist.template` runs `tartci disk watch`
+every 60 s. On m5studio on 2026-10-12 every create on `/Volumes/Atelier`
+stalled about 6 s for hours while reads stayed instant, and the kernel log
+had rotated before anyone looked (outage O10). Each pass:
+
+- probes every watched path (`TARTCI_DISK_WATCH_PATHS`, rendered from the
+  profile's `host.tart_home` and `host.cache_root`) with a create, a one-byte
+  write, `fsync` and `unlink`, in a child process it waits on for at most
+  10 s. The pass itself never touches the volume. A probe that outlives
+  SIGKILL is in the kernel; it is recorded as outstanding, and no second probe
+  starts on that path while it lives;
+- treats a write over 1 s, or one that does not finish, as the start or
+  continuation of an episode. Once per episode it saves
+  `~/.tartci/state/disk-watchdog/evidence/<path>-<start>/`: `log-show.txt`
+  (`/usr/bin/log show --last 5m`, APFS and kernel), `ps-blocked.txt`
+  (processes in state D or U), `sample-<pid>.txt` for the stuck probe and up
+  to five blocked processes, and `evidence.json` naming the ones whose stack
+  is in `open()`. Every capture is bounded and abandoned, never waited on;
+- reports through the host-off alert path: a `disk_latency_slow` event in
+  `~/.tartci/state/disk-watchdog/events.jsonl` and one GitHub issue per
+  episode, closed with `disk_latency_recovered` after three fast probes in a
+  row. `TARTCI_DISK_WATCH_ISSUE=0` keeps the evidence and the event but opens
+  no issue.
+
+`tartci disk status [--json]` prints each path's last probe, its open episode
+and its evidence directory. The agent is a support agent: declare
+`disk-watchdog` in the host profile's `[support_agents] declared` list to
+install it through `support_agents`.
+
 ## GitHub-hosted queue-saturation detector
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
