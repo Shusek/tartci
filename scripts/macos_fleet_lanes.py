@@ -316,6 +316,20 @@ def _verified_network_overlay(
     return body
 
 
+def _symlinked_component(path: PurePosixPath) -> str | None:
+    """The first existing component of ``path`` that is a symlink, if any."""
+    current = PurePosixPath("/")
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(mode):
+            return current.as_posix()
+    return None
+
+
 def validate_lane_cache_roots(host: dict, lanes: list) -> None:
     """A lane-owned cache root is mounted only into that lane's runner group.
 
@@ -348,6 +362,16 @@ def validate_lane_cache_roots(host: dict, lanes: list) -> None:
                 or any(char in value for char in ":,\r\n")):
             fail(f"lane {lane_id}: cache_root must be a normalized absolute path "
                  "without ':' or ','")
+        home = PurePosixPath(host["home"])
+        on_volume = (len(root.parts) >= 4 and root.parts[1] == "Volumes")
+        if not ((root != home and root.is_relative_to(home)) or on_volume):
+            fail(f"lane {lane_id}: cache_root must sit below host.home or a "
+                 "/Volumes/<volume>/ mount, where every component is created "
+                 "without following links")
+        linked = _symlinked_component(root)
+        if linked is not None:
+            fail(f"lane {lane_id}: cache_root component {linked} is a symlink; "
+                 "the VM would mount whatever it points at")
         if root == host_root or root.is_relative_to(host_root) or host_root.is_relative_to(root):
             fail(f"lane {lane_id}: cache_root must not be, contain or sit inside "
                  "host.cache_root, which every lane mounts")
@@ -2623,6 +2647,10 @@ def lane_plist(
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])
     if "jit_github_cli" in lane:
         env["TARTCI_JIT_GH_CLI"] = lane["jit_github_cli"]
+    if "cache_root" in lane:
+        # runner.sh refuses to boot when the lane root resolves into or around
+        # this one (lane-cache-root.lib.sh).
+        env["TARTCI_HOST_CI_CACHE"] = host["cache_root"]
     if "chrome_app_dir" in lane:
         env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
     if "assignment_mode" in lane:
