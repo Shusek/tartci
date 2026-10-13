@@ -1404,8 +1404,22 @@ def serving_truth_pass(now: float | None = None) -> str | None:
         cli = os.environ.get("TARTCI_GH_CLI", "ghapp")
         repo = os.environ.get("TARTCI_REPO")
         queued = serving_truth_alarm.fetch_required_queue(cli, repo)
+        published = {}
+        advertised = os.environ.get("TARTCI_ADVERTISED_LABELS")
+        if not advertised:
+            checkout = os.environ.get("TARTCI_CHECKOUT")
+            advertised = str(Path(checkout) / "fleet/advertised-labels.json") if checkout else ""
+        if advertised:
+            try:
+                payload = json.loads(Path(advertised).read_text())
+                for reg in payload.get("registrations", []):
+                    if isinstance(reg, dict) and reg.get("host_id"):
+                        published.setdefault(str(reg["host_id"]), set()).update(reg.get("labels") or [])
+            except (OSError, ValueError, TypeError):
+                published = {}
         out = serving_truth_alarm.alert_pass(state / "serving-truth", events, queued,
-                                             now=utcnow(), shadow=os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "shadow").lower() != "on")
+                                             now=utcnow(), published_hosts=published or None,
+                                             shadow=os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "shadow").lower() != "on")
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return (f"{_iso(utcnow())} launchd-watchdog: WARN serving-truth check FAILED "
                 f"({type(exc).__name__}: {exc}); no serving alarm was raised")

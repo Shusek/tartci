@@ -22,7 +22,7 @@ class ServingTruthTests(unittest.TestCase):
         payload = {"workflow_runs": [{"id": 1, "required_context": "pulp-build-pr-head"}, {"id": 2, "required": False}]}
         with mock.patch.object(alarm.subprocess, "run", return_value=mock.Mock(
                 returncode=0, stdout=json.dumps(payload), stderr="")) as run:
-            self.assertEqual([r["id"] for r in alarm.fetch_required_queue("ghapp", "Generous-Corp/pulp")], [1])
+            self.assertEqual([r["id"] for r in alarm.fetch_required_queue("ghapp", "Generous-Corp/pulp")], [1, 2])
         run.assert_called_once_with(
             ["ghapp", "api", "repos/Generous-Corp/pulp/actions/runs?status=queued&per_page=100"],
             capture_output=True, text=True, timeout=45, check=False)
@@ -143,6 +143,23 @@ class QueueAbsenceTests(unittest.TestCase):
         self.assertIn("queued_required_no_job_start", {t["rule"] for t in rules})
 
 class ReviewerMutantTests(unittest.TestCase):
+    def test_admission_precheck_is_not_a_job_start(self):
+        queued = [{"id": 50, "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1800, alarm.dt.timezone.utc).isoformat()}]
+        rows = [row(BASE - 60, "admission_precheck"), row(BASE - 30, "admission_check")]
+        self.assertIn("queued_required_no_job_start", {t["rule"] for t in alarm.classify(rows, queued, now=BASE)})
+
+    def test_scan_blind_cycles_trip_with_live_queue(self):
+        queued = [{"id": 51, "created_at": alarm.dt.datetime.fromtimestamp(BASE - 60, alarm.dt.timezone.utc).isoformat()}]
+        rows = [row(BASE - 180, "scan_blind", detail="consecutive=1"),
+                row(BASE - 120, "scan_blind", detail="consecutive=2"),
+                row(BASE - 60, "scan_blind", detail="consecutive=3")]
+        self.assertIn("scan_blind_while_queued", {t["rule"] for t in alarm.classify(rows, queued, now=BASE)})
+
+    def test_stale_zombie_queue_is_ignored(self):
+        queued = [{"id": 32218602754, "status": "queued",
+                   "created_at": "2026-08-19T00:00:00+00:00"}]
+        self.assertFalse(alarm.classify([], queued, now=alarm._epoch("2026-10-12T12:00:00Z")))
+
     def test_signal_quarantine_and_terminal_clear(self):
         rows = [row(BASE-100, "job_assigned", host="m3"), row(BASE-90, "supervisor_signal", host="m3", detail="TERM quarantine=none")]
         self.assertFalse(alarm.classify(rows, now=BASE))

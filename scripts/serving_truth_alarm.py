@@ -15,6 +15,8 @@ WINDOW_SECONDS=20*60
 ADMISSION_STREAK=3
 BURST_WINDOW_SECONDS=30*60
 DEFERRAL_WINDOW_SECONDS=60*60
+QUEUE_MAX_AGE_SECONDS=12*60*60
+SCAN_BLIND_CYCLES=3
 TITLE="[tartci] serving-truth alarm: {rule}"
 _HOST_RE=(("m1-","m1"),("studio-","m3"),("m3-","m3"),("m5studio-","m5s"),("m5s-","m5s"),("m5-","m5"))
 
@@ -61,7 +63,10 @@ def _value(r,*keys):
     return None
 
 def _job_starts(rows,start,end):
-    return [r for r in rows if start<=(_time(r) or -1)<=end and r.get("event") in {"job_assigned","job_started","in_progress"}]
+    # Assignment is the first durable evidence that a gate job actually
+    # started.  admission_precheck/clone/claim events happen before a runner
+    # owns a job and must never satisfy the serving-truth rule.
+    return [r for r in rows if start<=(_time(r) or -1)<=end and r.get("event") == "job_assigned"]
 
 def _head(r):
     v=_value(r,"pr_head","head_sha","head","sha")
@@ -73,31 +78,74 @@ def _first_error(r):
     v=_value(r,"first_error","error","reason")
     return str(v or _detail(r).splitlines()[0])
 
-def classify(events:Iterable[dict[str,Any]],queued:Iterable[dict[str,Any]]=(),*,now=None,window_seconds=WINDOW_SECONDS,admission_streak=ADMISSION_STREAK,burst_window_seconds=BURST_WINDOW_SECONDS,deferral_window_seconds=DEFERRAL_WINDOW_SECONDS):
+def _queue_time(q):
+    return _epoch(q.get("created_at") or q.get("queued_at") or q.get("updated_at"))
+
+def _live_queue(queued, now, max_age=QUEUE_MAX_AGE_SECONDS):
+    out=[]
+    for q in queued:
+        if not isinstance(q,dict):
+            continue
+        status=str(q.get("status") or "queued").lower()
+        if status not in {"queued","requested","waiting","pending"} and not q.get("queue_observed"):
+            continue
+        t=_queue_time(q)
+        if t is None or (t <= now and now - t <= max_age):
+            out.append(q)
+    return out
+
+def _labels(q):
+    vals=q.get("labels") or q.get("runner_labels") or q.get("required_labels") or []
+    if isinstance(vals,str): vals=vals.split(",")
+    return {str(v).strip().lower() for v in vals if str(v).strip()}
+
+def classify(events:Iterable[dict[str,Any]],queued:Iterable[dict[str,Any]]=(),*,now=None,window_seconds=WINDOW_SECONDS,admission_streak=ADMISSION_STREAK,burst_window_seconds=BURST_WINDOW_SECONDS,deferral_window_seconds=DEFERRAL_WINDOW_SECONDS,published_hosts:dict[str,Iterable[str]]|None=None,queue_max_age_seconds=QUEUE_MAX_AGE_SECONDS,scan_blind_cycles=SCAN_BLIND_CYCLES):
     rows=sorted((r for r in events if isinstance(r,dict)),key=lambda r:_time(r) or 0)
     end=time.time() if now is None else float(now); start=end-window_seconds; bstart=end-burst_window_seconds; dstart=end-deferral_window_seconds
     starts=_job_starts(rows,start,end); trips=[]
-    required=[q for q in queued if isinstance(q,dict) and q.get("required") is True]
-    qt=[_epoch(q.get("created_at") or q.get("queued_at")) for q in required]; qt=[x for x in qt if x is not None]
-    if required and qt and min(qt) <= start and not starts:
-        trips.append({"rule":"queued_required_no_job_start","host":"fleet","since":dt.datetime.fromtimestamp(min(qt),dt.timezone.utc).isoformat(),"evidence":{"queued_required":required,"window_start":start,"window_end":end,"job_starts":starts}})
-    # A published host can be absent while another host is still serving.
-    # Queue adapters may attach the selected host in host/runner; retain the
-    # fleet-wide rule above for unassigned demand and add a per-host episode.
-    by_queue_host = {}
-    for q in required:
-        qh = q.get("host") or q.get("runner") or q.get("assigned_host")
-        if qh:
-            by_queue_host.setdefault(str(qh), []).append(q)
-    for qh, host_queue in by_queue_host.items():
-        qtimes = [_epoch(q.get("created_at") or q.get("queued_at")) for q in host_queue]
-        qtimes = [t for t in qtimes if t is not None]
-        host_starts = [r for r in starts if _host(r) == qh or r.get("runner") == qh]
-        if qtimes and min(qtimes) <= start and not host_starts:
-            trips.append({"rule":"host_queued_no_job_start","host":qh,
-                          "since":dt.datetime.fromtimestamp(min(qtimes),dt.timezone.utc).isoformat(),
-                          "evidence":{"queued_required":host_queue,"window_start":start,
-                                      "window_end":end,"job_starts":host_starts}})
+    queued_live=_live_queue(queued,end,queue_max_age_seconds)
+    qt=[_queue_time(q) for q in queued_live]; qt=[x for x in qt if x is not None]
+    if queued_live and qt and min(qt) <= start and not starts:
+        trips.append({"rule":"queued_required_no_job_start","host":"fleet","since":dt.datetime.fromtimestamp(min(qt),dt.timezone.utc).isoformat(),"evidence":{"queued":queued_live,"window_start":start,"window_end":end,"job_starts":starts}})
+    # Published hosts are selected by runner-label intersection.  GitHub queue
+    # objects do not carry a host key; a host field is accepted only for old
+    # receipts and is never required for this rule.
+    if published_hosts:
+        for host, host_labels in published_hosts.items():
+            wanted={str(x).lower() for x in host_labels}
+            host_queue=[q for q in queued_live if not _labels(q) or wanted.intersection(_labels(q))]
+            host_starts=[r for r in starts if _host(r)==host]
+            htimes=[_queue_time(q) for q in host_queue]; htimes=[t for t in htimes if t is not None]
+            if host_queue and htimes and min(htimes)<=start and not host_starts:
+                trips.append({"rule":"host_queued_no_job_start","host":host,"since":dt.datetime.fromtimestamp(min(htimes),dt.timezone.utc).isoformat(),"evidence":{"queued":host_queue,"published_labels":sorted(wanted),"window_start":start,"window_end":end,"job_starts":host_starts}})
+    else:
+        # Compatibility for recorded receipts that already contain an
+        # assignment host.  Live GitHub queue objects do not, so production
+        # uses the published-host label path above.
+        by_host={}
+        for q in queued_live:
+            host=q.get("host") or q.get("runner") or q.get("assigned_host")
+            if host: by_host.setdefault(str(host),[]).append(q)
+        for host, host_queue in by_host.items():
+            htimes=[_queue_time(q) for q in host_queue]; htimes=[t for t in htimes if t is not None]
+            host_starts=[r for r in starts if _host(r)==host]
+            if htimes and min(htimes)<=start and not host_starts:
+                trips.append({"rule":"host_queued_no_job_start","host":host,"since":dt.datetime.fromtimestamp(min(htimes),dt.timezone.utc).isoformat(),"evidence":{"queued":host_queue,"window_start":start,"window_end":end,"job_starts":host_starts}})
+    # A lane that is repeatedly blind while work exists is itself a serving
+    # failure; it must not wait for the 20-minute fleet aggregate window.
+    if queued_live:
+        blind={}
+        for r in rows:
+            t=_time(r)
+            if t is None or not start<=t<=end or r.get("event")!="scan_blind": continue
+            h=_host(r); detail=_detail(r)
+            m=re.search(r"consecutive\s*[=:]\s*(\d+)",detail,re.I)
+            n=int(m.group(1)) if m else 1
+            blind[h]=max(blind.get(h,0),n)
+        for h,n in blind.items():
+            if n>=scan_blind_cycles:
+                hit=next(r for r in reversed(rows) if _host(r)==h and r.get("event")=="scan_blind")
+                trips.append({"rule":"scan_blind_while_queued","host":h,"since":hit.get("ts"),"evidence":{"queued":queued_live,"consecutive":n,"scan_blind":hit}})
     # Sustained admission errors only; scan errors are diagnostics, and any
     # successful precheck/admission breaks an episode.
     by={}
@@ -105,14 +153,14 @@ def classify(events:Iterable[dict[str,Any]],queued:Iterable[dict[str,Any]]=(),*,
         t=_time(r)
         if t is None or not start<=t<=end:continue
         ev=r.get("event")
-        if ev in {"admission_precheck","admission_check","admission_success","job_assigned","job_started","in_progress"}:
+        if ev in {"admission_precheck","admission_check","admission_success","admission_parallel_start","job_claim","lease_acquired","job_assigned"}:
             by.setdefault(_host(r),[]).append((t,ev,r))
         elif ev in {"admission_error","admission_precheck_error","admission_deferred"}:
             by.setdefault(_host(r),[]).append((t,ev,r))
     for h,items in by.items():
         streak=[]
         for t,ev,r in items:
-            if ev in {"admission_precheck","admission_check","admission_success","job_assigned","job_started","in_progress"}: streak=[]
+            if ev in {"admission_precheck","admission_check","admission_success","admission_parallel_start","job_claim","lease_acquired","job_assigned"}: streak=[]
             else: streak.append(r)
         if len(streak)>=admission_streak:
             trips.append({"rule":"admission_error_streak","host":h,"since":streak[0].get("ts"),"evidence":{"errors":streak,"threshold":admission_streak}})
@@ -143,7 +191,7 @@ def classify(events:Iterable[dict[str,Any]],queued:Iterable[dict[str,Any]]=(),*,
         t=_time(r)
         if t is None or t>end:continue
         h=_host(r); ev=r.get("event")
-        if ev in {"job_assigned","job_started","in_progress"}:assigned[h]=r
+        if ev == "job_assigned":assigned[h]=r
         elif ev=="job_terminal_receipt":assigned.pop(h,None)
         elif ev=="supervisor_signal" and start<=t<=end:
             detail=_detail(r); prior=assigned.get(h)
@@ -168,16 +216,12 @@ def fetch_required_queue(cli,repo=None):
         payload=_gh_json(cli,f"repos/{r}/actions/runs?status=queued&per_page=100")
         for run in payload.get("workflow_runs",[]) if isinstance(payload,dict) else []:
             if not isinstance(run,dict):continue
-            # Requiredness is explicit configuration, never an absent API key.
-            jobs = run.get("jobs") if isinstance(run.get("jobs"), list) else []
-            labels = {str(label).lower() for job in jobs if isinstance(job, dict)
-                      for label in (job.get("labels") or [])}
-            macos_gate = "self-hosted" in labels and "macos" in labels
-            names = {x.strip().lower() for x in os.environ.get(
-                "TARTCI_REQUIRED_WORKFLOW_NAMES", "Build and Test,Required gate liveness").split(",")}
-            named_gate = str(run.get("name") or run.get("display_title") or "").lower() in names
-            if run.get("required") is True or run.get("required_context") or run.get("required_labels") or macos_gate or named_gate:
-                out.append({**run,"source_repo":r,"required":True})
+            # A workflow_run has no `required` field.  The queue is the demand
+            # source; branch protection is resolved by the lane's label scan.
+            # Keep only recent queued work so zombie merge_group runs cannot
+            # hold the fleet alarm forever.
+            created=_queue_time(run)
+            out.append({**run,"source_repo":r,"queue_observed":True})
     return out
 
 def trip_receipt(state,trip,now=None):
@@ -185,9 +229,9 @@ def trip_receipt(state,trip,now=None):
     while p.exists():p=state/f"serving-truth-{trip['rule']}-{trip['host']}-{stamp}-{i}.json";i+=1
     p.write_text(json.dumps({"kind":"tartci.serving-truth","observed_at":stamp,**trip},indent=2,sort_keys=True)+"\n"); return p
 
-def alert_pass(state,events_path,queued,*,now=None,issue=None,close=None,update=None,shadow=None):
+def alert_pass(state,events_path,queued,*,now=None,issue=None,close=None,update=None,shadow=None,published_hosts=None):
     paths=[events_path] if isinstance(events_path,Path) else list(events_path)
-    rows=read_event_paths(paths); trips=classify(rows,queued,now=now); receipts=[trip_receipt(state,t,now) for t in trips]
+    rows=read_event_paths(paths); trips=classify(rows,queued,now=now,published_hosts=published_hosts); receipts=[trip_receipt(state,t,now) for t in trips]
     shadow = (os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "shadow").lower() in {"shadow","0","off"}) if shadow is None else shadow
     # Explicit issue callbacks are used by tests and operators opting in.
     if issue is not None and "TARTCI_SERVING_TRUTH_ALARM" not in os.environ and shadow is True: shadow = False
