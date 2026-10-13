@@ -106,6 +106,24 @@ class PoolLog(unittest.TestCase):
         self.host.value = status(tool_freshness="vellum 25.9 h behind (threshold 12 h)")
         self.assertNotIn("heartbeat", self.tick(65))
 
+    def test_only_free_standing_quantities_drift(self) -> None:
+        same = [
+            ("pulp 24.8 h behind (threshold 12 h)", "pulp 31.2 h behind (threshold 12 h)"),
+            ("watchdog RSS 512 MB over 400 MB", "watchdog RSS 640.5 MB over 400 MB"),
+            ("oldest job 3 h in queue", "oldest job 17 h in queue"),
+        ]
+        changed = [
+            ("installed v0.955.1 is broken", "installed v0.957.0 is broken"),
+            ("ROLLED BACK for sha 1a2b3c4d5e6f", "ROLLED BACK for sha 9f8e7d6c5b4a"),
+            ("ROLLED BACK for sha 123456789abc", "ROLLED BACK for sha 987654321abc"),
+            ("peer m1 unreachable", "peer m5 unreachable"),
+        ]
+        digest = lambda text: pool_log._digest({"problems": {"tool_freshness": text}})
+        for before, after in same:
+            self.assertEqual(digest(before), digest(after), (before, after))
+        for before, after in changed:
+            self.assertNotEqual(digest(before), digest(after), (before, after))
+
     def test_the_status_read_is_capped_at_sixty_seconds(self) -> None:
         self.tick(0)
         self.assertEqual(pool_log.STATUS_TIMEOUT_S, 60.0)
