@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
@@ -210,6 +210,16 @@ class QueueScanner:
         if not isinstance(payload, dict):
             raise ValueError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff without reacquiring the host observation flock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
 
     @staticmethod
     def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -776,6 +786,8 @@ def main() -> int:
         scanner = QueueScanner(args)
         count = scanner.scan()
     except AuthPreflightError as exc:
+        if scanner is not None:
+            scanner.record_timeout(exc)
         print(f"queue scan failed ({args.provider}): {exc}", file=os.sys.stderr)
         return 1
     except (
@@ -785,6 +797,8 @@ def main() -> int:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
+        if scanner is not None:
+            scanner.record_timeout(exc)
         probed = scanner.identity if scanner is not None else None
         print(
             f"queue scan failed ({args.provider}): "

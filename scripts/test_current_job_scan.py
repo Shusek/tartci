@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -228,6 +229,33 @@ else: raise SystemExit(4)
         self.assertEqual(result.returncode, 2)
         self.assertIn("observation_error", result.stdout)
         self.assertTrue(called, "the host lock blocked the API call")
+
+    def test_slow_api_observation_starts_while_host_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "observation.lock"
+            marker = root / "called"
+            fake = root / "slow-gh"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, time\n"
+                f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+                "time.sleep(2)\n"
+                "print('{\\\"total_count\\\":0,\\\"workflows\\\":[]}')\n"
+            )
+            fake.chmod(0o755)
+            with lock.open("a+") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                result = subprocess.run(
+                    [sys.executable, str(SCANNER), "--repo", "x/y", "--runner", "r",
+                     "--workflow", "Build and Test", "--gh-cli", str(fake),
+                     "--scan-timeout", "5", "--gh-timeout", "3",
+                     "--observation-lock-file", str(lock),
+                     "--observation-lock-timeout", "0.2"],
+                    text=True, capture_output=True, check=False,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(marker.exists(), "slow API call waited on the host lock")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

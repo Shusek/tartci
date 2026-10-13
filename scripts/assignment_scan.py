@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     CLI_REFUSED,
     NO_VALID_CREDENTIALS,
@@ -419,6 +419,16 @@ class AssignmentScanner:
     def _reason(self, text: str) -> ScanFailure:
         """Name a failure against the identity this scan proved it was using."""
         return classify_failure(text, self.identity)
+
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff using only the backoff-file lock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
 
     def _retry_sleep(self, attempt: int) -> bool:
         """Back off before the next attempt, or report that none is affordable.
@@ -1043,9 +1053,13 @@ def main() -> int:
         print(f"assignment scan failed closed: {error}", file=sys.stderr)
         return 2
     except (TimeoutError, ObservationBackoff) as error:
+        if scanner is not None:
+            scanner.record_timeout(error)
         print(f"assignment scan failed closed: lock_contention: {error}", file=sys.stderr)
         return 2
     except (ScanError, ValueError) as error:
+        if scanner is not None:
+            scanner.record_timeout(error)
         identity = scanner.identity if scanner is not None else None
         print(
             f"assignment scan failed closed: {classify_failure(str(error), identity)}",

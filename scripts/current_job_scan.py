@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
-from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 
 PER_PAGE = 100
 
@@ -95,6 +95,16 @@ class CurrentJobScanner:
         if not isinstance(payload, dict):
             raise ScanError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff without reacquiring the host observation flock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
 
     def _pages(self, prefix: str, key: str) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -303,18 +313,22 @@ def main() -> int:
         receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
         print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     except ObservationBackoff as error:
+        scanner.record_timeout(error)
         print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
                          sort_keys=True, separators=(",", ":")))
         return 2
     except ObservationTimeout as error:
+        scanner.record_timeout(error)
         print(json.dumps({"kind": "observation_error", "detail": f"api_timeout: {error}"},
                          sort_keys=True, separators=(",", ":")))
         return 2
     except TimeoutError as error:
+        scanner.record_timeout(error)
         print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
                          sort_keys=True, separators=(",", ":")))
         return 2
     except ScanError as error:
+        scanner.record_timeout(error)
         print(json.dumps({"kind": "observation_error", "detail": str(error)},
                          sort_keys=True, separators=(",", ":")))
         return 2
