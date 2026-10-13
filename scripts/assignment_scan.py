@@ -335,10 +335,19 @@ class AssignmentScanner:
         if remaining <= 0:
             raise AssignmentObservationTimeout("assignment scan exceeded its overall deadline")
         try:
+            started = time.monotonic()
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                timeout=min(self.args.gh_timeout, remaining),
+                timeout=min(
+                    self.args.gh_timeout,
+                    max(0.1, self.args.observation_lock_timeout / 2),
+                    remaining,
+                ),
                 operation="assignment_scan_github_api",
+            )
+            print(
+                f"assignment-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+                file=sys.stderr,
             )
         except (OSError, ObservationError) as error:
             raise TransientApiFault(
@@ -453,10 +462,19 @@ class AssignmentScanner:
         if remaining <= 0:
             return None
         try:
+            started = time.monotonic()
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                timeout=min(self.args.gh_timeout, remaining),
+                timeout=min(
+                    self.args.gh_timeout,
+                    max(0.1, self.args.observation_lock_timeout / 2),
+                    remaining,
+                ),
                 operation="assignment_scan_ref_probe",
+            )
+            print(
+                f"assignment-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+                file=sys.stderr,
             )
         except (OSError, ObservationError):
             return None
@@ -791,58 +809,49 @@ class AssignmentScanner:
         return len(matches)
 
     def scan(self) -> int:
-        # Every fleet supervisor shares this host-global observation slot. The
-        # exhaustive scanner can issue many GitHub calls; overlapping scans for
-        # different lanes made individually healthy ghapp requests time out and
-        # left the host scan-blind. The wait is bounded separately from the scan
-        # budget, so queueing behind other lanes costs this scan time to finish
-        # but never time to work; failure remains fail-closed either way.
-        # Reading the workflow ids from cache is file IO, so it happens
-        # before the host-global lock rather than under it.
+        # GitHub observation is deliberately lock-free.  The host-global flock
+        # is a claim/coordination primitive, not a network mutex: holding it
+        # over pagination lets one slow API call starve every other lane.
         workflow_ids = self._cached_workflow_ids()
         total = 0
-        with self._observation_lock():
-            # Inside the lock, so the identity probe is serialized, budgeted
-            # and bounded exactly like every other call this scan makes, and
-            # before the first GitHub read so an anonymous caller is refused
-            # rather than spending the shared 60/hour allowance.
-            self._preflight_identity()
-            if workflow_ids is None:
-                workflow_ids = self._workflow_ids()
+        self._preflight_identity()
+        if workflow_ids is None:
+            workflow_ids = self._workflow_ids()
+            # Publishing a resolved workflow id is the only shared mutation in
+            # this phase, so keep the host lock for that short file operation.
+            with self._observation_lock():
                 self._store_workflow_ids(workflow_ids)
-            scanned: set[int] = set()
+        scanned: set[int] = set()
 
-            # Concurrency remains opt-in for a measured host. The reliable
-            # fleet default is one call stream; raising it multiplies pressure
-            # inside the host-global scan and must not happen accidentally.
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.args.max_workers
-            ) as executor:
+        # Concurrency remains opt-in for a measured host. The reliable fleet
+        # default is one call stream; raising it multiplies API pressure but no
+        # longer blocks unrelated lanes on this host.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.args.max_workers
+        ) as executor:
 
-                def visit(page_items: list[dict[str, Any]]) -> None:
-                    nonlocal total
-                    fresh: list[dict[str, Any]] = []
-                    for run in page_items:
-                        run_id = run.get("id")
-                        if not isinstance(run_id, int):
-                            raise ScanError("configured workflow run has no integer id")
-                        # A run reachable from two listings, or re-read by a
-                        # restarted pass, is scanned once.
-                        if run_id in scanned:
-                            continue
-                        scanned.add(run_id)
-                        fresh.append(run)
-                    if not fresh:
-                        return
-                    total += sum(executor.map(self._scan_run, fresh), start=0)
-                    if self.witness.is_set():
-                        raise WitnessAbandon
+            def visit(page_items: list[dict[str, Any]]) -> None:
+                nonlocal total
+                fresh: list[dict[str, Any]] = []
+                for run in page_items:
+                    run_id = run.get("id")
+                    if not isinstance(run_id, int):
+                        raise ScanError("configured workflow run has no integer id")
+                    if run_id in scanned:
+                        continue
+                    scanned.add(run_id)
+                    fresh.append(run)
+                if not fresh:
+                    return
+                total += sum(executor.map(self._scan_run, fresh), start=0)
+                if self.witness.is_set():
+                    raise WitnessAbandon
 
-                try:
-                    for prefix in self._ordered_run_listings(workflow_ids):
-                        self._walk_listing(prefix, "workflow_runs", visit)
-                except WitnessAbandon:
-                    pass
+            try:
+                for prefix in self._ordered_run_listings(workflow_ids):
+                    self._walk_listing(prefix, "workflow_runs", visit)
+            except WitnessAbandon:
+                pass
         # Published on every exit path, including the abandoned one: a run
         # proved stale before the witness landed is still worth remembering.
         self.stale_demand.persist()

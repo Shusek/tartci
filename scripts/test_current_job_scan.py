@@ -209,7 +209,7 @@ else: raise SystemExit(4)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--parallelism must be 1", result.stderr)
 
-    def test_host_lock_timeout_fails_closed_before_api_call(self) -> None:
+    def test_host_lock_is_not_held_during_api_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "observation.lock"
             marker = Path(directory) / "called"
@@ -224,9 +224,10 @@ else: raise SystemExit(4)
                      "--observation-lock-timeout", "0.1"],
                     text=True, capture_output=True, check=False,
                 )
+            called = marker.exists()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("host queue observation lock timed out", result.stdout)
-        self.assertFalse(marker.exists())
+        self.assertIn("observation_error", result.stdout)
+        self.assertTrue(called, "the host lock blocked the API call")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

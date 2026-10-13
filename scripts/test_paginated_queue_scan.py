@@ -815,7 +815,7 @@ print(json.dumps(payload))
                 10,
             )
 
-    def test_distinct_namespaces_share_one_host_observation_slot(self) -> None:
+    def test_slow_namespace_fetch_does_not_block_another_lane(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
         eligible = _run(999, origin)
         active = 0
@@ -859,7 +859,11 @@ print(json.dumps(payload))
                 results = list(executor.map(scan, scanners))
 
         self.assertEqual(results, [1, 1, 1])
-        self.assertEqual(peak, 1)
+        self.assertGreater(
+            peak,
+            1,
+            "a slow GitHub fetch must not serialize unrelated host lanes",
+        )
 
     def test_distinct_process_namespaces_bound_actual_github_children(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -923,9 +927,13 @@ finally:
             results = [process.communicate(timeout=10) for process in processes]
             self.assertEqual([process.returncode for process in processes], [0, 0, 0])
             self.assertEqual([stdout.strip() for stdout, _ in results], ["0", "0", "0"])
-            self.assertEqual(json.loads(activity.read_text(encoding="utf-8"))["peak"], 1)
+            self.assertGreater(
+                json.loads(activity.read_text(encoding="utf-8"))["peak"],
+                1,
+                "unrelated GitHub children should not serialize on the host flock",
+            )
 
-    def test_scanner_death_releases_host_lock_even_with_slow_observation_child(self) -> None:
+    def test_scanner_death_does_not_leave_observation_child_holding_host_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             entered = root / "entered"
@@ -994,13 +1002,20 @@ print(json.dumps(payload))
             self.assertEqual(recovered.stdout.strip(), "0")
             self.assertGreaterEqual(len(calls.read_text(encoding="utf-8").splitlines()), 2)
 
-    def test_host_observation_lock_timeout_fails_closed(self) -> None:
+    def test_host_lock_is_not_held_during_api_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            called = False
+
+            def api(path: str) -> dict[str, Any]:
+                nonlocal called
+                called = True
+                return self._base_api([], None)(path)
+
             scanner = self._scanner(
                 "tart-macos",
                 root / "lane.json",
-                lambda _path: self.fail("API must not run without the lock"),
+                api,
                 observation_lock_file=str(root / "host-observation.lock"),
                 observation_lock_timeout=0.05,
             )
@@ -1008,6 +1023,7 @@ print(json.dumps(payload))
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 with self.assertRaisesRegex(RuntimeError, "observation lock timed out"):
                     scanner.scan()
+            self.assertTrue(called, "the host lock blocked the API call")
 
     def test_namespace_lock_wait_shares_the_bounded_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

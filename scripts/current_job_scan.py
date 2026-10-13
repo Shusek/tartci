@@ -66,10 +66,19 @@ class CurrentJobScanner:
         if remaining <= 0:
             raise ObservationTimeout("scan exceeded its overall deadline")
         try:
+            started = time.monotonic()
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                timeout=min(self.args.gh_timeout, remaining),
+                timeout=min(
+                    self.args.gh_timeout,
+                    max(0.1, self.args.observation_lock_timeout / 2),
+                    remaining,
+                ),
                 operation="current_job_github_api",
+            )
+            print(
+                f"current-job-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+                file=sys.stderr,
             )
         except ObservationError as error:
             raise ScanError(f"GitHub API unavailable for {path}: {error}") from error
@@ -250,7 +259,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", type=int)
     parser.add_argument("--job-id", type=int)
     parser.add_argument("--gh-cli", default=os.environ.get("TARTCI_GH_CLI") or "gh")
-    parser.add_argument("--gh-timeout", type=float, default=5)
+    parser.add_argument("--gh-timeout", type=float, default=15)
     parser.add_argument("--max-pages", type=int, default=3)
     parser.add_argument("--scan-timeout", type=float, default=10)
     parser.add_argument("--result-cap", type=int, default=300)
@@ -289,8 +298,9 @@ def main() -> int:
     try:
         args = parse_args()
         scanner = CurrentJobScanner(args)
-        with scanner.observation_lock():
-            receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
+        # API observation is lock-free. The host flock is reserved for short
+        # claim/state operations; holding it across pagination starves lanes.
+        receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
         print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     except ObservationBackoff as error:
         print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},

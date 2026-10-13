@@ -187,10 +187,15 @@ class QueueScanner:
                 f"GitHub API call budget exhausted ({self.args.max_api_calls})"
             )
         self.api_calls += 1
+        started = time.monotonic()
         result = run_bounded(
             [self.args.gh_cli, "api", path],
-            timeout=self.args.gh_timeout,
+            timeout=min(self.args.gh_timeout, max(0.1, self.args.observation_lock_timeout / 2)),
             operation="queue_scan_github_api",
+        )
+        print(
+            f"queue-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+            file=os.sys.stderr,
         )
         if getattr(result, "timed_out", False):
             raise ObservationTimeout(
@@ -498,35 +503,30 @@ class QueueScanner:
             ):
                 return cached_runs
 
-            # Namespace locks coalesce identical scans. This host-global lock
-            # additionally prevents distinct repos/workflows from launching
-            # simultaneous gh/ghapp bursts. On slower hosts those bursts can
-            # all exceed their subprocess deadline and make healthy lanes look
-            # scan-blind. A bounded wait fails closed instead of hanging the
-            # supervisor or publishing a partial snapshot.
-            with self._observation_lock():
-                self.now = int(time.time())
-                self.api_calls = 0
-                # Inside the lock, so the identity probe is serialized,
-                # budgeted and bounded exactly like every other call.
-                self._preflight_identity()
-                runs = self._runs(discovery)
-                candidates, backlog_ids = self._candidate_runs(runs, discovery)
-                discovered: list[dict[str, Any]] = []
-                for run in candidates[: self.args.max_job_fetches]:
-                    run_id = int(run["id"])
-                    jobs = self._gh(
-                        f"repos/{self.args.repo}/actions/runs/{run_id}"
-                        "/jobs?filter=latest&per_page=100"
-                    ).get("jobs", [])
-                    if not isinstance(jobs, list):
-                        raise ValueError(f"jobs is not a list for run {run_id}")
-                    discovered.append({**run, "_jobs": jobs})
+            # GitHub calls happen outside the host-global flock. Only the
+            # final snapshot publication is serialized, so a slow fetch cannot
+            # block another lane's claim/observation.
+            self.now = int(time.time())
+            self.api_calls = 0
+            self._preflight_identity()
+            runs = self._runs(discovery)
+            candidates, backlog_ids = self._candidate_runs(runs, discovery)
+            discovered: list[dict[str, Any]] = []
+            for run in candidates[: self.args.max_job_fetches]:
+                run_id = int(run["id"])
+                jobs = self._gh(
+                    f"repos/{self.args.repo}/actions/runs/{run_id}"
+                    "/jobs?filter=latest&per_page=100"
+                ).get("jobs", [])
+                if not isinstance(jobs, list):
+                    raise ValueError(f"jobs is not a list for run {run_id}")
+                discovered.append({**run, "_jobs": jobs})
 
-                discovery["fetched_at"] = int(time.time())
-                discovery["runs"] = discovered
+            discovery["fetched_at"] = int(time.time())
+            discovery["runs"] = discovered
+            with self._observation_lock():
                 self._save_json(self.discovery_path, discovery)
-                return discovered
+            return discovered
 
     def _scan_locked(self) -> int:
         runs = self._discover()

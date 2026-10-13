@@ -1629,7 +1629,7 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         self.assertEqual(scanner.scan(), 6)
         self.assertEqual(peak, 3)
 
-    def test_cross_process_assignment_scans_share_host_observation_lock(self) -> None:
+    def test_slow_assignment_fetch_does_not_block_another_lane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "entered"
@@ -1638,11 +1638,14 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
             _write_exec(
                 fake,
                 """#!/usr/bin/env python3
-import json, os, time
+import json, os, sys, time
 from pathlib import Path
 Path(os.environ['ENTERED']).write_text('yes', encoding='utf-8')
 time.sleep(2)
-print(json.dumps({'total_count': 0, 'workflows': []}))
+if sys.argv[-1].startswith('repos/') and '/actions/workflows?' in sys.argv[-1]:
+    print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
+else:
+    print(json.dumps({'total_count': 0, 'workflow_runs': []}))
 """,
             )
             common = [
@@ -1660,12 +1663,11 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(marker.exists(), "first scanner never entered GitHub observation")
-            denied = subprocess.run(
-                [*common, "--observation-lock-timeout", "0.05"],
+            concurrent = subprocess.run(
+                [*common, "--observation-lock-timeout", "5"],
                 text=True, capture_output=True, check=False, env=env,
             )
-            self.assertEqual(denied.returncode, 2)
-            self.assertIn("observation lock timed out", denied.stderr)
+            self.assertEqual(concurrent.returncode, 0, concurrent.stderr)
             holder.terminate()
             holder.communicate(timeout=5)
 
@@ -1780,37 +1782,25 @@ else:
             assert match is not None
             return float(match.group(1)), elapsed
 
-    def test_scan_budget_is_measured_from_lock_acquisition(self) -> None:
+    def test_scan_budget_is_independent_of_host_lock(self) -> None:
         hold, scan_timeout = 2.0, 4
         budget, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
         # Control: a run where the scanner never actually queued would prove
         # nothing about what queueing costs it.
-        self.assertGreaterEqual(
-            elapsed, hold,
-            f"the scanner never waited for the lock ({elapsed:.2f}s < {hold}s), so this proved nothing",
-        )
-        self.assertGreater(
-            budget, scan_timeout - hold + 0.5,
-            f"the {hold}s lock wait was charged to the scan: it began work with only "
-            f"{budget:.2f}s of its {scan_timeout}s budget",
-        )
-        # A budget larger than the one configured would mean the deadline is
-        # being extended rather than rebased.
         self.assertLessEqual(
             budget, scan_timeout + 0.5,
-            f"the scan claimed {budget:.2f}s against a {scan_timeout}s budget",
+            f"the scan exceeded its {scan_timeout}s budget ({budget:.2f}s)",
         )
+        self.assertLess(elapsed, hold + scan_timeout + 1.0, "the host lock blocked API observation")
 
-    def test_waiting_longer_for_the_lock_does_not_shrink_the_scan(self) -> None:
-        """The same scan, queued twice as long, must get the same budget."""
+    def test_a_long_host_lock_does_not_delay_scan_start(self) -> None:
+        """A slow holder cannot make another lane wait before its API call."""
         scan_timeout = 4
         brief, _ = self._budget_after_waiting(1.0, scan_timeout, lock_timeout=20.0)
         patient, elapsed = self._budget_after_waiting(3.0, scan_timeout, lock_timeout=20.0)
-        self.assertGreaterEqual(elapsed, 3.0, "the long-wait case never queued")
-        self.assertAlmostEqual(
-            brief, patient, delta=0.75,
-            msg=f"budget tracks the lock wait: 1s wait -> {brief:.2f}s, 3s wait -> {patient:.2f}s",
-        )
+        self.assertLessEqual(brief, scan_timeout + 0.5)
+        self.assertLessEqual(patient, scan_timeout + 0.5)
+        self.assertLess(elapsed, 3.0 + scan_timeout + 1.0, "the host lock blocked API observation")
 
     def test_lock_wait_is_not_truncated_by_the_scan_budget(self) -> None:
         """--observation-lock-timeout means what it says, even when it exceeds --scan-timeout.
@@ -1867,8 +1857,8 @@ else:
         hold, scan_timeout = 2.0, 3
         _, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
         self.assertLess(
-            elapsed, hold + scan_timeout + 5.0,
-            f"the scan ran {elapsed:.2f}s, past its {hold}s wait plus {scan_timeout}s budget",
+            elapsed, scan_timeout + 5.0,
+            f"the scan ran {elapsed:.2f}s past its API budget",
         )
 
     def test_tests_never_contend_with_the_hosts_real_observation_lock(self) -> None:
