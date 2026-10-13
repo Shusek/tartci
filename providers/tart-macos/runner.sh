@@ -94,6 +94,8 @@ TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
 # shellcheck source=providers/tart-macos/lifecycle.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/lifecycle.lib.sh"
+# shellcheck source=providers/tart-macos/lane-cache-root.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/lane-cache-root.lib.sh"
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
 # GitHub CLI used for every API call (queue polling, JIT mint, runner reclaim,
 # job/run polling, cancel). Default `gh` (the personal/host auth) keeps generic
@@ -111,6 +113,9 @@ JIT_GH_CLI="${TARTCI_JIT_GH_CLI:-$GH_CLI}"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
+# Set by the fleet renderer only for a lane that owns its cache root; the
+# boot refuses when that root resolves into, or around, this host root.
+HOST_CACHE_ROOT="${TARTCI_HOST_CI_CACHE:-}"
 CCACHE_MAX_SIZE="${TARTCI_CCACHE_MAX_SIZE:-40G}"
 [[ "$CCACHE_MAX_SIZE" =~ ^[1-9][0-9]*[KMGT]$ ]] \
   || { printf 'invalid TARTCI_CCACHE_MAX_SIZE: expected a positive ccache size such as 40G\n' >&2; exit 1; }
@@ -1865,6 +1870,16 @@ boot_vm_to_ssh(){
   fi
   tartci_lifecycle_mark clone_start "${CLONE_STARTED_AT:-0}"
   tartci_lifecycle_mark cloned
+  local lane_cache_refusal=""
+  # A lane-owned cache root is checked before anything is created or trimmed
+  # through it (lane-cache-root.lib.sh).
+  if ! lane_cache_refusal="$(tartci_lane_cache_root_refusal "$CACHE_ROOT" "$HOST_CACHE_ROOT")"; then
+    note "[$i] $lane_cache_refusal; refusing to boot"
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
   if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
     discard_current_vm
     tartci_release_vm_lease
@@ -1884,6 +1899,14 @@ boot_vm_to_ssh(){
   # every VM on the host. Without a mount the cache lives in the disposable
   # guest and every gate configure re-runs all 192 try_compiles.
   if ! tartci_prepare_disk_root "$CACHE_ROOT/configure-checks"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
+  # Again after preparation, now that every mounted directory exists.
+  if ! lane_cache_refusal="$(tartci_lane_cache_root_refusal "$CACHE_ROOT" "$HOST_CACHE_ROOT")"; then
+    note "[$i] $lane_cache_refusal; refusing to boot"
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
