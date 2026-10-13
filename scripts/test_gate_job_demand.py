@@ -70,6 +70,21 @@ class GateJobDemandTests(unittest.TestCase):
         self.assertEqual((job["run_id"], job["workflow"]), (38433042640, "Build and Test"))
         self.assertEqual(job["hosts"], ["m1", "m5", "m5studio", "studio"])
 
+    def test_a_queued_macos_job_in_an_in_progress_run_is_demand(self) -> None:
+        # The common shape: Build and Test is in_progress because its hosted
+        # jobs started, and its macOS job is still queued. Only the
+        # in_progress listing finds it.
+        path = f"repos/{PULP}/actions/runs/38432684644/jobs?filter=latest&per_page=100"
+        answer = copy.deepcopy(load("pulp-jobs-38432684644.json"))
+        macos = [job for job in answer["jobs"] if job["id"] == 115418896156]
+        self.assertEqual(macos[0]["labels"][:2], ["self-hosted", "macOS"])
+        macos[0]["status"] = "queued"
+        fetch = Recorder({path: answer})
+        jobs, errors = demand.queued_jobs(fetch, pulp_registrations(), NOW)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(job["id"] for job in jobs), sorted([QUEUED_MACOS, 115418896156]))
+        self.assertTrue(any("status=in_progress" in p for p in fetch.paths))
+
     def test_the_zombie_run_is_never_read(self) -> None:
         fetch = Recorder()
         demand.queued_jobs(fetch, pulp_registrations(), NOW)

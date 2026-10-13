@@ -420,6 +420,19 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("host_queued_no_job_start:m5", out["episodes"])
         self.assertNotIn(("close", "101"), self.gh.calls)
 
+    def test_a_peer_start_never_fixes_this_hosts_episode(self) -> None:
+        # The queue drained because studio took the job; m5 has still not
+        # started anything since detection, so its episode stays open.
+        self.tick([], [gate_job(BASE - 3600)], BASE)
+        peer = [row(BASE + 120, "job_assigned", runner="studio-pulp-gate-01")]
+        out = self.tick(peer, [], BASE + 180)
+        self.assertEqual(out["fixed"], [])
+        self.assertIn("host_queued_no_job_start:m5", out["episodes"])
+        self.assertNotIn(("close", "101"), self.gh.calls)
+        # Control: the same start on m5 itself fixes it.
+        own = [row(BASE + 240, "job_assigned", runner="m5-pulp-gate-01")]
+        self.assertEqual(self.tick(peer + own, [], BASE + 300)["fixed"][0]["fixed_at"], iso(BASE + 240))
+
     def test_the_fix_is_patched_into_the_marker_before_close(self) -> None:
         jobs = [gate_job(BASE - 3600)]
         self.tick([], jobs, BASE)
