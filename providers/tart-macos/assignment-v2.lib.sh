@@ -132,9 +132,39 @@ tartci_assignment_v2_tier_labels(){
 # the true magnitude instead; only reporting needs it, and it costs a full scan.
 tartci_assignment_v2_tier_demand(){
   local tier_label="$1" exhaustive="${2:-0}" min_age="${3:-$MIN_QUEUED_AGE}"
-  local workflow tier_args=() selected_labels
+  local workflow tier_args=() selected_labels group_id access_error access_rc
   local error_file detail rc count_args=() evidence
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
+  # A queued job is not demand for this lane when GitHub's runner group cannot
+  # serve the repository. Keep that explicit denial out of the demand count so
+  # an unselectable public-repository lane does not boot/discard VMs forever.
+  # Operational uncertainty still fails closed and keeps the lane from minting.
+  group_id="${TARTCI_RUNNER_GROUP_ID:-${RUNNER_GROUP_ID:-}}"
+  if [ -n "$group_id" ] && [ -f "$TARTCI_ROOT/scripts/runner_group_repository_access.py" ]; then
+    access_error="$(mktemp "$STATE_DIR/$RUNNER_NAME.runner-group.XXXXXX")" || return 1
+    if SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+        --repo "$REPO" --runner-group-id "$group_id" --gh-cli "${JIT_GH_CLI:-$GH_CLI}" \
+        >/dev/null 2>"$access_error"; then
+      access_rc=0
+    else
+      access_rc=$?
+    fi
+    if [ "$access_rc" -eq 3 ]; then
+      event assignment_group_unservable \
+        "tier=$tier_label repo=$REPO group=$group_id reason=$(head -c 240 "$access_error" | tr '\n\t' '  ')"
+      rm -f "$access_error"
+      printf '0\n'
+      return 0
+    fi
+    if [ "$access_rc" -ne 0 ]; then
+      event assignment_group_access_error \
+        "tier=$tier_label repo=$REPO group=$group_id rc=$access_rc"
+      rm -f "$access_error"
+      return 1
+    fi
+    rm -f "$access_error"
+  fi
   # bash 3.2 (the macOS system shell) treats an empty "${a[@]}" as an unbound
   # variable under `set -u`, so the expansion must be guarded, not just quoted.
   [ "$exhaustive" = 1 ] && count_args=(--exhaustive-count)
@@ -149,6 +179,7 @@ tartci_assignment_v2_tier_demand(){
     "${tier_args[@]}" \
     --labels "$selected_labels" \
     --require-label "$tier_label" \
+    --require-head-repo "$REPO" \
     --min-age-seconds "$min_age" \
     ${count_args[@]+"${count_args[@]}"} \
     --gh-cli "$GH_CLI" \

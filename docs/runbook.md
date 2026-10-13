@@ -2085,6 +2085,9 @@ fleet`), and check GitHub's job history against it with
   min) **and whose check runs are all green**; a red commit is skipped for an
   older green one, and with none green nothing happens (`unverified`). An
   explicit `--target` must be on main's first-parent chain and meet both.
+- Recovery from an off-history receipt may move a host to an older soaked,
+  green commit when that is the explicit target; skew remains unknown until a
+  verified apply records a generation in the tartci history.
 - **Prepare** (changes nothing on the host): `support-manifest write`,
   `fleet-macos validate`, install dry-run; on a sealed host the signing
   identity is **extracted** from the live bundle's leaf certificate and proven

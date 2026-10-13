@@ -58,6 +58,8 @@
 #                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
 #                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
 #   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
+#   tartci disk <watch|status> [--json]  # write-latency watchdog for the cache/VM volumes
+#                              # (one pass; the disk-watchdog LaunchAgent runs it every 60 s)
 #   tartci hooks print         # print (never write) Claude/Codex hook settings
 #   tartci help
 #
@@ -426,6 +428,12 @@ cmd_runtime() {
 
 cmd_reclaim() {
   tartci_toml_exec_or_python3 "$HERE/scripts/disk_reclaim.py" "$@"
+}
+
+# A create+fsync+unlink probe of each cache/VM volume, with evidence and an
+# issue when a write stalls. Runs without tomllib: the agent renders its paths.
+cmd_disk() {
+  tartci_toml_exec_or_python3 "$HERE/scripts/disk_watchdog.py" "$@"
 }
 
 # The host artifact cache macOS guests mount read-only; see scripts/artifact-cache.sh.
@@ -1338,15 +1346,22 @@ if fleet["managed"]:
     if blocked is None:
         print("serving: unknown (not checked from here)")
     elif blocked:
+        dhcp = [lane for lane in lanes if lane.get("cause") == "dhcp_breaker"]
+        admission = [lane for lane in lanes if lane.get("cause") == "admission failing"]
         disk = [lane for lane in lanes if lane.get("cause") == "disk"]
-        if disk:
+        if dhcp:
+            print(f"serving: NOT SERVING (DHCP breaker open; {len(dhcp)} lane(s))")
+        elif admission:
+            print(f"serving: NOT SERVING (admission failing; {len(admission)} lane(s))")
+        elif disk:
             reasons = ",".join(sorted({str(lane.get("reason") or "denied") for lane in disk}))
             print(f"serving: BLOCKED (disk: {reasons}; {len(disk)} lane(s) refused a VM lease)")
         else:
             print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
         for lane in lanes:
             streak = lane.get("streak")
-            extra = f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk" else ""
+            extra = (f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk"
+                     else f" cause={lane.get('cause')}" if lane.get("cause") else "")
             print(
                 f"  lane {lane['label']}: blocked_seconds={lane['blocked_seconds']} "
                 f"streak={'unknown' if streak is None else streak} "
@@ -1449,6 +1464,7 @@ usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  disk)    shift; cmd_disk "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
   retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;

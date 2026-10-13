@@ -641,6 +641,8 @@ class ProviderWiringTests(unittest.TestCase):
         def streak(contended: str) -> str:
             script = (
                 "set -euo pipefail\n"
+                "tartci_boundary_proof_abandon(){ :; }\n"
+                "tartci_job_claim_release(){ :; }\n"
                 'SERVING_BLOCKED_SINCE="x"\nSERVING_BLOCKED_STREAK=3\n'
                 'SERVING_BLOCKED_LAST_PHASE="p"\nLAST_HEARTBEAT_PHASE=q\n'
                 f"CURRENT_SERVED=0\nJOB_CLAIM_CONTENDED={contended}\nrun_rc=75\n"

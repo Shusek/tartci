@@ -285,10 +285,13 @@ class AssignmentScanner:
             label.strip().lower() for label in args.labels.split(",") if label.strip()
         }
         self.required_label = args.require_label.strip().lower()
+        self.require_head_repo = str(getattr(args, "require_head_repo", "") or "").strip().lower()
         if not self.workflows:
             raise ScanError("at least one workflow is required")
         if not self.required_label:
             raise ScanError("the required assignment-class label is empty")
+        if self.require_head_repo and "/" not in self.require_head_repo:
+            raise ScanError("--require-head-repo must be OWNER/REPO")
         if self.required_label not in self.runner_labels:
             raise ScanError("required assignment-class label is absent from runner labels")
         # Provisional only: --scan-timeout budgets the SCAN, and the scan has
@@ -720,6 +723,16 @@ class AssignmentScanner:
         matches: set[int] = set()
         queued_jobs = 0
         run_id = int(run["id"])
+        if self.require_head_repo:
+            head = run.get("head_repository")
+            head_name = head.get("full_name") if isinstance(head, dict) else None
+            # A fork run must never be admitted to a self-hosted lane. GitHub
+            # returns null when the fork was deleted; that run is not demand
+            # for this first-party lane and must not blind the whole scan.
+            if not isinstance(head_name, str) or not head_name.strip():
+                return 0
+            if head_name.strip().lower() != self.require_head_repo:
+                return 0
         # A run already proved stale is not fetched again. That fetch is not
         # free: a permanently queued run is re-read by every lane on every
         # pass, and that added call is what pushes an otherwise healthy scan
@@ -858,6 +871,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workflow", required=True, action="append")
     parser.add_argument("--labels", required=True)
     parser.add_argument("--require-label", required=True)
+    parser.add_argument(
+        "--require-head-repo",
+        default=os.environ.get("TARTCI_ASSIGNMENT_REQUIRE_HEAD_REPO", ""),
+        help="count only runs whose head_repository.full_name is this exact OWNER/REPO",
+    )
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument(
         "--exhaustive-count",

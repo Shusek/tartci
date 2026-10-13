@@ -138,6 +138,63 @@ class Trigger(Case):
         self.assertEqual(self.state()["state"], "closed")
 
 
+class PreCloneCancellation(Case):
+    def test_verifying_check_never_reports_an_open_breaker(self):
+        vb.verify("post_update", now=T0)
+        result = self.check(T0 + 1, lane="probe-lane")
+        self.assertFalse(result["breaker_open"])
+
+    def test_admission_error_after_granted_probe_is_not_unreported(self):
+        # Today's outage sequence: verification starts, a probe is granted,
+        # admission fails before clone, and no VM ever reaches DHCP reporting.
+        vb.verify("post_update", now=T0)
+        self.assertEqual(self.check(T0 + 1, lane="probe-lane")["action"], "probe")
+        cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="admission_error"),
+                               now=T0 + 2)
+        self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
+        state = self.state()
+        self.assertEqual(state["state"], "verifying")
+        self.assertIsNone(state.get("probe_lane"))
+        self.assertIsNone(state.get("consecutive_unreported"))
+        self.assertNotEqual(state.get("cause"), "probe_unreported")
+        # A later lane can take the still-required verification probe; the
+        # cancelled turn did not open the breaker or consume a VM.
+        self.assertEqual(self.check(T0 + 3, lane="next-lane")["action"], "probe")
+        self.assertEqual(self.state()["state"], "verifying")
+
+    def test_open_cancel_preserves_unreported_streak_and_probe_history(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.assertEqual(self.check(T0 + 400, lane="probe-lane")["action"], "probe")
+        path = self.tmp / "vm-dhcp" / "breaker.json"
+        state = json.loads(path.read_text())
+        state["consecutive_unreported"] = 1
+        path.write_text(json.dumps(state))
+        previous_probes = state["probe_prev_probes"]
+        previous_last = state["probe_prev_last_probe_at"]
+        cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="disk_full"),
+                              now=T0 + 401)
+        self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
+        after = self.state()
+        self.assertEqual(after["consecutive_unreported"], 1)
+        self.assertEqual(after["probes"], previous_probes)
+        self.assertEqual(after["last_probe_at"], previous_last)
+        self.assertIsNone(after.get("probe_lane"))
+
+    def test_open_cancel_rolls_back_probe_counters(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.assertEqual(self.check(T0 + 400, lane="probe-lane")["action"], "probe")
+        before = self.state()
+        self.assertEqual(before["probes"], 1)
+        cancelled = vb.cancel(argparse.Namespace(lane="probe-lane", reason="disk_full"),
+                              now=T0 + 401)
+        self.assertEqual(self.names(cancelled), ["vm_dhcp_probe_cancelled"])
+        after = self.state()
+        self.assertEqual(after["probes"], 0)
+        self.assertEqual(after["last_probe_at"], before["opened_at"])
+        self.assertIsNone(after.get("probe_lane"))
+
 class Open(Case):
     def open(self) -> None:
         self.record("no_ip", T0)
@@ -145,7 +202,8 @@ class Open(Case):
 
     def test_lanes_back_off_until_the_probe_cadence(self):
         self.open()
-        self.assertEqual(self.check(T0 + 61), {"action": "backoff", "events": []})
+        self.assertEqual(self.check(T0 + 61),
+                         {"action": "backoff", "breaker_open": True, "events": []})
         result = self.check(T0 + 60 + 300)
         self.assertEqual(result["action"], "probe")
         self.assertIn("trigger=cadence", result["events"][0][1])
@@ -153,7 +211,8 @@ class Open(Case):
     def test_one_probe_per_cadence_across_lanes(self):
         self.open()
         self.assertEqual(self.check(T0 + 400, lane="a")["action"], "probe")
-        self.assertEqual(self.check(T0 + 401, lane="b"), {"action": "backoff", "events": []})
+        self.assertEqual(self.check(T0 + 401, lane="b"),
+                         {"action": "backoff", "breaker_open": True, "events": []})
 
     def test_two_lanes_racing_for_the_probe_get_exactly_one(self):
         self.open()
@@ -267,6 +326,26 @@ class Shell(Case):
         self.assertIn("rc=75 backoff=1", out.stdout, out.stderr)
         self.assertIn("vm_dhcp_unanswered", (self.tmp / "events").read_text())
 
+    def test_open_breaker_exports_open_flag_to_the_runner(self):
+        out = self.run_lib(
+            "tartci_vm_dhcp_record l no_ip v1; "
+            "tartci_vm_dhcp_record l no_ip v2; "
+            "rc=0; tartci_vm_dhcp_check l || rc=$?; "
+            "echo \"rc=$rc backoff=$VM_DHCP_BACKOFF open=$VM_DHCP_BREAKER_OPEN\"\n",
+            {"TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400)},
+        )
+        self.assertIn("rc=75 backoff=1 open=1", out.stdout, out.stderr)
+
+    def test_verifying_backoff_exports_closed_flag_to_the_runner(self):
+        (self.tmp / "vm-dhcp" / "breaker.json").write_text(json.dumps(
+            {"state": "verifying", "probe_lane": "other-lane",
+             "probe_started_at": T0, "boot_time": T0 - 86400, "streak": []}))
+        out = self.run_lib(
+            "rc=0; tartci_vm_dhcp_check l || rc=$?; "
+            "echo \"rc=$rc backoff=$VM_DHCP_BACKOFF open=$VM_DHCP_BREAKER_OPEN\"\n",
+            {"TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400)})
+        self.assertIn("rc=75 backoff=1 open=0", out.stdout, out.stderr)
+
     def test_knob_off_reads_and_writes_nothing(self):
         before = (self.tmp / "vm-dhcp" / "breaker.json").read_text()
         out = self.run_lib("tartci_vm_dhcp_record l no_ip v1; tartci_vm_dhcp_record l no_ip v2\n"
@@ -300,6 +379,95 @@ class Shell(Case):
 
 
 class Wiring(unittest.TestCase):
+    def test_once_releases_a_probe_after_a_pre_clone_return(self):
+        body = RUNNER.read_text()
+        call = '  run_one 1 "$selected_labels" "$selected_tier" || run_rc=$?'
+        self.assertIn(call, body)
+        after = body[body.index(call) + len(call):]
+        cancel = after.index('tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone')
+        self.assertIn('[ "${VM_DHCP_PROBE:-0}" = 1 ]', after[:cancel])
+        self.assertIn('[ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]', after[:cancel])
+        broken = body.replace(
+            '  if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then\n'
+            '    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone\n'
+            '  fi\n', '', 1)
+        with self.assertRaises(AssertionError):
+            self.assertIn('once_pre_clone', broken)
+
+    def test_pre_clone_paths_keep_probe_cancellation_coverage(self):
+        body = RUNNER.read_text()
+        for reason in ('job_claim_covered', 'admission_precheck', 'warm_lease_denied',
+                       'demand_gone', 'lease_denied', 'pre_clone_error'):
+            self.assertIn(f'tartci_vm_dhcp_cancel "${{TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}}" {reason}', body)
+
+    def test_shipped_loop_cancel_clears_a_real_probe_and_noop_lib_fails(self):
+        import re
+        source = RUNNER.read_text()
+        match = re.search(
+            r'      if \[ "\$\{VM_DHCP_PROBE:-0\}" = 1 \].*?\n      fi\n',
+            source, re.DOTALL)
+        self.assertIsNotNone(match)
+        loop_cancel = match.group(0)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            real_lib = root / "vm-dhcp.lib.sh"
+            real_lib.write_text(LIB.read_text())
+            noop_lib = root / "vm-dhcp-noop.lib.sh"
+            noop_lib.write_text(re.sub(
+                r'tartci_vm_dhcp_cancel\(\)\{.*?\n\}',
+                'tartci_vm_dhcp_cancel(){ return 0; }',
+                LIB.read_text(), flags=re.DOTALL))
+            env = {**os.environ, "TARTCI_VM_DHCP_DIR": str(root / "breaker"),
+                   "TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400),
+                   "TARTCI_VM_DHCP_BREAKER": "1", "TARTCI_ROOT": str(ROOT)}
+            Path(env["TARTCI_VM_DHCP_DIR"]).mkdir()
+            (Path(env["TARTCI_VM_DHCP_DIR"]) / "breaker.json").write_text(json.dumps(
+                {"state": "verifying", "probe_lane": "lane-a", "probe_started_at": T0,
+                 "boot_time": T0 - 86400, "streak": []}))
+            driver = ("set -euo pipefail\n"
+                      "event(){ :; }\n"
+                      "TARTCI_QUEUE_LANE_ID=lane-a\n"
+                      f"source {real_lib!s}\nVM_DHCP_PROBE=1\nVM_DHCP_PROBE_REPORTED=0\n{loop_cancel}"
+                      f"python3 {BREAKER!s} status --json\n")
+            real = subprocess.run(["bash", "-c", driver], env=env,
+                                  capture_output=True, text=True, check=True)
+            self.assertIsNone(json.loads(real.stdout)["probe_lane"])
+            (Path(env["TARTCI_VM_DHCP_DIR"]) / "breaker.json").write_text(json.dumps(
+                {"state": "verifying", "probe_lane": "lane-a", "probe_started_at": T0,
+                 "boot_time": T0 - 86400, "streak": []}))
+            noop_driver = driver.replace(str(real_lib), str(noop_lib))
+            noop = subprocess.run(["bash", "-c", noop_driver], env=env,
+                                   capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(noop.stdout)["probe_lane"], "lane-a",
+                             "a no-op cancel must fail the shipped-loop test")
+    def test_loop_releases_a_probe_after_any_unreported_run_one(self):
+        body = RUNNER.read_text()
+        call = 'run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?'
+        self.assertIn(call, body)
+        after = body[body.index(call) + len(call):]
+        cancel = after.index('tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone')
+        accounting = after.index('if [ "$CURRENT_SERVED" = 1 ]')
+        self.assertGreater(cancel, accounting)
+        self.assertIn('[ "${VM_DHCP_PROBE:-0}" = 1 ]', after[accounting:cancel])
+        self.assertIn('[ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]', after[accounting:cancel])
+
+        # The guard is behavioral: remove the loop-level cancel and the
+        # structural assertion must fail, so wiring cannot silently regress.
+        broken = body.replace(
+            '      if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then\n'
+            '        tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone\n'
+            '      fi\n', '', 1)
+        with self.assertRaises(AssertionError):
+            self.assertIn('loop_pre_clone', broken)
+
+    def test_each_boot_outcome_marks_probe_reported(self):
+        body = RUNNER.read_text()
+        for outcome in ('no_ip', 'ip'):
+            at = body.index(
+                f'tartci_vm_dhcp_record "${{TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}}" '
+                f'{outcome} "$vm"'
+            )
+            self.assertIn('VM_DHCP_PROBE_REPORTED=1', body[at:at + 120])
     def test_the_breaker_is_checked_before_the_job_claim(self):
         body = RUNNER.read_text()
         run_one = body[body.index("run_one(){"):]

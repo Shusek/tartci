@@ -28,6 +28,7 @@ HOST_CONFIGS = {
     "m1": ROOT / "profiles" / "m1-macos-fleet.toml",
     "studio": ROOT / "profiles" / "m3-macos-fleet.toml",
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
+    "m5studio": ROOT / "profiles" / "m5studio-macos-fleet.toml",
 }
 # The Pulp gate classes each host's pulp-gate serves.
 GATE_CLASSES = {}
@@ -700,6 +701,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             "m1": ("/Users/danielraffel/VMs", "vellum-host-m1", False),
             "studio": ("/Volumes/Workshop/VMs", "vellum-host-m3", False),
             "m5": ("/Users/danielraffel/VMs", "vellum-host-m5", False),
+            "m5studio": ("/Volumes/Atelier/VMs", "vellum-host-m5studio", False),
         }
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
@@ -762,7 +764,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertNotIn("priority", pulp_lane)
                 self.assertEqual(
                     pulp_lane.get("vm_cores"),
-                    7 if host_id == "studio" else None,
+                    7 if host_id == "studio" else (8 if host_id == "m5studio" else None),
                 )
                 self.assertEqual(
                     pulp_lane["supervisors"], 2
@@ -906,7 +908,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "Generous-Corp/pulp": None,
                             "danielraffel/spectr": "vm" if host_id == "m1" else "gate",
                             "Generous-Corp/forge": "gate",
-                            "Generous-Corp/vellum": "gate",
+                            "Generous-Corp/vellum": "vm",
                         },
                     )
                     for value in values:
@@ -915,7 +917,12 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "7"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
-                            else None
+                            else (
+                                "8"
+                                if host_id == "m5studio"
+                                and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+                                else None
+                            )
                         )
                         self.assertEqual(
                             env.get("TARTCI_MACOS_VM_CORES"),
@@ -1975,7 +1982,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         """Only the trial hosts' profiles declare the retarget, and only on
         their pulp-gate slots; every other shipped host and lane is unaffected."""
         env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
-        canary = {"m1": "120", "studio": "120", "m5": "120"}
+        canary = {"m1": "120", "studio": "120", "m5": "120", "m5studio": "120"}
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(shipped=host_id):
                 rendered = fleet.rendered_plists(fleet.load(config))
@@ -2025,6 +2032,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                                           "pulp-release-tagged,pulp-release-pr-gate"),
         ".m5.pulp-gate.plist": None,
         ".m5.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
+        ".m5studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
+        ".m5studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
+                                             "pulp-release-tagged,pulp-release-pr-gate"),
     }
 
     def test_m5studio_slot2_prefers_merge_group_before_pr_head(self) -> None:
@@ -3139,6 +3149,30 @@ class ServingBlockedTests(unittest.TestCase):
         )
         self.assertEqual(value["verified_running_supervisors"], 1)
         self.assertTrue(value["fleet_ready"])
+
+    def test_repeated_admission_failure_names_cause_and_clears_fleet_ready(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(600),
+            "serving_blocked_streak": 6,
+            "serving_blocked_last_phase": "admission-precheck-error",
+            "serving_blocked_cause": "admission failing",
+        })
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertFalse(value["fleet_ready"])
+        self.assertEqual(lane["cause"], "admission failing")
+        self.assertEqual(lane["reason"], "admission failing")
+
+    def test_open_dhcp_breaker_is_immediately_not_serving(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10),
+            "serving_blocked_streak": 1,
+            "serving_blocked_last_phase": "vm-dhcp-breaker-open",
+            "serving_blocked_cause": "dhcp_breaker",
+        })
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertFalse(value["fleet_ready"])
+        self.assertEqual(lane["cause"], "dhcp_breaker")
+        self.assertEqual(lane["reason"], "DHCP breaker open")
 
     def test_a_host_set_to_sleep_is_a_host_condition_not_a_readiness_problem(self) -> None:
         # m5 (AC sleep 1) rolled back every self-update once its idle sleep
