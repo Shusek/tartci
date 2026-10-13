@@ -2272,6 +2272,138 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertIn("supervisors must be 1 or 2", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def _trusted_release(self, **overrides) -> tuple[dict, list[dict]]:
+        host = {"home": "/Users/x", "cache_root": "/Users/x/.cache/pulp-ci"}
+        lane = {
+            "id": "pulp-release", "repo": "Generous-Corp/pulp", "runner_group_id": 12,
+            "cache_root": "/Users/x/.cache/pulp-ci-trusted",
+            "tier": [{"label": "pulp-release-tagged", "runner_group_id": 12}],
+        }
+        lane.update(overrides)
+        return host, [{"id": "pulp-gate", "repo": "Generous-Corp/pulp",
+                       "runner_group_id": 1}, lane]
+
+    def test_lane_cache_root_accepts_a_trusted_runner_group(self) -> None:
+        host, lanes = self._trusted_release()
+        fleet.validate_lane_cache_roots(host, lanes)
+        twin = dict(lanes[1], id="pulp-release-2")
+        fleet.validate_lane_cache_roots(host, lanes + [twin])
+
+    def test_lane_cache_root_refuses_what_an_untrusted_job_could_write(self) -> None:
+        cases = {
+            "repository group": (
+                {"runner_group_id": 1,
+                 "tier": [{"label": "pulp-release-tagged", "runner_group_id": 1}]},
+                "repository-wide group 1"),
+            "repository scope": ({"registration_scope": "repository"},
+                                 "repository-wide group 1"),
+            "tier leaves the group": (
+                {"tier": [{"label": "pulp-release-pr-gate", "runner_group_id": 1}]},
+                "leaves runner group"),
+            "the host root": ({"cache_root": "/Users/x/.cache/pulp-ci"}, "host.cache_root"),
+            "inside the host root": (
+                {"cache_root": "/Users/x/.cache/pulp-ci/trusted"}, "host.cache_root"),
+            "containing the host root": ({"cache_root": "/Users/x/.cache"}, "host.cache_root"),
+            "relative": ({"cache_root": "cache/trusted"}, "normalized absolute"),
+            "unnormalized": ({"cache_root": "/Users/x/./trusted"}, "normalized absolute"),
+            "tart --dir separator": ({"cache_root": "/Users/x/a:b"}, "normalized absolute"),
+            "not a string": ({"cache_root": 7}, "absolute path"),
+            "outside home and /Volumes": ({"cache_root": "/opt/pulp-trusted"}, "below host.home"),
+            "shared world-writable dir": ({"cache_root": "/Users/Shared/pulp-trusted"},
+                                          "below host.home"),
+            "the home itself": ({"cache_root": "/Users/x"}, "below host.home"),
+            "a volume mount point": ({"cache_root": "/Volumes/Workshop"}, "below host.home"),
+        }
+        for name, (overrides, message) in cases.items():
+            with self.subTest(name=name):
+                host, lanes = self._trusted_release(**overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    fleet.validate_lane_cache_roots(host, lanes)
+
+    def test_lane_cache_root_on_a_volume_is_accepted(self) -> None:
+        host, lanes = self._trusted_release(cache_root="/Volumes/NoSuchVolume/ci/trusted")
+        fleet.validate_lane_cache_roots(host, lanes)
+
+    def test_lane_cache_root_through_a_symlink_is_refused(self) -> None:
+        # A lane root reached through a link would mount the link's target,
+        # e.g. the host-wide root every PR gate VM writes.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(os.path.realpath(td))
+            shared = home / ".cache" / "pulp-ci"
+            (shared / "ccache").mkdir(parents=True)
+            for link, root in (("trusted", "trusted"), ("caches", "caches/trusted")):
+                with self.subTest(link=link):
+                    (home / link).symlink_to(shared)
+                    host = {"home": str(home), "cache_root": str(shared)}
+                    _, lanes = self._trusted_release(cache_root=str(home / root))
+                    with self.assertRaisesRegex(ValueError, "is a symlink"):
+                        fleet.validate_lane_cache_roots(host, lanes)
+            real = home / "real-trusted"
+            real.mkdir()
+            _, lanes = self._trusted_release(cache_root=str(real))
+            fleet.validate_lane_cache_roots({"home": str(home), "cache_root": str(shared)}, lanes)
+
+    def test_lane_cache_root_is_owned_by_one_group(self) -> None:
+        host, lanes = self._trusted_release()
+        other_group = dict(lanes[1], id="other", runner_group_id=13,
+                           tier=[{"label": "x", "runner_group_id": 13}])
+        with self.assertRaisesRegex(ValueError, "another repository or runner group"):
+            fleet.validate_lane_cache_roots(host, lanes + [other_group])
+        nested = dict(lanes[1], id="nested", cache_root="/Users/x/.cache/pulp-ci-trusted/n")
+        with self.assertRaisesRegex(ValueError, "nest"):
+            fleet.validate_lane_cache_roots(host, lanes + [nested])
+
+    def test_lane_cache_root_renders_only_into_its_own_lane(self) -> None:
+        data = fleet.load(HOST_CONFIGS["m5"])
+        release = next(lane for lane in data["lane"] if lane["id"] == "pulp-release")
+        trusted = data["host"]["home"] + "/.cache/pulp-ci-trusted"
+        release["cache_root"] = trusted
+        envs = {
+            name: plistlib.loads(body)["EnvironmentVariables"]
+            for name, body in fleet.rendered_plists(data).items()
+        }
+        release_env = envs[
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"]
+        self.assertEqual(release_env["TARTCI_CI_CACHE"], trusted)
+        self.assertEqual(release_env["TARTCI_HOST_CI_CACHE"], data["host"]["cache_root"])
+        others = {name: env for name, env in envs.items()
+                  if ".pulp-release." not in name and not name.endswith(".pulp-release.plist")}
+        self.assertEqual({env["TARTCI_CI_CACHE"] for env in others.values()},
+                         {data["host"]["cache_root"]})
+        self.assertFalse(any("TARTCI_HOST_CI_CACHE" in env for env in others.values()))
+
+    def test_every_writable_vm_mount_lives_under_the_lane_cache_root(self) -> None:
+        # A lane cache_root isolates only what runner.sh mounts from
+        # $CACHE_ROOT. ccache AND configure-checks are both writable, and the
+        # configure-check cache holds CMake that Pulp include()s, so neither
+        # may come from anywhere else. Read-only mounts may.
+        body = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text(encoding="utf-8")
+        mounts = re.findall(r'--dir="([^"]+)"', body)
+        self.assertIn("ccache:$CACHE_ROOT/ccache", mounts)
+        self.assertIn("configure-checks:$CACHE_ROOT/configure-checks", mounts)
+        writable = [m for m in mounts if not m.endswith(":ro") and m != "$CHROME_MOUNT_ARG"]
+        self.assertEqual(
+            [m for m in writable if not m.split(":", 1)[1].startswith("$CACHE_ROOT/")], [],
+            "a writable VM mount outside $CACHE_ROOT escapes a lane-owned cache_root")
+        chrome = (ROOT / "providers" / "tart-macos" / "chrome-mount.lib.sh").read_text(encoding="utf-8")
+        self.assertIn('CHROME_MOUNT_ARG="google-chrome:$CHROME_APP_DIR:ro"', chrome)
+
+    def test_shipped_release_lane_cannot_take_a_cache_root_in_group_1(self) -> None:
+        body = HOST_CONFIGS["m5"].read_text()
+        home = tomllib.loads(body)["host"]["home"]
+        anchor = 'id = "pulp-release"\n'
+        self.assertIn(anchor, body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(body.replace(
+                anchor, anchor + f'cache_root = "{home}/.cache/pulp-ci-trusted"\n', 1))
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("repository-wide group 1", result.stderr)
+
     def test_chrome_mount_is_forge_only_and_path_normalized(self) -> None:
         base = CONFIG.read_text()
         fixtures = {
