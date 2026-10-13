@@ -1068,7 +1068,7 @@ class UpdateQueueTests(Base):
     def test_the_earliest_ticket_goes_whatever_its_survey_delay(self) -> None:
         # 2026-10-02: m3 held the earliest ticket, surveyed after a 10 min
         # checkout, and yielded to m5 while m5 yielded back. No host updated.
-        mine, theirs = NOW - 12000, NOW - 12000 + 420
+        mine, theirs = NOW - 1800, NOW - 1800 + 420
         self.ticket(since=mine)
         self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": theirs, "ts": NOW - 60}
         self.slow_checkout(3600)
@@ -1079,8 +1079,8 @@ class UpdateQueueTests(Base):
 
     def test_a_slow_checkout_still_yields_to_an_earlier_ticket(self) -> None:
         # Control, same instrument: m5 now joined the queue 7 min BEFORE this host.
-        self.ticket(since=NOW - 12000)
-        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 12000 - 420,
+        self.ticket(since=NOW - 1800)
+        self.sys.peer_waiting["m5"] = {"host_id": "m5", "since": NOW - 1800 - 420,
                                        "ts": NOW - 60}
         self.slow_checkout(600)
         self.assertDeferred(self.apply())
@@ -1108,13 +1108,14 @@ class UpdateQueueTests(Base):
         self.assertUpdated(self.apply())
 
     def test_the_place_in_the_queue_survives_a_new_target(self) -> None:
-        self.ticket(since=NOW - 2 * 3600, target="c" * 40)
+        self.ticket(since=NOW - 1800, target="c" * 40)
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
-        self.assertEqual(su.waiting_ticket(self.cfg)["since"], NOW - 2 * 3600)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], NOW - 1800)
 
     def test_deferral_past_the_bound_is_starvation_and_loud_once(self) -> None:
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {"observed_at": su._iso(NOW), "host_id": "m1", "labels": ["pulp-build-pr-head"], "jobs": [{"host": "m1", "queued": True, "labels": ["pulp-build-pr-head"]}]})
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -1126,6 +1127,7 @@ class UpdateQueueTests(Base):
     def test_starvation_opens_one_issue_and_the_next_turn_closes_it(self) -> None:
         # 2026-10-01: three hosts starved for 7-9 h and wrote events nobody read.
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {"observed_at": su._iso(NOW), "host_id": "m1", "labels": ["pulp-build-pr-head"], "jobs": [{"queued": True, "labels": ["pulp-build-pr-head"]}]})
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -1136,9 +1138,19 @@ class UpdateQueueTests(Base):
         self.assertUpdated(self.apply())
         self.assertEqual(self.issues[-1], ("close", "77"))
 
+    def test_starvation_alert_trips_after_one_hour_through_apply(self) -> None:
+        # Real apply entry point: the audit bound is about one hour, not six.
+        self.ticket(since=NOW - 3600 - 60)
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {"observed_at": su._iso(NOW), "host_id": "m1", "labels": ["pulp-build-pr-head"], "jobs": [{"host": "m1", "queued": True, "labels": ["pulp-build-pr-head"]}]})
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("self_update_starved", events)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+
     def test_a_short_deferral_is_quiet(self) -> None:
-        # Control for the bound: the same deferral an hour in is not a problem.
-        self.ticket(since=NOW - 3600)
+        # Control for the bound: a deferral just under one hour is not a problem.
+        self.ticket(since=NOW - 3599)
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
         self.assertFalse((self.cfg.state_dir / "events.jsonl").exists()

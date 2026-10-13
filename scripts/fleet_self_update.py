@@ -109,8 +109,11 @@ ANNOUNCE_TIE_SECONDS = 10
 # A waiting ticket not refreshed within this long belongs to a host that has
 # stopped trying (halted, off the network, profile removed) and is ignored.
 WAITING_TICKET_TTL = 2 * 3600
-# Deferred this long without a turn is starvation: loud, and exit 3.
-STARVED_AFTER_SECONDS = 6 * 3600
+# Deferred for about one hour without a turn is starvation: loud, and exit 3.
+# Keep this short enough to catch a fleet-wide update deadlock before it grows
+# into a multi-hour merge gap.
+STARVED_AFTER_SECONDS = 3600
+STARVED_FALLBACK_SECONDS = 6 * 3600
 # The self-update agent's launchd StartInterval: one survey of every peer per
 # attempt (launchd/com.danielraffel.tartci.self-update.plist.template).
 SELF_UPDATE_INTERVAL_SECONDS = 1800
@@ -168,7 +171,7 @@ EXIT_REFUSED = 3       # a precondition refused; the host was not touched
 # A peer was busy or had waited longer, so this host deferred its turn. That is
 # the protocol working, so it exits 0 and launchd's last exit stays clean;
 # waiting.json and `pool status` carry it, and it becomes EXIT_REFUSED plus a
-# self_update_starved event once it has lasted STARVED_AFTER_SECONDS.
+# self_update_starved event once it has lasted STARVED_AFTER_SECONDS (about one hour).
 EXIT_DEFERRED = 0
 # tartci pool off exits these when a precondition refuses before it stops
 # anything: 11 the capacity floor (including an unreadable census), 12 a lane
@@ -1136,11 +1139,84 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
         ticket["issue_error"] = text[:300]
 
 
+GATE_DEMAND_FRESH_SECONDS = 10 * 60
+
+def _epoch(value: object) -> float | None:
+    if isinstance(value, (int, float)): return float(value)
+    if not value: return None
+    try: return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError: return None
+
+def _host_gate_labels(cfg: Config, me: str) -> tuple[set[str], set[str]]:
+    """Return this host's published runner labels and workflow names."""
+    path = cfg.checkout / "fleet/advertised-labels.json"
+    value = _read_json(path) or {}
+    labels: set[str] = set(); workflows: set[str] = set()
+    for reg in value.get("registrations", []) if isinstance(value, dict) else []:
+        if isinstance(reg, dict) and str(reg.get("host_id")) == me:
+            labels.update(str(x).lower() for x in (reg.get("labels") or []))
+            workflows.update(str(x).lower() for x in (reg.get("workflows") or []))
+    return labels, workflows
+
+def _gate_demand_jobs(value: object, me: str, now: float, labels: set[str], workflows: set[str]) -> list[dict]:
+    if not isinstance(value, dict): return []
+    observed = _epoch(value.get("observed_at"))
+    if observed is None or now - observed < 0 or now - observed > GATE_DEMAND_FRESH_SECONDS:
+        return []
+    jobs = value.get("jobs", [])
+    if not isinstance(jobs, list): return []
+    out=[]
+    for job in jobs:
+        if not isinstance(job, dict) or job.get("queued", True) is False: continue
+        jlabels={str(x).lower() for x in (job.get("labels") or job.get("runner_labels") or [])}
+        name=str(job.get("name") or job.get("workflow_name") or "").lower()
+        if (jlabels and labels.intersection(jlabels)) or (not jlabels and name and name in workflows):
+            out.append(job)
+    return out
+
+def refresh_gate_demand(cfg: Config, me: str, now: float | None = None) -> bool:
+    """Write a fresh host-scoped queue snapshot from the authenticated API."""
+    now = time.time() if now is None else now
+    labels, workflows = _host_gate_labels(cfg, me)
+    if not labels and not workflows: return False
+    cli = os.environ.get("TARTCI_GH_CLI") or "ghapp"
+    repos = [x for x in os.environ.get("TARTCI_SERVED_REPOS", "Generous-Corp/pulp").split(",") if x]
+    jobs=[]
+    for repo in repos:
+        try:
+            result = subprocess.run([cli, "api", f"repos/{repo}/actions/runs?status=queued&per_page=100"],
+                                    capture_output=True, text=True, timeout=30, check=False)
+            payload=json.loads(result.stdout) if result.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            continue
+        for run in payload.get("workflow_runs", []) if isinstance(payload, dict) else []:
+            if not isinstance(run, dict): continue
+            jobs.append({"id": run.get("id"), "queued": True,
+                         "name": run.get("name") or run.get("display_title"),
+                         "labels": run.get("labels") or [],
+                         "created_at": run.get("created_at"), "repo": repo})
+    path = Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(cfg.state_dir / "gate-queue.json"))
+    _write_json(path, {"observed_at": _iso(now), "host_id": me, "labels": sorted(labels), "jobs": jobs})
+    return bool(_gate_demand_jobs({"observed_at": _iso(now), "jobs": jobs}, me, now, labels, workflows))
+
+def gate_demand_waiting(cfg: Config, me: str = "", now: float | None = None) -> bool:
+    """Return fresh queued demand matching this host's published labels."""
+    now = time.time() if now is None else now
+    path = Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(cfg.state_dir / "gate-queue.json"))
+    value = _read_json(path)
+    labels, workflows = _host_gate_labels(cfg, me)
+    if isinstance(value, dict) and (not labels and (not value.get("host_id") or value.get("host_id") == me)):
+        labels.update(str(x).lower() for x in (value.get("labels") or []))
+    return bool(_gate_demand_jobs(value, me, now, labels, workflows))
+
+
 def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
-    """Record the deferral; EXIT_DEFERRED until it has lasted STARVED_AFTER_SECONDS."""
+    """Record the deferral; become loud after the one-hour starvation bound."""
     ticket = note_waiting(cfg, me, target, reason, now)
     waited = max(0.0, now - float(ticket["since"]))
-    if waited < STARVED_AFTER_SECONDS:
+    refresh_gate_demand(cfg, me, now)
+    bound = STARVED_AFTER_SECONDS if gate_demand_waiting(cfg, me, now) else STARVED_FALLBACK_SECONDS
+    if waited < bound:
         print(f"self-update: DEFERRED ({waited / 3600:.1f} h in the update queue): {reason}")
         return EXIT_DEFERRED
     print(f"self-update: STARVED: no update turn for {waited / 3600:.1f} h "
@@ -2848,7 +2924,10 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
     waited = max(0.0, now - float(ticket["since"]))
     # The run that crossed the bound records it, so a reader whose clock is
     # behind the run's still says STARVED.
-    starved = waited >= STARVED_AFTER_SECONDS or bool(ticket.get("starved_evented"))
+    cfg = Config(home=state_dir.parent.parent)
+    has_demand = gate_demand_waiting(cfg, str(ticket.get("host_id") or ""), now)
+    bound = STARVED_AFTER_SECONDS if has_demand else STARVED_FALLBACK_SECONDS
+    starved = waited >= bound or bool(ticket.get("starved_evented"))
     word = "STARVED" if starved else "deferred"
     return (f"self-update: {word}, {waited / 3600:.1f} h in the update queue (since "
             f"{_iso(float(ticket['since']))}): {ticket.get('reason')}")
