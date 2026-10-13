@@ -36,6 +36,7 @@ HELPERS = (
     "http_connect_ssh_relay.py",
     "reuse_canary.py",
     "pool_usage.py",
+    "scan_blind_status.py",
 )
 
 
