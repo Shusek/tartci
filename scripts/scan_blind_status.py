@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 import json
+import plistlib
 import sys
 from pathlib import Path
 
 PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
+
+
+def lane_log_name(plist: Path) -> str | None:
+    """The log a receipted launch agent writes, as its plist declares it.
+
+    The plist's StandardOutPath is the source of truth: the plist name and
+    the log name spell multi-part lanes differently (<host>.pulp-gate.slot2
+    writes macos-fleet-pulp-gate-slot2.log).
+    """
+    try:
+        with plist.open("rb") as handle:
+            declared = plistlib.load(handle).get("StandardOutPath")
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    return Path(declared).name if isinstance(declared, str) and declared else None
 
 
 def active_log_names(receipt: dict) -> set[str]:
@@ -17,12 +33,21 @@ def active_log_names(receipt: dict) -> set[str]:
         value = receipt.get(key)
         if isinstance(value, dict):
             rows.extend(value)
+    agents_dir = receipt.get("agents_dir")
     for raw in rows:
-        stem = Path(str(raw)).name.removesuffix(".plist")
+        name = Path(str(raw)).name
+        if isinstance(agents_dir, str) and agents_dir:
+            declared = lane_log_name(Path(agents_dir) / name)
+            if declared:
+                names.add(declared)
+                continue
+        stem = name.removesuffix(".plist")
         if stem.startswith(PREFIX):
-            suffix = stem[len(PREFIX):]
-            suffix = suffix.split(".", 1)[1] if "." in suffix else suffix
-            names.add(f"macos-fleet-{suffix}.log")
+            # <host>.<lane>[.<slot>]: the lane identity joins the parts
+            # after the host with `-`, as macos_fleet_lanes.py names logs.
+            parts = stem[len(PREFIX):].split(".")
+            lane = "-".join(parts[1:]) if len(parts) > 1 else parts[0]
+            names.add(f"macos-fleet-{lane}.log")
         elif stem:
             # Test and legacy receipts may carry the already-short lane name.
             names.add(f"macos-fleet-{stem}.log")

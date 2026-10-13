@@ -529,13 +529,19 @@ class QueueScanner:
                 except FileExistsError:
                     fd = -1
                 if fd >= 0:
+                    # The owner's pid lets a waiter tell a fetch in flight
+                    # from one whose owner was killed.
+                    os.write(fd, str(os.getpid()).encode())
                     os.close(fd)
                     break
                 try:
                     stale = time.time() - self.discovery_fetch_path.stat().st_mtime
                 except OSError:
                     stale = 0
-                if stale > self.args.observation_lock_timeout:
+                if (
+                    stale > self.args.observation_lock_timeout
+                    or self._fetch_owner_gone()
+                ):
                     try:
                         self.discovery_fetch_path.unlink()
                     except FileNotFoundError:
@@ -575,6 +581,24 @@ class QueueScanner:
                 self.discovery_fetch_path.unlink()
             except FileNotFoundError:
                 pass
+
+    def _fetch_owner_gone(self) -> bool:
+        """Whether the single-flight marker names a process that no longer
+        exists. A marker with no readable pid (an older writer, or one killed
+        between creating and writing it) is judged by age alone."""
+        try:
+            pid = int(self.discovery_fetch_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return False
+        if pid <= 0 or pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
 
     def _scan_locked(self) -> int:
         runs = self._discover()

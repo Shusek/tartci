@@ -865,6 +865,59 @@ print(json.dumps(payload))
             "a slow GitHub fetch must not serialize unrelated host lanes",
         )
 
+    def test_a_killed_discovery_owner_does_not_block_its_namespace(self) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                self._base_api([eligible], eligible["id"]),
+                observation_lock_timeout=10.0,
+            )
+            # A fresh marker left by an owner that was SIGKILLed mid-fetch.
+            scanner.discovery_fetch_path.parent.mkdir(parents=True, exist_ok=True)
+            scanner.discovery_fetch_path.write_text(str(dead.pid), encoding="utf-8")
+            started = time.monotonic()
+            self.assertEqual(scanner.scan(), 1)
+            elapsed = time.monotonic() - started
+            self.assertFalse(scanner.discovery_fetch_path.exists())
+        self.assertLess(elapsed, 5, "a dead owner's marker held the namespace")
+
+    def test_a_live_discovery_owner_still_holds_its_namespace(self) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                self._base_api([eligible], eligible["id"]),
+                observation_lock_timeout=2.0,
+            )
+            # The marker names a live process: the waiter leaves its fetch
+            # alone for the whole lock wait, as before the owner pid was
+            # recorded.
+            live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                scanner.discovery_fetch_path.parent.mkdir(parents=True, exist_ok=True)
+                scanner.discovery_fetch_path.write_text(str(live.pid), encoding="utf-8")
+                started = time.monotonic()
+                # At the lock wait the marker's age and the waiter's deadline
+                # expire together; either ending is fine, a quick one is not.
+                try:
+                    scanner._discover()
+                except RuntimeError:
+                    pass
+                elapsed = time.monotonic() - started
+            finally:
+                live.kill()
+                live.wait()
+        self.assertGreaterEqual(elapsed, 1.5, "a live owner's fetch was taken over")
+
     def test_distinct_process_namespaces_bound_actual_github_children(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

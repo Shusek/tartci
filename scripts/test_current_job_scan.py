@@ -222,7 +222,9 @@ else: raise SystemExit(4)
                     ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
                      "--workflow", "w", "--gh-cli", str(fake),
                      "--observation-lock-file", str(lock),
-                     "--observation-lock-timeout", "0.1"],
+                     # Each call is capped at half the lock wait: 0.1 s
+                     # killed the fake before it started on a loaded host.
+                     "--observation-lock-timeout", "2"],
                     text=True, capture_output=True, check=False,
                 )
             called = marker.exists()
@@ -251,7 +253,7 @@ else: raise SystemExit(4)
                      "--workflow", "Build and Test", "--gh-cli", str(fake),
                      "--scan-timeout", "5", "--gh-timeout", "3",
                      "--observation-lock-file", str(lock),
-                     "--observation-lock-timeout", "0.2"],
+                     "--observation-lock-timeout", "2"],
                     text=True, capture_output=True, check=False,
                 )
             self.assertNotEqual(result.returncode, 0)
