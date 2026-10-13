@@ -887,6 +887,57 @@ print(json.dumps(payload))
             self.assertFalse(scanner.discovery_fetch_path.exists())
         self.assertLess(elapsed, 5, "a dead owner's marker held the namespace")
 
+    def test_a_real_owner_killed_mid_fetch_is_taken_over(self) -> None:
+        # The case above plants the marker by hand, so it cannot see the owner
+        # stop writing its pid. Here a real process claims the namespace
+        # through _discover(), with a fetch that never returns, and is
+        # SIGKILLed mid-fetch, as a lane is by launchd teardown.
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owner_script = (
+                "import sys, time, unittest\n"
+                "from pathlib import Path\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import test_paginated_queue_scan as t\n"
+                "case = t.PaginatedQueueScanTests('test_a_real_owner_killed_mid_fetch_is_taken_over')\n"
+                "scanner = case._scanner('tart-macos', Path(sys.argv[2]),\n"
+                "                        lambda path: time.sleep(600) or {},\n"
+                "                        observation_lock_timeout=10.0)\n"
+                "scanner._discover()\n"
+            )
+            owner = subprocess.Popen(
+                [sys.executable, "-c", owner_script, str(ROOT / "scripts"), str(root / "lane.json")],
+                env={**os.environ, _RECEIPT_TTL_ENV: "0"},
+            )
+            try:
+                scanner = self._scanner(
+                    "tart-macos",
+                    root / "lane.json",
+                    self._base_api([eligible], eligible["id"]),
+                    observation_lock_timeout=10.0,
+                )
+                marker = scanner.discovery_fetch_path
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if marker.exists() and marker.read_text(encoding="utf-8").strip():
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(marker.exists(), "the owner never claimed the namespace")
+                self.assertEqual(
+                    marker.read_text(encoding="utf-8").strip(), str(owner.pid),
+                    "the owner's marker does not name the owner",
+                )
+            finally:
+                owner.kill()
+                owner.wait()
+            started = time.monotonic()
+            self.assertEqual(scanner.scan(), 1)
+            elapsed = time.monotonic() - started
+            self.assertFalse(marker.exists())
+        self.assertLess(elapsed, 5, "a killed owner's fetch held the namespace")
+
     def test_a_live_discovery_owner_still_holds_its_namespace(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
         eligible = _run(999, origin)
