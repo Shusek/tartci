@@ -174,6 +174,15 @@ class ReviewerMutantTests(unittest.TestCase):
     def test_burst_requires_three_heads(self):
         rows = [row(BASE-100, "job_failed", host="m3", head_sha="a"*40, error="license error")]
         self.assertFalse(alarm.classify(rows, now=BASE))
+        rows.extend([row(BASE-80, "job_failed", host="m3", head_sha="b"*40, error="license error"),
+                     row(BASE-60, "job_failed", host="m3", head_sha="c"*40, error="license error")])
+        self.assertIn("host_error_burst", {t["rule"] for t in alarm.classify(rows, now=BASE)})
+
+    def test_admission_job_assignment_breaks_error_streak(self):
+        rows = [row(BASE-300, "admission_error"), row(BASE-250, "admission_error"),
+                row(BASE-200, "job_assigned"), row(BASE-100, "admission_error"),
+                row(BASE-80, "admission_error")]
+        self.assertNotIn("admission_error_streak", {t["rule"] for t in alarm.classify(rows, now=BASE)})
 
     def test_deferral_requires_three_hosts(self):
         rows = [row(BASE-3599, "self_update_starved", host="m3", peer="m1")]
