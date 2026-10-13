@@ -65,6 +65,7 @@ import glob
 import json
 import os
 import plistlib
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -1380,6 +1381,84 @@ def host_off_pass(status_only: bool = False, now: float | None = None) -> str | 
     return None
 
 
+def _serving_truth_host_id() -> str | None:
+    """This host's advertised host_id: TARTCI_HOST_ID, else the installed
+    fleet profile's host.id. None when neither says (never a guess)."""
+    explicit = os.environ.get("TARTCI_HOST_ID", "").strip()
+    if explicit:
+        return explicit
+    if tomllib is None:
+        return None
+    profile = os.environ.get("TARTCI_MACOS_FLEET_PROFILE",
+                             os.path.expanduser("~/.config/tartci/macos-fleet-profile.toml"))
+    try:
+        with open(profile, "rb") as fh:
+            host = tomllib.load(fh).get("host")
+    except (OSError, ValueError):
+        return None
+    value = host.get("id") if isinstance(host, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def serving_truth_pass(now: float | None = None) -> str | None:
+    """Run the rules-only serving monitor for THIS host once per watchdog tick.
+
+    The host judges only itself: its own lane event logs (read back
+    LOOKBACK_SECONDS, not whole) and the queued gate jobs its own published
+    registrations serve. It is shadow unless TARTCI_SERVING_TRUTH_ALARM=on
+    (then it opens one issue per episode); =0 disables the pass. Fail-open
+    for the watchdog: a failure is reported, never turned into a host action.
+    """
+    mode = os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "shadow").lower()
+    if mode == "0":
+        return None
+    stamp = _iso(utcnow() if now is None else now)
+    try:
+        import gate_job_demand  # noqa: PLC0415 - sibling module
+        import host_off  # noqa: PLC0415
+        import serving_truth_alarm  # noqa: PLC0415
+        state = Path(os.environ.get("TARTCI_HOME", os.path.join(os.path.expanduser("~"), ".tartci"))) / "state"
+        events_env = os.environ.get("TARTCI_EVENT_LOG")
+        events = [Path(events_env)] if events_env else sorted((state / "macos-fleet").glob("*/events.jsonl"))
+        events = [p for p in events if p.exists()]
+        if not events:
+            return None
+        me = _serving_truth_host_id()
+        me = gate_job_demand.canonical_host(me) if me else me
+        if not me:
+            return (f"{stamp} launchd-watchdog: WARN serving-truth skipped: this host's host_id is "
+                    "unknown (set TARTCI_HOST_ID or install a fleet profile with host.id)")
+        advertised_path = os.environ.get("TARTCI_ADVERTISED_LABELS", "")
+        if not advertised_path:
+            checkout = os.environ.get("TARTCI_CHECKOUT") or host_off._update_checkout()
+            advertised_path = str(Path(checkout) / "fleet/advertised-labels.json") if checkout else ""
+        if not advertised_path:
+            return (f"{stamp} launchd-watchdog: WARN serving-truth skipped: no advertised-labels.json "
+                    "(set TARTCI_ADVERTISED_LABELS or TARTCI_CHECKOUT)")
+        advertised = json.loads(Path(advertised_path).read_text())
+        current = utcnow() if now is None else now
+        jobs, errors = serving_truth_alarm.fetch_demand(
+            os.environ.get("TARTCI_GH_CLI", "ghapp"), advertised, me, current)
+        rows = serving_truth_alarm.read_event_paths(
+            events, current - serving_truth_alarm.LOOKBACK_SECONDS)
+        out = serving_truth_alarm.alert_pass(
+            state / "serving-truth", rows, jobs, me=me,
+            regs=gate_job_demand.registrations(advertised), now=current,
+            shadow=mode != "on", demand_errors=errors)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{stamp} launchd-watchdog: WARN serving-truth check FAILED "
+                f"({type(exc).__name__}: {exc}); no serving alarm was raised")
+    parts = []
+    if out.get("trips"):
+        parts.append(f"{len(out['trips'])} rule trip(s) on {me} "
+                     f"({', '.join(t['rule'] for t in out['trips'])}), evidence recorded")
+    if out.get("demand_errors"):
+        parts.append(f"gate demand partly unread: {out['demand_errors'][0]}")
+    if not parts:
+        return None
+    return f"{stamp} launchd-watchdog: WARN serving-truth: " + "; ".join(parts)
+
+
 # ── rate limiting ────────────────────────────────────────────────────────────
 
 def _state_file() -> str:
@@ -1553,6 +1632,9 @@ def main(argv: list[str] | None = None) -> int:
         resolver_line = resolver_health_pass()
         if resolver_line:
             print(resolver_line)
+        serving_line = serving_truth_pass()
+        if serving_line:
+            print(serving_line)
         hold_line = debug_hold_pass()
         if hold_line:
             print(hold_line)
