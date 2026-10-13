@@ -191,9 +191,6 @@ class QueueScanner:
             [self.args.gh_cli, "api", path],
             timeout=self.args.gh_timeout,
             operation="queue_scan_github_api",
-            pass_fds=(self.observation_lock_fd,)
-            if self.observation_lock_fd is not None
-            else (),
         )
         if getattr(result, "timed_out", False):
             raise ObservationTimeout(
@@ -291,13 +288,10 @@ class QueueScanner:
                 getattr(self.args, "observation_backoff_seconds", 30.0),
                 getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
             ).hold() as handle:
-                self.observation_lock_fd = os.dup(handle.fileno())
-                os.set_inheritable(self.observation_lock_fd, True)
-                try:
-                    yield
-                finally:
-                    os.close(self.observation_lock_fd)
-                    self.observation_lock_fd = None
+                # Do not inherit the host lock into gh/ssh descendants. If a
+                # scanner is killed, a slow child must not hold the lock and
+                # starve every other lane; the parent flock is the authority.
+                yield
         except (TimeoutError, ObservationBackoff) as error:
             raise RuntimeError(str(error)) from error
 

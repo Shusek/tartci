@@ -320,13 +320,9 @@ class AssignmentScanner:
             getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
         ).hold() as handle:
             self.deadline = time.monotonic() + self.args.scan_timeout
-            self.observation_lock_fd = os.dup(handle.fileno())
-            os.set_inheritable(self.observation_lock_fd, True)
-            try:
-                yield
-            finally:
-                os.close(self.observation_lock_fd)
-                self.observation_lock_fd = None
+            # Descendants must not inherit this flock: a killed scanner's
+            # slow API child cannot starve the other host lanes.
+            yield
 
     def _gh_once(self, path: str) -> dict[str, Any]:
         with self.api_calls_lock:
@@ -343,9 +339,6 @@ class AssignmentScanner:
                 [self.args.gh_cli, "api", path],
                 timeout=min(self.args.gh_timeout, remaining),
                 operation="assignment_scan_github_api",
-                pass_fds=(self.observation_lock_fd,)
-                if self.observation_lock_fd is not None
-                else (),
             )
         except (OSError, ObservationError) as error:
             raise TransientApiFault(
@@ -464,9 +457,6 @@ class AssignmentScanner:
                 [self.args.gh_cli, "api", path],
                 timeout=min(self.args.gh_timeout, remaining),
                 operation="assignment_scan_ref_probe",
-                pass_fds=(self.observation_lock_fd,)
-                if self.observation_lock_fd is not None
-                else (),
             )
         except (OSError, ObservationError):
             return None

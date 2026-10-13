@@ -1254,6 +1254,30 @@ EOF
           fi
         fi
       fi
+      # A scan-blind lane cannot prove serving capacity.  Keep pool status
+      # fail-closed while the lane has exceeded its bounded blind streak; the
+      # queue-backed supervisor will clear this on its next successful scan.
+      local blind_logs blind_threshold
+      blind_threshold="${TARTCI_SCAN_BLIND_STATUS_THRESHOLD:-3}"
+      blind_logs="$(find "$HOME/Library/Logs/tartci" -maxdepth 1 -name 'macos-fleet-*.log' -print 2>/dev/null || true)"
+      if [ -n "$blind_logs" ]; then
+        fleet_readiness="$($status_python - "$blind_logs" "$blind_threshold" "$fleet_readiness" <<'PY'
+import json, sys
+value=json.loads(sys.argv[3]); paths=sys.argv[1].splitlines(); threshold=int(sys.argv[2]); bad=[]
+for path in paths:
+    try: lines=open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError: continue
+    count=0
+    for line in reversed(lines):
+        if "SCAN BLIND" in line: count += 1
+        elif line.strip(): break
+    if count >= threshold: bad.append({"code":"scan_blind","label":path,"cycles":count})
+if bad:
+    value.setdefault("problems", []).extend(bad); value["fleet_ready"] = False
+print(json.dumps(value, separators=(",", ":")))
+PY
+)"
+      fi
       # A runner agent this host's pool receipt does not name is one no pool
       # transition starts or stops. Reporting that per runner is what makes a
       # lane outside the fleet's model visible here instead of only in a queue

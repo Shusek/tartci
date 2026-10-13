@@ -925,7 +925,7 @@ finally:
             self.assertEqual([stdout.strip() for stdout, _ in results], ["0", "0", "0"])
             self.assertEqual(json.loads(activity.read_text(encoding="utf-8"))["peak"], 1)
 
-    def test_scanner_death_keeps_host_lock_with_observation_child(self) -> None:
+    def test_scanner_death_releases_host_lock_even_with_slow_observation_child(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             entered = root / "entered"
@@ -986,17 +986,13 @@ print(json.dumps(payload))
                 command("owner/second", "0.1"),
                 text=True, capture_output=True, check=False, env=env,
             )
-            self.assertEqual(denied.returncode, 1)
-            self.assertIn("host queue observation lock timed out", denied.stderr)
-            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
-
-            time.sleep(1.1)
             recovered = subprocess.run(
-                command("owner/third", "2"),
+                command("owner/second", "2"),
                 text=True, capture_output=True, check=False, env=env,
             )
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
             self.assertEqual(recovered.stdout.strip(), "0")
+            self.assertGreaterEqual(len(calls.read_text(encoding="utf-8").splitlines()), 2)
 
     def test_host_observation_lock_timeout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
