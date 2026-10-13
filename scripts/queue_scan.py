@@ -131,6 +131,9 @@ class QueueScanner:
         self.discovery_lock_path = self.discovery_path.with_suffix(
             f"{self.discovery_path.suffix}.lock"
         )
+        self.discovery_fetch_path = self.discovery_path.with_suffix(
+            f"{self.discovery_path.suffix}.fetching"
+        )
         self.observation_lock_path = Path(args.observation_lock_file)
         self.lock_deadline = time.monotonic() + args.observation_lock_timeout
         self.state: dict[str, Any] = {}
@@ -499,44 +502,79 @@ class QueueScanner:
         return [*latency, *selected], [int(run["id"]) for run in selected]
 
     def _discover(self) -> list[dict[str, Any]]:
-        with self._discovery_lock():
-            discovery = self._load_json(
-                self.discovery_path,
-                {"cursor_run_id": None, "run_page_cursor": {}},
-            )
-            fetched_at = int(discovery.get("fetched_at", 0))
-            cached_runs = discovery.get("runs")
-            if (
-                not self.args.force_refresh
-                and isinstance(cached_runs, list)
-                and self.now - fetched_at < self.args.discovery_ttl
-            ):
-                return cached_runs
+        # Claim a single flight under the short discovery lock.  The marker is
+        # deliberately separate from that lock: the owner releases the lock
+        # before doing any GitHub work, while other lanes wait lock-free for the
+        # published snapshot.
+        while True:
+            with self._discovery_lock():
+                discovery = self._load_json(
+                    self.discovery_path,
+                    {"cursor_run_id": None, "run_page_cursor": {}},
+                )
+                fetched_at = int(discovery.get("fetched_at", 0))
+                cached_runs = discovery.get("runs")
+                if (
+                    not self.args.force_refresh
+                    and isinstance(cached_runs, list)
+                    and self.now - fetched_at < self.args.discovery_ttl
+                ):
+                    return cached_runs
+                try:
+                    fd = os.open(
+                        self.discovery_fetch_path,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                except FileExistsError:
+                    fd = -1
+                if fd >= 0:
+                    os.close(fd)
+                    break
+                try:
+                    stale = time.time() - self.discovery_fetch_path.stat().st_mtime
+                except OSError:
+                    stale = 0
+                if stale > self.args.observation_lock_timeout:
+                    try:
+                        self.discovery_fetch_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+            if time.monotonic() >= self.lock_deadline:
+                raise RuntimeError("queue discovery fetch did not complete before observation deadline")
+            time.sleep(0.05)
 
         # GitHub calls happen outside both the shared discovery lock and the
         # host-global observation flock. Only the final snapshot publication is
         # serialized, so a slow fetch cannot block another lane's claim.
         self.now = int(time.time())
         self.api_calls = 0
-        self._preflight_identity()
-        runs = self._runs(discovery)
-        candidates, backlog_ids = self._candidate_runs(runs, discovery)
-        discovered: list[dict[str, Any]] = []
-        for run in candidates[: self.args.max_job_fetches]:
-            run_id = int(run["id"])
-            jobs = self._gh(
-                f"repos/{self.args.repo}/actions/runs/{run_id}"
-                "/jobs?filter=latest&per_page=100"
-            ).get("jobs", [])
-            if not isinstance(jobs, list):
-                raise ValueError(f"jobs is not a list for run {run_id}")
-            discovered.append({**run, "_jobs": jobs})
+        try:
+            self._preflight_identity()
+            runs = self._runs(discovery)
+            candidates, backlog_ids = self._candidate_runs(runs, discovery)
+            discovered: list[dict[str, Any]] = []
+            for run in candidates[: self.args.max_job_fetches]:
+                run_id = int(run["id"])
+                jobs = self._gh(
+                    f"repos/{self.args.repo}/actions/runs/{run_id}"
+                    "/jobs?filter=latest&per_page=100"
+                ).get("jobs", [])
+                if not isinstance(jobs, list):
+                    raise ValueError(f"jobs is not a list for run {run_id}")
+                discovered.append({**run, "_jobs": jobs})
 
-        discovery["fetched_at"] = int(time.time())
-        discovery["runs"] = discovered
-        with self._observation_lock():
-            self._save_json(self.discovery_path, discovery)
-        return discovered
+            discovery["fetched_at"] = int(time.time())
+            discovery["runs"] = discovered
+            with self._observation_lock():
+                self._save_json(self.discovery_path, discovery)
+            return discovered
+        finally:
+            try:
+                self.discovery_fetch_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _scan_locked(self) -> int:
         runs = self._discover()
