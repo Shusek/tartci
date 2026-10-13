@@ -82,6 +82,16 @@ class MacosGateSlot2Tests(unittest.TestCase):
         self.assertEqual(env["TART_HOME"], str(self.tart_home))
         self.assertEqual(env["TARTCI_CCACHE_MAX_SIZE"], "40G")
 
+    def test_slot2_supervisor_renders_out_of_the_background_band(self) -> None:
+        # The slot-2 supervisor's queue scan holds the host-global observation
+        # lock. Background (and Adaptive, which launchd leaves in the same band
+        # for a job holding no XPC transaction) runs it at scheduling priority
+        # 4 on efficiency cores while every other lane waits on that lock.
+        rendered = self.render()
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        value = plistlib.loads(self.slot2.read_bytes())
+        self.assertEqual(value["ProcessType"], "Standard")
+
     def test_both_gate_slots_agree_on_guest_memory_sizing(self) -> None:
         """Neither gate slot may pin guest memory — they must size the same way.
 

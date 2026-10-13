@@ -60,6 +60,8 @@
 #   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
 #   tartci disk <watch|status> [--json]  # write-latency watchdog for the cache/VM volumes
 #                              # (one pass; the disk-watchdog LaunchAgent runs it every 60 s)
+#   tartci pool log [--status] [--json]  # bounded history of this host's pool status
+#                              # (one pass; the pool-log LaunchAgent runs it every 300 s)
 #   tartci hooks print         # print (never write) Claude/Codex hook settings
 #   tartci help
 #
@@ -812,7 +814,7 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
+  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|log|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
@@ -823,6 +825,9 @@ cmd_pool() {
            lane event logs (read-only; see scripts/pool_usage.py)
   supply --repo OWNER/REPO --class LABEL [--json]: free, leasable gate slots
            for one event class on this host (read-only; see gate_supply.py)
+  log [--status] [--json]: one pool-log pass, appending this host's status to
+           ~/.tartci/state/pool-log/events.jsonl on a change or hourly (the
+           pool-log LaunchAgent runs it every 300 s; see scripts/pool_log.py)
   exit 11 capacity floor refused; 12 off refused because a lane is mid-job;
   13 off closed admission but a lane was still loaded after the unload wait"
   case "$sub" in
@@ -830,6 +835,8 @@ cmd_pool() {
     # Read-only: this host's free, leasable gate slots for one event class,
     # which a fallback lane on another host reads over SSH before booting.
     supply) tartci_toml_exec "$HERE/scripts/gate_supply.py" report "$@" ;;
+    # Read-only: a bounded history of this host's pool status. Needs no tomllib.
+    log) tartci_toml_exec_or_python3 "$HERE/scripts/pool_log.py" "$@" ;;
   esac
   local arg allow_last_serving_host=0 plan=0 now=0 restore_receipt=0
   for arg in "$@"; do

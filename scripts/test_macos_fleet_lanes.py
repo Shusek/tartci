@@ -2146,7 +2146,7 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_process_type_accepts_only_documented_launchd_values(self) -> None:
         base = CONFIG.read_text()
-        self.assertIn('process_type = "Adaptive"', base)
+        self.assertIn('process_type = "Standard"', base)
         rejected = {
             "unknown": 'process_type = "Fast"',
             "lowercase": 'process_type = "adaptive"',
@@ -2158,7 +2158,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.subTest(name=name):
                     path = Path(td) / f"{name}.toml"
                     path.write_text(
-                        base.replace('process_type = "Adaptive"', replacement, 1)
+                        base.replace('process_type = "Standard"', replacement, 1)
                     )
                     result = subprocess.run(
                         [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
@@ -2169,12 +2169,12 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertIn("process_type", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
-            for value in fleet.PROCESS_TYPES:
+            for value in fleet.SUPERVISOR_PROCESS_TYPES:
                 with self.subTest(accepted=value):
                     path = Path(td) / f"ok-{value}.toml"
                     path.write_text(
                         base.replace(
-                            'process_type = "Adaptive"',
+                            'process_type = "Standard"',
                             f'process_type = "{value}"',
                             1,
                         )
@@ -2185,8 +2185,32 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_an_undeclared_lane_still_renders_the_background_default(self) -> None:
-        body = CONFIG.read_text().replace('process_type = "Adaptive"\n', "", 1)
+    def test_background_band_process_types_are_refused(self) -> None:
+        # Background always, and Adaptive whenever launchd sees no XPC
+        # transaction, run the supervisor in the darwinbg band while it holds
+        # the host-global observation lock. That starved every lane on a host.
+        base = CONFIG.read_text()
+        with tempfile.TemporaryDirectory() as td:
+            for value in ("Background", "Adaptive"):
+                with self.subTest(refused=value):
+                    path = Path(td) / f"band-{value}.toml"
+                    path.write_text(
+                        base.replace(
+                            'process_type = "Standard"',
+                            f'process_type = "{value}"',
+                            1,
+                        )
+                    )
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("darwinbg", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_an_undeclared_lane_renders_the_standard_default(self) -> None:
+        body = CONFIG.read_text().replace('process_type = "Standard"\n', "", 1)
         self.assertNotIn("process_type", body)
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "no-process-type.toml"
@@ -2204,10 +2228,10 @@ class MacosFleetLaneTests(unittest.TestCase):
             ]
             self.assertTrue(values)
             self.assertEqual(
-                {value["ProcessType"] for value in values}, {"Background"}
+                {value["ProcessType"] for value in values}, {"Standard"}
             )
 
-    def test_only_pulp_gate_supervisors_leave_the_background_band(self) -> None:
+    def test_no_shipped_supervisor_renders_in_the_background_band(self) -> None:
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
                 with tempfile.TemporaryDirectory() as td:
@@ -2224,21 +2248,16 @@ class MacosFleetLaneTests(unittest.TestCase):
                             for plist in sorted(Path(td).glob("*.plist"))
                         )
                     }
-                promoted = {
-                    label for label, kind in by_label.items() if kind == "Adaptive"
+                self.assertTrue(by_label)
+                # Every supervisor shares the host observation lock, so none
+                # may hold it from the darwinbg band.
+                # Spelled out rather than read from the module, so loosening
+                # the module's allow-list cannot also loosen this guard.
+                in_band = {
+                    label: kind for label, kind in by_label.items()
+                    if kind in {"Background", "Adaptive"}
                 }
-                prefix = (
-                    "com.danielraffel.tartci.tart-runner-macos-fleet."
-                    f"{host_id}.pulp-gate"
-                )
-                # Both supervisors of the gate lane, and nothing else --
-                # release and the other product gates stay Background.
-                self.assertEqual(promoted, {prefix, f"{prefix}.slot2"})
-                self.assertEqual(
-                    {kind for label, kind in by_label.items()
-                     if label not in promoted},
-                    {"Background"},
-                )
+                self.assertEqual(in_band, {})
 
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
@@ -2785,13 +2804,13 @@ replaces_launchd_labels=REPLACEMENT
             self.M5_PR_HEAD_TIER + (self.RELEASE_TIERS if tiers is None else tiers),
             1,
         )
-        anchor = 'process_type = "Adaptive"\n\n[[lane.tier]]\nlabel = "pulp-build-merge-group"'
+        anchor = 'process_type = "Standard"\n\n[[lane.tier]]\nlabel = "pulp-build-merge-group"'
         self.assertEqual(body.count(anchor), 1)
         return body.replace(
             anchor,
             anchor.replace(
-                'process_type = "Adaptive"\n',
-                'process_type = "Adaptive"\n'
+                'process_type = "Standard"\n',
+                'process_type = "Standard"\n'
                 + (self.RELEASE_FIRST if order is None else order) + "\n",
                 1,
             ),

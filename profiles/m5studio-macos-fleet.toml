@@ -121,12 +121,12 @@ replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
 guest_heartbeat_stale_seconds = 600
-# The queue scan this supervisor runs is latency-sensitive: a Background
-# supervisor's GitHub API calls measured materially slower than the same calls
-# at normal priority, and every observed scan failure on this lane is a
-# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
-# promote the supervisor out of the background band. Gate lanes only.
-process_type = "Adaptive"
+# Standard, never Background or Adaptive: every lane's queue scan holds the
+# host-global observation lock, and a supervisor launchd leaves in the
+# darwinbg band (Adaptive without an XPC transaction is in that band) makes
+# each GitHub call several times slower while it holds the lock, starving
+# every other lane on the host. The validator refuses both values.
+process_type = "Standard"
 # Work-conserving idle retarget (trial, both slots): a runner unassigned for
 # 120 s re-observes both classes and is discarded only when its own class has
 # no queued job and the other class has admissible demand. It composes with the
