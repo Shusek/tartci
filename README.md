@@ -366,6 +366,42 @@ package, image-pull, or experiment credential for JIT registration. The M1
 Forge gate deliberately uses the default `TARTCI_GH_CLI=ghapp` route: its
 macOS-27 stackbench credential is registry-only.
 
+**A lane can own its caches.** Every macOS VM mounts `<cache_root>/ccache`
+and `<cache_root>/configure-checks` writable, so on the host-wide root any job
+on any lane, PR gates included, can plant an object that a later job links.
+The configure-check cache is worse than an object: Pulp's
+`PulpConfigureCheckCache.cmake` `include()`s its files, so a planted one runs
+CMake in the next configure. That holds between two PR gate runs as well as
+from a PR into a release. Both writable mounts derive from the lane's root, and
+a test keeps every writable mount under it. A
+lane that signs or publishes can set its own `cache_root`; the renderer emits
+it as that lane's `TARTCI_CI_CACHE`, so only VMs booted for that lane mount it.
+Validation requires an organization runner group (never the repository-wide
+group 1), keeps every tier in that group, refuses a root that nests with the
+host root or another lane's, and refuses to share one root across runner
+groups. Restricting the group to protected workflows and refs is a GitHub
+setting the profile cannot see; verify it before trusting the cache. The
+FetchContent seed is already mounted read-only. Roll out on one host first.
+
+A lane root must sit below `host.home` or a `/Volumes/<volume>/` mount, the
+places where the disk-root preparation creates every component without
+following links. Validation refuses a root reached through a symlink in any
+existing component. At boot, `runner.sh` (`lane-cache-root.lib.sh`) refuses
+the VM when the root, its `ccache` or its `configure-checks` is a link or
+resolves elsewhere. It also refuses when the root's physical path is,
+contains, or sits inside the host root (`TARTCI_HOST_CI_CACHE`, rendered only
+for such a lane). Without these checks, a lane root that links to the host
+root mounts the cache every PR gate VM writes.
+
+Two things a lane root costs that lane:
+- **No artifact-cache or pip-wheelhouse mount.** Both derive from the lane's
+  root, which nothing populates (the refresh agent and
+  `scripts/pip-wheelhouse.sh` fill only the host root), so the lane boots
+  without them.
+- **No age-based ccache eviction.** `gate_ccache_trim.py` trims only the host
+  root's ccache. A lane root's ccache relies on the per-boot ccache guard and
+  `TARTCI_CCACHE_MAX_SIZE`.
+
 **Registry tooling is not runner tooling.** The M1 macOS-27 stackbench
 credential is for GHCR push/pull only, never Actions registration. Its GHCR
 harness must invoke `/usr/bin/curl` explicitly: a PATH-shadowing curl wrapper
