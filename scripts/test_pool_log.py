@@ -88,6 +88,38 @@ class PoolLog(unittest.TestCase):
                          [pool_log._iso(T0 + minutes * 60) for minutes in (0, 60, 65, 75)])
         self.assertEqual(len(self.host.calls), 8, "every pass reads the status")
 
+    def test_a_problem_whose_hour_count_drifts_is_one_condition(self) -> None:
+        # Twelve passes of one stale tool, its age counting up each time.
+        for index in range(12):
+            self.host.value = status(tool_freshness=f"pulp {24.8 + index * 0.1:.1f} h behind "
+                                                    f"(threshold 12 h)")
+            self.tick(index * 5)
+        records = self.records()
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["problems"]["tool_freshness"],
+                         "pulp 24.8 h behind (threshold 12 h)", "the raw text is kept")
+        # The heartbeat carries the text as read at that pass.
+        self.host.value = status(tool_freshness="pulp 25.8 h behind (threshold 12 h)")
+        self.assertEqual(self.tick(60)["problems"]["tool_freshness"],
+                         "pulp 25.8 h behind (threshold 12 h)")
+        # Control: different words are a change.
+        self.host.value = status(tool_freshness="vellum 25.9 h behind (threshold 12 h)")
+        self.assertNotIn("heartbeat", self.tick(65))
+
+    def test_the_status_read_is_capped_at_sixty_seconds(self) -> None:
+        self.tick(0)
+        self.assertEqual(pool_log.STATUS_TIMEOUT_S, 60.0)
+        timeouts = []
+        pool_log.read_status(lambda argv, timeout: (timeouts.append(timeout), (0, "{}", ""))[1])
+        self.assertEqual(timeouts, [60.0])
+        code, out, err = pool_log.run(["/bin/sleep", "5"], 0.3)
+        self.assertEqual(code, 124)
+        self.assertIn("did not finish", err)
+        # A pass whose read times out writes an error record, not a crash.
+        record = pool_log.log_pass(T0 + 300, lambda argv, timeout: pool_log.run(
+            ["/bin/sleep", "5"], 0.3), self.dir)
+        self.assertIn("pool status exited 124: pool status did not finish", record["error"])
+
     def test_a_record_holds_only_what_a_host_reader_classifies(self) -> None:
         self.host.value = status(gate_reserve="cores demand 6 against reserve 3\nsecond line",
                                  tool_freshness="x" * 900)

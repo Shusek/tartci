@@ -14,7 +14,9 @@ a host reader classifies:
 
 where `problems` maps each `fleet.config` section with a problem to its first
 500 characters. A status that cannot be read writes `{"at", "error"}`, once
-per distinct error. The log rotates at 2 MiB to `events.jsonl.1`, so a host
+per distinct error. Numbers in problem and error text do not count as a
+change (a stale tool's "24.8 h behind" counts up every pass); the record keeps
+the text as read. The log rotates at 2 MiB to `events.jsonl.1`, so a host
 keeps at most two files.
 
 `tartci pool log --status [--json]` prints the log's size, its last record and
@@ -30,6 +32,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -124,8 +127,22 @@ def read_status(runner: Runner) -> Dict[str, Any]:
     return condense(value)
 
 
+NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+
 def _digest(record: Dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+    """What makes a record a change. Numbers in problem and error text are
+    left out: a stale tool's problem reads "pulp 24.8 h behind" and counts up
+    every pass, and the same condition must not write a record each time."""
+    def steady(value: Any) -> Any:
+        if isinstance(value, str):
+            return NUMBER.sub("#", value)
+        if isinstance(value, dict):
+            return {key: steady(item) for key, item in value.items()}
+        return value
+    stable = {key: steady(value) if key in ("problems", "error") else value
+              for key, value in record.items()}
+    return hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
 
 
 def _read_last(path: pathlib.Path) -> Dict[str, Any]:
