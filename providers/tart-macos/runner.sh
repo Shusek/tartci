@@ -293,35 +293,6 @@ SERVING_BLOCKED_SINCE=""
 SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
 SERVING_BLOCKED_CAUSE=""
-# A lane that cannot read its queue never reaches a work entry, so the
-# per-entry streak above would leave it reading "serving: ok" for as long as it
-# stays blind. Each blind poll therefore counts as an entry served nothing.
-# Losing the host's own observation lock is host-local (a slow or throttled
-# holder on this host), so it gets its own cause; any other scan failure may be
-# upstream and is reported without that distinction.
-tartci_serving_mark_scan_blind(){
-  local detail="${1:-}"
-  SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
-  SERVING_BLOCKED_LAST_PHASE="scan_blind"
-  case "$detail" in
-    *lock_contention*) SERVING_BLOCKED_CAUSE="scan_blind_host_lock" ;;
-    *) SERVING_BLOCKED_CAUSE="scan_blind" ;;
-  esac
-  [ -n "$SERVING_BLOCKED_SINCE" ] \
-    || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-}
-# A recovered scan ends a blind streak; it does not prove the lane serves, so
-# only a blind streak is cleared here and any other cause keeps counting.
-tartci_serving_clear_scan_blind(){
-  case "$SERVING_BLOCKED_CAUSE" in
-    scan_blind|scan_blind_host_lock)
-      SERVING_BLOCKED_SINCE=""
-      SERVING_BLOCKED_STREAK=0
-      SERVING_BLOCKED_LAST_PHASE=""
-      SERVING_BLOCKED_CAUSE=""
-      ;;
-  esac
-}
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
 # 1 when the last work entry declined to clone because the opt-in pre-clone
@@ -2647,7 +2618,6 @@ if [ "$LOOP" = 1 ]; then
       # never observed failing, and sent every reader to audit a healthy CLI.
       note "SCAN BLIND ${blind}/${BLIND_MAX} — queue scan failed: ${scan_detail:-no diagnostic captured} — NOT idling as empty (running_macos_vms=$r/$cap)"
       event scan_blind "consecutive=$blind running=$r/$cap detail=${scan_detail:-no diagnostic captured}"
-      tartci_serving_mark_scan_blind "$scan_detail"
       heartbeat scan_blind
       if [ "$blind" -ge "$BLIND_MAX" ]; then
         blind_restarts="$(read_blind_restarts)"
@@ -2680,7 +2650,6 @@ if [ "$LOOP" = 1 ]; then
       note "scan recovered after ${blind} blind poll(s)"
       event scan_recovered "after=$blind"
     fi
-    tartci_serving_clear_scan_blind
     blind=0
     reset_blind_restarts
     clear_scan_error

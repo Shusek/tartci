@@ -3181,40 +3181,6 @@ class ServingBlockedTests(unittest.TestCase):
         self.assertEqual(lane["cause"], "admission failing")
         self.assertEqual(lane["reason"], "admission failing")
 
-    def test_host_lock_scan_blind_streak_is_not_serving_and_clears_fleet_ready(self) -> None:
-        value = self._readiness({
-            "serving_blocked_since": self._ago(900),
-            "serving_blocked_streak": 6,
-            "serving_blocked_last_phase": "scan_blind",
-            "serving_blocked_cause": "scan_blind_host_lock",
-        })
-        lane = value["serving"]["blocked_lanes"][0]
-        self.assertTrue(value["serving"]["blocked"])
-        self.assertFalse(value["fleet_ready"])
-        self.assertEqual(lane["cause"], "scan_blind_host_lock")
-        self.assertIn("observation lock", lane["reason"])
-
-    def test_upstream_scan_blind_is_not_serving_without_gating_the_fleet(self) -> None:
-        value = self._readiness({
-            "serving_blocked_since": self._ago(900),
-            "serving_blocked_streak": 6,
-            "serving_blocked_last_phase": "scan_blind",
-            "serving_blocked_cause": "scan_blind",
-        })
-        self.assertTrue(value["serving"]["blocked"])
-        self.assertEqual(value["serving"]["blocked_lanes"][0]["cause"], "scan_blind")
-        self.assertTrue(value["fleet_ready"])
-
-    def test_a_short_scan_blind_blip_stays_serving(self) -> None:
-        value = self._readiness({
-            "serving_blocked_since": self._ago(40),
-            "serving_blocked_streak": 2,
-            "serving_blocked_last_phase": "scan_blind",
-            "serving_blocked_cause": "scan_blind_host_lock",
-        })
-        self.assertFalse(value["serving"]["blocked"])
-        self.assertTrue(value["fleet_ready"])
-
     def test_open_dhcp_breaker_is_immediately_not_serving(self) -> None:
         value = self._readiness({
             "serving_blocked_since": self._ago(10),

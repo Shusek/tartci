@@ -1576,13 +1576,6 @@ plist, which is rendered from the profile (a hand edit is reverted by the next
 render). Confirm a host with `ps -o pri= -p <supervisor pid>`: 20 or above is
 out of the band, 4 is in it.
 
-The lock also publishes holds that outlast what other lanes wait for it
-(`TARTCI_QUEUE_OBSERVATION_HOLD_BUDGET_SECS`, default the lock-wait timeout) to
-`queue-observation.lock.overrun.json` beside the lock, and a holder that finds
-itself in the darwinbg band says so on stderr. A lane whose scans stay blind is
-reported `serving: NOT SERVING` after the serving streak threshold; when the
-cause is this host's own observation lock it also clears `fleet ready`.
-
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
 file**, never on the outer ssh command line (cmd.exe's 8191-char limit blows

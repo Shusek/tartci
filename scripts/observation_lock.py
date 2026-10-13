@@ -2,14 +2,11 @@
 from __future__ import annotations
 
 import contextlib
-import ctypes
-import ctypes.util
 import fcntl
 import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 import datetime as dt
 import weakref
@@ -25,51 +22,6 @@ class ObservationBackoff(RuntimeError):
 
 class ObservationTimeout(TimeoutError):
     """A scanner exhausted a bounded observation timeout."""
-
-
-# macOS schedules a darwinbg (throttled) task at priority 4 and confines it to
-# efficiency cores. launchd puts a job there for ProcessType Background, and for
-# Adaptive whenever it holds no XPC transaction. getpriority(PRIO_DARWIN_PROCESS)
-# reports only the setpriority flavour of that band, not launchd's role, so the
-# band is read from the task's own scheduling priority instead.
-DARWINBG_MAX_PRIORITY = 4
-_PROC_PIDTASKINFO = 4
-
-
-class _ProcTaskInfo(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint64)
-        for name in ("virtual_size", "resident_size", "total_user",
-                     "total_system", "threads_user", "threads_system")
-    ] + [
-        (name, ctypes.c_int32)
-        for name in ("policy", "faults", "pageins", "cow_faults",
-                     "messages_sent", "messages_received", "syscalls_mach",
-                     "syscalls_unix", "csw", "threadnum", "numrunning",
-                     "priority")
-    ]
-
-
-def scheduling_priority(pid: int | None = None) -> int | None:
-    """Return a process's Mach scheduling priority, or None where unknowable."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "libproc.dylib")
-        info = _ProcTaskInfo()
-        size = libproc.proc_pidinfo(
-            int(os.getpid() if pid is None else pid), _PROC_PIDTASKINFO,
-            ctypes.c_uint64(0), ctypes.byref(info), ctypes.sizeof(info),
-        )
-    except (OSError, AttributeError, TypeError, ValueError):
-        return None
-    if size != ctypes.sizeof(info):
-        return None
-    return int(info.priority)
-
-
-def in_background_band(priority: int | None) -> bool:
-    return priority is not None and 0 < priority <= DARWINBG_MAX_PRIORITY
 
 
 def _process_start(pid: int) -> str | None:
@@ -178,16 +130,6 @@ class FairObservationLock:
         self.generation = generation or os.environ.get("TARTCI_GENERATION") or "unknown"
         self.max_age = max_age if max_age is not None else float(
             os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_MAX_AGE_SECS", "300")
-        )
-        # Other lanes give up after `timeout` seconds of waiting, so a holder
-        # that keeps the lock longer than that blinds them however fair the
-        # queue is. Overruns are published, not enforced: the scan's own
-        # budget still bounds it.
-        self.hold_budget = float(
-            os.environ.get("TARTCI_QUEUE_OBSERVATION_HOLD_BUDGET_SECS", "") or timeout
-        )
-        self.overrun_path = self.lock_path.with_name(
-            self.lock_path.name + ".overrun.json"
         )
         self.owner_path = self.lock_path.with_name(self.lock_path.name + ".owner.json")
         self.escalation_path = self.lock_path.with_name(
@@ -350,35 +292,6 @@ class FairObservationLock:
             detail += f" escalation=owner_age_exceeded:{self.max_age:.1f}s"
         return detail
 
-    def _report_hold(self, held: float, priority: int | None) -> None:
-        """Publish a hold that outlasted what other lanes wait for the lock."""
-        if held <= self.hold_budget:
-            return
-        record = {
-            "lane": self.lane,
-            "repo": self.repo,
-            "pid": os.getpid(),
-            "held_seconds": round(held, 1),
-            "budget_seconds": self.hold_budget,
-            "priority": priority,
-            "background_band": in_background_band(priority),
-            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        }
-        print(
-            f"observation: held the host queue observation lock {held:.1f}s, "
-            f"over the {self.hold_budget:.0f}s other lanes wait for it "
-            f"(lane={self.lane} repo={self.repo} priority={priority})",
-            file=sys.stderr,
-        )
-        try:
-            temp = self.overrun_path.with_name(
-                self.overrun_path.name + f".{os.getpid()}.{time.time_ns()}.tmp"
-            )
-            temp.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
-            os.replace(temp, self.overrun_path)
-        except OSError:
-            pass
-
     def _next_ticket(self, queue: Path) -> Path:
         queue.mkdir(parents=True, exist_ok=True)
         counter = queue / "counter"
@@ -448,17 +361,6 @@ class FairObservationLock:
                 self._holding = True
                 _ACTIVE_LOCKS.add(self)
                 self._write_owner(os.getpid())
-                acquired = time.monotonic()
-                priority = scheduling_priority()
-                if in_background_band(priority):
-                    print(
-                        "observation: holding the host queue observation lock "
-                        f"at scheduling priority {priority} (darwinbg band); "
-                        "every GitHub call under it is throttled and other "
-                        "lanes wait on it. The lane's launchd ProcessType must "
-                        f"be Standard. lane={self.lane}",
-                        file=sys.stderr,
-                    )
                 try:
                     yield handle
                 except BaseException as error:
@@ -472,7 +374,6 @@ class FairObservationLock:
                     self._holding = False
                     _ACTIVE_LOCKS.discard(self)
                     self._clear_owner()
-                    self._report_hold(time.monotonic() - acquired, priority)
         finally:
             if marker.exists():
                 marker.unlink()

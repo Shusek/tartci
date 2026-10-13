@@ -2272,28 +2272,6 @@ def fleet_readiness(
                     # DHCP breaker open is a host-local hard stop: report the
                     # lane NOT SERVING immediately, without waiting for the
                     # generic transient streak threshold.
-                    # A lane that cannot read its queue serves nothing. The
-                    # streak gate keeps a single blind blip quiet; past it the
-                    # lane is NOT SERVING. Losing this host's own observation
-                    # lock is host-local and host-fixable, so it also clears
-                    # fleet readiness; a blind scan of unknown cause may be
-                    # upstream and is reported without gating the fleet.
-                    if blocked_cause in {"scan_blind", "scan_blind_host_lock"}:
-                        if streak is not None and streak >= blocked_serving_streak:
-                            serving_blocked_lanes.append({
-                                "label": label,
-                                "blocked_seconds": int(blocked_for),
-                                "streak": streak,
-                                "last_phase": str(matching_state.get("serving_blocked_last_phase", "") or ""),
-                                "cause": blocked_cause,
-                                "reason": (
-                                    "queue scan blind: host observation lock"
-                                    if blocked_cause == "scan_blind_host_lock"
-                                    else "queue scan blind"
-                                ),
-                            })
-                        verified_running += 1
-                        continue
                     if blocked_cause == "dhcp_breaker":
                         serving_blocked_lanes.append({
                             "label": label,
@@ -2413,9 +2391,8 @@ def fleet_readiness(
             and verified_running == len(labels)
             and persistent_verified == len(persistent_labels)
             and not problems
-            and not any(lane.get("cause") in {
-                "dhcp_breaker", "admission failing", "scan_blind_host_lock",
-            } for lane in serving_blocked_lanes)
+            and not any(lane.get("cause") in {"dhcp_breaker", "admission failing"}
+                        for lane in serving_blocked_lanes)
         ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),

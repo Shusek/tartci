@@ -1349,14 +1349,8 @@ if fleet["managed"]:
         dhcp = [lane for lane in lanes if lane.get("cause") == "dhcp_breaker"]
         admission = [lane for lane in lanes if lane.get("cause") == "admission failing"]
         disk = [lane for lane in lanes if lane.get("cause") == "disk"]
-        blind = [lane for lane in lanes
-                 if lane.get("cause") in ("scan_blind", "scan_blind_host_lock")]
         if dhcp:
             print(f"serving: NOT SERVING (DHCP breaker open; {len(dhcp)} lane(s))")
-        elif blind:
-            local = [lane for lane in blind if lane.get("cause") == "scan_blind_host_lock"]
-            where = "host observation lock" if local else "queue unreadable"
-            print(f"serving: NOT SERVING (queue scan blind: {where}; {len(blind)} lane(s))")
         elif admission:
             print(f"serving: NOT SERVING (admission failing; {len(admission)} lane(s))")
         elif disk:
