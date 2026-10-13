@@ -1148,31 +1148,50 @@ def _pending_fixes(cfg: Config) -> list[dict]:
         if isinstance(fixes, list) else []
 
 
+# GitHub answers 404 for an issue that no longer exists (or that the App can
+# no longer see) and 410 for a deleted one. Neither changes on a retry.
+_ISSUE_GONE = re.compile(r"HTTP 40[4]|HTTP 410|\"status\"\s*:\s*\"?(?:404|410)\b|\b(?:Not Found|was deleted)\b")
+
+
+def _issue_gone(text: str) -> bool:
+    return bool(_ISSUE_GONE.search(text or ""))
+
+
 def finish_pending_fixes(cfg: Config) -> bool:
     """PATCH each recorded fix time into its issue's marker, then close the
-    issue. Whatever fails stays recorded for the next run. True when none is
-    left."""
+    issue. Whatever fails stays recorded for the next run, except an issue
+    GitHub says is gone (404 or 410): that is dropped and logged once, since
+    no retry can reach it. True when none is left."""
     pending = _pending_fixes(cfg)
     if not pending:
         return True
     import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
     left = []
     for fix in pending:
+        step, rc, text = "", 0, ""
         if not fix.get("patched"):
+            step = "patch"
             rc, text = host_off._patch_issue_body(fix["issue"], str(fix["issue_body"]))
-            if rc != 0:
-                fix["error"] = f"patch: {text}"[:300]
-                print(f"self-update: starvation issue #{fix['issue']}: fixed_at not recorded "
-                      f"({fix['error']}); retrying next run")
-                left.append(fix)
-                continue
-            fix["patched"] = True
-        rc, text = host_off._close_issue(fix["issue"])
-        if rc != 0:
-            fix["error"] = f"close: {text}"[:300]
-            print(f"self-update: starvation issue #{fix['issue']}: not closed "
-                  f"({fix['error']}); retrying next run")
-            left.append(fix)
+            if rc == 0:
+                fix["patched"] = True
+        if rc == 0:
+            step = "close"
+            rc, text = host_off._close_issue(fix["issue"])
+        if rc == 0:
+            continue
+        fix["error"] = f"{step}: {text}"[:300]
+        if _issue_gone(text):
+            print(f"self-update: starvation issue #{fix['issue']} is gone ({fix['error']}); "
+                  f"dropping its fix time {fix.get('fixed_at')}")
+            host_off.event(cfg.state_dir, "self_update_issue_gone",
+                           f"starvation issue #{fix['issue']} is gone; fix time not recorded",
+                           {"issue": fix["issue"], "fixed_at": fix.get("fixed_at"),
+                            "error": fix["error"]})
+            continue
+        print(f"self-update: starvation issue #{fix['issue']}: "
+              + ("fixed_at not recorded" if step == "patch" else "not closed")
+              + f" ({fix['error']}); retrying next run")
+        left.append(fix)
     path = cfg.state_dir / PENDING_FIX_NAME
     if left:
         _write_json(path, {"fixes": left})
