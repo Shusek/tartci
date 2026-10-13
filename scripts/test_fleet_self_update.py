@@ -93,6 +93,7 @@ class FakeSystem(su.System):
 
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
+        self.cat_file_rc = 0
         self.relay = {"ok": True, "probe": "relay authenticated"}
         self.status_after_on = {"state": "on", "participating": True,
                                 "fleet": {"managed": True, "fleet_ready": True,
@@ -192,7 +193,7 @@ class FakeSystem(su.System):
                 ref = a[-1].split("^")[0]
                 return ok((ref if su.SHA.fullmatch(ref) else T_NEW) + "\n")
             if "cat-file" in a:
-                return ok()
+                return su.Result(self.cat_file_rc, "", "missing commit" if self.cat_file_rc else "")
             if "merge-base" in a:
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
@@ -2086,6 +2087,45 @@ class RecordTests(Base):
 
 
 class ChecksAndTargetTests(Base):
+    def test_explicit_target_recovers_an_off_history_install(self) -> None:
+        self.sys.cat_file_rc = 1
+        scheduled = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW)
+        self.assertEqual(scheduled["state"], "unknown")
+        self.assertIn("not in the tartci history", scheduled["reason"])
+        explicit = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_OLD, explicit=True)
+        self.assertEqual((explicit["state"], explicit["behind"], explicit["target"],
+                          explicit["selected_target"]), ("behind", None, T_OLD, T_OLD))
+        self.assertIn("not in the tartci history", explicit["reason"])
+        self.assertIsNone(explicit["oldest_undeployed"])
+        self.assertNotIn("stale", explicit)
+        self.assertIn("skew UNKNOWN", su.render_skew(explicit))
+
+    def test_off_history_explicit_target_still_soaking_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_red_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 9000)}\n{T_OLD} {int(NOW - 10000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_off_chain_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, "d" * 40, explicit=True)
+        self.assertEqual(skew["state"], "unknown")
+        self.assertIn("first-parent", skew["reason"])
+
     def test_red_newest_soaked_commit_falls_back_to_an_older_green_one(self) -> None:
         older = "c" * 40
         self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"

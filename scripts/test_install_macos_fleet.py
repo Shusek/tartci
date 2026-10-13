@@ -735,7 +735,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             exec {sys.executable} "$@"
         """))
         python.chmod(0o755)
-        result = self.run_installer("--apply")
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(python))
         self.assertEqual(result.returncode, 1)
         self.assertTrue(target.is_symlink())
         self.assertEqual(self.root / "missing-target", target.readlink())
@@ -753,13 +753,28 @@ class InstallMacosFleetTests(unittest.TestCase):
             exec {sys.executable} "$@"
         """))
         python.chmod(0o755)
-        result = self.run_installer("--apply")
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(python))
         self.assertEqual(1, result.returncode)
         self.assertEqual(prior, (self.bin / "tartci").read_bytes())
         self.assertFalse(
             (self.home / ".config/tartci/macos-fleet-install.json").exists()
         )
         self.assertEqual([], list(self.bin.glob(".tartci-wrapper.*")))
+
+    def test_installer_prefers_versioned_python_before_unversioned_python3(self) -> None:
+        for name in ("python3.12", "python3.11", "python3"):
+            interpreter = self.fakebin / name
+            interpreter.write_text(textwrap.dedent(f"""\
+                #!/bin/sh
+                exec {sys.executable} "$@"
+            """))
+            interpreter.chmod(0o755)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = list(self.agents.glob("*macos-fleet*.plist"))
+        self.assertEqual(len(installed), 1)
+        environment = plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]
+        self.assertEqual(Path(environment["TARTCI_PYTHON"]).name, "python3.12")
 
     def test_sigkill_after_receipt_is_fail_closed_and_reinstall_recovers(self) -> None:
         crashed = self.run_installer(
