@@ -2203,8 +2203,17 @@ fleet`), and check GitHub's job history against it with
   read. Doctor: `peer_unreachable` (dark, still holding the turn) and
   `peer_unreachable_excluded`. A host that flaps between readable and
   unreadable never qualifies and keeps blocking; `self_update_starved`
-  reports after 1 h when gate demand for this host is queued; without queued gate demand the fallback is 6 h. Recovery of the dark host itself is manual: it
-  needs someone at the machine.
+  reports after 4 h when gate jobs this host serves are queued (one hour past
+  the 3 h exclusion, so one dark peer cannot raise issues on every other host
+  before the queue heals), and after 6 h otherwise or when the demand read
+  fails. Demand is a queued self-hosted *job* whose labels a registration of
+  this host serves, for a workflow it names, at most 12 h old
+  (`scripts/gate_job_demand.py`); runs carry no labels, so a run-level read
+  would count hosted-only runs and the 2026-08-19 zombie merge group. The
+  starvation issue names the peer holding the turn and why, the queued jobs,
+  the fix per cause and how to verify, and ends with a `tartci-incident`
+  marker line whose `fixed_at` is written before the issue closes. Recovery of
+  the dark host itself is manual: it needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only
   takes effect after some host updates. If the queue itself is wedged, unwedge

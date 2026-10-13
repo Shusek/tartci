@@ -59,6 +59,8 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
+import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate jobs
+import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 
 try:
@@ -109,10 +111,9 @@ ANNOUNCE_TIE_SECONDS = 10
 # A waiting ticket not refreshed within this long belongs to a host that has
 # stopped trying (halted, off the network, profile removed) and is ignored.
 WAITING_TICKET_TTL = 2 * 3600
-# Deferred for about one hour without a turn is starvation: loud, and exit 3.
-# Keep this short enough to catch a fleet-wide update deadlock before it grows
-# into a multi-hour merge gap.
-STARVED_AFTER_SECONDS = 3600
+# Deferred without a turn this long is starvation: loud, and exit 3. Without
+# queued gate demand for this host the bound is STARVED_FALLBACK_SECONDS; with
+# it, STARVED_AFTER_SECONDS (set below), one hour past the dark-peer exclusion.
 STARVED_FALLBACK_SECONDS = 6 * 3600
 # The self-update agent's launchd StartInterval: one survey of every peer per
 # attempt (launchd/com.danielraffel.tartci.self-update.plist.template).
@@ -132,6 +133,10 @@ PEER_UNREACHABLE_MIN_READS = 4
 # measured on its own clock.
 PEER_UNREACHABLE_FRESH_SECONDS = 3600
 PEER_UNREADABLE_NAME = "peer-unreadable.json"
+# With gate demand queued, starvation is one hour past the point a dark peer
+# stops holding the turn: a single dark host must not make every other host
+# raise an issue two hours before the queue heals itself.
+STARVED_AFTER_SECONDS = PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600
 # A peer DRAINING with no live update marker, whose pool state has not changed
 # for this long, stops holding the update turn and is left to the capacity
 # floor, like an off peer. A self-update holds a live marker for its whole
@@ -1102,21 +1107,121 @@ def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> 
     ticket = waiting_ticket(cfg) or {}
     since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
     ticket = {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
-              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue")}
+              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue"),
+              "issue_body": ticket.get("issue_body")}
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return ticket
 
 
-def clear_waiting(cfg: Config) -> None:
+def clear_waiting(cfg: Config, now: float | None = None) -> None:
     ticket = waiting_ticket(cfg) or {}
     if ticket.get("issue"):
-        # The host has its turn again: the starvation issue closes itself.
+        # The host has its turn again: record when on the issue's incident
+        # marker, then close it.
         import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        body = ticket.get("issue_body")
+        if isinstance(body, str) and body:
+            fixed_at = _iso(time.time() if now is None else now)
+            try:
+                host_off._patch_issue_body(str(ticket["issue"]),
+                                           tartci_incident.fixed(body, fixed_at))
+            except ValueError:
+                pass
         host_off._close_issue(str(ticket["issue"]))
     (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
 
 
-def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str) -> None:
+def _turn_holder(reason: str) -> tuple[str, str]:
+    """(cause, the peers named) from the reason a deferral recorded."""
+    text = reason or ""
+    if text.startswith("yielding the update turn to a host that has waited longer: "):
+        return "waited_longer", text.split(": ", 1)[1]
+    if text.startswith("another fleet host is not serving normally: "):
+        evidence = text.split(": ", 1)[1]
+        dark = any(word in evidence.lower() for word in ("unreadable", "unreachable"))
+        return ("dark" if dark else "busy"), evidence
+    if text.startswith("peer announced first") or text.startswith("peer changed after announcing"):
+        return "announced", text.split(": ", 1)[1] if ": " in text else text
+    return "unknown", text
+
+
+def starvation_body(cfg: Config, me: str, ticket: dict, waited: float, reason: str,
+                    now: float) -> str:
+    """What happened, the evidence, the likely cause, the exact fix, whether it
+    is safe to apply unattended, and how to verify: one issue a reader can act
+    on without opening a host."""
+    cause, named = _turn_holder(reason)
+    since = _iso(float(ticket["since"]))
+    demand = ticket.get("demand") or []
+    dark = _read_json(cfg.state_dir / PEER_UNREADABLE_NAME) or {}
+    lines = [
+        f"**What happened.** {me} has had no tartci self-update turn for "
+        f"{waited / 3600:.1f} h (in the update queue since {since}), while gate jobs it "
+        f"serves were queued. The bound with queued gate demand is "
+        f"{STARVED_AFTER_SECONDS // 3600} h: one hour past the "
+        f"{PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h after which a dark peer stops "
+        "holding the turn.",
+        "",
+        "**Evidence.**",
+        f"- Deferral reason: {reason[:300]}",
+        f"- Waiting ticket: since {since}, target {str(ticket.get('target') or '')[:12]}",
+    ]
+    for job in demand[:5]:
+        lines.append(f"- Queued gate job {job.get('id')} ({job.get('repo')} "
+                     f"{job.get('workflow')}: {job.get('name')}) since {job.get('created_at')}")
+    if len(demand) > 5:
+        lines.append(f"- ...and {len(demand) - 5} more queued gate jobs")
+    if ticket.get("demand_error"):
+        lines.append(f"- Gate demand read failed: {str(ticket['demand_error'])[:200]}")
+    for peer, streak in sorted(dark.items()) if isinstance(dark, dict) else []:
+        if isinstance(streak, dict) and isinstance(streak.get("since"), (int, float)):
+            lines.append(f"- {peer} unreadable since {_iso(float(streak['since']))} "
+                         f"({streak.get('reads')} reads; excluded: {bool(streak.get('excluded'))})")
+    lines += ["", "**Likely cause and fix.**"]
+    if cause == "dark":
+        lines += [
+            f"A peer this host cannot read holds the turn ({named[:200]}). It stops holding "
+            f"it automatically once it has been dark for {PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h, "
+            "read unreadable by every readable peer.",
+            "- Check the dark host at the machine: `tartci pool status`.",
+            f"- To update {me} now instead, on {me}: `tartci fleet-macos self-update --plan`, "
+            "then `tartci fleet-macos self-update --apply`.",
+            "- Safe to auto-apply: no. The automatic exclusion already runs; a manual "
+            "update takes this host out of service.",
+        ]
+    elif cause == "busy":
+        lines += [
+            f"A peer is not serving normally ({named[:200]}), so this host will not drain too.",
+            "- On that peer: `tartci pool status`, and let its update or drain finish.",
+            "- Safe to auto-apply: no; wait for the peer, or fix it by hand.",
+        ]
+    elif cause == "waited_longer":
+        lines += [
+            f"{named[:200]} joined the update queue first and goes first.",
+            "- On that host: `tartci fleet-macos self-update --plan` shows why it has not "
+            "updated. If its ticket is stale, move it aside there: "
+            "`mv ~/.tartci/state/self-update/waiting.json ~/.tartci/state/self-update/waiting.json.aside` "
+            "(it rejoins at the back on its next attempt).",
+            "- Safe to auto-apply: no; moving a ticket changes the queue order.",
+        ]
+    else:
+        lines += [
+            f"A peer holds the turn ({named[:200]}).",
+            "- On every host: `tartci pool status`.",
+            "- Safe to auto-apply: no.",
+        ]
+    lines += [
+        "",
+        f"**Verify.** On {me}, `tartci fleet-macos self-update --plan` takes the turn, or "
+        "`~/.tartci/state/self-update/waiting.json` is gone. This issue records the fix "
+        "time on its marker and closes itself when the host gets its turn.",
+    ]
+    marker = tartci_incident.marker(me, "self_update_starved", since, _iso(now))
+    return tartci_incident.with_marker("\n".join(lines), marker)
+
+
+def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str,
+                     now: float | None = None) -> None:
     """Once per episode, a GitHub issue: the event log alone was read by nobody.
 
     During the 2026-10-01 stall three hosts crossed the bound and wrote
@@ -1126,88 +1231,73 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
     if ticket.get("issue") or os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
         return
     import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    now = time.time() if now is None else now
     title = (f"[tartci] {me} self-update starved for {waited / 3600:.1f} h "
              f"since {_iso(float(ticket['since']))}")
-    body = (f"{me} has deferred its tartci self-update for {waited / 3600:.1f} h: {reason}\n\n"
-            "A busy, unreachable or longer-waiting peer holds the update turn. Check "
-            "tartci pool status on every host. This issue closes itself when the host "
-            "gets its turn.")
+    body = starvation_body(cfg, me, ticket, waited, reason, now)
     rc, text = host_off._open_issue(title, body)
     if rc == 0 and text.strip().isdigit():
         ticket["issue"] = text.strip()
+        ticket["issue_body"] = body
     else:
         ticket["issue_error"] = text[:300]
 
 
+# A gate-demand snapshot older than this is not used: the bound falls back.
 GATE_DEMAND_FRESH_SECONDS = 10 * 60
 
-def _epoch(value: object) -> float | None:
-    if isinstance(value, (int, float)): return float(value)
-    if not value: return None
-    try: return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except ValueError: return None
 
-def _host_gate_labels(cfg: Config, me: str) -> tuple[set[str], set[str]]:
-    """Return this host's published runner labels and workflow names."""
-    path = cfg.checkout / "fleet/advertised-labels.json"
-    value = _read_json(path) or {}
-    labels: set[str] = set(); workflows: set[str] = set()
-    for reg in value.get("registrations", []) if isinstance(value, dict) else []:
-        if isinstance(reg, dict) and str(reg.get("host_id")) == me:
-            labels.update(str(x).lower() for x in (reg.get("labels") or []))
-            workflows.update(str(x).lower() for x in (reg.get("workflows") or []))
-    return labels, workflows
+def _demand_fetch() -> gate_job_demand.Fetch:
+    return gate_job_demand.gh_fetcher(os.environ.get("TARTCI_GH_CLI") or "ghapp")
 
-def _gate_demand_jobs(value: object, me: str, now: float, labels: set[str], workflows: set[str]) -> list[dict]:
-    if not isinstance(value, dict): return []
-    observed = _epoch(value.get("observed_at"))
-    if observed is None or now - observed < 0 or now - observed > GATE_DEMAND_FRESH_SECONDS:
-        return []
-    jobs = value.get("jobs", [])
-    if not isinstance(jobs, list): return []
-    out=[]
-    for job in jobs:
-        if not isinstance(job, dict) or job.get("queued", True) is False: continue
-        jlabels={str(x).lower() for x in (job.get("labels") or job.get("runner_labels") or [])}
-        name=str(job.get("name") or job.get("workflow_name") or "").lower()
-        if (jlabels and labels.intersection(jlabels)) or (not jlabels and name and name in workflows):
-            out.append(job)
-    return out
 
-def refresh_gate_demand(cfg: Config, me: str, now: float | None = None) -> bool:
-    """Write a fresh host-scoped queue snapshot from the authenticated API."""
+def _gate_queue_path(cfg: Config) -> Path:
+    return _gate_queue_path_in(cfg.state_dir)
+
+
+def refresh_gate_demand(cfg: Config, me: str, now: float) -> dict:
+    """Read the queued self-hosted gate jobs this host serves and keep them in
+    gate-queue.json. A host with no published registration reads nothing."""
+    advertised = _read_json(cfg.checkout / "fleet/advertised-labels.json")
+    regs = gate_job_demand.registrations(advertised, me)
+    if not regs:
+        return {}
+    try:
+        jobs, errors = gate_job_demand.queued_jobs(_demand_fetch(), regs, now)
+    except Exception as error:  # noqa: BLE001 - a failed read is recorded, not raised
+        jobs, errors = [], [str(error)[:300]]
+    snapshot = {"observed_at": _iso(now), "host_id": me, "jobs": jobs, "errors": errors}
+    _write_json(_gate_queue_path(cfg), snapshot)
+    return snapshot
+
+
+def gate_demand(cfg: Config, me: str, now: float | None = None) -> tuple[list[dict], list[str]]:
+    """(queued gate jobs this host serves, read errors) from a fresh snapshot."""
+    return gate_demand_at(_gate_queue_path(cfg), me, now)
+
+
+def gate_demand_at(path: Path, me: str, now: float | None = None) -> tuple[list[dict], list[str]]:
+    """gate_demand for the snapshot at `path`; a stale or missing snapshot is
+    no demand, reported as an error."""
     now = time.time() if now is None else now
-    labels, workflows = _host_gate_labels(cfg, me)
-    if not labels and not workflows: return False
-    cli = os.environ.get("TARTCI_GH_CLI") or "ghapp"
-    repos = [x for x in os.environ.get("TARTCI_SERVED_REPOS", "Generous-Corp/pulp").split(",") if x]
-    jobs=[]
-    for repo in repos:
-        try:
-            result = subprocess.run([cli, "api", f"repos/{repo}/actions/runs?status=queued&per_page=100"],
-                                    capture_output=True, text=True, timeout=30, check=False)
-            payload=json.loads(result.stdout) if result.returncode == 0 else {}
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            continue
-        for run in payload.get("workflow_runs", []) if isinstance(payload, dict) else []:
-            if not isinstance(run, dict): continue
-            jobs.append({"id": run.get("id"), "queued": True,
-                         "name": run.get("name") or run.get("display_title"),
-                         "labels": run.get("labels") or [],
-                         "created_at": run.get("created_at"), "repo": repo})
-    path = Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(cfg.state_dir / "gate-queue.json"))
-    _write_json(path, {"observed_at": _iso(now), "host_id": me, "labels": sorted(labels), "jobs": jobs})
-    return bool(_gate_demand_jobs({"observed_at": _iso(now), "jobs": jobs}, me, now, labels, workflows))
+    value = _read_json(path)
+    if not isinstance(value, dict) or value.get("host_id") != me:
+        return [], ["no gate-demand snapshot for this host"]
+    observed = gate_job_demand.epoch(value.get("observed_at"))
+    if observed is None or not 0 <= now - observed <= GATE_DEMAND_FRESH_SECONDS:
+        return [], ["the gate-demand snapshot is stale"]
+    jobs = value.get("jobs") if isinstance(value.get("jobs"), list) else []
+    errors = value.get("errors") if isinstance(value.get("errors"), list) else []
+    return gate_job_demand.jobs_for(jobs, me, now), [str(error) for error in errors]
+
 
 def gate_demand_waiting(cfg: Config, me: str = "", now: float | None = None) -> bool:
-    """Return fresh queued demand matching this host's published labels."""
-    now = time.time() if now is None else now
-    path = Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(cfg.state_dir / "gate-queue.json"))
-    value = _read_json(path)
-    labels, workflows = _host_gate_labels(cfg, me)
-    if isinstance(value, dict) and (not labels and (not value.get("host_id") or value.get("host_id") == me)):
-        labels.update(str(x).lower() for x in (value.get("labels") or []))
-    return bool(_gate_demand_jobs(value, me, now, labels, workflows))
+    """Whether queued gate jobs this host serves are waiting."""
+    return bool(gate_demand(cfg, me, now)[0])
+
+
+def _gate_queue_path_in(state_dir: Path) -> Path:
+    return Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(state_dir / "gate-queue.json"))
 
 
 def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
@@ -1215,7 +1305,16 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
     ticket = note_waiting(cfg, me, target, reason, now)
     waited = max(0.0, now - float(ticket["since"]))
     refresh_gate_demand(cfg, me, now)
-    bound = STARVED_AFTER_SECONDS if gate_demand_waiting(cfg, me, now) else STARVED_FALLBACK_SECONDS
+    demand, demand_errors = gate_demand(cfg, me, now)
+    ticket["demand"] = demand[:20]
+    # A failed demand read falls back to the long bound, and says so: a blind
+    # read is not "no demand".
+    ticket["demand_error"] = "; ".join(demand_errors)[:300] or None
+    _write_json(cfg.state_dir / "waiting.json", ticket)
+    if demand_errors:
+        print(f"self-update: gate demand unread ({ticket['demand_error']}); "
+              f"starvation bound {STARVED_FALLBACK_SECONDS // 3600} h")
+    bound = STARVED_AFTER_SECONDS if demand else STARVED_FALLBACK_SECONDS
     if waited < bound:
         print(f"self-update: DEFERRED ({waited / 3600:.1f} h in the update queue): {reason}")
         return EXIT_DEFERRED
@@ -1225,9 +1324,11 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
         import host_off  # noqa: PLC0415 - sibling module; owns the event log format
         host_off.event(cfg.state_dir, "self_update_starved",
                        f"no update turn for {waited / 3600:.1f} h: {reason[:200]}",
-                       {"since": _iso(float(ticket["since"])), "target": target[:12]}, now)
+                       {"since": _iso(float(ticket["since"])), "target": target[:12],
+                        "gate_jobs": [job.get("id") for job in demand[:20]],
+                        "demand_error": ticket.get("demand_error")}, now)
         ticket["starved_evented"] = now
-    starvation_issue(cfg, me, ticket, waited, reason)
+    starvation_issue(cfg, me, ticket, waited, reason, now)
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return EXIT_REFUSED
 
@@ -2250,7 +2351,7 @@ class Run:
             self.receipt.step("announce", str(self.cfg.state_dir / "active.json"))
             # This host has its turn: whatever the update's outcome, it no
             # longer holds a place in the queue.
-            clear_waiting(self.cfg)
+            clear_waiting(self.cfg, self.sys.now())
             self._snapshot()
             try:
                 self._update()
@@ -2924,8 +3025,8 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
     waited = max(0.0, now - float(ticket["since"]))
     # The run that crossed the bound records it, so a reader whose clock is
     # behind the run's still says STARVED.
-    cfg = Config(home=state_dir.parent.parent)
-    has_demand = gate_demand_waiting(cfg, str(ticket.get("host_id") or ""), now)
+    has_demand = bool(gate_demand_at(_gate_queue_path_in(state_dir),
+                                      str(ticket.get("host_id") or ""), now)[0])
     bound = STARVED_AFTER_SECONDS if has_demand else STARVED_FALLBACK_SECONDS
     starved = waited >= bound or bool(ticket.get("starved_evented"))
     word = "STARVED" if starved else "deferred"
