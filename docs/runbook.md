@@ -2215,7 +2215,9 @@ fleet`), and check GitHub's job history against it with
   marker line whose `fixed_at` is written before the issue closes. If that
   PATCH or the close fails, the fix time waits in
   `~/.tartci/state/self-update/pending-fix.json` and the next run retries it;
-  the issue is never closed with `fixed_at` still null. Recovery of
+  the issue is never closed with `fixed_at` still null. An issue GitHub
+  reports gone (404 or 410) is dropped from the record and logged once as
+  `self_update_issue_gone`; no retry could reach it. Recovery of
   the dark host itself is manual: it needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only

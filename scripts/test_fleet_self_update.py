@@ -1326,6 +1326,48 @@ class UpdateQueueTests(Base):
         self.assertEqual(self.bodies[-1], body)
         self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
 
+    def pending_fix(self, issue: str = "41") -> None:
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": issue, "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+
+    def test_a_deleted_issue_is_dropped_and_logged_once_not_retried_forever(self) -> None:
+        import host_off
+        answers = {
+            "patch 404": ("_patch_issue_body", lambda n, b: (1, "gh: Not Found (HTTP 404)")),
+            "close 410": ("_close_issue",
+                          lambda n: (1, '{"message":"This issue was deleted","status":"410"}')),
+        }
+        for name, (helper, answer) in answers.items():
+            with self.subTest(name=name):
+                self.pending_fix()
+                events = self.cfg.state_dir / "events.jsonl"
+                events.unlink(missing_ok=True)
+                with mock.patch.object(host_off, helper, answer), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertTrue(su.finish_pending_fixes(self.cfg))
+                self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+                self.assertIn("#41 is gone", out.getvalue())
+                self.assertEqual(events.read_text().count("self_update_issue_gone"), 1)
+                # Nothing is left to retry: the next pass makes no calls.
+                before = len(self.issues)
+                self.assertTrue(su.finish_pending_fixes(self.cfg))
+                self.assertEqual(len(self.issues), before)
+                self.assertEqual(events.read_text().count("self_update_issue_gone"), 1)
+
+    def test_a_transient_error_is_still_retried(self) -> None:
+        # Control for the terminal case, same instrument: a 502 stays pending.
+        import host_off
+        self.pending_fix()
+        with mock.patch.object(host_off, "_patch_issue_body", lambda n, b: (1, "gh: Server Error (HTTP 502)")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(su.finish_pending_fixes(self.cfg))
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists())
+
     def fresh_demand(self, observed: float) -> None:
         su._write_json(self.cfg.state_dir / "gate-queue.json", {
             "observed_at": su._iso(observed), "host_id": "m1", "errors": [],
