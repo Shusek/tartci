@@ -340,6 +340,14 @@ def _open_issue(title: str, body: str) -> tuple[int, str]:
                    "-f", f"body={body}", "--jq", ".number"], _update_checkout())
 
 
+def _patch_issue_body(number: str, body: str) -> tuple[int, str]:
+    """Rewrite an issue's body, as when its incident marker gains fixed_at."""
+    if _scratch_home():
+        return 1, "refused: issue writes from a scratch TARTCI_HOME (a test run) never reach GitHub"
+    return _ghapp(["api", "-X", "PATCH", f"repos/{ISSUE_REPO}/issues/{number}",
+                   "-f", f"body={body}", "--jq", ".number"], _update_checkout())
+
+
 def _close_issue(number: str) -> tuple[int, str]:
     if _scratch_home():
         return 1, "refused: issue writes from a scratch TARTCI_HOME (a test run) never reach GitHub"

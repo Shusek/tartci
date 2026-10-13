@@ -1,3 +1,14 @@
+"""Serving-truth alarm: one host judging only itself.
+
+Fixtures:
+- fixtures/serving_truth_m1_20261013.json: m1's own lane event logs from
+  2026-10-12T20:00Z to 2026-10-13T02:10Z, and every self-hosted job (with its
+  run) of the Generous-Corp/pulp `Build and Test` runs created 2026-10-13
+  00:30-02:06Z. A job was queued at T when created_at <= T < started_at.
+- fixtures/gate_job_demand/: queue answers captured 2026-10-13 16:48Z and the
+  fleet's advertised-labels.json (real host ids m1, studio, m5, m5studio).
+- fixtures/serving_truth_real_replay.json: recorded rows from all four hosts.
+"""
 from __future__ import annotations
 
 import json
@@ -6,194 +17,521 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import gate_job_demand as demand
 import serving_truth_alarm as alarm
+import tartci_incident as incident
+
+HERE = Path(__file__).resolve().parent
+FIX = HERE / "fixtures"
+ADVERTISED = json.loads((FIX / "gate_job_demand" / "advertised-labels.json").read_text())
+REGS = demand.registrations(ADVERTISED)
+HOSTS = ("m1", "studio", "m5", "m5studio")
+BASE = demand.epoch("2026-10-13T12:00:00Z")
+PULP = "Generous-Corp/pulp"
+M1 = json.loads((FIX / "serving_truth_m1_20261013.json").read_text())
+SNAPSHOT = demand.epoch("2026-10-13T02:06:00Z")
 
 
-BASE = 1_800_000_000.0
+def iso(ts: float) -> str:
+    return alarm._iso(ts)
 
 
-def row(ts: float, event: str, host: str = "m5", **extra: object) -> dict:
-    return {"ts": alarm.dt.datetime.fromtimestamp(ts, alarm.dt.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"), "event": event, "runner": host, **extra}
+def row(ts: float, event: str, runner: str = "m5-pulp-gate-01", **extra: object) -> dict:
+    return {"ts": iso(ts), "event": event, "runner": runner, **extra}
 
 
-class ServingTruthTests(unittest.TestCase):
-    def test_queue_fetch_uses_one_paginated_api_read_and_keeps_required_rows(self) -> None:
-        payload = {"workflow_runs": [{"id": 1, "required_context": "pulp-build-pr-head"}, {"id": 2, "required": False}]}
-        with mock.patch.object(alarm.subprocess, "run", return_value=mock.Mock(
-                returncode=0, stdout=json.dumps(payload), stderr="")) as run:
-            self.assertEqual([r["id"] for r in alarm.fetch_required_queue("ghapp", "Generous-Corp/pulp")], [1, 2])
-        run.assert_called_once_with(
-            ["ghapp", "api", "repos/Generous-Corp/pulp/actions/runs?status=queued&per_page=100"],
-            capture_output=True, text=True, timeout=45, check=False)
+def gate_job(created: float, job_id: int = 7, label: str = "pulp-build-pr-head") -> dict:
+    """A queued pulp macOS job, shaped as gate_job_demand returns it."""
+    labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm", label]
+    job = {"id": job_id, "run_id": 1, "repo": PULP, "workflow": "Build and Test",
+           "name": "macos", "labels": labels, "created_at": iso(created)}
+    job["hosts"] = demand.serving_hosts(job, PULP, "Build and Test", REGS)
+    return job
 
-    def test_clone_is_not_a_job_start_and_queued_work_trips_at_20_minutes(self) -> None:
-        queued = [{"id": 11, "required": True,
-                   "created_at": alarm.dt.datetime.fromtimestamp(
-                       BASE - 1800, alarm.dt.timezone.utc).isoformat()}]
-        trips = alarm.classify([row(BASE - 100, "clone_start")], queued, now=BASE)
-        self.assertEqual([t["rule"] for t in trips], ["queued_required_no_job_start"])
 
-    def test_job_assigned_is_the_distinct_start_control(self) -> None:
-        queued = [{"id": 12, "created_at": alarm.dt.datetime.fromtimestamp(
-            BASE - 1800, alarm.dt.timezone.utc).isoformat()}]
-        self.assertEqual(alarm.classify([row(BASE - 100, "job_assigned")], queued, now=BASE), [])
+def m1_fetch(at: float):
+    """The production fetch, answered from the m1 capture as GitHub stood at `at`."""
+    runs = {run["id"]: run for run in M1["runs"]}
+    jobs: dict = {}
+    for job in M1["jobs"]:
+        jobs.setdefault(job["run_id"], []).append(job)
 
-    def test_admission_streak_trips_without_host_start(self) -> None:
-        events = [row(BASE - 300 + i * 30, "admission_error", detail="exit 255") for i in range(3)]
-        trips = alarm.classify(events, now=BASE)
-        self.assertEqual([t["rule"] for t in trips], ["admission_error_streak"])
-        self.assertEqual(len(trips[0]["evidence"]["errors"]), 3)
+    def status(job: dict) -> str:
+        created, started = demand.epoch(job["created_at"]), demand.epoch(job["started_at"])
+        completed = demand.epoch(job["completed_at"])
+        if created > at:
+            return "absent"
+        if started is None or at < started:
+            return "queued"
+        return "in_progress" if completed is None or at < completed else "completed"
 
-    def test_signal_death_requires_assigned_work(self) -> None:
-        events = [row(BASE - 60, "job_assigned", job_id="114426391754"),
-                  row(BASE - 10, "supervisor_signal", detail="INT/TERM quarantine=signal_teardown_unknown")]
-        trips = alarm.classify(events, now=BASE)
-        self.assertEqual([t["rule"] for t in trips], ["lane_death_by_signal"])
+    def fetch(path: str) -> dict:
+        if path.startswith(f"repos/{PULP}/actions/runs?status="):
+            listed = [dict(run, status="in_progress") for run in runs.values()
+                      if demand.epoch(run["created_at"]) <= at
+                      and any(status(j) in {"queued", "in_progress"} for j in jobs.get(run["id"], []))]
+            listed = listed if "status=in_progress" in path else []
+            return {"total_count": len(listed), "workflow_runs": listed}
+        if path.startswith(f"repos/{PULP}/actions/runs/"):
+            run = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+            return {"jobs": [dict(j, status=status(j)) for j in jobs.get(run, [])
+                             if status(j) != "absent"]}
+        return {"total_count": 0, "workflow_runs": []}
+    return fetch
 
-    def test_replay_outage_shapes_and_quiet_control(self) -> None:
-        fixture = json.loads((Path(__file__).parent / "fixtures" / "serving_truth_replay.json").read_text())
-        replay_rules = {}
-        for name, recorded in fixture["cases"].items():
-            with self.subTest(case=name):
-                trips = alarm.classify(recorded, fixture["queued"], now=fixture["now"])
-                self.assertTrue(trips, name)
-                replay_rules[name] = {trip["rule"] for trip in trips}
-        self.assertIn("host_error_burst", replay_rules["XCODE-license-burst"])
-        self.assertIn("fleet_self_update_deferral_streak", replay_rules["O11-deferral-streak"])
-        self.assertEqual(alarm.classify(fixture["quiet"], [], now=fixture["now"]), [])
 
-        # O3/O9/O10/O11 all have the same serving truth: required work exists,
-        # while the lanes emit no starts.  O3 additionally supplies admission
-        # evidence, and O9 supplies the signal-death evidence.
-        queued = [{"id": n, "required": True,
-                   "created_at": alarm.dt.datetime.fromtimestamp(
-                       BASE - 3600, alarm.dt.timezone.utc).isoformat()} for n in range(4)]
-        outage = [row(BASE - 900, "admission_error", host="m5s"),
-                  row(BASE - 840, "admission_error", host="m5s"),
-                  row(BASE - 780, "admission_error", host="m5s")]
-        rules = {trip["rule"] for trip in alarm.classify(outage, queued, now=BASE)}
-        self.assertEqual(rules, {"queued_required_no_job_start", "admission_error_streak"})
-        signal_rules = alarm.classify([
-            row(BASE - 30, "job_assigned", host="m3", job_id="o9"),
-            row(BASE - 10, "supervisor_signal", host="m3", detail="INT/TERM quarantine=signal_teardown_unknown")
-        ], queued, now=BASE)
-        self.assertEqual([trip["rule"] for trip in signal_rules], ["lane_death_by_signal"])
-        quiet = [row(BASE - 100, "clone_start"), row(BASE - 80, "boot_ip")]
-        self.assertEqual(alarm.classify(quiet, [], now=BASE), [])
+def m1_demand(at: float) -> list:
+    pulp = [reg for reg in REGS if reg["repo"] == PULP]
+    jobs, errors = demand.queued_jobs(m1_fetch(at), pulp, at)
+    assert errors == [], errors
+    return jobs
 
-    def test_alert_writes_receipt_and_deduplicates_issue(self) -> None:
+
+def rules(trips: list) -> set:
+    return {trip["rule"] for trip in trips}
+
+
+class HostIdentityTests(unittest.TestCase):
+    def test_runner_names_map_to_the_advertised_host_ids(self) -> None:
+        for runner, host in (("m1-pulp-gate-01", "m1"), ("studio-pulp-gate-slot2-02", "studio"),
+                             ("m5-pulp-gate-01", "m5"), ("m5studio-pulp-gate-01", "m5studio")):
+            self.assertEqual(alarm.host_of({"runner": runner}), host)
+        self.assertEqual({reg["host_id"] for reg in REGS}, set(HOSTS))
+        nested = {"event": "job_assigned", "fields": {"runner": "m5studio-forge-gate-01"}}
+        self.assertEqual(alarm.host_of(nested), "m5studio")
+
+    def test_every_host_that_just_started_a_job_is_quiet(self) -> None:
+        # The review's repro: all four hosts assigned a job 2 min ago, while a
+        # job they all serve has waited 43 min. Nobody trips.
+        rows = [row(BASE - 120, "job_assigned", runner=f"{host}-pulp-gate-01") for host in HOSTS]
+        rows += [row(BASE - 60, "job_terminal_receipt", runner=f"{host}-pulp-gate-01")
+                 for host in HOSTS]
+        jobs = [gate_job(BASE - 43 * 60)]
+        self.assertEqual(jobs[0]["hosts"], sorted(HOSTS))
+        for host in HOSTS:
+            with self.subTest(host=host):
+                self.assertEqual(alarm.classify(rows, jobs, me=host, regs=REGS, now=BASE), [])
+
+
+class JudgeOnlySelfTests(unittest.TestCase):
+    def test_a_host_never_reports_a_verdict_about_a_peer(self) -> None:
+        # m1's own view: it assigned a job 2 min ago, one job has waited 43 min.
+        rows = [row(BASE - 120, "job_assigned", runner="m1-pulp-gate-01")]
+        jobs = [gate_job(BASE - 43 * 60)]
+        self.assertEqual(alarm.classify(rows, jobs, me="m1", regs=REGS, now=BASE), [])
+
+    def test_a_silent_host_trips_only_for_itself(self) -> None:
+        rows = [row(BASE - 120, "job_assigned", runner="m1-pulp-gate-01")]
+        jobs = [gate_job(BASE - 43 * 60)]
+        trips = alarm.classify(rows, jobs, me="m5", regs=REGS, now=BASE)
+        self.assertEqual([(t["rule"], t["host"]) for t in trips], [("host_queued_no_job_start", "m5")])
+        for host in HOSTS:
+            for trip in alarm.classify(rows + [row(BASE - 50, "admission_error", runner="m5-pulp-gate-01")] * 3,
+                                       jobs, me=host, regs=REGS, now=BASE):
+                self.assertEqual(trip["host"], host)
+
+    def test_peer_rows_never_count_as_this_hosts_starts_or_errors(self) -> None:
+        jobs = [gate_job(BASE - 43 * 60)]
+        peer = [row(BASE - 120, "job_assigned", runner="studio-pulp-gate-01")]
+        self.assertIn("host_queued_no_job_start",
+                      rules(alarm.classify(peer, jobs, me="m5studio", regs=REGS, now=BASE)))
+        errors = [row(BASE - 300 + 30 * i, "admission_error", runner="studio-pulp-gate-01")
+                  for i in range(3)]
+        self.assertEqual(alarm.classify(errors, me="m5studio", regs=REGS, now=BASE), [])
+        self.assertEqual(rules(alarm.classify(errors, me="studio", regs=REGS, now=BASE)),
+                         {"admission_error_streak"})
+
+
+class DemandTests(unittest.TestCase):
+    def test_only_gate_jobs_this_host_serves_are_demand(self) -> None:
+        hosted = dict(gate_job(BASE - 3600), labels=["windows-latest"], hosts=[])
+        intel = dict(gate_job(BASE - 3600), labels=["self-hosted", "pulp-intel-native"], hosts=[])
+        self.assertEqual(alarm.classify([], [hosted, intel], me="m1", regs=REGS, now=BASE), [])
+        self.assertIn("host_queued_no_job_start",
+                      rules(alarm.classify([], [gate_job(BASE - 3600)], me="m1", regs=REGS, now=BASE)))
+
+    def test_a_job_queued_less_than_the_window_does_not_trip(self) -> None:
+        self.assertEqual(alarm.classify([], [gate_job(BASE - 19 * 60)], me="m1", regs=REGS, now=BASE), [])
+
+    def test_an_old_zombie_job_is_not_demand(self) -> None:
+        zombie = gate_job(demand.epoch("2026-08-19T00:00:00Z"))
+        self.assertEqual(alarm.classify([], [zombie], me="m1", regs=REGS, now=BASE), [])
+
+    def test_the_captured_queue_is_demand_through_the_production_fetch(self) -> None:
+        # 16:48:10Z: the in-progress run's queued macOS job, 1 min old. At 17:10
+        # it has waited 23 min, and m1 logged no job start.
+        import test_gate_job_demand as captured  # noqa: PLC0415
+        later = demand.epoch("2026-10-13T17:10:00Z")
+        jobs, errors = demand.queued_jobs(captured.Recorder(), captured.pulp_registrations(), later)
+        self.assertEqual(errors, [])
+        trips = alarm.classify([], jobs, me="m1", regs=REGS, now=later)
+        self.assertEqual(rules(trips), {"host_queued_no_job_start"})
+        self.assertEqual([j["id"] for j in trips[0]["evidence"]["queued_jobs"]], [115420876725])
+
+
+class BusyTests(unittest.TestCase):
+    def test_a_host_whose_serving_lanes_all_hold_jobs_is_not_flagged(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        busy = [row(BASE - 50 * 60, "job_assigned", runner="m1-pulp-gate-01"),
+                row(BASE - 45 * 60, "job_assigned", runner="m1-pulp-gate-slot2-02")]
+        self.assertEqual(alarm.classify(busy, jobs, me="m1", regs=REGS, now=BASE), [])
+        one_free = busy + [row(BASE - 40 * 60, "job_terminal_receipt", runner="m1-pulp-gate-slot2-02")]
+        self.assertIn("host_queued_no_job_start",
+                      rules(alarm.classify(one_free, jobs, me="m1", regs=REGS, now=BASE)))
+
+    def test_a_busy_lane_that_does_not_serve_the_job_does_not_suppress(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        other = [row(BASE - 50 * 60, "job_assigned", runner="m1-vellum-gate-01")]
+        self.assertIn("host_queued_no_job_start",
+                      rules(alarm.classify(other, jobs, me="m1", regs=REGS, now=BASE)))
+
+    def test_an_assignment_older_than_the_lookback_is_not_running(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        stale = [row(BASE - alarm.LOOKBACK_SECONDS - 60, "job_assigned", runner="m1-pulp-gate-01"),
+                 row(BASE - 3 * 3600, "scan_blind", runner="m1-pulp-gate-01")]
+        self.assertIn("host_queued_no_job_start",
+                      rules(alarm.classify(stale, jobs, me="m1", regs=REGS, now=BASE)))
+
+
+class RuleTests(unittest.TestCase):
+    def test_admission_precheck_is_not_a_job_start(self) -> None:
+        rows = [row(BASE - 60, "admission_precheck", runner="m1-pulp-gate-01"),
+                row(BASE - 30, "admission_check", runner="m1-pulp-gate-01")]
+        self.assertIn("host_queued_no_job_start",
+                      rules(alarm.classify(rows, [gate_job(BASE - 1800)], me="m1", regs=REGS, now=BASE)))
+
+    def test_scan_blind_on_a_serving_lane_trips_and_other_lanes_do_not(self) -> None:
+        jobs = [gate_job(BASE - 60)]
+        blind = [row(BASE - 180 + 60 * i, "scan_blind", runner="m1-pulp-gate-01",
+                     detail=f"consecutive={i + 1} running=0/2") for i in range(3)]
+        self.assertEqual(rules(alarm.classify(blind, jobs, me="m1", regs=REGS, now=BASE)),
+                         {"scan_blind_while_queued"})
+        vellum = [dict(r, runner="m1-vellum-gate-01") for r in blind]
+        self.assertEqual(alarm.classify(vellum, jobs, me="m1", regs=REGS, now=BASE), [])
+        self.assertEqual(alarm.classify(blind, [], me="m1", regs=REGS, now=BASE), [])
+        two = blind[:2]
+        self.assertEqual(alarm.classify(two, jobs, me="m1", regs=REGS, now=BASE), [])
+
+    def test_admission_streak_and_its_breakers(self) -> None:
+        def errs(*kinds: str) -> list:
+            return [row(BASE - 300 + 30 * i, kind) for i, kind in enumerate(kinds)]
+        self.assertEqual(rules(alarm.classify(errs("admission_error", "admission_precheck_error",
+                                                   "admission_error"), me="m5", now=BASE)),
+                         {"admission_error_streak"})
+        for breaker in ("admission_precheck", "job_assigned"):
+            with self.subTest(breaker=breaker):
+                self.assertEqual(alarm.classify(errs("admission_error", "admission_error", breaker,
+                                                     "admission_error", "admission_error"),
+                                                me="m5", now=BASE), [])
+
+    def test_burst_needs_three_heads(self) -> None:
+        rows = [row(BASE - 100, "job_failed", head_sha="a" * 40, error="license error")]
+        self.assertEqual(alarm.classify(rows, me="m5", now=BASE), [])
+        rows += [row(BASE - 80, "job_failed", head_sha="b" * 40, error="license error"),
+                 row(BASE - 60, "job_failed", head_sha="c" * 40, error="license error")]
+        self.assertEqual(rules(alarm.classify(rows, me="m5", now=BASE)), {"host_error_burst"})
+
+    def test_signal_death_needs_a_held_job_on_the_same_lane(self) -> None:
+        signal = "INT/TERM quarantine=signal_teardown_unknown"
+        rows = [row(BASE - 60, "job_assigned", runner="m5-pulp-gate-01"),
+                row(BASE - 10, "supervisor_signal", runner="m5-pulp-gate-slot2-02", detail=signal)]
+        self.assertEqual(alarm.classify(rows, me="m5", now=BASE), [])
+        rows.append(row(BASE - 5, "supervisor_signal", runner="m5-pulp-gate-01", detail=signal))
+        self.assertEqual(rules(alarm.classify(rows, me="m5", now=BASE)), {"lane_death_by_signal"})
+        clean = [row(BASE - 60, "job_assigned"), row(BASE - 10, "supervisor_signal",
+                                                      detail="TERM quarantine=none")]
+        self.assertEqual(alarm.classify(clean, me="m5", now=BASE), [])
+
+
+class RealReplayTests(unittest.TestCase):
+    def test_m1_on_2026_10_13_trips_within_20_minutes(self) -> None:
+        # m1's last job_assigned was 01:20:32Z, its lanes went scan-blind from
+        # 01:39:56Z, and 8 macOS gate jobs were queued at 02:06Z.
+        rows = M1["rows"]
+        jobs = m1_demand(SNAPSHOT)
+        self.assertEqual(len(jobs), 8)
+        self.assertTrue(all("m1" in job["hosts"] for job in jobs))
+        trips = alarm.classify(rows, jobs, me="m1", regs=REGS, now=SNAPSHOT)
+        self.assertIn("host_queued_no_job_start", rules(trips))
+        # m1 went free at its last terminal receipt; that is when the symptom began.
+        self.assertEqual(next(t for t in trips if t["rule"] == "host_queued_no_job_start")["since"],
+                         "2026-10-13T01:37:19Z")
+        first = None
+        for minute in range(0, 61):
+            at = demand.epoch("2026-10-13T01:20:32Z") + 20 * 60 + minute * 60
+            if alarm.classify(rows, m1_demand(at), me="m1", regs=REGS, now=at):
+                first = at
+                break
+        self.assertIsNotNone(first)
+        # The alarm fires 20 min after the last start plus at most 20 min of
+        # queue age; m1 was silent from 01:39:56Z.
+        self.assertLessEqual(first - demand.epoch("2026-10-13T01:39:56Z"), 20 * 60)
+
+    def test_m1_is_quiet_while_it_is_serving(self) -> None:
+        # 01:25Z: m1 started jobs at 01:02 and 01:20; nothing to report.
+        at = demand.epoch("2026-10-13T01:25:00Z")
+        self.assertEqual(alarm.classify(M1["rows"], m1_demand(at), me="m1", regs=REGS, now=at), [])
+
+    def test_the_quiet_day_has_no_admission_trips_on_any_host(self) -> None:
+        fixture = json.loads((FIX / "serving_truth_real_replay.json").read_text())
+        quiet = fixture["cases"]["quiet"]
+        end = alarm._epoch(quiet[-1]["ts"])
+        for host in HOSTS:
+            with self.subTest(host=host):
+                self.assertEqual(alarm.classify(quiet, me=host, regs=REGS, now=end), [])
+
+
+class BodyTests(unittest.TestCase):
+    def trip(self) -> dict:
+        jobs = m1_demand(SNAPSHOT)
+        trips = alarm.classify(M1["rows"], jobs, me="m1", regs=REGS, now=SNAPSHOT)
+        return next(t for t in trips if t["rule"] == "host_queued_no_job_start")
+
+    def test_the_body_is_actionable_and_ends_with_one_marker(self) -> None:
+        trip = self.trip()
+        title, body = alarm.render(trip, "2026-10-13T02:06:00Z")
+        self.assertEqual(title, "[tartci] serving-truth: host_queued_no_job_start on m1")
+        for heading in ("## What happened", "## Evidence", "## Likely cause", "## Fix (run on `m1`)",
+                        "## Safe to auto-apply", "## How to verify"):
+            self.assertIn(heading, body)
+        self.assertIn("`m1` started 0 gate jobs", body)
+        self.assertIn("job 115079270964", body)
+        self.assertNotIn("job 115090933480", body)  # queued 12 min: not yet waiting the window
+        self.assertIn("2026-10-13T01:20:32Z on `m1-pulp-gate-slot2-02`", body)
+        self.assertIn("scan_blind", body)
+        self.assertIn("observation lock", body)
+        self.assertIn("queue-observation.lock.owner.json", body)
+        self.assertIn("tartci pool status", body)
+        marker = incident.parse(body)
+        self.assertEqual(marker, {"host": "m1", "class": "host_queued_no_job_start",
+                                  "symptom_at": trip["since"], "detected_at": "2026-10-13T02:06:00Z",
+                                  "fixed_at": None})
+        self.assertEqual(sum(1 for line in body.split("\n") if line.startswith(incident.PREFIX)), 1)
+
+    def test_every_rule_renders_every_section(self) -> None:
+        signal = "INT/TERM quarantine=signal_teardown_unknown"
+        cases = {
+            "scan_blind_while_queued": ([row(BASE - 180 + 60 * i, "scan_blind", runner="m1-pulp-gate-01",
+                                             detail=f"consecutive={i + 1}") for i in range(3)],
+                                        [gate_job(BASE - 60)]),
+            "admission_error_streak": ([row(BASE - 90 + 30 * i, "admission_error", runner="m1-pulp-gate-01",
+                                            detail="exit 255") for i in range(3)], []),
+            "host_error_burst": ([row(BASE - 90 + 30 * i, "job_failed", runner="m1-pulp-gate-01",
+                                      head_sha=c * 40, error="license error") for i, c in enumerate("abc")], []),
+            "lane_death_by_signal": ([row(BASE - 60, "job_assigned", runner="m1-pulp-gate-01"),
+                                      row(BASE - 10, "supervisor_signal", runner="m1-pulp-gate-01",
+                                          detail=signal)], []),
+        }
+        for rule, (rows, jobs) in cases.items():
+            with self.subTest(rule=rule):
+                trip = next(t for t in alarm.classify(rows, jobs, me="m1", regs=REGS, now=BASE)
+                            if t["rule"] == rule)
+                _, body = alarm.render(trip, iso(BASE))
+                for heading in ("## What happened", "## Evidence", "## Likely cause", "## Fix",
+                                "## Safe to auto-apply", "## How to verify"):
+                    self.assertIn(heading, body)
+                self.assertEqual(incident.parse(body)["class"], rule)
+
+
+class GitHub:
+    """Fake issue API recording every call in order."""
+
+    def __init__(self, fail: set | None = None) -> None:
+        self.calls: list = []
+        self.bodies: dict = {}
+        self.fail = fail or set()
+        self.next = 100
+
+    def open(self, title: str, body: str):
+        self.calls.append(("open", title))
+        if "open" in self.fail:
+            return 1, "HTTP 502"
+        self.next += 1
+        self.bodies[str(self.next)] = body
+        return 0, str(self.next)
+
+    def patch(self, number: str, body: str):
+        self.calls.append(("patch", number))
+        if "patch" in self.fail:
+            return 1, "HTTP 502"
+        self.bodies[number] = body
+        return 0, number
+
+    def close(self, number: str):
+        self.calls.append(("close", number))
+        if "close" in self.fail:
+            return 1, "HTTP 502"
+        return 0, "closed"
+
+
+class LifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "serving-truth"
+        self.gh = GitHub()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def tick(self, rows: list, jobs: list, at: float, shadow: bool = False) -> dict:
+        return alarm.alert_pass(self.state, rows, jobs, me="m5", regs=REGS, now=at, shadow=shadow,
+                                issue=self.gh.open, patch=self.gh.patch, close=self.gh.close)
+
+    def test_each_episode_has_its_own_detection_and_fix(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        first = self.tick([], jobs, BASE)
+        self.assertEqual(first["opened"], ["101"])
+        self.assertEqual(self.tick([], jobs, BASE + 300)["opened"], [])
+        start = [row(BASE + 600, "job_assigned")]
+        fixed = self.tick(start, jobs, BASE + 660)
+        self.assertEqual(fixed["fixed"][0]["fixed_at"], iso(BASE + 600))
+        self.assertEqual(fixed["fixed"][0]["detected_at"], iso(BASE))
+        self.assertEqual(self.gh.calls[-2:], [("patch", "101"), ("close", "101")])
+        # A day later: a new episode with its own timestamps and its own issue.
+        later = BASE + 86400
+        second = self.tick([], [gate_job(later - 3600)], later)
+        self.assertEqual(second["opened"], ["102"])
+        ep = second["episodes"]["host_queued_no_job_start:m5"]
+        self.assertEqual((ep["detected_at"], ep["fixed_at"]), (iso(later), None))
+        self.assertEqual(incident.parse(self.gh.bodies["102"])["detected_at"], iso(later))
+
+    def test_a_success_from_before_detection_never_fixes(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        old = [row(BASE - 5000, "job_assigned"),
+               row(BASE - 4900, "job_terminal_receipt", detail="result=Succeeded")]
+        self.tick(old, jobs, BASE)
+        out = self.tick(old, [], BASE + 600)
+        self.assertEqual(out["fixed"], [])
+        self.assertIn("host_queued_no_job_start:m5", out["episodes"])
+        self.assertNotIn(("close", "101"), self.gh.calls)
+
+    def test_the_fix_is_patched_into_the_marker_before_close(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        self.tick([], jobs, BASE)
+        self.tick([row(BASE + 120, "job_assigned")], jobs, BASE + 180)
+        body = self.gh.bodies["101"]
+        marker = incident.parse(body)
+        self.assertEqual(marker["fixed_at"], iso(BASE + 120))
+        self.assertEqual(marker["detected_at"], iso(BASE))
+        self.assertEqual(sum(1 for line in body.split("\n") if line.startswith(incident.PREFIX)), 1)
+        self.assertLess(self.gh.calls.index(("patch", "101")), self.gh.calls.index(("close", "101")))
+
+    def test_a_failed_patch_keeps_the_issue_open_and_retries(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        self.tick([], jobs, BASE)
+        self.gh.fail = {"patch"}
+        start = [row(BASE + 120, "job_assigned")]
+        out = self.tick(start, jobs, BASE + 180)
+        self.assertEqual(out["fixed"], [])
+        self.assertNotIn(("close", "101"), self.gh.calls)
+        self.gh.fail = set()
+        out = self.tick(start, jobs, BASE + 480)
+        self.assertEqual(out["fixed"][0]["fixed_at"], iso(BASE + 120))
+        self.assertEqual(self.gh.calls[-2:], [("patch", "101"), ("close", "101")])
+
+    def test_a_failed_open_is_retried(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        self.gh.fail = {"open"}
+        self.assertEqual(self.tick([], jobs, BASE)["opened"], [])
+        self.gh.fail = set()
+        self.assertEqual(self.tick([], jobs, BASE + 300)["opened"], ["101"])
+        self.assertEqual(incident.parse(self.gh.bodies["101"])["detected_at"], iso(BASE))
+
+    def test_shadow_never_touches_github_and_still_tracks_the_episode(self) -> None:
+        jobs = [gate_job(BASE - 3600)]
+        out = self.tick([], jobs, BASE, shadow=True)
+        self.assertEqual(self.gh.calls, [])
+        self.assertTrue(out["receipts"])
+        ep = out["episodes"]["host_queued_no_job_start:m5"]
+        self.assertEqual(incident.parse(ep["issue_body"])["fixed_at"], None)
+        out = self.tick([row(BASE + 120, "job_assigned")], jobs, BASE + 180, shadow=True)
+        self.assertEqual(out["fixed"][0]["fixed_at"], iso(BASE + 120))
+        self.assertEqual(self.gh.calls, [])
+
+    def test_evidence_from_before_the_last_fix_does_not_reopen(self) -> None:
+        errors = [row(BASE - 90 + 30 * i, "admission_error") for i in range(3)]
+        self.tick(errors, [], BASE)
+        recovered = errors + [row(BASE + 60, "job_assigned")]
+        # The assignment fixes the episode; the same old errors, read again
+        # without it, cannot start a new one.
+        self.assertTrue(self.tick(recovered, [], BASE + 120)["fixed"])
+        self.assertEqual(self.tick(errors, [], BASE + 180)["opened"], [])
+        fresh = errors + [row(BASE + 200 + 30 * i, "admission_error") for i in range(3)]
+        self.assertEqual(self.tick(fresh, [], BASE + 300)["opened"], ["102"])
+
+
+class ReadTests(unittest.TestCase):
+    def test_only_the_recent_tail_is_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            events = root / "events.jsonl"
-            events.write_text(json.dumps(row(BASE - 30, "admission_error")) + "\n" +
-                              json.dumps(row(BASE - 20, "admission_error")) + "\n" +
-                              json.dumps(row(BASE - 10, "admission_error")) + "\n")
-            opened: list[str] = []
-            issue = lambda title, body: (opened.append(title) or (0, "91"))
-            first = alarm.alert_pass(root / "state", events, [], now=BASE, issue=issue)
-            second = alarm.alert_pass(root / "state", events, [], now=BASE + 60, issue=issue)
-            self.assertTrue(first["receipts"])
-            self.assertEqual(len(opened), 1)
-            self.assertFalse(second["evented"])
-            lifecycle = json.loads((root / "state" / "serving-truth-lifecycle.json").read_text())
-            self.assertEqual(set(lifecycle), {"detected_at", "symptom_at"})
-            quiet = alarm.alert_pass(root / "state", events.with_name("quiet.json"), [], now=BASE + 3600,
-                                     issue=issue, close=lambda number: (0, "closed"),
-                                     update=lambda number, body: (0, "updated"))
-            self.assertTrue(quiet["closed"])
-            lifecycle = json.loads((root / "state" / "serving-truth-lifecycle.json").read_text())
-            self.assertIn("fixed_at", lifecycle)
+            path = Path(tmp) / "events.jsonl"
+            old = "".join(json.dumps(row(BASE - 86400 + i, "scan_blind")) + "\n" for i in range(20000))
+            new = [row(BASE - 60 + i, "job_assigned") for i in range(5)]
+            path.write_text(old + "".join(json.dumps(r) + "\n" for r in new) + "not json\n")
+            read = []
+            real_open = Path.open
+
+            def counting_open(self, *args, **kwargs):
+                handle = real_open(self, *args, **kwargs)
+                real_read = handle.read
+
+                def tracked(n=-1):
+                    data = real_read(n)
+                    read.append(len(data))
+                    return data
+                handle.read = tracked
+                return handle
+            with mock.patch.object(Path, "open", counting_open):
+                rows = alarm.read_events_since(path, BASE - 3600, chunk=512)
+            self.assertEqual(rows, new)
+            self.assertLess(sum(read), 4096)
+            self.assertGreater(path.stat().st_size, 1_000_000)
+
+    def test_rows_split_across_chunks_are_whole(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            rows = [row(BASE - 600 + i, "job_assigned", detail="x" * (i * 7)) for i in range(50)]
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            self.assertEqual(alarm.read_events_since(path, 0, chunk=64), rows)
+            self.assertEqual(alarm.read_events_since(path, BASE - 600 + 25, chunk=64), rows[25:])
+
+
+class WatchdogTests(unittest.TestCase):
+    def test_the_watchdog_pass_judges_this_host_in_shadow(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lane = home / "state" / "macos-fleet" / "pulp-gate"
+            lane.mkdir(parents=True)
+            (lane / "events.jsonl").write_text(
+                json.dumps(row(BASE - 120, "job_assigned", runner="studio-pulp-gate-01")) + "\n")
+            env = {"TARTCI_HOME": str(home), "TARTCI_HOST_ID": "m5",
+                   "TARTCI_ADVERTISED_LABELS": str(FIX / "gate_job_demand" / "advertised-labels.json")}
+            calls: list = []
+            with mock.patch.dict("os.environ", env, clear=True), \
+                    mock.patch.object(watchdog, "utcnow", return_value=BASE), \
+                    mock.patch.object(alarm, "fetch_demand",
+                                      lambda cli, adv, me, now: (calls.append(me) or [gate_job(BASE - 3600)], [])), \
+                    mock.patch("host_off._open_issue", side_effect=AssertionError("shadow opened an issue")):
+                line = watchdog.serving_truth_pass()
+            self.assertEqual(calls, ["m5"])
+            self.assertIn("host_queued_no_job_start", line)
+            self.assertIn("on m5", line)
+            episodes = json.loads((home / "state" / "serving-truth" / alarm.STATE_NAME).read_text())
+            self.assertEqual(list(episodes["episodes"]), ["host_queued_no_job_start:m5"])
+
+    def test_an_unknown_host_id_is_reported_not_guessed(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lane = home / "state" / "macos-fleet" / "pulp-gate"
+            lane.mkdir(parents=True)
+            (lane / "events.jsonl").write_text(json.dumps(row(BASE, "job_assigned")) + "\n")
+            env = {"TARTCI_HOME": str(home),
+                   "TARTCI_MACOS_FLEET_PROFILE": str(home / "absent.toml")}
+            with mock.patch.dict("os.environ", env, clear=True):
+                line = watchdog.serving_truth_pass()
+            self.assertIn("host_id is unknown", line)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-class RealReplayTests(unittest.TestCase):
-    def test_recorded_rows_are_used_and_quiet_has_no_admission_trip(self):
-        fixture = json.loads((Path(__file__).parent / "fixtures" / "serving_truth_real_replay.json").read_text())
-        self.assertGreaterEqual(sum(len(v) for k, v in fixture["cases"].items() if k != "quiet"), 1)
-        quiet = fixture["cases"]["quiet"]
-        self.assertFalse([t for t in alarm.classify(quiet, now=alarm._epoch(quiet[-1]["ts"])) if t["rule"] == "admission_error_streak"])
-        nested = {"ts": "2026-10-12T17:00:00Z", "event": "job_assigned", "runner": "m1-pulp-gate-01", "fields": {"job_id": "x"}}
-        self.assertEqual(alarm._host(nested), "m1")
-
-    def test_shadow_default_never_calls_issue(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); events = root / "events.jsonl"
-            events.write_text(json.dumps(row(BASE - 300, "admission_error")) + "\n" + json.dumps(row(BASE - 200, "admission_error")) + "\n" + json.dumps(row(BASE - 100, "admission_error")) + "\n")
-            opened = []
-            with mock.patch.dict("os.environ", {}, clear=True):
-                out = alarm.alert_pass(root / "state", events, [], now=BASE)
-            self.assertTrue(out["shadow"])
-            self.assertFalse(opened)
-
-class QueueAbsenceTests(unittest.TestCase):
-    def test_published_host_absence_trips_while_another_host_starts(self):
-        queued = [{"id": 1, "required": True, "host": "m3",
-                   "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1200, alarm.dt.timezone.utc).isoformat()}]
-        events = [row(BASE - 60, "job_assigned", host="m5")]
-        rules = alarm.classify(events, queued, now=BASE, window_seconds=900)
-        self.assertIn("host_queued_no_job_start", {t["rule"] for t in rules})
-
-    def test_whole_fleet_zero_starts_trips_when_demand_exists(self):
-        queued = [{"id": 1, "required": True,
-                   "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1200, alarm.dt.timezone.utc).isoformat()}]
-        rules = alarm.classify([], queued, now=BASE, window_seconds=900)
-        self.assertIn("queued_required_no_job_start", {t["rule"] for t in rules})
-
-class ReviewerMutantTests(unittest.TestCase):
-    def test_admission_precheck_is_not_a_job_start(self):
-        queued = [{"id": 50, "created_at": alarm.dt.datetime.fromtimestamp(BASE - 1800, alarm.dt.timezone.utc).isoformat()}]
-        rows = [row(BASE - 60, "admission_precheck"), row(BASE - 30, "admission_check")]
-        self.assertIn("queued_required_no_job_start", {t["rule"] for t in alarm.classify(rows, queued, now=BASE)})
-
-    def test_scan_blind_cycles_trip_with_live_queue(self):
-        queued = [{"id": 51, "created_at": alarm.dt.datetime.fromtimestamp(BASE - 60, alarm.dt.timezone.utc).isoformat()}]
-        rows = [row(BASE - 180, "scan_blind", detail="consecutive=1"),
-                row(BASE - 120, "scan_blind", detail="consecutive=2"),
-                row(BASE - 60, "scan_blind", detail="consecutive=3")]
-        self.assertIn("scan_blind_while_queued", {t["rule"] for t in alarm.classify(rows, queued, now=BASE)})
-
-    def test_stale_zombie_queue_is_ignored(self):
-        queued = [{"id": 32218602754, "status": "queued",
-                   "created_at": "2026-08-19T00:00:00+00:00"}]
-        self.assertFalse(alarm.classify([], queued, now=alarm._epoch("2026-10-12T12:00:00Z")))
-
-    def test_signal_quarantine_and_terminal_clear(self):
-        rows = [row(BASE-100, "job_assigned", host="m3"), row(BASE-90, "supervisor_signal", host="m3", detail="TERM quarantine=none")]
-        self.assertFalse(alarm.classify(rows, now=BASE))
-        rows.append(row(BASE-80, "job_terminal_receipt", host="m3", detail="conclusion success"))
-        rows.append(row(BASE-70, "supervisor_signal", host="m3", detail="TERM quarantine=signal_teardown_unknown"))
-        self.assertFalse(alarm.classify(rows, now=BASE))
-
-    def test_admission_precheck_resets_error_streak(self):
-        rows = [row(BASE-300, "admission_error"), row(BASE-250, "admission_error"), row(BASE-200, "admission_precheck"), row(BASE-100, "admission_error")]
-        self.assertFalse(alarm.classify(rows, now=BASE))
-
-    def test_burst_requires_three_heads(self):
-        rows = [row(BASE-100, "job_failed", host="m3", head_sha="a"*40, error="license error")]
-        self.assertFalse(alarm.classify(rows, now=BASE))
-        rows.extend([row(BASE-80, "job_failed", host="m3", head_sha="b"*40, error="license error"),
-                     row(BASE-60, "job_failed", host="m3", head_sha="c"*40, error="license error")])
-        self.assertIn("host_error_burst", {t["rule"] for t in alarm.classify(rows, now=BASE)})
-
-    def test_admission_job_assignment_breaks_error_streak(self):
-        rows = [row(BASE-300, "admission_error"), row(BASE-250, "admission_error"),
-                row(BASE-200, "job_assigned"), row(BASE-100, "admission_error"),
-                row(BASE-80, "admission_error")]
-        self.assertNotIn("admission_error_streak", {t["rule"] for t in alarm.classify(rows, now=BASE)})
-
-    def test_deferral_requires_three_hosts(self):
-        rows = [row(BASE-3599, "self_update_starved", host="m3", peer="m1")]
-        self.assertFalse(alarm.classify(rows, now=BASE))
-
-    def test_lifecycle_second_tick_does_not_reopen_episode(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp); events=root/"events.jsonl"
-            events.write_text("\n".join(json.dumps(row(BASE-i*10,"admission_error")) for i in (3,2,1))+"\n")
-            opened=[]
-            issue=lambda title,body:(opened.append(title) or (0,"1"))
-            alarm.alert_pass(root/"state",events,[],now=BASE,issue=issue)
-            alarm.alert_pass(root/"state",events,[],now=BASE+60,issue=issue)
-            self.assertEqual(len(opened),1)

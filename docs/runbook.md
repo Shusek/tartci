@@ -2306,6 +2306,26 @@ fleet`), and check GitHub's job history against it with
   08:40Z to 17:16Z: two updates and their rollbacks could not `pool on`
   because the launch helper's volume probe timed out on a stalled Workshop
   volume, and the same-target guard then refused every scheduled run.
+- **Serving truth: is this host taking the gate work it serves?**
+  (`scripts/serving_truth_alarm.py`). Every watchdog pass, each host judges
+  only itself, never a peer: its own lane event logs
+  (`~/.tartci/state/macos-fleet/*/events.jsonl`, read back 6 h from the end,
+  not whole) against the queued self-hosted jobs its own registrations in
+  `fleet/advertised-labels.json` serve (`scripts/gate_job_demand.py`: jobs,
+  not runs, so hosted-only and zombie runs are not demand). Its host_id is
+  `TARTCI_HOST_ID` or the installed profile's `host.id`; neither is a WARN,
+  never a guess. Rules: a served job waited 20 min with no `job_assigned` here
+  while a serving lane was free; a serving lane scan-blind 3 cycles while a
+  served job waits; 3 admission errors in a row; one first error on 3 heads in
+  30 min; a lane holding a job killed by a quarantining signal. Each
+  (rule, host) is an episode with its own receipt under
+  `state/serving-truth/` and, with `TARTCI_SERVING_TRUTH_ALARM=on` (default
+  shadow: receipts and the rendered issue body only; `0` disables), its own
+  issue: what happened, evidence, likely cause, the fix to run, whether it is
+  safe to auto-apply, how to verify, and the tartci-incident marker. An episode
+  is fixed only by evidence on that host after detection (`job_assigned`, or a
+  successful terminal receipt for the failure rules); the marker's `fixed_at`
+  is PATCHed in before the issue closes.
 - **Disk pressure.** `pool status` prints a `disk:` line for the VM store
   volume (`host.tart_home`) and the home volume: `WARN` at 85% used. At 92%
   the VM store volume is a readiness problem (`disk_pressure`, fleet ready: NO),
