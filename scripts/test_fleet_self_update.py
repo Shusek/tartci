@@ -1273,6 +1273,97 @@ class UpdateQueueTests(Base):
         self.assertIsNotNone(fixed)
         self.assertGreaterEqual(su.gate_job_demand.epoch(fixed), NOW)
 
+    def test_a_failed_patch_keeps_the_fix_time_and_retries_before_closing(self) -> None:
+        # A transient API error on the PATCH must not close the issue with a
+        # marker still saying fixed_at null: nothing would ever correct it.
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n, b: self.issues.append(("patch-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_patch_issue_body", failing):
+            self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed"])
+        pending = json.loads((self.cfg.state_dir / su.PENDING_FIX_NAME).read_text())["fixes"]
+        self.assertEqual([fix["issue"] for fix in pending], ["77"])
+        fixed_at = pending[0]["fixed_at"]
+        self.assertIn("HTTP 502", pending[0]["error"])
+        # The next run PATCHes the recorded fix time, then closes.
+        self.apply()
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed", "patch", "close"])
+        self.assertEqual(su.tartci_incident.parse(self.bodies[-1])["fixed_at"], fixed_at)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def test_a_failed_close_is_retried_without_patching_again(self) -> None:
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n: self.issues.append(("close-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_close_issue", failing):
+            self.assertUpdated(self.apply())
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertTrue(su.finish_pending_fixes(self.cfg))
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close-failed", "close"])
+
+    def test_a_deferred_run_still_retries_a_pending_fix(self) -> None:
+        # A run that defers never clears a ticket, so the retry has to happen
+        # at entry: the fix recorded by an earlier run still lands.
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": "41", "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+        self.ticket(since=NOW - 1800)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [("patch", "41"), ("close", "41")])
+        self.assertEqual(self.bodies[-1], body)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def fresh_demand(self, observed: float) -> None:
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {
+            "observed_at": su._iso(observed), "host_id": "m1", "errors": [],
+            "jobs": [{"id": 1, "hosts": ["m1"], "repo": "Generous-Corp/pulp",
+                      "workflow": "Build and Test", "name": "macos",
+                      "created_at": su._iso(NOW - 600)}]})
+
+    def test_a_stale_demand_snapshot_is_no_demand(self) -> None:
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        jobs, errors = su.gate_demand(self.cfg, "m1", NOW)
+        self.assertEqual(jobs, [])
+        self.assertTrue(any("stale" in error for error in errors), errors)
+        # Control, same instrument: the same snapshot, fresh, is demand.
+        self.fresh_demand(NOW - 60)
+        self.assertEqual([job["id"] for job in su.gate_demand(self.cfg, "m1", NOW)[0]], [1])
+
+    def test_defer_on_a_stale_snapshot_keeps_the_six_hour_bound(self) -> None:
+        # A refresh that wrote nothing leaves an old snapshot behind; it is
+        # not demand, so 4 h in the queue is still only a deferral.
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        with mock.patch.object(su, "refresh_gate_demand", lambda *args: {}):
+            self.assertDeferred(self.apply())
+            self.assertEqual(self.issues, [])
+            # Control: a fresh snapshot of the same job trips the 4 h bound.
+            self.fresh_demand(NOW - 60)
+            self.assertEqual(self.apply(), su.EXIT_REFUSED)
+
+    def test_waiting_line_uses_the_demand_bound(self) -> None:
+        # 4.5 h in the queue: starved when gate jobs this host serves are
+        # queued, still only deferred without them.
+        self.ticket(since=NOW - 4.5 * 3600)
+        self.fresh_demand(NOW - 60)
+        self.assertIn("STARVED", su.waiting_line(self.cfg.state_dir, NOW))
+        (self.cfg.state_dir / "gate-queue.json").unlink()
+        self.assertIn("deferred", su.waiting_line(self.cfg.state_dir, NOW))
+
     def test_a_short_deferral_is_quiet(self) -> None:
         # Control for the bound: a deferral just under it, with demand queued,
         # is not a problem.

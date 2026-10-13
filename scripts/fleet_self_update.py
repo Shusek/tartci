@@ -1114,22 +1114,71 @@ def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> 
     return ticket
 
 
+PENDING_FIX_NAME = "pending-fix.json"
+
+
 def clear_waiting(cfg: Config, now: float | None = None) -> None:
+    """This host has its turn: leave the queue, and finish its starvation issue.
+
+    The fix time is recorded first (pending-fix.json), then the ticket goes.
+    The issue's marker is PATCHed with fixed_at and only then is the issue
+    closed; a failed PATCH or close is retried on the next run, so a transient
+    API error never leaves a closed issue whose marker says fixed_at null.
+    """
     ticket = waiting_ticket(cfg) or {}
     if ticket.get("issue"):
-        # The host has its turn again: record when on the issue's incident
-        # marker, then close it.
-        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        fixed_at = _iso(time.time() if now is None else now)
         body = ticket.get("issue_body")
-        if isinstance(body, str) and body:
-            fixed_at = _iso(time.time() if now is None else now)
-            try:
-                host_off._patch_issue_body(str(ticket["issue"]),
-                                           tartci_incident.fixed(body, fixed_at))
-            except ValueError:
-                pass
-        host_off._close_issue(str(ticket["issue"]))
+        try:
+            fixed_body = tartci_incident.fixed(body, fixed_at) if isinstance(body, str) and body else None
+        except ValueError:
+            fixed_body = None
+        pending = _pending_fixes(cfg)
+        pending.append({"issue": str(ticket["issue"]), "issue_body": fixed_body,
+                        "fixed_at": fixed_at, "patched": fixed_body is None})
+        _write_json(cfg.state_dir / PENDING_FIX_NAME, {"fixes": pending})
     (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
+    finish_pending_fixes(cfg)
+
+
+def _pending_fixes(cfg: Config) -> list[dict]:
+    value = _read_json(cfg.state_dir / PENDING_FIX_NAME)
+    fixes = value.get("fixes") if isinstance(value, dict) else None
+    return [fix for fix in fixes if isinstance(fix, dict) and fix.get("issue")] \
+        if isinstance(fixes, list) else []
+
+
+def finish_pending_fixes(cfg: Config) -> bool:
+    """PATCH each recorded fix time into its issue's marker, then close the
+    issue. Whatever fails stays recorded for the next run. True when none is
+    left."""
+    pending = _pending_fixes(cfg)
+    if not pending:
+        return True
+    import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    left = []
+    for fix in pending:
+        if not fix.get("patched"):
+            rc, text = host_off._patch_issue_body(fix["issue"], str(fix["issue_body"]))
+            if rc != 0:
+                fix["error"] = f"patch: {text}"[:300]
+                print(f"self-update: starvation issue #{fix['issue']}: fixed_at not recorded "
+                      f"({fix['error']}); retrying next run")
+                left.append(fix)
+                continue
+            fix["patched"] = True
+        rc, text = host_off._close_issue(fix["issue"])
+        if rc != 0:
+            fix["error"] = f"close: {text}"[:300]
+            print(f"self-update: starvation issue #{fix['issue']}: not closed "
+                  f"({fix['error']}); retrying next run")
+            left.append(fix)
+    path = cfg.state_dir / PENDING_FIX_NAME
+    if left:
+        _write_json(path, {"fixes": left})
+    else:
+        path.unlink(missing_ok=True)
+    return not left
 
 
 def _turn_holder(reason: str) -> tuple[str, str]:
@@ -2053,6 +2102,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_FAILED
     if apply:
         recover_left_off(cfg, sys_)
+        finish_pending_fixes(cfg)
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)

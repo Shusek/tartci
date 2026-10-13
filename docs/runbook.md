@@ -2212,7 +2212,10 @@ fleet`), and check GitHub's job history against it with
   would count hosted-only runs and the 2026-08-19 zombie merge group. The
   starvation issue names the peer holding the turn and why, the queued jobs,
   the fix per cause and how to verify, and ends with a `tartci-incident`
-  marker line whose `fixed_at` is written before the issue closes. Recovery of
+  marker line whose `fixed_at` is written before the issue closes. If that
+  PATCH or the close fails, the fix time waits in
+  `~/.tartci/state/self-update/pending-fix.json` and the next run retries it;
+  the issue is never closed with `fixed_at` still null. Recovery of
   the dark host itself is manual: it needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only
