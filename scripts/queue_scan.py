@@ -513,30 +513,30 @@ class QueueScanner:
             ):
                 return cached_runs
 
-            # GitHub calls happen outside the host-global flock. Only the
-            # final snapshot publication is serialized, so a slow fetch cannot
-            # block another lane's claim/observation.
-            self.now = int(time.time())
-            self.api_calls = 0
-            self._preflight_identity()
-            runs = self._runs(discovery)
-            candidates, backlog_ids = self._candidate_runs(runs, discovery)
-            discovered: list[dict[str, Any]] = []
-            for run in candidates[: self.args.max_job_fetches]:
-                run_id = int(run["id"])
-                jobs = self._gh(
-                    f"repos/{self.args.repo}/actions/runs/{run_id}"
-                    "/jobs?filter=latest&per_page=100"
-                ).get("jobs", [])
-                if not isinstance(jobs, list):
-                    raise ValueError(f"jobs is not a list for run {run_id}")
-                discovered.append({**run, "_jobs": jobs})
+        # GitHub calls happen outside both the shared discovery lock and the
+        # host-global observation flock. Only the final snapshot publication is
+        # serialized, so a slow fetch cannot block another lane's claim.
+        self.now = int(time.time())
+        self.api_calls = 0
+        self._preflight_identity()
+        runs = self._runs(discovery)
+        candidates, backlog_ids = self._candidate_runs(runs, discovery)
+        discovered: list[dict[str, Any]] = []
+        for run in candidates[: self.args.max_job_fetches]:
+            run_id = int(run["id"])
+            jobs = self._gh(
+                f"repos/{self.args.repo}/actions/runs/{run_id}"
+                "/jobs?filter=latest&per_page=100"
+            ).get("jobs", [])
+            if not isinstance(jobs, list):
+                raise ValueError(f"jobs is not a list for run {run_id}")
+            discovered.append({**run, "_jobs": jobs})
 
-            discovery["fetched_at"] = int(time.time())
-            discovery["runs"] = discovered
-            with self._observation_lock():
-                self._save_json(self.discovery_path, discovery)
-            return discovered
+        discovery["fetched_at"] = int(time.time())
+        discovery["runs"] = discovered
+        with self._observation_lock():
+            self._save_json(self.discovery_path, discovery)
+        return discovered
 
     def _scan_locked(self) -> int:
         runs = self._discover()
