@@ -366,6 +366,18 @@ package, image-pull, or experiment credential for JIT registration. The M1
 Forge gate deliberately uses the default `TARTCI_GH_CLI=ghapp` route: its
 macOS-27 stackbench credential is registry-only.
 
+**A lane can own its caches.** Every macOS VM mounts `<cache_root>/ccache`
+and `<cache_root>/configure-checks` writable, so on the host-wide root any job
+on any lane, PR gates included, can plant an object that a later job links. A
+lane that signs or publishes can set its own `cache_root`; the renderer emits
+it as that lane's `TARTCI_CI_CACHE`, so only VMs booted for that lane mount it.
+Validation requires an organization runner group (never the repository-wide
+group 1), keeps every tier in that group, refuses a root that nests with the
+host root or another lane's, and refuses to share one root across runner
+groups. Restricting the group to protected workflows and refs is a GitHub
+setting the profile cannot see; verify it before trusting the cache. The
+FetchContent seed is already mounted read-only. Roll out on one host first.
+
 **Registry tooling is not runner tooling.** The M1 macOS-27 stackbench
 credential is for GHCR push/pull only, never Actions registration. Its GHCR
 harness must invoke `/usr/bin/curl` explicitly: a PATH-shadowing curl wrapper

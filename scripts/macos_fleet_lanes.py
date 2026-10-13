@@ -100,7 +100,7 @@ WORKTREE_CLEANUP_KEYS = {
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
-    "jit_github_cli", "chrome_app_dir", "assignment_mode",
+    "jit_github_cli", "chrome_app_dir", "assignment_mode", "cache_root",
     "ccache_write_isolation",
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
@@ -314,6 +314,63 @@ def _verified_network_overlay(
     if value != base or plistlib.dumps(value, sort_keys=False) != base_body:
         return None
     return body
+
+
+def validate_lane_cache_roots(host: dict, lanes: list) -> None:
+    """A lane-owned cache root is mounted only into that lane's runner group.
+
+    The host ``cache_root`` backs the ccache that every lane's VM mounts
+    writable, so any job on any lane can plant an object a later job links. A
+    lane that signs or publishes sets its own ``cache_root``: only VMs booted
+    for runner groups that list it mount it, so only their jobs write it. It
+    must not nest with the host root or another root (one ``--dir`` would
+    expose the other), and every lane sharing it must share its repository
+    and runner group, or an untrusted lane would write the trusted cache.
+
+    The trust boundary is the runner group, so the lane must register into an
+    organization group (never the repository-wide group 1, which any
+    workflow on any branch can target) and every tier must stay in that
+    group. Restricting that group to the protected workflows and refs is a
+    GitHub-side setting this file cannot see; the group's policy verifier
+    owns it.
+    """
+    host_root = PurePosixPath(host["cache_root"])
+    owners: dict[str, tuple] = {}
+    for lane in lanes:
+        if not isinstance(lane, dict) or "cache_root" not in lane:
+            continue
+        lane_id = lane.get("id", "")
+        value = lane["cache_root"]
+        if not isinstance(value, str):
+            fail(f"lane {lane_id}: cache_root must be an absolute path")
+        root = PurePosixPath(posixpath.normpath(value))
+        if (not root.is_absolute() or root.as_posix() != value
+                or any(char in value for char in ":,\r\n")):
+            fail(f"lane {lane_id}: cache_root must be a normalized absolute path "
+                 "without ':' or ','")
+        if root == host_root or root.is_relative_to(host_root) or host_root.is_relative_to(root):
+            fail(f"lane {lane_id}: cache_root must not be, contain or sit inside "
+                 "host.cache_root, which every lane mounts")
+        group = lane.get("runner_group_id")
+        if group == 1 or lane.get("registration_scope") == "repository":
+            fail(f"lane {lane_id}: a lane-owned cache_root needs an organization "
+                 "runner group restricted to protected workflows, not the "
+                 "repository-wide group 1")
+        for tier in lane.get("tier") or []:
+            if isinstance(tier, dict) and tier.get("runner_group_id", group) != group:
+                fail(f"lane {lane_id}: tier {tier.get('label')!r} leaves runner group "
+                     f"{group}, so its jobs would write the lane's cache_root")
+        owner = (lane.get("repo"), group)
+        for other, other_owner in owners.items():
+            other_root = PurePosixPath(other)
+            if other_root == root and other_owner != owner:
+                fail(f"lane {lane_id}: cache_root {value} is shared with a lane of "
+                     "another repository or runner group")
+            if other_root != root and (root.is_relative_to(other_root)
+                                       or other_root.is_relative_to(root)):
+                fail(f"lane {lane_id}: cache_root must not nest with another "
+                     "lane's cache_root")
+        owners[root.as_posix()] = owner
 
 
 def load(path: Path) -> dict:
@@ -629,6 +686,7 @@ def load(path: Path) -> dict:
                 f"{host['id']}.{lane.get('id', '')}"
                 f"{'' if slot == 1 else f'.slot{slot}'}"
             )
+    validate_lane_cache_roots(host, lanes)
     seen: set[str] = set()
     replaced: set[str] = set()
     for lane in lanes:
@@ -2477,7 +2535,7 @@ def lane_plist(
         "TARTCI_RUNNER_GROUP_ID": str(lane["runner_group_id"]),
         "TARTCI_RUNNER_LABELS": ",".join(lane["labels"]),
         "TARTCI_MACOS_GOLDEN": lane["golden"],
-        "TARTCI_CI_CACHE": host["cache_root"],
+        "TARTCI_CI_CACHE": lane.get("cache_root", host["cache_root"]),
         "TARTCI_STATE_DIR": state,
         "TARTCI_DISK_DENIAL_RECEIPT_DIR": f"{host['home']}/.tartci/state/disk-admission",
         "TARTCI_RECEIPT_HOST_ID": host["id"],

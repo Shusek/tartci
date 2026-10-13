@@ -2272,6 +2272,89 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertIn("supervisors must be 1 or 2", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def _trusted_release(self, **overrides) -> tuple[dict, list[dict]]:
+        host = {"cache_root": "/Users/x/.cache/pulp-ci"}
+        lane = {
+            "id": "pulp-release", "repo": "Generous-Corp/pulp", "runner_group_id": 12,
+            "cache_root": "/Users/x/.cache/pulp-ci-trusted",
+            "tier": [{"label": "pulp-release-tagged", "runner_group_id": 12}],
+        }
+        lane.update(overrides)
+        return host, [{"id": "pulp-gate", "repo": "Generous-Corp/pulp",
+                       "runner_group_id": 1}, lane]
+
+    def test_lane_cache_root_accepts_a_trusted_runner_group(self) -> None:
+        host, lanes = self._trusted_release()
+        fleet.validate_lane_cache_roots(host, lanes)
+        twin = dict(lanes[1], id="pulp-release-2")
+        fleet.validate_lane_cache_roots(host, lanes + [twin])
+
+    def test_lane_cache_root_refuses_what_an_untrusted_job_could_write(self) -> None:
+        cases = {
+            "repository group": (
+                {"runner_group_id": 1,
+                 "tier": [{"label": "pulp-release-tagged", "runner_group_id": 1}]},
+                "repository-wide group 1"),
+            "repository scope": ({"registration_scope": "repository"},
+                                 "repository-wide group 1"),
+            "tier leaves the group": (
+                {"tier": [{"label": "pulp-release-pr-gate", "runner_group_id": 1}]},
+                "leaves runner group"),
+            "the host root": ({"cache_root": "/Users/x/.cache/pulp-ci"}, "host.cache_root"),
+            "inside the host root": (
+                {"cache_root": "/Users/x/.cache/pulp-ci/trusted"}, "host.cache_root"),
+            "containing the host root": ({"cache_root": "/Users/x/.cache"}, "host.cache_root"),
+            "relative": ({"cache_root": "cache/trusted"}, "normalized absolute"),
+            "unnormalized": ({"cache_root": "/Users/x/./trusted"}, "normalized absolute"),
+            "tart --dir separator": ({"cache_root": "/Users/x/a:b"}, "normalized absolute"),
+            "not a string": ({"cache_root": 7}, "absolute path"),
+        }
+        for name, (overrides, message) in cases.items():
+            with self.subTest(name=name):
+                host, lanes = self._trusted_release(**overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    fleet.validate_lane_cache_roots(host, lanes)
+
+    def test_lane_cache_root_is_owned_by_one_group(self) -> None:
+        host, lanes = self._trusted_release()
+        other_group = dict(lanes[1], id="other", runner_group_id=13,
+                           tier=[{"label": "x", "runner_group_id": 13}])
+        with self.assertRaisesRegex(ValueError, "another repository or runner group"):
+            fleet.validate_lane_cache_roots(host, lanes + [other_group])
+        nested = dict(lanes[1], id="nested", cache_root="/Users/x/.cache/pulp-ci-trusted/n")
+        with self.assertRaisesRegex(ValueError, "nest"):
+            fleet.validate_lane_cache_roots(host, lanes + [nested])
+
+    def test_lane_cache_root_renders_only_into_its_own_lane(self) -> None:
+        data = fleet.load(HOST_CONFIGS["m5"])
+        release = next(lane for lane in data["lane"] if lane["id"] == "pulp-release")
+        release["cache_root"] = "/Users/x/.cache/pulp-ci-trusted"
+        envs = {
+            name: plistlib.loads(body)["EnvironmentVariables"]
+            for name, body in fleet.rendered_plists(data).items()
+        }
+        release_env = envs[
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"]
+        self.assertEqual(release_env["TARTCI_CI_CACHE"], "/Users/x/.cache/pulp-ci-trusted")
+        others = {env["TARTCI_CI_CACHE"] for name, env in envs.items()
+                  if ".pulp-release." not in name and not name.endswith(".pulp-release.plist")}
+        self.assertEqual(others, {data["host"]["cache_root"]})
+
+    def test_shipped_release_lane_cannot_take_a_cache_root_in_group_1(self) -> None:
+        body = HOST_CONFIGS["m5"].read_text()
+        anchor = 'id = "pulp-release"\n'
+        self.assertIn(anchor, body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(body.replace(
+                anchor, anchor + 'cache_root = "/Users/x/.cache/pulp-ci-trusted"\n', 1))
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("repository-wide group 1", result.stderr)
+
     def test_chrome_mount_is_forge_only_and_path_normalized(self) -> None:
         base = CONFIG.read_text()
         fixtures = {
