@@ -42,11 +42,18 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-# launchd.plist(5) documents exactly these ProcessType values. A supervisor
-# left Background is throttled by the system for latency-insensitive work,
-# which lengthens every GitHub API call its queue scan makes.
+# launchd.plist(5) documents exactly these ProcessType values.
 PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
-DEFAULT_PROCESS_TYPE = "Background"
+# Every fleet supervisor takes the host-global queue observation lock, so a
+# supervisor in the darwinbg band is a priority inversion for the whole host:
+# its GitHub calls run several times slower (confined to efficiency cores and
+# throttled) while it holds the lock every other lane waits on. Background
+# puts a job in that band unconditionally and Adaptive does so whenever the
+# job holds no XPC transaction, which a supervisor never does. Measured on a
+# loaded host, the same exhaustive scan held the lock for 154 s in the band
+# and 18 s out of it, past the 120 s lock wait, so every lane went blind.
+SUPERVISOR_PROCESS_TYPES = ("Standard", "Interactive")
+DEFAULT_PROCESS_TYPE = "Standard"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
@@ -686,6 +693,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: process_type must be one of "
                 f"{list(PROCESS_TYPES)}"
+            )
+        if process_type is not None and process_type not in SUPERVISOR_PROCESS_TYPES:
+            fail(
+                f"lane {lane_id}: process_type {process_type!r} runs the "
+                "supervisor in the darwinbg band while it holds the host "
+                "queue observation lock; use one of "
+                f"{list(SUPERVISOR_PROCESS_TYPES)}"
             )
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
