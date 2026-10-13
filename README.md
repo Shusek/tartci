@@ -368,7 +368,12 @@ macOS-27 stackbench credential is registry-only.
 
 **A lane can own its caches.** Every macOS VM mounts `<cache_root>/ccache`
 and `<cache_root>/configure-checks` writable, so on the host-wide root any job
-on any lane, PR gates included, can plant an object that a later job links. A
+on any lane, PR gates included, can plant an object that a later job links.
+The configure-check cache is worse than an object: Pulp's
+`PulpConfigureCheckCache.cmake` `include()`s its files, so a planted one runs
+CMake in the next configure. That holds between two PR gate runs as well as
+from a PR into a release. Both writable mounts derive from the lane's root, and
+a test keeps every writable mount under it. A
 lane that signs or publishes can set its own `cache_root`; the renderer emits
 it as that lane's `TARTCI_CI_CACHE`, so only VMs booted for that lane mount it.
 Validation requires an organization runner group (never the repository-wide

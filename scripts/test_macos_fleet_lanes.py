@@ -2340,6 +2340,22 @@ class MacosFleetLaneTests(unittest.TestCase):
                   if ".pulp-release." not in name and not name.endswith(".pulp-release.plist")}
         self.assertEqual(others, {data["host"]["cache_root"]})
 
+    def test_every_writable_vm_mount_lives_under_the_lane_cache_root(self) -> None:
+        # A lane cache_root isolates only what runner.sh mounts from
+        # $CACHE_ROOT. ccache AND configure-checks are both writable, and the
+        # configure-check cache holds CMake that Pulp include()s, so neither
+        # may come from anywhere else. Read-only mounts may.
+        body = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text(encoding="utf-8")
+        mounts = re.findall(r'--dir="([^"]+)"', body)
+        self.assertIn("ccache:$CACHE_ROOT/ccache", mounts)
+        self.assertIn("configure-checks:$CACHE_ROOT/configure-checks", mounts)
+        writable = [m for m in mounts if not m.endswith(":ro") and m != "$CHROME_MOUNT_ARG"]
+        self.assertEqual(
+            [m for m in writable if not m.split(":", 1)[1].startswith("$CACHE_ROOT/")], [],
+            "a writable VM mount outside $CACHE_ROOT escapes a lane-owned cache_root")
+        chrome = (ROOT / "providers" / "tart-macos" / "chrome-mount.lib.sh").read_text(encoding="utf-8")
+        self.assertIn('CHROME_MOUNT_ARG="google-chrome:$CHROME_APP_DIR:ro"', chrome)
+
     def test_shipped_release_lane_cannot_take_a_cache_root_in_group_1(self) -> None:
         body = HOST_CONFIGS["m5"].read_text()
         anchor = 'id = "pulp-release"\n'
