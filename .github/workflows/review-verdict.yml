@@ -40,8 +40,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: danielraffel/Shipyard
-          # Shipyard #824's merge commit.
-          ref: cf5c74bc142f76238bea0348f65f48c75fd54a00
+          # Shipyard v0.326.0 (#824, #827, #828, #829).
+          ref: e9866ff9f08c791ccae73dbfc46fbededd6d4f42
           persist-credentials: false
       - name: Set up Python
         id: python
