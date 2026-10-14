@@ -547,6 +547,32 @@ class WatchdogTests(unittest.TestCase):
             episodes = json.loads((home / "state" / "serving-truth" / alarm.STATE_NAME).read_text())
             self.assertEqual(list(episodes["episodes"]), ["host_queued_no_job_start:m5"])
 
+    def test_a_failed_demand_read_is_a_warn_line(self) -> None:
+        # A blind demand read reads as "no demand" to every rule; this line is
+        # the only place it shows. m5 just started a job, so nothing trips.
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        failure = "repos/Generous-Corp/pulp/actions/runs?status=queued&per_page=100: gh exit 1: HTTP 502"
+        lines = {}
+        for name, errors in (("failed", [failure]), ("control", [])):
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                lane = home / "state" / "macos-fleet" / "pulp-gate"
+                lane.mkdir(parents=True)
+                (lane / "events.jsonl").write_text(
+                    json.dumps(row(BASE - 120, "job_assigned", runner="m5-pulp-gate-01")) + "\n")
+                env = {"TARTCI_HOME": str(home), "TARTCI_HOST_ID": "m5",
+                       "TARTCI_ADVERTISED_LABELS": str(FIX / "gate_job_demand" / "advertised-labels.json")}
+                with mock.patch.dict("os.environ", env, clear=True), \
+                        mock.patch.object(watchdog, "utcnow", return_value=BASE), \
+                        mock.patch.object(alarm, "fetch_demand",
+                                          lambda cli, adv, me, now, errors=errors: ([], list(errors))):
+                    lines[name] = watchdog.serving_truth_pass()
+        self.assertIsNotNone(lines["failed"], "a failed demand read printed nothing")
+        self.assertIn("launchd-watchdog: WARN serving-truth: gate demand partly unread: ", lines["failed"])
+        self.assertIn("HTTP 502", lines["failed"])
+        self.assertNotIn("rule trip", lines["failed"])
+        self.assertIsNone(lines["control"])
+
     def test_an_unknown_host_id_is_reported_not_guessed(self) -> None:
         import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
         with tempfile.TemporaryDirectory() as tmp:

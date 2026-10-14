@@ -97,27 +97,112 @@ class LaneCacheRootRefusalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
 
 
-class RunnerWiringTests(unittest.TestCase):
+    def test_a_parent_link_to_a_non_host_dir_is_refused(self) -> None:
+        # Not an overlap with the host root, so only the physical-path
+        # comparison can see that the root is not the directory it names.
+        elsewhere = self.base / "elsewhere"
+        (elsewhere / "lane").mkdir(parents=True)
+        (self.base / "link").symlink_to(elsewhere)
+        result = refusal(self.base / "link" / "lane", str(self.host))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(f"resolves to {elsewhere / 'lane'}", result.stdout)
+        # Control: the same directory named by its real path boots.
+        self.assertEqual(refusal(elsewhere / "lane", str(self.host)).returncode, 0)
+
+
+# Stubs for the functions the mount preparation calls, each recording its call.
+STUBS = r"""
+calls="$1"; shift
+tartci_prepare_disk_root() { echo "prepare $1" >>"$calls"; mkdir -p "$1" || return 1; [ -z "${STUB_AFTER_PREPARE:-}" ] || eval "$STUB_AFTER_PREPARE"; }
+tartci_ccache_guard() { echo "guard $1" >>"$calls"; }
+note() { echo "note $*" >>"$calls"; }
+discard_current_vm() { echo "discard" >>"$calls"; }
+tartci_release_vm_lease() { echo "release" >>"$calls"; }
+runtime_emit_complete() { echo "complete $*" >>"$calls"; }
+"""
+
+
+class MountPreparationTests(unittest.TestCase):
+    """The mount preamble, executed: the lib function, and the runner's own
+    lines that call it, with every side effect stubbed and recorded."""
+
     def setUp(self) -> None:
-        self.body = RUNNER.read_text(encoding="utf-8")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(os.path.realpath(tmp.name))
+        self.host = self.base / "host-ci"
+        (self.host / "ccache").mkdir(parents=True)
+        (self.host / "configure-checks").mkdir()
+        self.fetch = self.base / "fetchcontent"
+        self.calls = self.base / "calls.log"
 
-    def test_runner_sources_the_lib_and_reads_the_host_root(self) -> None:
-        self.assertIn('source "$TARTCI_ROOT/providers/tart-macos/lane-cache-root.lib.sh"', self.body)
-        self.assertIn('HOST_CACHE_ROOT="${TARTCI_HOST_CI_CACHE:-}"', self.body)
+    def runner_block(self) -> str:
+        # The whole statement around the call, taken as written: a guard that
+        # was neutralized (`if false && ...`) runs here as it would in a boot.
+        body = RUNNER.read_text(encoding="utf-8")
+        call = body.index('tartci_prepare_lane_cache_mounts "$CACHE_ROOT"')
+        start = body.rindex("\n", 0, call) + 1
+        return body[start:body.index("\n  fi\n", start) + len("\n  fi\n")]
 
-    def test_refusal_runs_before_preparation_and_before_the_mounts(self) -> None:
-        call = 'tartci_lane_cache_root_refusal "$CACHE_ROOT" "$HOST_CACHE_ROOT"'
-        first = self.body.index(call)
-        second = self.body.index(call, first + 1)
-        self.assertLess(first, self.body.index('tartci_prepare_disk_root "$CACHE_ROOT/ccache"'))
-        self.assertLess(first, self.body.index('tartci_ccache_guard "$CACHE_ROOT/ccache"'))
-        self.assertGreater(second, self.body.index('tartci_prepare_disk_root "$CACHE_ROOT/configure-checks"'))
-        self.assertLess(second, self.body.index('--dir="ccache:$CACHE_ROOT/ccache"'))
-        # Each refusal stops the boot.
-        for start in (first, second):
-            block = self.body[start:self.body.index("\n  fi\n", start)]
-            self.assertIn("return 1", block)
-            self.assertIn("discard_current_vm", block)
+    def boot(self, root: Path, host: str, after_prepare: str = "") -> tuple[int, list[str], str]:
+        """Run the runner's own preamble lines inside a boot function."""
+        script = (STUBS + 'source "$1"; shift\n'
+                  'CACHE_ROOT="$1" HOST_CACHE_ROOT="$2" FETCHCONTENT_SOURCE_ROOT="$3"\n'
+                  'boot() {\n  local i=1 logdir=log\n' + self.runner_block()
+                  + '  echo booted >>"$calls"\n}\nboot\n')
+        result = subprocess.run(
+            ["/bin/bash", "-c", script, "_", str(self.calls), str(LIB), str(root), host,
+             str(self.fetch)],
+            text=True, capture_output=True, check=False,
+            env={"PATH": "/usr/bin:/bin", "STUB_AFTER_PREPARE": after_prepare},
+        )
+        calls = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return result.returncode, calls, result.stderr
+
+    def test_a_clean_lane_root_is_prepared_in_order_and_boots(self) -> None:
+        root = self.base / "trusted"
+        rc, calls, err = self.boot(root, str(self.host))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(calls, [f"prepare {root}/ccache", f"guard {root}/ccache",
+                                 f"prepare {self.fetch}", f"prepare {root}/configure-checks",
+                                 "booted"])
+
+    def test_a_symlinked_root_stops_the_boot_before_anything_is_prepared(self) -> None:
+        root = self.base / "trusted"
+        root.symlink_to(self.host)
+        rc, calls, err = self.boot(root, str(self.host))
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(calls[1:], ["discard", "release", "complete fail cache_setup_failed 1  log"])
+        self.assertTrue(calls[0].startswith(f"note [1] lane cache root: {root} is a symlink"), calls)
+        self.assertTrue(calls[0].endswith("; refusing to boot"), calls)
+
+    def test_a_link_that_appears_during_preparation_is_refused_by_the_second_check(self) -> None:
+        # configure-checks becomes a link to the host's after the first check.
+        root = self.base / "trusted"
+        swap = (f'[ "$1" = "{root}/configure-checks" ] && rmdir "$1" '
+                f'&& ln -s "{self.host}/configure-checks" "$1"; true')
+        rc, calls, err = self.boot(root, str(self.host), after_prepare=swap)
+        self.assertEqual(rc, 1, err)
+        self.assertIn(f"prepare {root}/configure-checks", calls)
+        self.assertNotIn("booted", calls)
+        self.assertTrue(any(c.startswith(f"note [1] lane cache root: {root}/configure-checks is a symlink")
+                            for c in calls), calls)
+        self.assertEqual(calls[-3:], ["discard", "release", "complete fail cache_setup_failed 1  log"])
+
+    def test_a_failed_preparation_stops_the_boot_without_a_refusal_note(self) -> None:
+        root = self.base / "trusted"
+        rc, calls, err = self.boot(root, str(self.host), after_prepare="false")
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(calls, [f"prepare {root}/ccache", "discard", "release",
+                                 "complete fail cache_setup_failed 1  log"])
+
+    def test_a_host_root_lane_is_prepared_without_checks(self) -> None:
+        # No TARTCI_HOST_CI_CACHE: a link in the host-root lane is not judged.
+        root = self.base / "linked"
+        root.symlink_to(self.host)
+        rc, calls, err = self.boot(root, "")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(calls[-1], "booted")
 
 
 if __name__ == "__main__":
