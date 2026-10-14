@@ -946,6 +946,12 @@ stock bash 3.2:
 bug that only bites at run time on a CI host — e.g. a help line that executes as
 a command before `set -e`.
 
+When any job in a `ci.yml` run fails, the advisory `ci-cause` job names
+each failure as a `ci.cause/v1` record. It reads the failed jobs' finished logs
+and prints each record as a `::notice title=ci-cause::` annotation. The
+extractor is the pinned, checksum-verified Shipyard release in
+`scripts/ci_cause_notices.sh`. The job never gates a pull request.
+
 ## Metrics (file-based, no server)
 Per-run build/configure/ctest times + cache-hit% land in a `metrics.jsonl` (one
 JSON object per line). Two zero-dependency Python scripts read it:
