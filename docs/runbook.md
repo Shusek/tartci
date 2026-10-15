@@ -3459,7 +3459,14 @@ Homebrew's GNU `timeout` resets `XPC_SERVICE_NAME` to `0`) with neither
 refuses to run, unless its installed fleet lanes carry an absolute
 `TARTCI_PYTHON`: that bootstraps a host whose pin was never written (m3 and
 m5s, 2026-10-15, where the self-update agent was refused before the install
-that writes the pin could run). Otherwise it refuses to run
+that writes the pin could run). The bootstrap applies to every tartci
+LaunchAgent on such a host (watchdog, relay, reclaim, reap and self-update),
+each running the binary its lanes already run; when lanes disagree, the newest
+lane plist wins. Each use logs `no ~/.config/tartci/python.pin: <job> uses the
+fleet lanes' interpreter <path>`, and `tartci doctor fleet` reports a managed
+host without a pin (`python_pin_missing`) or with one that names no executable
+(`python_pin_unusable`), so a host cannot stay on the bootstrap unnoticed.
+Otherwise it refuses to run
 and logs `refusing an unpinned interpreter`; it never takes whatever
 `/opt/homebrew/bin/python3` is today. The helpers that otherwise fall back to
 `/usr/bin/python3` when no TOML-capable interpreter exists (status, reclaim,
@@ -3500,7 +3507,14 @@ watchdog opens `[tartci] <host> kept its lane interpreter: <new> failed the
 launchd preflight` (`interpreter_switch_refused`), naming the grant; it closes
 once a later install switches or no switch is attempted. A self-update
 rollback reinstalls with the interpreter the previous generation's lanes ran
-and restores its `python.pin`, never the new generation's. When the watchdog itself is refused,
+and restores its `python.pin`, never the new generation's: it passes
+`TARTCI_ROLLBACK_PYTHON`, which outranks the snapshot profile's `host.python`
+(that profile may name the switch the preflight refused, and it is not
+rewritten because a sealed launcher's policy digest covers it). A rollback is
+not preflighted; it restores a binary the lanes already ran. The installer
+honours `TARTCI_ROLLBACK_PYTHON` only when it equals `python.pin` (self-update
+pins it first) or an installed lane's `TARTCI_PYTHON`, and refuses any other
+value, so a stray export cannot skip the preflight. When the watchdog itself is refused,
 `tartci launchd heal` still runs that alert alone under `/usr/bin/python3`
 (`scripts/interpreter_alert.py`, stdlib only; Homebrew never replaces it) and
 then exits 127, so a host with a broken pin reports it instead of going

@@ -6,7 +6,9 @@
 # stdlib tomllib module added in Python 3.11. Resolve a supported interpreter
 # explicitly so launchd cannot turn a real readiness result into the generic
 # readiness_probe_failed fallback. TARTCI_PYTHON may name an absolute path or
-# a PATH command; otherwise prefer common Homebrew 3.11/3.12 installations.
+# a PATH command. Without it: the pin, then (under a tartci LaunchAgent only)
+# the fleet lanes' interpreter or a refusal; only an operator's shell searches
+# PATH for a Homebrew 3.11/3.12.
 # The host's pinned interpreter: the absolute path the fleet installer wrote
 # to ~/.config/tartci/python.pin (TARTCI_PYTHON_PIN overrides the file). It is
 # the same path the lane LaunchAgents carry as TARTCI_PYTHON, so a LaunchAgent
@@ -66,22 +68,30 @@ tartci_launchd_context() {
 
 # The absolute TARTCI_PYTHON the installed fleet lanes carry: what the
 # installer pinned before python.pin existed. It is the bootstrap for a host
-# whose pin was never written, so its self-update (which hands off to the new
-# generation's picker) can install, and the install writes the pin. Read from
-# the plist XML without a TOML or plist parser.
+# whose pin was never written, and it applies to EVERY tartci LaunchAgent on
+# that host (watchdog, relay, reclaim, reap, self-update), not only the
+# self-update that writes the pin: each runs the binary the lanes already run,
+# with the lanes' privacy grants. The installer also reads it as the
+# interpreter the lanes run now. The newest lane plist wins, so a half-rendered
+# lane set resolves to the last one written. Read from the plist XML without a
+# TOML or plist parser.
 tartci_lane_pinned_python() {
   local dir="${TARTCI_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}" plist candidate
+  local newest="" chosen=""
   for plist in "$dir"/com.danielraffel.tartci.tart-runner-macos-fleet.*.plist; do
     [ -f "$plist" ] || continue
     candidate="$(awk '
       /<key>TARTCI_PYTHON<\/key>/ { want = 1; next }
       want && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit }
     ' "$plist")"
-    case "$candidate" in
-      /*) printf '%s\n' "$candidate"; return 0 ;;
-    esac
+    case "$candidate" in /*) ;; *) continue ;; esac
+    if [ -z "$newest" ] || [ "$plist" -nt "$newest" ]; then
+      newest="$plist"
+      chosen="$candidate"
+    fi
   done
-  return 1
+  [ -n "$chosen" ] || return 1
+  printf '%s\n' "$chosen"
 }
 
 tartci_toml_python_path() {
@@ -99,6 +109,10 @@ tartci_toml_python_path() {
   if [ -z "$configured" ]; then
     if tartci_launchd_context && pinned="$(tartci_lane_pinned_python)" \
         && [ -x "$pinned" ] && "$pinned" -c 'import tomllib' >/dev/null 2>&1; then
+      # Said on every use: a host should run on the bootstrap for one cycle,
+      # and `tartci doctor fleet` reports one that stays (python_pin_missing).
+      echo "tartci: no $(tartci_python_pin_file): ${XPC_SERVICE_NAME:-this job} uses the fleet lanes' interpreter $pinned;" \
+           "a fleet install writes the pin" >&2
       printf '%s\n' "$pinned"
       return 0
     fi
