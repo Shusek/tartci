@@ -672,6 +672,8 @@ $jitPath="C:\actions-runner\jit.cfg"
   "C:\ProgramData\chocolatey\bin"
 )
 $env:Path = (($runnerPathAdd + @($env:Path -split ";")) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ";"
+$env:CMAKE_BUILD_PARALLEL_LEVEL="'"$effective_win_cpus"'"
+Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f $env:CMAKE_BUILD_PARALLEL_LEVEL)
 $vcvarsArch="'"$VCVARS_ARCH"'"
 $vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
 if ($vcvars) {

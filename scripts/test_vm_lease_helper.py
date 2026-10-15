@@ -37,6 +37,20 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 
 class VmLeaseHelperTests(unittest.TestCase):
+    def test_windows_runner_exports_granted_parallelism_to_guest_job(self) -> None:
+        body = WINDOWS_RUNNER.read_text(encoding="utf-8")
+        self.assertIn(
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL="\'"$effective_win_cpus"\'"',
+            body,
+        )
+        self.assertIn(
+            "cmake-build-parallel-level={0}",
+            body,
+        )
+        # The runner must not replace the lease grant with a fixed whole-host
+        # count. Explicit workflow `-j` remains the caller's responsibility.
+        self.assertNotIn("CMAKE_BUILD_PARALLEL_LEVEL=8", body)
+
     def test_apply_false_cannot_enter_cleanup_provider(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"scripts").mkdir(); marker=root/"called"
