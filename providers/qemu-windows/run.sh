@@ -20,14 +20,23 @@
 #   providers/qemu-windows/run.sh                       # build origin/main
 #   providers/qemu-windows/run.sh --ref origin/feat/x   # build a ref
 #   providers/qemu-windows/run.sh --smoke               # boot + SSH + toolchain probe only
-#   providers/qemu-windows/run.sh --keep                # leave the clone running
+#   providers/qemu-windows/run.sh --keep                # hold the clone until stopped
 set -euo pipefail
 
+TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=providers/common/vm-lease.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
+# shellcheck source=providers/common/vm-state.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
 SRC_REPO="${TARTCI_WIN_SRC_REPO:-https://github.com/Generous-Corp/pulp}"
-WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
+# Reuse an explicitly configured external VM store before falling back to the
+# host's temporary volume; an overlay may grow by many gigabytes during a build.
+WORKROOT="${TARTCI_WIN_WORK:-${TART_HOME:-${TMPDIR:-/tmp}}/tartci-win}"
+WIN_CPUS="${TARTCI_WIN_VM_CORES:-4}"
+WIN_MEMORY_MB="${TARTCI_WIN_MEMORY_MB:-8192}"
 REF=""; BUILD_TYPE="Release"; SMOKE=0; KEEP=0
 GPU="${TARTCI_WIN_GPU:-${PULP_WIN_GPU:-off}}"
 # Default excludes the `validation`-labeled tests, matching the Windows CI leg.
@@ -68,6 +77,11 @@ case "$GPU" in
   off|OFF|false|FALSE|0) GPU=OFF;;
   *) die "invalid TARTCI_WIN_GPU='$GPU' (on|off)";;
 esac
+case "$WIN_CPUS:$WIN_MEMORY_MB" in
+  *[!0-9:]*|:*|*:) die "invalid Windows VM CPU/memory size";;
+esac
+[ "$WIN_CPUS" -gt 0 ] && [ "$WIN_MEMORY_MB" -gt 0 ] || die "Windows VM CPU/memory must be positive"
+tartci_vm_leases_enabled || die "manual Windows clone requires a VM lease"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
 
@@ -89,28 +103,70 @@ done
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 JOB="win-job-$$"
 JOBDIR="$WORKROOT/$JOB"
-mkdir -p "$JOBDIR"
 OVERLAY="$JOBDIR/overlay.qcow2"
 EFIVARS="$JOBDIR/efivars.fd"
 
 QPID=""
+qemu_running(){
+  local state
+  state="$(ps -p "$QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+  case "$state" in
+    ''|Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 cleanup(){
-  if [ "$KEEP" = 1 ]; then note "--keep: $JOB still running on port $PORT (kill $QPID; rm -rf $JOBDIR)"; return; fi
-  [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true
-  sleep 1
-  rm -rf "$JOBDIR"
-  note "discarded ephemeral clone $JOB"
+  local had_jobdir=0 qemu_alive=0
+  if [ -n "$QPID" ]; then
+    kill "$QPID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      qemu_running || break
+      sleep 1
+    done
+    if qemu_running; then
+      kill -KILL "$QPID" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        qemu_running || break
+        sleep 1
+      done
+    fi
+    if qemu_running; then
+      qemu_alive=1
+      note "QEMU pid $QPID is still alive; preserving its lease and overlay for recovery"
+    else
+      wait "$QPID" 2>/dev/null || true
+    fi
+  fi
+  [ "$qemu_alive" = 0 ] || return 0
+  tartci_release_vm_lease || true
+  [ ! -d "$JOBDIR" ] || had_jobdir=1
+  [ ! -d "$JOBDIR" ] || rm -r "$JOBDIR" || note "could not remove clone directory $JOBDIR"
+  if [ "$had_jobdir" = 1 ] && [ ! -d "$JOBDIR" ]; then
+    note "discarded ephemeral clone $JOB"
+  fi
+  return 0
 }
 trap cleanup EXIT
+if ! tartci_prepare_and_check_disk_root_observed "$WORKROOT" \
+  "$(tartci_vm_lease_disk_expected_mount_path qemu-windows "$WORKROOT")" \
+  "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" \
+  qemu-windows manual "$JOB"; then
+  die "Windows clone work root is not admitted"
+fi
+if ! tartci_acquire_vm_lease "$JOB" "$WIN_CPUS" qemu-windows-vm vm \
+  spectr-windows-manual "$WIN_MEMORY_MB" "$WORKROOT" qemu-windows manual "$JOB"; then
+  die "Windows clone VM lease denied"
+fi
+mkdir -p "$JOBDIR"
 
 note "CoW overlay off $(basename "$GOLDEN") → $OVERLAY"
-qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$OVERLAY" >/dev/null
+tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$OVERLAY" >/dev/null
 cp "$VARS_TPL" "$EFIVARS"
 
 note "booting $JOB headless (ssh: 127.0.0.1:$PORT)"
-qemu-system-aarch64 \
+tartci_vm_lease_guard_exec qemu-system-aarch64 \
   -name "$JOB" \
-  -accel hvf -machine virt,highmem=on -cpu host -smp 8 -m 8192 \
+  -accel hvf -machine virt,highmem=on -cpu host -smp "${TARTCI_ACTIVE_VM_LEASE_CORES:-$WIN_CPUS}" -m "$WIN_MEMORY_MB" \
   -drive if=pflash,format=raw,readonly=on,file="$FW" \
   -drive if=pflash,format=raw,file="$EFIVARS" \
   -device ramfb -device qemu-xhci,id=usb -device usb-kbd -device usb-tablet \
@@ -132,6 +188,11 @@ if [ "$SMOKE" = 1 ]; then
   # every required tool and the architecture-specific MSVC environment, then
   # fail closed if any component is absent.
   PS_SMOKE='$ErrorActionPreference = "Stop"
+$ninja = Get-Command ninja -ErrorAction SilentlyContinue
+if (-not $ninja) {
+  $ninja = Get-ChildItem @("C:\Program Files\Microsoft Visual Studio", "C:\VS2026BuildTools") -Recurse -Filter ninja.exe -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($ninja) { $env:PATH = $ninja.DirectoryName + ";" + $env:PATH }
+}
 $required = @("cmake", "ninja", "git", "python")
 foreach ($name in $required) {
   $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -152,6 +213,10 @@ Write-Output "smoke: required Windows ARM64 toolchain is present"'
   set -e
   [ "$RC" -eq 0 ] || die "smoke toolchain probe failed (exit $RC)"
   note "smoke OK (overlay boot + complete ARM64 toolchain probe)"
+  if [ "$KEEP" = 1 ]; then
+    note "--keep: holding $JOB on SSH port $PORT until this command is stopped"
+    wait "$QPID"
+  fi
   exit 0
 fi
 
@@ -176,6 +241,11 @@ wsh "cmd /c \"cd C:\\pulp && git rev-parse --short HEAD\"" 2>&1 | tr -d '\r'
 # `vcvarsall arm64`). base64 is opaque to bash, dodging all the quoting hazards.
 note "build + ctest (Release, GPU=$GPU) via MSVC arm64 — the long step"
 PS_BUILD='$ProgressPreference = "SilentlyContinue"
+$ninja = Get-Command ninja -ErrorAction SilentlyContinue
+if (-not $ninja) {
+  $ninja = Get-ChildItem @("C:\Program Files\Microsoft Visual Studio", "C:\VS2026BuildTools") -Recurse -Filter ninja.exe -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($ninja) { $env:PATH = $ninja.DirectoryName + ";" + $env:PATH }
+}
 $vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
 if (-not $vcv) { Write-Error "no vcvarsall.bat under BuildTools"; exit 1 }
 cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU='"$GPU"' && cmake --build build && ctest --test-dir build --parallel '"$CTEST_JOBS"' '"$CTEST_ARGS"' > C:\tmp\tartci-ctest.log 2>&1"
@@ -206,4 +276,8 @@ wsh "powershell -NoProfile -EncodedCommand $ENC"
 RC=$?
 set -e
 note "in-guest build+ctest exit=$RC"
+if [ "$KEEP" = 1 ]; then
+  note "--keep: holding $JOB on SSH port $PORT until this command is stopped"
+  wait "$QPID"
+fi
 exit $RC
