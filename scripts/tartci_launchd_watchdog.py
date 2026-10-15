@@ -1361,6 +1361,10 @@ def tailnet_pass(now: float | None = None) -> str | None:
                          f"{v.get('since')} ({v.get('minutes')} min)")
         elif v.get("state") == "unmapped":
             parts.append(f"{host} has no tailnet node ({v.get('detail')})")
+        if (v.get("lan_blind") or {}).get("active"):
+            parts.append(f"this host ({host}) cannot reach the LAN since "
+                         f"{v['lan_blind'].get('since')}: likely macOS Local Network privacy "
+                         "for the tartci launcher; fallback routes unchecked")
         for kind, route in sorted((v.get("routes") or {}).items()):
             if route.get("active"):
                 parts.append(f"{route.get('alias') or host + '-' + kind} ({route.get('addr')}) "

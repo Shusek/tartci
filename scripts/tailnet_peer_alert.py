@@ -453,6 +453,26 @@ def judge(read: Dict[str, Any], hosts: Any, me: Optional[str],
         for h in claimed:
             out[h].update(state="unknown", active=False, since=None, minutes=None,
                           detail="this host reaches no peer over the tailnet")
+
+    # Every fallback route of two or more hosts the tailnet reaches is dead
+    # from here, so the LAN is unreachable from this host, not from them. On
+    # macOS that is most often a launcher without Local Network permission:
+    # the tailnet (utun) still works and the LAN is refused (m5s, 2026-10-15).
+    lan_hosts = [h for h, v in out.items()
+                 if h != me and v["state"] == "online" and v["routes"]]
+    if me in out and len(lan_hosts) >= 2 and all(
+            route["status"] == "down" for h in lan_hosts for route in out[h]["routes"].values()):
+        prior = held.get(me) if isinstance(held.get(me), dict) else {}
+        blind = prior.get("lan_blind") if isinstance(prior.get("lan_blind"), dict) else {}
+        out[me]["lan_blind"] = dict(
+            detail=f"every Ethernet and Wi-Fi route of {len(lan_hosts)} hosts the tailnet "
+                   "reaches is down from this host",
+            **_episode({"since": blind.get("since"), "state": "blind"} if blind else {},
+                       "blind", now, threshold))
+        for h, v in out.items():
+            for route in (v.get("routes") or {}).values():
+                route.update(status="unchecked", active=False, resolved=False, since=None,
+                             minutes=None, detail="this host cannot reach the LAN")
     return out
 
 
@@ -553,6 +573,41 @@ def _route_lines(verdict: Dict[str, Any]) -> List[str]:
     for kind, route in sorted((verdict.get("routes") or {}).items()):
         rows.append(f"- `{route.get('alias') or kind}` ({route['addr']}): {route['status']}")
     return rows
+
+
+LAN_BLIND_TITLE = "[tartci] {host} cannot reach the LAN from tartci"
+LAN_BLIND_CLASS = "lan_blind"
+
+
+def lan_blind_text(host: str, blind: Dict[str, Any], now: float,
+                   detected_at: str) -> Tuple[str, str]:
+    """(title, body) for a host whose tartci cannot reach the LAN at all."""
+    body = "\n".join([
+        "## What happened",
+        f"`{host}`'s tartci has reached no Ethernet or Wi-Fi address of any fleet host since "
+        f"{blind['since']} ({blind['minutes']} min), while the same hosts answer over the "
+        "tailnet. Its fallback-route checks are blind, so they report nothing.", "",
+        "## Evidence", f"- {blind['detail']}",
+        f"- `tailnet_peer_alert.py --status` on {host} lists every -lan/-wifi route `unchecked`",
+        f"- read by {host} itself at {iso(now)}", "",
+        "## Likely cause",
+        "macOS Local Network privacy: the process that runs tartci's watchdog (on a sealed "
+        "host, TartCILauncher.app) was never allowed to reach the local network. The tailnet "
+        "interface is not covered, which is why only the LAN fails. An interactive ssh "
+        "session is a different process tree, so `ssh-keyscan` by hand still works.", "",
+        "## Fix", "```sh",
+        f"# on {host}, at the machine: System Settings > Privacy & Security > Local Network,",
+        "# allow TartCILauncher (or the tartci helper listed there)",
+        "```", "",
+        "## Safe to auto-apply",
+        "No. Granting Local Network access is a privacy setting only someone at the machine "
+        "can change.", "",
+        "## How to verify",
+        f"The next pass on {host} lists -lan and -wifi routes as up; this issue records the "
+        "fix time on its marker and closes itself.",
+    ])
+    marker = tartci_incident.marker(host, LAN_BLIND_CLASS, blind["since"], detected_at)
+    return LAN_BLIND_TITLE.format(host=host), tartci_incident.with_marker(body, marker)
 
 
 def route_alert_text(host: str, kind: str, route: Dict[str, Any], me: str, now: float,
@@ -701,6 +756,24 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                     host, verdict, me or "a fleet host", now, detected),
                 issue=opener, close=closer, issues_enabled=enabled)
             verdict["issue"], verdict["closed"] = out.get("issue"), bool(out.get("closed"))
+        if host == me:
+            blind = verdict.get("lan_blind")
+            blind_path = directory / f"{host}.lan-blind.json"
+            if blind or host_off._read_json(blind_path):
+                out = host_off.episode_alert(
+                    blind_path, active=bool(blind and blind["active"]),
+                    resolved=not blind and bool(verdicts) and any(
+                        r.get("status") == "up" for v in verdicts.values()
+                        for r in (v.get("routes") or {}).values()),
+                    since=blind["since"] if blind else None,
+                    raise_event=lambda host=host, blind=blind: host_off.event(
+                        directory, "lan_blind", f"{host}: cannot reach the LAN since "
+                        f"{blind['since']}", {"host": host, "since": blind["since"]}, now),
+                    render=lambda host=host, blind=blind: lan_blind_text(
+                        host, blind, now, detected),
+                    issue=opener, close=closer, issues_enabled=enabled)
+                if blind:
+                    blind["issue"] = out.get("issue")
         actual: Dict[str, Optional[str]] = {}
         for kind, route in sorted((verdict.get("routes") or {}).items()):
             route_path = directory / f"{host}.route-{kind}.json"

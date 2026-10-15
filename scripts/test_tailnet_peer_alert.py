@@ -314,6 +314,55 @@ class OptionalRouteTests(Base):
         self.assertEqual(self.issues.closed, ["101"])
 
 
+class LanBlindTests(Base):
+    """m5s, 2026-10-15: its sealed launcher reached every host over the tailnet
+    and none over the LAN, while an interactive shell on it reached them all."""
+
+    LAN = {row[kind] for row in tna.parse_table(TABLE).values()
+           for kind in ("lan", "wifi") if row[kind]}
+
+    def test_a_host_that_reaches_no_lan_route_blames_itself_not_the_routes(self) -> None:
+        net = Net(down=self.LAN)
+        self.tick(net, OFFLINE_SINCE, me="m1")
+        out = self.tick(net, OFFLINE_SINCE + 11 * 60, me="m1")
+        me = out["hosts"]["m1"]
+        self.assertTrue(me["lan_blind"]["active"])
+        self.assertEqual({r["status"] for v in out["hosts"].values()
+                          for r in v["routes"].values()}, {"unchecked"})
+        self.assertEqual(self.issues.titles(), ["[tartci] m1 cannot reach the LAN from tartci"])
+        body = self.issues.opened[0][1]
+        self.assertIn("Local Network", body)
+        self.assertEqual(tartci_incident.parse(body)["class"], "lan_blind")
+
+    def test_one_hosts_dead_lan_is_still_that_hosts_route(self) -> None:
+        # Control, same instrument: only m5's routes are down, so the LAN is
+        # reachable from here and m5's routes are reported as broken.
+        net = Net(down={"192.0.2.81", "192.0.2.60"})
+        self.tick(net, OFFLINE_SINCE, me="m1")
+        out = self.tick(net, OFFLINE_SINCE + 11 * 60, me="m1")
+        self.assertNotIn("lan_blind", out["hosts"]["m1"])
+        self.assertEqual(sorted(self.issues.titles()),
+                         ["[tartci] m5-lan fallback route to m5 is broken",
+                          "[tartci] m5-wifi fallback route to m5 is broken"])
+
+    def test_the_lan_coming_back_closes_the_blind_issue(self) -> None:
+        self.tick(Net(down=self.LAN), OFFLINE_SINCE, me="m1")
+        self.tick(Net(down=self.LAN), OFFLINE_SINCE + 11 * 60, me="m1")
+        out = self.tick(Net(), OFFLINE_SINCE + 20 * 60, me="m1")
+        self.assertNotIn("lan_blind", out["hosts"]["m1"])
+        self.assertEqual(self.issues.closed, ["101"])
+        self.assertFalse((self.dir / "m1" / "m1.lan-blind.json").exists())
+
+    def test_the_watchdog_line_names_a_blind_host(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        fake = {"skipped": False, "table": "", "hosts": {
+            "m5studio": {"state": "online", "routes": {},
+                         "lan_blind": {"active": True, "since": "2026-10-15T03:47:54Z"}}}}
+        with mock.patch.object(tna, "alert_pass", return_value=fake):
+            line = watchdog.tailnet_pass(now=OFFLINE_SINCE)
+        self.assertIn("this host (m5studio) cannot reach the LAN since 2026-10-15T03:47:54Z", line)
+
+
 class FallbackRouteTests(Base):
     def test_a_dead_lan_route_is_reported_with_the_hosts_real_addresses(self) -> None:
         net = Net(down={"192.0.2.50"}, addresses="en0 192.0.2.76\nen7 192.0.2.51")

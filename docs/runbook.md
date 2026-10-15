@@ -2068,6 +2068,15 @@ Each body ends with the tartci-incident marker. On recovery `fixed_at` is
 PATCHed in and the issue closes; a failed PATCH or close is retried every
 pass.
 
+A host that reaches no Ethernet or Wi-Fi route of two or more hosts the
+tailnet does reach is LAN-blind: the fault is its own, not theirs. Its routes
+read `unchecked`, it attributes nothing to them, and after 10 min it opens
+`[tartci] <host> cannot reach the LAN from tartci` (`lan_blind`). On macOS
+the usual cause is Local Network privacy: the launcher that runs tartci's
+watchdog (TartCILauncher.app on a sealed host) was never allowed onto the
+local network, which leaves the tailnet working and the LAN refused. Allow it
+in System Settings > Privacy & Security > Local Network, at the machine.
+
 `python3 scripts/tailnet_peer_alert.py --status` prints which routes reached
 each host in the last pass. `TARTCI_TAILNET_ISSUE=0` keeps the events and
 WARN lines without opening issues; `TARTCI_TAILNET_OFFLINE_ALERT_SECS` changes
