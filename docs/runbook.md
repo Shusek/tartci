@@ -2144,7 +2144,13 @@ A pass now keeps an offline row, recording `action: keep_not_minted_here` and a
 |---|---|
 | `persistent_runner` | The name is listed in `TARTCI_REAP_PERSISTENT_RUNNERS` (comma-separated) or passed with `--persistent-runners`. |
 | `not_a_per_boot_name` | The name lacks the `<runner>-<pid>-<n>` shape that tartci gives every registration it mints, so this host did not mint it. |
-| `bound_to_other_host:<label>` | The runner carries a host-bound label (a prefix in `TARTCI_REAP_HOST_LABEL_PREFIXES`, default `pulp-host-`) that is not one of this host's own (`TARTCI_HOST_LABEL`, comma-separated). If this host declares no host labels, every host-bound runner is kept. |
+| `not_this_hosts_prefix` | The per-boot name does not start with a prefix this host mints. Those prefixes come from this host's fleet lanes (`<runner_name>-`, never the shared lane identity) and its installed Linux/Windows lane plists (`linux-ephr-`, `win-ephr-<host>-`), plus `TARTCI_REAP_OWN_NAME_PREFIXES`. When no prefix is known, everything is kept. |
+| `bound_to_other_host:<label>` | The runner carries a host-bound label (a prefix in `TARTCI_REAP_HOST_LABEL_PREFIXES`, default `pulp-host-`) that is not one of this host's own. This host's labels are read from the `--labels` of its installed Linux/Windows lane plists, plus `TARTCI_HOST_LABEL`. The digest's `config.host_labels` shows the effective set. |
+| `offline_too_recent` (action `wait_offline_age`) | Every other check passed, but GitHub has reported the runner offline on fewer than `TARTCI_REAP_MIN_OFFLINE_PASSES` (3) consecutive passes, or for less than `TARTCI_REAP_MIN_OFFLINE_SECS` (900). Any online or busy reading resets the clock, which is kept in `<state root>/reap/runner-offline.json`. |
+
+The janitor no longer reaps ghosts of retired lanes, such as legacy
+`pulp-vm-*` names, because no installed lane on this host claims those names.
+Remove them by hand, or list them in `TARTCI_REAP_OWN_NAME_PREFIXES` for a pass.
 
 A kept row is not a problem and does not change the exit status. Its owner is
 responsible for it: the persistent runner's own host, or the reaper of the pool
