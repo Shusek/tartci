@@ -85,6 +85,37 @@ class Picker(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stdout), (127, ""))
                 self.assertIn("refusing an unpinned interpreter", result.stderr)
 
+    def test_the_launchd_marker_refuses_even_when_the_label_is_reset(self) -> None:
+        # Homebrew's GNU timeout resets XPC_SERVICE_NAME to 0 for its child.
+        result = self.pick(TARTCI_LAUNCHD="1", XPC_SERVICE_NAME="0")
+        self.assertEqual((result.returncode, result.stdout), (127, ""))
+        self.assertIn("refusing an unpinned interpreter", result.stderr)
+
+    def test_every_template_and_rendered_lane_sets_the_launchd_marker(self) -> None:
+        import plistlib  # noqa: PLC0415
+        import re  # noqa: PLC0415
+        for path in sorted((ROOT / "launchd").glob("*.plist.template")):
+            with self.subTest(template=path.name):
+                text = re.sub(r"<!--.*?-->", "", path.read_text(), flags=re.S)
+                env = plistlib.loads(text.encode()).get("EnvironmentVariables") or {}
+                self.assertEqual(env.get("TARTCI_LAUNCHD"), "1")
+        lanes_source = (ROOT / "scripts" / "macos_fleet_lanes.py").read_text()
+        self.assertIn('"TARTCI_LAUNCHD": "1",', lanes_source)
+
+    def test_a_python3_fallback_helper_stays_refused_under_launchd(self) -> None:
+        # The relay and the other *_or_python3 helpers fall back to
+        # /usr/bin/python3 for an operator, never under a LaunchAgent.
+        base = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
+        refused = subprocess.run(["/bin/bash", str(ROOT / "tartci"), "pre-mint-outcomes", "--help"],
+                                 capture_output=True, text=True, check=False,
+                                 env=dict(base, TARTCI_LAUNCHD="1"))
+        self.assertEqual(refused.returncode, 127, refused.stdout + refused.stderr)
+        self.assertIn("refusing an unpinned interpreter", refused.stderr)
+        # Control: the same command from a shell falls back and runs.
+        shell = subprocess.run(["/bin/bash", str(ROOT / "tartci"), "pre-mint-outcomes", "--help"],
+                               capture_output=True, text=True, check=False, env=base)
+        self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
+
     def test_without_launchd_the_same_search_still_finds_the_bait(self) -> None:
         # Control, same instrument: an interactive shell keeps the search.
         result = self.pick()

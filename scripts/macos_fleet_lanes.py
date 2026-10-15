@@ -2574,6 +2574,9 @@ def lane_plist(
         "TARTCI_RUNNER_NAME_PREFIX": f"{host['id']}-{identity}",
         "TARTCI_RUNNER_SLOT": str(slot),
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
+        # Marks a LaunchAgent run: the interpreter picker refuses to search
+        # PATH under it (providers/common/toml-python.lib.sh).
+        "TARTCI_LAUNCHD": "1",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
     # The installer resolves and probes one interpreter before rendering. Keep

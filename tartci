@@ -97,10 +97,19 @@ tartci_toml_exec() {
 # Like tartci_toml_exec, for a helper that still does useful work without
 # tomllib: the reclaim janitor and status read the fleet profile to find the
 # Tart store's volume, but without a TOML-capable interpreter they fall back to
-# judging every scanned volume rather than refusing to run at all.
+# judging every scanned volume rather than refusing to run at all. That
+# fallback is for an operator's shell only: under a tartci LaunchAgent a
+# refused pin stays refused, so the network relay and the other agents never
+# drift onto /usr/bin/python3, a binary with its own privacy grants.
 tartci_toml_exec_or_python3() {
   local python
-  python="$(tartci_verified_python 2>/dev/null)" || python=/usr/bin/python3
+  if ! python="$(tartci_verified_python 2>/dev/null)"; then
+    if tartci_launchd_context; then
+      tartci_toml_python_path >/dev/null || true   # prints the refusal to the job's log
+      return 127
+    fi
+    python=/usr/bin/python3
+  fi
   "$python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || return 127
   exec "$python" "$@"
 }
