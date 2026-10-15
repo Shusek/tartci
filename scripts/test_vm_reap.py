@@ -449,6 +449,74 @@ else:
             delete_runner.assert_not_called()
 
 
+class ForeignRunnerTests(unittest.TestCase):
+    """A janitor deletes only offline registrations this host could have minted.
+
+    Replays 2026-09-29: m3's janitor saw the bare-metal `pulp-intel-macmini`
+    runner (registered from another host) read offline for one pass, found no
+    local state for it, and deleted the registration.
+    """
+
+    MACMINI_LABELS = ["self-hosted", "X64", "macOS", "pulp-intel-native", "pulp-host-macmini"]
+
+    def reap(self, runner: dict, *extra: str) -> tuple[dict, mock.MagicMock]:
+        with tempfile.TemporaryDirectory() as td:
+            args = vm_reap.parse_args([
+                "--repo", "Generous-Corp/pulp",
+                "--state-root", str(Path(td) / "state"),
+                "--fix",
+                *extra,
+            ])
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                 mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+                 mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+                 mock.patch.object(vm_reap, "github_runners", return_value=[runner]), \
+                 mock.patch.object(vm_reap, "delete_runner", return_value="deleted") as delete_runner:
+                digest, _ = vm_reap.build_digest(args)
+        return digest["github_runners"][0], delete_runner
+
+    def offline(self, name: str, labels: list) -> dict:
+        return {"id": 27620, "name": name, "status": "offline", "busy": False, "labels": labels}
+
+    def test_incident_persistent_runner_on_another_host_is_kept(self) -> None:
+        row, delete_runner = self.reap(self.offline("pulp-intel-macmini", self.MACMINI_LABELS))
+        delete_runner.assert_not_called()
+        self.assertEqual(row["action"], "keep_not_minted_here")
+        self.assertEqual(row["refusal"], "not_a_per_boot_name")
+
+    def test_raw_api_label_objects_are_read(self) -> None:
+        labels = [{"id": i, "name": n, "type": "custom"} for i, n in enumerate(self.MACMINI_LABELS)]
+        name = "pulp-intel-macmini-20261015034211-73971-1"
+        row, delete_runner = self.reap(self.offline(name, labels), "--host-labels", "pulp-host-macstudio")
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "bound_to_other_host:pulp-host-macmini")
+
+    def test_another_hosts_per_boot_jit_runner_is_kept_when_this_host_is_unnamed(self) -> None:
+        name = "pulp-intel-macmini-20261015034211-73971-1"
+        row, delete_runner = self.reap(self.offline(name, self.MACMINI_LABELS))
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "bound_to_other_host:pulp-host-macmini")
+
+    def test_declared_persistent_runner_is_kept_even_with_a_per_boot_shape(self) -> None:
+        name = "pulp-studio-01-12345-1"
+        row, delete_runner = self.reap(
+            self.offline(name, ["self-hosted"]), "--persistent-runners", f"other,{name}")
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "persistent_runner")
+
+    def test_own_per_boot_ghost_is_still_deleted(self) -> None:
+        # Positive control: the guard must not blind the janitor to its own residue.
+        for labels, extra in (
+            (["self-hosted", "macOS"], ()),
+            (["self-hosted", "Linux", "pulp-host-macstudio"], ("--host-labels", "pulp-host-macstudio")),
+        ):
+            with self.subTest(labels=labels):
+                row, delete_runner = self.reap(self.offline("pulp-studio-01-12345-1", labels), *extra)
+                delete_runner.assert_called_once()
+                self.assertEqual(row["action"], "delete_offline_runner")
+                self.assertEqual(row["refusal"], "")
+
+
 class OrphanedLaneVmTests(unittest.TestCase):
     """Stopped lane VMs whose supervisor is gone are deleted; any doubt keeps one.
 

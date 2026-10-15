@@ -8,6 +8,9 @@ The janitor is intentionally conservative:
   * GitHub runner deletion only touches stale offline registrations whose
     names match an allowed CI prefix and are not backed by a fresh live
     supervisor heartbeat.
+  * A registration this host could not have minted is never deleted: a
+    declared persistent runner, a name without the per-boot shape, or a
+    runner bound by label to another host (see `foreign_runner_reason`).
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -121,6 +125,48 @@ def github_cli() -> str:
 
 def starts_with_any(name: str, prefixes: list[str]) -> bool:
     return any(name.startswith(prefix) for prefix in prefixes if prefix)
+
+
+# A runner's state file lives only on the host that minted it, so "no local
+# state" proves ownerlessness only for a registration THIS host mints. Every
+# host's janitor sees every registration in the repository, and GitHub reports
+# a healthy, connected runner as offline for the seconds its broker long-poll
+# stalls. On 2026-09-29 m3's janitor read a bare-metal runner on another host
+# as offline once in 1,618 passes, found no state for it, and deleted the
+# registration; the runner then wiped its own configuration and the lane it
+# served sat dead for sixteen days with nothing alerting.
+PER_BOOT_RUNNER_RE = re.compile(r"^.+-[0-9]+-[0-9]+$")
+
+
+def runner_label_names(runner: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for label in runner.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def foreign_runner_reason(
+    runner: dict[str, Any],
+    persistent: list[str],
+    host_label_prefixes: list[str],
+    own_host_labels: list[str],
+) -> str:
+    """Why this host must not delete `runner`, or "" when it may.
+
+    Every doubt keeps the registration: a ghost costs one stale row, a wrong
+    delete takes a live lane offline until someone re-registers it by hand.
+    """
+    name = str(runner.get("name") or "")
+    if name in persistent:
+        return "persistent_runner"
+    if not PER_BOOT_RUNNER_RE.match(name):
+        return "not_a_per_boot_name"
+    for label in runner_label_names(runner):
+        if starts_with_any(label, host_label_prefixes) and label not in own_host_labels:
+            return f"bound_to_other_host:{label}"
+    return ""
 
 
 def is_protected_name(name: str, protected: list[str]) -> bool:
@@ -567,6 +613,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     store = ensure_tart_home()
     tart_home = pathlib.Path(store["path"])
     protected = [p for p in args.protected_names.split(",") if p]
+    persistent_runners = [p for p in args.persistent_runners.split(",") if p]
+    host_label_prefixes = [p for p in args.host_label_prefixes.split(",") if p]
+    own_host_labels = [p for p in args.host_labels.split(",") if p]
     tart_providers = {"", "tart-macos", "tart-linux"}
 
     for tool in ("tart", github_cli()):
@@ -856,6 +905,11 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         stale = True
                         action = "suspect_live_owner_stale_offline_runner"
                         problems.append(f"suspect_live_owner_stale_offline_runner:{name}")
+                    elif refusal := foreign_runner_reason(
+                        runner, persistent_runners, host_label_prefixes, own_host_labels
+                    ):
+                        action = "keep_not_minted_here"
+                        runner["refusal"] = refusal
                     else:
                         stale = True
                         action = "delete_offline_runner"
@@ -981,6 +1035,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "owner_pid_alive": runner.get("owner_pid_alive"),
                 "state_file": runner.get("state_file"),
                 "local_ownership": runner.get("action", ""),
+                "refusal": runner.get("refusal", ""),
             }
             for runner in runners
             if runner.get("owned")
@@ -1016,6 +1071,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--prefixes", default=os.environ.get("TARTCI_REAP_PREFIXES", "pulp-,linux-ephr-,win-ephr-,tartci-"))
     parser.add_argument("--protected-names", default=os.environ.get("TARTCI_REAP_PROTECTED_NAMES", "pulp-vm,rosetta-probe"))
+    parser.add_argument(
+        "--persistent-runners",
+        default=os.environ.get("TARTCI_REAP_PERSISTENT_RUNNERS", ""),
+        help="comma-separated runner names never deleted, whatever their state",
+    )
+    parser.add_argument(
+        "--host-label-prefixes",
+        default=os.environ.get("TARTCI_REAP_HOST_LABEL_PREFIXES", "pulp-host-"),
+        help="label prefixes that bind a runner to one host; another host's are never deleted",
+    )
+    parser.add_argument(
+        "--host-labels",
+        default=os.environ.get("TARTCI_HOST_LABEL", ""),
+        help="this host's own host-bound labels (comma-separated); empty keeps every host-bound runner",
+    )
     parser.add_argument("--macos-cap", type=int, default=int(os.environ.get("TARTCI_MACOS_VM_CAP", "2")))
     parser.add_argument("--stopped-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_STOPPED_AGE_SECS", "900")))
     parser.add_argument("--orphan-age-secs", type=int,
