@@ -1,7 +1,9 @@
 # TartCI cache policy status ledger
 
 - Scope: TartCI/Shipyard cache-policy improvements for repeat Windows/Linux builds.
-- Current SHA: `c90edfb0795396fcc6c58846189cce3de4ea118c` (fresh detached worktree from `origin/main`).
+- Base SHA: `c90edfb0795396fcc6c58846189cce3de4ea118c` (fresh worktree from `origin/main`).
+- Current branch SHA: `af0fa4c0d0218d61cb65f23fdcd8239d20c505f2`.
+- PR: https://github.com/danielraffel/tartci/pull/547
 - Ownership limits: no live UTM or Proxmox builds, VM images, runners, macOS capacity, Windows runner registration, or TartCI PR 546.
 - Evidence reviewed: Linux Tart runner already propagates the granted lease to `CMAKE_BUILD_PARALLEL_LEVEL`; Windows QEMU runner sized the VM from the lease but did not propagate the grant to the Actions job. Active build measurements supplied for comparison: ARM UTM governed at 1 core; Proxmox x64 SDK on `B:` with FetchContent junction governed at 4 cores.
 - Change: Windows JIT listener now exports the lease-granted `effective_win_cpus` as `CMAKE_BUILD_PARALLEL_LEVEL` and emits a diagnostic. Explicit workflow `-j` remains caller-owned.
