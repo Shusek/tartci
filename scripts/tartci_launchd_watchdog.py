@@ -1330,6 +1330,49 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def tailnet_pass(now: float | None = None) -> str | None:
+    """Tell someone when a fleet host is off the tailnet or a fallback route
+    to it is broken (scripts/tailnet_peer_alert.py).
+
+    Read-only: one local `tailscale status --json` and one ssh-keyscan per
+    route per tick. A host offline, or online in control with its tailnet
+    route down, for 10 min; this host's own tailscaled down; or a `-lan` /
+    `-wifi` route the fleet-ssh table lists that is dead or reaches another
+    machine, raises an issue through the peer-alert path. Prints a WARN for
+    each. Never raises.
+    """
+    try:
+        import tailnet_peer_alert  # noqa: PLC0415 - sibling module
+        out = tailnet_peer_alert.alert_pass(now=utcnow() if now is None else now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tailnet check FAILED "
+                f"({type(exc).__name__}: {exc}); a host off the tailnet would not be reported")
+    if out.get("skipped"):
+        return None
+    parts = []
+    for host, v in sorted((out.get("hosts") or {}).items()):
+        if v.get("state") in ("local", "local_route_down") and v.get("active"):
+            parts.append(f"this host ({host}) is off the tailnet: {v.get('detail')} "
+                         f"since {v.get('since')}")
+        elif v.get("state") == "offline" and v.get("active"):
+            parts.append(f"{host} offline since {v.get('since')} ({v.get('minutes')} min)")
+        elif v.get("state") == "route_down" and v.get("active"):
+            parts.append(f"{host} online in control but its tailnet route is down since "
+                         f"{v.get('since')} ({v.get('minutes')} min)")
+        elif v.get("state") == "unmapped":
+            parts.append(f"{host} has no tailnet node ({v.get('detail')})")
+        for kind, route in sorted((v.get("routes") or {}).items()):
+            if route.get("active"):
+                parts.append(f"{route.get('alias') or host + '-' + kind} ({route.get('addr')}) "
+                             f"{route.get('status')} since {route.get('since')}")
+    if out.get("table"):
+        parts.append(str(out["table"]))
+    if not parts:
+        return None
+    return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN tailnet: "
+            + "; ".join(parts))
+
+
 def resolver_health_pass(now: float | None = None) -> str | None:
     """Publish one resolver/TCP probe for peers to read.
 
@@ -1641,6 +1684,9 @@ def main(argv: list[str] | None = None) -> int:
         peer_stall_line = peer_stall_pass()
         if peer_stall_line:
             print(peer_stall_line)
+        tailnet_line = tailnet_pass()
+        if tailnet_line:
+            print(tailnet_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

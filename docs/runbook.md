@@ -2015,6 +2015,64 @@ fallback is `sudo killall -HUP mDNSResponder`. The issue closes when a peer
 reads a later non-`resolver_dead` state. The watchdog never changes host
 network configuration itself.
 
+### A fleet host off the tailnet, or a dead fallback route (`tailnet_offline`, `fallback_route_broken`)
+
+Every watchdog tick also runs `scripts/tailnet_peer_alert.py`. Everything it
+does is read-only: it never starts, stops or reconfigures Tailscale, never
+touches tailnet DNS or ACLs, and never edits ssh config or the fleet-ssh
+table. Per tick it runs:
+
+- this host's own `tailscale status --json` (the CLI at
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, or
+  `TARTCI_TAILSCALE_CLI`);
+- one `ssh-keyscan -T 5` per route of every other host. The routes are the
+  ones the fleet SSH table lists (`danielraffel/fleet-ssh`
+  `fleet/hosts.tsv`, read through ghapp at most hourly and cached in
+  `~/.tartci/state/tailnet/hosts.tsv`): the tailnet address, the Ethernet
+  address (`<host>-lan`) and the Wi-Fi address (`<host>-wifi`). A route is
+  `up` only when it answers with the host key known_hosts holds for that
+  host. An address now owned by another machine is `wrong_host`, and an ssh
+  alias that resolves somewhere other than the table says is `stale_alias`.
+
+Every address comes from that table; tartci, a public repository, holds
+none. A host is matched to its tailnet node by the table's tailscale address
+(table names map to tartci host ids as m3 is `studio`, m5s is `m5studio`).
+A published host the table does not list is reported as `unmapped`.
+Machines without a tartci profile (macmini, macpro) are checked too.
+
+A route can be marked optional in the table's eighth column, `optional`
+(space-separated: `lan`, `wifi`), for an interface that is legitimately
+absent, such as a laptop's Ethernet when it is undocked. An optional route
+is still probed and shown by `--status` as `down (optional)`, but opens no
+issue. The tailnet route is never optional.
+
+Each of these is an episode, alerted after 10 min:
+
+| state | meaning |
+|---|---|
+| `offline` | the host's node reads Online=false (from its `LastSeen`) |
+| `route_down` | the node reads Online=true, but this host's tailnet probe to it fails. fleet-ssh falls back to the LAN, so only this check sees it |
+| `local` | this host's own tailscaled is Stopped, logged out or unreadable |
+| `local_route_down` | control lists two or more peers online and none answers over the tailnet from here: the broken path is this host's |
+| a fallback route | a `-lan` or `-wifi` route the table lists is down, `wrong_host` or `stale_alias` |
+
+A host whose own tailscaled is down judges no peers' tailnet state. For any
+other host, one published host acts: the lowest published host id, other
+than that host, whose tailnet route reads up from here. Issues go through
+the peer-alert open-or-adopt path: `[tartci] <host> is off the tailnet` per
+host and `[tartci] <host>-<lan|wifi> fallback route to <host> is broken` per
+route. A broken route's issue names the address that failed, what this
+host's alias resolves to, and the addresses the host reports for itself (read
+with a read-only `ipconfig getifaddr` per interface over its default route).
+Each body ends with the tartci-incident marker. On recovery `fixed_at` is
+PATCHed in and the issue closes; a failed PATCH or close is retried every
+pass.
+
+`python3 scripts/tailnet_peer_alert.py --status` prints which routes reached
+each host in the last pass. `TARTCI_TAILNET_ISSUE=0` keeps the events and
+WARN lines without opening issues; `TARTCI_TAILNET_OFFLINE_ALERT_SECS` changes
+the 10 min bound.
+
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
 launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
