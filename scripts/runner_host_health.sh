@@ -41,7 +41,7 @@ now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 emit() { echo "runner_host_health ts=$now service=$SERVICE $*"; }
 
 listener_running() {
-    "$PGREP" -f "$RUNNER_DIR/bin/Runner.Listener" >/dev/null 2>&1
+    "$PGREP" -f "$RUNNER_DIR/bin[^/ ]*/Runner.Listener" >/dev/null 2>&1
 }
 
 if [ ! -f "$RUNNER_DIR/.runner" ]; then

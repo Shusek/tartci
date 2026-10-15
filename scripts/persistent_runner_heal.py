@@ -88,7 +88,8 @@ class Fleet:
         d = remote_path(spec["dir"])
         script = (
             f"if [ -f {d}/.runner ]; then echo configured=1; else echo configured=0; fi; "
-            f"if pgrep -f {d}/bin/Runner.Listener >/dev/null 2>&1; "
+            # bin is a symlink to bin.<version>; match either spelling.
+            f"if pgrep -f {d}/'bin[^/ ]*/Runner.Listener' >/dev/null 2>&1; "
             "then echo listening=1; else echo listening=0; fi"
         )
         proc = self.run(["ssh", *SSH_OPTS, spec["host"], script], timeout=60)
