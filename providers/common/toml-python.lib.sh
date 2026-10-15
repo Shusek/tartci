@@ -54,6 +54,16 @@ tartci_note_interpreter_refusal() {
     >"$marker" 2>/dev/null || true
 }
 
+# Whether this process runs under a LaunchAgent tartci ships. Every template
+# and rendered lane sets TARTCI_LAUNCHD=1. The label is the fallback for an
+# agent installed before the marker existed; it alone is not enough, because a
+# wrapper such as Homebrew's GNU timeout resets XPC_SERVICE_NAME to 0.
+tartci_launchd_context() {
+  [ "${TARTCI_LAUNCHD:-}" = 1 ] && return 0
+  case "${XPC_SERVICE_NAME:-}" in com.danielraffel.*) return 0 ;; esac
+  return 1
+}
+
 tartci_toml_python_path() {
   local candidate configured="${TARTCI_PYTHON:-}" pinned
   if [ -z "$configured" ] && pinned="$(tartci_pinned_python)"; then
@@ -67,21 +77,16 @@ tartci_toml_python_path() {
     return 127
   fi
   if [ -z "$configured" ]; then
-    # Every LaunchAgent tartci ships is labelled com.danielraffel.* (tartci,
-    # pulp lanes, the network relay, shipyard and forge helpers); interactive
-    # shells carry 0, application.* or nothing.
-    case "${XPC_SERVICE_NAME:-}" in
-      com.danielraffel.*)
-        # A LaunchAgent must never run whatever python3 PATH resolves to
-        # today: a Homebrew upgrade would swap the binary under launchd, and
-        # macOS privacy grants (Local Network) do not follow it.
-        echo "tartci: refusing an unpinned interpreter under launchd job $XPC_SERVICE_NAME:" \
-             "no TARTCI_PYTHON and no $(tartci_python_pin_file); set host.python in the" \
-             "fleet profile and reinstall" >&2
-        tartci_note_interpreter_refusal "no TARTCI_PYTHON and no $(tartci_python_pin_file)"
-        return 127
-        ;;
-    esac
+    if tartci_launchd_context; then
+      # A LaunchAgent must never run whatever python3 PATH resolves to
+      # today: a Homebrew upgrade would swap the binary under launchd, and
+      # macOS privacy grants (Local Network) do not follow it.
+      echo "tartci: refusing an unpinned interpreter under launchd job ${XPC_SERVICE_NAME:-unset} (TARTCI_LAUNCHD=${TARTCI_LAUNCHD:-}):" \
+           "no TARTCI_PYTHON and no $(tartci_python_pin_file); set host.python in the" \
+           "fleet profile and reinstall" >&2
+      tartci_note_interpreter_refusal "no TARTCI_PYTHON and no $(tartci_python_pin_file)"
+      return 127
+    fi
   fi
   if [ -n "$configured" ]; then
     candidate="$(command -v "$configured" 2>/dev/null || true)"

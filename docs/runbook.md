@@ -3453,10 +3453,16 @@ pin and any search, refuses the install if it is missing, renders it into
 every lane as `TARTCI_PYTHON`, and writes it to `~/.config/tartci/python.pin`.
 LaunchAgents rendered without their own `TARTCI_PYTHON` (the watchdog,
 reclaim, self-update) resolve through that pin. Any LaunchAgent tartci ships
-(`XPC_SERVICE_NAME` `com.danielraffel.*`: tartci, pulp lanes, the network
-relay, shipyard and forge helpers) with neither refuses to run
+(every template and rendered lane sets `TARTCI_LAUNCHD=1`; an older agent is
+recognised by its `com.danielraffel.*` label, though a wrapper such as
+Homebrew's GNU `timeout` resets `XPC_SERVICE_NAME` to `0`) with neither
+refuses to run
 and logs `refusing an unpinned interpreter`; it never takes whatever
-`/opt/homebrew/bin/python3` is today. Interactive commands keep the search.
+`/opt/homebrew/bin/python3` is today. The helpers that otherwise fall back to
+`/usr/bin/python3` when no TOML-capable interpreter exists (status, reclaim,
+governor, the network relay, job claims and the rest of
+`tartci_toml_exec_or_python3`) do so only in an operator's shell; under a
+LaunchAgent the refusal stands. Interactive commands keep the search.
 
 Why: macOS privacy grants follow the binary. On m5s (2026-10-15) the watchdog
 picked Homebrew Python 3.15, Local Network was denied to it, and every LAN
