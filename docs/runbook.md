@@ -2121,6 +2121,94 @@ the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) 
 anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
 host-wide "no VM running" gate.
 
+### Runners the janitor must never delete (`keep_not_minted_here`)
+
+Every host's janitor (`scripts/vm_reap.py`, run by the `reap` LaunchAgent) reads
+every self-hosted registration in the repository, but it holds a state file
+only for the runners its own lanes minted. "Offline, not busy, no local state"
+therefore proves a registration is a dead ghost only when this host could have
+minted it. GitHub also reports a healthy, connected runner as `offline` for the
+seconds its broker long-poll stalls, so a single offline reading proves nothing
+about a persistent runner.
+
+That combination deleted a persistent bare-metal runner that lived on a
+different host. The runner noticed its registration was gone, deleted its own
+`.runner` and `.credentials` files, and exited cleanly. That left its launchd
+job loaded but not running, and the lane stayed dead until someone re-registered
+it by hand.
+
+A pass now keeps an offline row, recording `action: keep_not_minted_here` and a
+`refusal`, whenever any of these holds:
+
+| `refusal` | Meaning |
+|---|---|
+| `persistent_runner` | The name is listed in `TARTCI_REAP_PERSISTENT_RUNNERS` (comma-separated) or passed with `--persistent-runners`. |
+| `not_a_per_boot_name` | The name lacks the `<runner>-<pid>-<n>` shape that tartci gives every registration it mints, so this host did not mint it. |
+| `not_this_hosts_prefix` | The per-boot name does not start with a prefix this host mints. Those prefixes come from this host's fleet lanes (`<runner_name>-`, never the shared lane identity) and its installed Linux/Windows lane plists (`linux-ephr-`, `win-ephr-<host>-`), plus `TARTCI_REAP_OWN_NAME_PREFIXES`. When no prefix is known, everything is kept. |
+| `bound_to_other_host:<label>` | The runner carries a host-bound label (a prefix in `TARTCI_REAP_HOST_LABEL_PREFIXES`, default `pulp-host-`) that is not one of this host's own. This host's label is read from the `--labels` of its installed Linux/Windows lane plists, plus `TARTCI_HOST_LABEL`. A host owns exactly one host-bound label. If those sources give more than one, or one that disagrees with `TARTCI_HOST_LABEL`, the host owns none and the pass reports `host_label_conflict:<labels>`. Linux per-boot names (`linux-ephr-<pid>-<n>`) carry no host, so for Linux runners the label is the only ownership axis. The digest's `config.host_labels` shows the effective set. |
+| `offline_too_recent` (action `wait_offline_age`) | Every other check passed, but GitHub has reported the runner offline on fewer than `TARTCI_REAP_MIN_OFFLINE_PASSES` (3) consecutive passes, or for less than `TARTCI_REAP_MIN_OFFLINE_SECS` (900). Any online or busy reading resets the clock, which is kept in `<state root>/reap/runner-offline.json`. |
+
+The janitor no longer reaps ghosts of retired lanes, such as legacy
+`pulp-vm-*` names, because no installed lane on this host claims those names.
+Remove them by hand, or list them in `TARTCI_REAP_OWN_NAME_PREFIXES` for a pass.
+
+A kept row is not a problem and does not change the exit status. Its owner is
+responsible for it: the persistent runner's own host, or the reaper of the pool
+that minted it. The janitor still deletes its own residue, meaning per-boot names
+that carry no host label or carry one of this host's own labels.
+
+**Runner inventory.** Before you register a runner by hand, decide which kind it is.
+
+- *Per-job (JIT / ephemeral).* tartci's VM lanes and other pools that mint a
+  fresh name per job. A stale registration can't outlive the job, and a ghost
+  is harmless residue.
+- *Persistent, host-bound.* One long-lived registration on bare metal. Give it
+  a `<project>-host-<host>` label, add its name to
+  `TARTCI_REAP_PERSISTENT_RUNNERS` on every host that runs the janitor, and give
+  it its own health check, because nothing else revives it.
+
+**Keeping a persistent runner alive.** Two jobs work together. Neither needs a
+long-lived credential on the runner's host.
+
+- `scripts/runner_host_health.sh` runs on the runner's own host every 5
+  minutes, at background priority
+  (`launchd/com.danielraffel.tartci.runner-host-health.plist.template`). If the
+  runner is configured but its listener is not running, the script kickstarts
+  the runner's launchd job. That job, written by svc.sh, has no KeepAlive. If
+  `.runner` is gone, the script writes a `deconfigured` marker, because only a
+  registration token can fix that.
+- `tartci runner-heal --fix` runs on one fleet host that has `ghapp` and ssh
+  access to the runner hosts
+  (`launchd/com.danielraffel.tartci.persistent-runner-heal.plist.template`). It
+  reads the runners declared in `~/.config/tartci/persistent-runners.json` and
+  compares GitHub's view with each host's view over ssh. A registered runner
+  whose listener is down gets restarted. A runner that is missing on GitHub, or
+  whose host lost `.runner`, gets re-registered: the job mints a one-hour
+  registration token and sends it over ssh stdin. The old local identity is
+  moved aside, not deleted, and each runner is re-registered at most once an
+  hour. Without `--fix`, the job only reports. An unreachable host or an
+  unreadable census is reported and never acted on.
+
+Roll out one host at a time, and run report-only for a few passes first.
+
+**If a persistent runner has vanished.** Its log in `_diag/Runner_*.log` ends
+with `Runner registration no longer exists ... Cleaning up local
+configuration.`, `.runner` is missing, and the lane's jobs wait for a runner
+until they are cancelled.
+
+1. Find who deleted it. Search the org audit log for
+   `action:repo.remove_self_hosted_runner` or
+   `action:org.remove_self_hosted_runner` in the minute before that log line.
+   Then search each host's `~/Library/Logs/tartci/tartci-reap.log` for
+   `github_runner_deleted:<name>`.
+2. `tartci runner-heal --fix` re-registers it automatically if it is declared.
+   To do it by hand, re-register it with a short-lived registration token
+   (`POST repos/OWNER/REPO/actions/runners/registration-token`), then run
+   `./config.sh --unattended --replace --url https://github.com/OWNER/REPO
+   --token <token> --name <name> --labels <labels>` and restart its launchd job.
+3. Confirm it reads `online` in `GET repos/OWNER/REPO/actions/runners`, and that
+   a dispatched job lists it as `runner_name`.
+
 ### Published fleet supply and how to fact-check it
 
 `fleet/advertised-labels.json` is the declared label supply other projects read
