@@ -2302,6 +2302,38 @@ class SealedRollbackTests(Base):
         source = rollback[rollback.index("--launch-helper-source") + 1]
         self.assertIn("rollback", source)
 
+    def test_rollback_reinstalls_with_the_previous_interpreter_and_pin(self) -> None:
+        # m5s, 2026-10-15: the update switched the lanes to a new interpreter
+        # and its pin; the rollback rendered the old launcher against the new
+        # pin, refused, and left the host off.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/python3.15\n")
+
+        seen = {"installs": 0}
+
+        def switch_on_install(argv):
+            if "--apply" in argv and "install" in argv:
+                seen["installs"] += 1
+                if seen["installs"] == 1:  # the new generation's install writes its pin
+                    pin.write_text("/new/python3.12\n")
+        self.sys.hook = switch_on_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "rolled_back")
+        installs = [(a, e) for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertGreaterEqual(len(installs), 2)
+        rollback_argv, rollback_env = installs[-1]
+        self.assertIn("rollback", " ".join(rollback_argv))
+        self.assertEqual(rollback_env.get("TARTCI_PYTHON"), "/old/python3.15")
+        self.assertEqual(pin.read_text().strip(), "/old/python3.15")
+
     def test_signing_probe_failure_refuses_before_drain(self) -> None:
         self.sys.signing_rc = 1
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
