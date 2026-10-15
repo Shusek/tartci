@@ -296,9 +296,71 @@ class WatchdogIssue(unittest.TestCase):
         # the alert reached it.
         self.assertIn("scratch", state)
 
+    def test_a_refused_switch_opens_its_own_issue_and_closes_on_removal(self) -> None:
+        record = self.home / "state" / "interpreter-switch-refused"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("2026-10-15T13:59:30Z\t/new/python3.12\t/old/python3.15\t"
+                          "did not finish a write to /Volumes/Atelier/VMs within 60s\n")
+        line = self.run_pass()
+        self.assertIn("the lanes kept /old/python3.15; /new/python3.12 failed the launchd "
+                      "preflight", line)
+        self.assertEqual([t for t, _ in self.opened],
+                         ["[tartci] m5studio kept its lane interpreter: /new/python3.12 failed "
+                          "the launchd preflight"])
+        body = self.opened[0][1]
+        self.assertIn("Full Disk Access", body)
+        import tartci_incident  # noqa: PLC0415
+        self.assertEqual(tartci_incident.parse(body)["class"], "interpreter_switch_refused")
+        record.unlink()
+        self.assertIsNone(self.run_pass())
+        self.assertEqual(self.closed, ["61"])
+
     def test_no_refusal_is_quiet(self) -> None:
         self.assertIsNone(self.run_pass())
         self.assertEqual(self.opened, [])
+
+
+class InterpreterPreflight(unittest.TestCase):
+    """The launchd job runs the NEW binary; its exit code decides."""
+
+    def run_with(self, prints, timeout=0.5):
+        import interpreter_preflight as ip  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+        calls = []
+
+        def fake(*args, timeout=5):
+            calls.append(args)
+            if args[0] != "print":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            text = prints(args)
+            return subprocess.CompletedProcess(args, 0 if text else 1, text, "")
+        profile = {"host": {"tart_home": "/Volumes/Atelier/VMs"}}
+        with mock.patch.object(ip, "launchctl", side_effect=fake):
+            return ip.run(profile, "/new/python3.12", timeout=timeout), calls
+
+    def test_a_clean_exit_passes(self) -> None:
+        state = {"n": 0}
+
+        def prints(args):
+            state["n"] += 1
+            return "" if state["n"] == 1 else "\tlast exit code = 0\n"
+        reason, calls = self.run_with(prints)
+        self.assertIsNone(reason)
+        self.assertIn(("bootout", "gui/%d/com.danielraffel.tartci.interpreter-preflight"
+                       % os.getuid()), calls)
+
+    def test_a_failure_or_a_hang_names_the_grant(self) -> None:
+        state = {"n": 0}
+
+        def failing(args):
+            state["n"] += 1
+            return "" if state["n"] == 1 else "\tlast exit code = 1\n"
+        reason, _ = self.run_with(failing)
+        self.assertIn("exit 1", reason)
+        self.assertIn("Removable Volumes", reason)
+        reason, _ = self.run_with(lambda args: "")
+        self.assertIn("did not finish a write to /Volumes/Atelier/VMs", reason)
+        self.assertIn("Full Disk Access", reason)
 
 
 class DoctorLastExit(unittest.TestCase):

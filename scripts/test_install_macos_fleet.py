@@ -405,6 +405,52 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertFalse((self.home / ".tartci/state/interpreter-refused").exists())
         self.assertIn(f"pinned interpreter {expected}", result.stdout)
 
+    def preflight(self, rc: int) -> Path:
+        script = self.root / f"preflight-{rc}"
+        script.write_text("#!/bin/sh\n"
+                          f"echo \"preflight said $2 cannot write the store\" >&2\nexit {rc}\n")
+        script.chmod(0o755)
+        return script
+
+    def interpreter(self, name: str) -> Path:
+        path = self.root / name
+        shutil.copy2(sys.executable, path)
+        path.chmod(0o755)
+        return path
+
+    def lane_python(self) -> str:
+        installed = list(self.agents.glob("*macos-fleet*.plist"))
+        return plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]["TARTCI_PYTHON"]
+
+    def test_a_new_interpreter_that_fails_the_preflight_is_not_switched_to(self) -> None:
+        # m5s, 2026-10-15: the lanes moved to a binary with no grant for the
+        # external-volume store, and the host could not come back on.
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        first = self.run_installer("--apply", TARTCI_PYTHON=str(old))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(new),
+                                    TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(1)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"keeps the lane interpreter {os.path.realpath(old)}", result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(old))
+        record = (self.home / ".tartci/state/interpreter-switch-refused").read_text()
+        stamp, tried, kept, reason = record.rstrip("\n").split("\t")
+        self.assertEqual((tried, kept), (os.path.realpath(new), os.path.realpath(old)))
+        self.assertIn("cannot write the store", reason)
+
+    def test_a_new_interpreter_that_passes_the_preflight_is_switched_to(self) -> None:
+        # Control, same instrument: the same switch with a passing preflight.
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        self.assertEqual(self.run_installer("--apply", TARTCI_PYTHON=str(old)).returncode, 0)
+        refused = self.home / ".tartci/state/interpreter-switch-refused"
+        refused.parent.mkdir(parents=True, exist_ok=True)
+        refused.write_text("2026-10-15T13:59:30Z\tx\ty\tz\n")
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(new),
+                                    TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(0)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(new))
+        self.assertFalse(refused.exists())
+
     def test_a_missing_profile_python_refuses_without_falling_back(self) -> None:
         self.set_profile_python(self.root / "gone" / "python3.12")
         result = self.run_installer("--apply")

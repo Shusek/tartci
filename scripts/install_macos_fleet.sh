@@ -130,6 +130,37 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# Switching the lane interpreter: macOS grants (Full Disk Access, Removable
+# Volumes, Local Network) belong to the binary, so prove the NEW one can use the
+# VM store from launchd before any lane runs it. If it cannot, keep the
+# interpreter the lanes run now and record why; the watchdog raises an issue
+# naming the grant (scripts/interpreter_alert.py). m5s, 2026-10-15.
+SWITCH_RECORD="${TARTCI_HOME:-$HOME/.tartci}/state/interpreter-switch-refused"
+PREVIOUS_PYTHON="$(tartci_lane_pinned_python 2>/dev/null || true)"
+if [ -n "$PREVIOUS_PYTHON" ] && [ "$PREVIOUS_PYTHON" != "$PYTHON_BIN" ] \
+    && [ -x "$PREVIOUS_PYTHON" ] && "$PREVIOUS_PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
+  preflight_rc=0
+  if [ -n "${TARTCI_INTERPRETER_PREFLIGHT:-}" ]; then
+    preflight_text="$("$TARTCI_INTERPRETER_PREFLIGHT" "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
+  elif [ "${TARTCI_TESTING:-0}" != 1 ]; then
+    preflight_text="$("$PREVIOUS_PYTHON" "$ROOT/scripts/interpreter_preflight.py" \
+      "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
+  else
+    preflight_text="interpreter preflight skipped (TARTCI_TESTING)"
+  fi
+  if [ "$preflight_rc" -ne 0 ]; then
+    echo "fleet install keeps the lane interpreter $PREVIOUS_PYTHON: $preflight_text" >&2
+    mkdir -p "$(dirname "$SWITCH_RECORD")"
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PYTHON_BIN" "$PREVIOUS_PYTHON" \
+      "$(printf '%s' "$preflight_text" | tr '\t\n' '  ')" >"$SWITCH_RECORD"
+    PYTHON_BIN="$PREVIOUS_PYTHON"
+  else
+    rm -f "$SWITCH_RECORD"
+  fi
+else
+  # No switch is attempted, so no switch stands refused.
+  rm -f "$SWITCH_RECORD"
+fi
 # The interpreter is part of the installed launch contract.  Probe GitHub
 # through that exact executable before writing any LaunchAgent; a PATH python3
 # may be a newly linked Homebrew build that is blocked by the host firewall.

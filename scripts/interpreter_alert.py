@@ -80,9 +80,52 @@ def host_id() -> str:
     return vm_boot_alert._alert_host()[0]
 
 
+SWITCH_TITLE = "[tartci] {host} kept its lane interpreter: {new} failed the launchd preflight"
+SWITCH_CLASS = "interpreter_switch_refused"
+
+
+def read_switch(home: Optional[Path] = None) -> Tuple[str, str, str, str]:
+    """(time, new, kept, reason) of an interpreter switch the installer refused."""
+    record = (home or _home()) / "state" / "interpreter-switch-refused"
+    try:
+        fields = record.read_text().strip().split("\t")
+    except OSError:
+        return "", "", "", ""
+    return tuple((fields + ["", "", "", ""])[:4])  # type: ignore[return-value]
+
+
+def render_switch(host: str, stamp: str, new: str, kept: str, reason: str, record: Path,
+                  detected: str) -> Tuple[str, str]:
+    body = "\n".join([
+        "## What happened",
+        f"An install on `{host}` at {stamp} was to switch the lanes to `{new}`, but that "
+        f"binary failed the launchd preflight, so the lanes keep `{kept}`. The host is "
+        "serving; the requested interpreter (host.python) is not in effect.", "",
+        "## Evidence", f"- `{record}`: {reason}",
+        "- the preflight starts the new binary as a launchd job, as the lanes would be, "
+        "and has it write, read back and remove one file in the profile's tart_home", "",
+        "## Likely cause",
+        "macOS grants belong to the binary: the new interpreter was never granted access to "
+        "the VM store's volume (Full Disk Access, or Files & Folders > Removable Volumes for a "
+        "store under /Volumes), so its first write waits on a consent nobody answers.", "",
+        "## Fix", "```sh",
+        f"# at {host}: System Settings > Privacy & Security > Full Disk Access, add {new}",
+        "#   (Cmd-Shift-G in the + picker and paste the path); also Local Network > Python",
+        "tartci fleet-macos self-update --apply   # the next install retries the switch",
+        "```", "",
+        "## Safe to auto-apply",
+        "No. Privacy grants are given at the machine; nothing here changes them.", "",
+        "## How to verify",
+        f"The next install reports no `keeps the lane interpreter` line, the lanes' "
+        f"TARTCI_PYTHON is `{new}`, and `{record}` is gone; this issue then closes itself.",
+    ])
+    line = tartci_incident.marker(host, SWITCH_CLASS, stamp or detected, detected)
+    return SWITCH_TITLE.format(host=host, new=new), tartci_incident.with_marker(body, line)
+
+
 def alert_pass(now: Optional[float] = None, issue: Optional[Callable[..., Any]] = None,
                close: Optional[Callable[..., Any]] = None) -> Optional[str]:
-    """One pass: the WARN line to log, or None when nothing is refused."""
+    """One pass: the WARN line(s) to log, or None when nothing is refused."""
     now = time.time() if now is None else now
     home = _home()
     stamp, job, reason = read_refusal(home)
@@ -96,13 +139,28 @@ def alert_pass(now: Optional[float] = None, issue: Optional[Callable[..., Any]] 
                                            f"{job}: {reason}", {"job": job}, now),
         render=lambda: render(host, stamp, job, reason, marker, detected),
         issue=issue, close=close)
-    if not stamp:
-        return None
-    return (f"{detected} launchd-watchdog: WARN interpreter: {job} refused to run an "
-            f"unpinned interpreter since {stamp}: {reason}"
-            + (f" (issue #{out.get('issue')})" if out.get("issue") else "")
-            + (f" (issue not opened: {out.get('issue_error') or ''})"
-               if not out.get("issue") else ""))
+    lines = []
+    if stamp:
+        lines.append(f"{detected} launchd-watchdog: WARN interpreter: {job} refused to run an "
+                     f"unpinned interpreter since {stamp}: {reason}"
+                     + (f" (issue #{out.get('issue')})" if out.get("issue") else "")
+                     + (f" (issue not opened: {out.get('issue_error') or ''})"
+                        if not out.get("issue") else ""))
+    sw_stamp, new, kept, sw_reason = read_switch(home)
+    record = home / "state" / "interpreter-switch-refused"
+    sw = host_off.episode_alert(
+        home / "state" / "interpreter-switch-alert.json", active=bool(sw_stamp),
+        resolved=not sw_stamp, since=sw_stamp or None,
+        raise_event=lambda: host_off.event(home / "state", "interpreter_switch_refused",
+                                           f"kept {kept}; {new} failed: {sw_reason}",
+                                           {"new": new, "kept": kept}, now),
+        render=lambda: render_switch(host, sw_stamp, new, kept, sw_reason, record, detected),
+        issue=issue, close=close)
+    if sw_stamp:
+        lines.append(f"{detected} launchd-watchdog: WARN interpreter: the lanes kept {kept}; "
+                     f"{new} failed the launchd preflight at {sw_stamp}: {sw_reason}"
+                     + (f" (issue #{sw.get('issue')})" if sw.get("issue") else ""))
+    return "\n".join(lines) or None
 
 
 def main() -> int:

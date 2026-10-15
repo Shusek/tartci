@@ -3486,7 +3486,21 @@ A refusal is loud: the job's log gets `refusing an unpinned interpreter` (or
 `~/.tartci/state/interpreter-refused`, and the watchdog opens
 `[tartci] <host> refused to run an unpinned interpreter` (class
 `interpreter_unpinned`), which closes itself once the installer writes a
-working pin and removes that record. When the watchdog itself is refused,
+working pin and removes that record.
+
+Changing the lane interpreter is gated. Before an install moves the lanes to
+a different binary, it starts that binary as a launchd job, the way the lanes
+will run it, and has it write, read back and remove one file in the profile's
+`tart_home` within 60 s (`scripts/interpreter_preflight.py`). macOS grants
+(Full Disk Access, Files & Folders > Removable Volumes, Local Network) belong
+to the binary, so a new one that was never granted waits on a consent nobody
+answers. If the preflight fails, the install keeps the interpreter the lanes
+run now, records `~/.tartci/state/interpreter-switch-refused`, and the
+watchdog opens `[tartci] <host> kept its lane interpreter: <new> failed the
+launchd preflight` (`interpreter_switch_refused`), naming the grant; it closes
+once a later install switches or no switch is attempted. A self-update
+rollback reinstalls with the interpreter the previous generation's lanes ran
+and restores its `python.pin`, never the new generation's. When the watchdog itself is refused,
 `tartci launchd heal` still runs that alert alone under `/usr/bin/python3`
 (`scripts/interpreter_alert.py`, stdlib only; Homebrew never replaces it) and
 then exits 127, so a host with a broken pin reports it instead of going
