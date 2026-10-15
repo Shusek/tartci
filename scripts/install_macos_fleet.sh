@@ -967,6 +967,19 @@ fi
 loaded_receipt_touched=1
 maybe_test_crash receipt
 
+# Every tartci LaunchAgent without its own TARTCI_PYTHON (the watchdog,
+# reclaim, self-update) resolves the interpreter through this pin, so they run
+# the same binary as the lanes. Written before the entrypoint swap, so no
+# LaunchAgent of the new generation ever starts without it; the old
+# generation's picker never reads it, so a rollback is unaffected.
+pin_file="$(tartci_python_pin_file)"
+pin_tmp="$(mktemp "$(dirname "$pin_file")/.python.pin.XXXXXX")"
+printf '%s\n' "$PYTHON_BIN" >"$pin_tmp"
+chmod 644 "$pin_tmp"
+durable_file "$pin_tmp"
+mv -f "$pin_tmp" "$pin_file"
+durable_file "$pin_file"
+
 if [ -d "$ENTRYPOINT" ] && [ ! -L "$ENTRYPOINT" ]; then
   echo "fleet install refuses a directory at the canonical TartCI entrypoint: $ENTRYPOINT" >&2
   exit 3
@@ -989,18 +1002,6 @@ maybe_test_crash wrapper
 "$PYTHON_BIN" "$PY" verify-installed "$RECEIPT" \
   --config "$PROFILE_SNAPSHOT" --agents-dir "$AGENTS_DIR" \
   --support-root "$support_root" >/dev/null
-
-# Every tartci LaunchAgent without its own TARTCI_PYTHON (the watchdog,
-# reclaim, self-update) resolves the interpreter through this pin, so they run
-# the same binary as the lanes. Written last: a failed install keeps the pin
-# that matches the lanes still installed.
-pin_file="$(tartci_python_pin_file)"
-pin_tmp="$(mktemp "$(dirname "$pin_file")/.python.pin.XXXXXX")"
-printf '%s\n' "$PYTHON_BIN" >"$pin_tmp"
-chmod 644 "$pin_tmp"
-durable_file "$pin_tmp"
-mv -f "$pin_tmp" "$pin_file"
-durable_file "$pin_file"
 
 tartci_pool_lock_release
 lock_owned=0
