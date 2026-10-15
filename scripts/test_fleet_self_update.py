@@ -2332,6 +2332,9 @@ class SealedRollbackTests(Base):
         rollback_argv, rollback_env = installs[-1]
         self.assertIn("rollback", " ".join(rollback_argv))
         self.assertEqual(rollback_env.get("TARTCI_PYTHON"), "/old/python3.15")
+        # It must outrank the snapshot profile's host.python in the installer.
+        self.assertEqual(rollback_env.get("TARTCI_ROLLBACK_PYTHON"), "/old/python3.15")
+        self.assertNotIn("TARTCI_ROLLBACK_PYTHON", installs[0][1] or {})
         self.assertEqual(pin.read_text().strip(), "/old/python3.15")
 
     def test_signing_probe_failure_refuses_before_drain(self) -> None:

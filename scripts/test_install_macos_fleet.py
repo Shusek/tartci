@@ -128,13 +128,30 @@ class InstallMacosFleetTests(unittest.TestCase):
                 if os.environ.get("FAKE_FAIL_BOOTOUT_LABEL") == label:
                     raise SystemExit(70)
                 state.pop(label, None)
+                state.pop(label + ":exit", None)
                 state_path.write_text(json.dumps(state))
                 raise SystemExit(0)
             if command == "kickstart":
                 if os.environ.get("FAKE_FAIL_KICKSTART_LABEL") == label:
                     raise SystemExit(70)
+                if label == "com.danielraffel.tartci.interpreter-preflight" and label in state:
+                    # Run the interpreter preflight's job for real, as launchd
+                    # would: its program, its log, its exit code.
+                    import subprocess
+                    job = plistlib.loads(Path(state[label]).read_bytes())
+                    with open(job["StandardOutPath"], "ab") as log:
+                        done = subprocess.run(job["ProgramArguments"], stdout=log,
+                                              stderr=subprocess.STDOUT, check=False)
+                    state[label + ":exit"] = done.returncode
+                    state_path.write_text(json.dumps(state))
                 raise SystemExit(0)
             if command != "print":
+                raise SystemExit(0)
+            if label == "com.danielraffel.tartci.interpreter-preflight" and label in state:
+                print("gui/{self.uid}/" + label + " = {{")
+                if label + ":exit" in state:
+                    print("\tlast exit code = " + str(state[label + ":exit"]))
+                print("}}")
                 raise SystemExit(0)
             forced = os.environ.get("FAKE_LOADED_LABEL", "__none__")
             if forced in target and label not in state:
@@ -450,6 +467,60 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lane_python(), os.path.realpath(new))
         self.assertFalse(refused.exists())
+
+    def test_the_real_preflight_refuses_a_new_interpreter_that_cannot_write_the_store(self) -> None:
+        # No TARTCI_INTERPRETER_PREFLIGHT: the installer runs
+        # scripts/interpreter_preflight.py, which starts the NEW binary as a
+        # launchd job (the fake launchctl runs it) that writes into tart_home.
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        self.assertEqual(self.run_installer("--apply", TARTCI_PYTHON=str(old)).returncode, 0)
+        store = self.home / "VMs"
+        store.mkdir(exist_ok=True)
+        store.chmod(0o500)
+        try:
+            result = self.run_installer("--apply", TARTCI_PYTHON=str(new))
+        finally:
+            store.chmod(0o755)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"keeps the lane interpreter {os.path.realpath(old)}", result.stderr)
+        self.assertIn(f"could not use {store}", result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(old))
+        self.assertIn("kickstart gui/", self.calls.read_text())
+        self.assertTrue((self.home / ".tartci/state/interpreter-switch-refused").exists())
+
+    def test_the_real_preflight_switches_to_a_new_interpreter_that_can_write_the_store(self) -> None:
+        # Control, same instrument: a writable store passes the real preflight.
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        self.assertEqual(self.run_installer("--apply", TARTCI_PYTHON=str(old)).returncode, 0)
+        (self.home / "VMs").mkdir(exist_ok=True)
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(new))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(new))
+        self.assertIn("interpreter-preflight", self.calls.read_text())
+        self.assertEqual(list((self.home / "VMs").iterdir()), [])
+
+    def test_a_rollback_interpreter_wins_over_the_profiles_host_python(self) -> None:
+        # The snapshot profile can name the switch the preflight refused; the
+        # rollback must reinstall what the previous lanes ran.
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        self.set_profile_python(new)
+        result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON=os.path.realpath(old),
+                                    TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(1)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(rollback) uses the previous lanes' interpreter", result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(old))
+        pin = (self.home / ".config/tartci/python.pin").read_text().strip()
+        self.assertEqual(pin, os.path.realpath(old))
+        # Control, same profile: without the rollback, host.python wins.
+        result = self.run_installer("--apply", TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(0)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(new))
+
+    def test_a_relative_rollback_interpreter_is_refused(self) -> None:
+        result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON="python3")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("TARTCI_ROLLBACK_PYTHON must be an absolute path", result.stderr)
+        self.assertEqual(list(self.agents.glob("*macos-fleet*.plist")), [])
 
     def test_a_missing_profile_python_refuses_without_falling_back(self) -> None:
         self.set_profile_python(self.root / "gone" / "python3.12")

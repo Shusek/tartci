@@ -116,14 +116,16 @@ class Picker(unittest.TestCase):
                                capture_output=True, text=True, check=False, env=base)
         self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
 
-    def lane(self, python: Path) -> None:
+    def lane(self, python: Path, lane: str = "pulp-gate") -> Path:
         agents = self.home / "Library" / "LaunchAgents"
         agents.mkdir(parents=True, exist_ok=True)
-        (agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m5studio.pulp-gate.plist").write_text(
+        plist = agents / f"com.danielraffel.tartci.tart-runner-macos-fleet.m5studio.{lane}.plist"
+        plist.write_text(
             '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
             "    <key>EnvironmentVariables</key>\n    <dict>\n"
             "        <key>TARTCI_PYTHON</key>\n"
             f"        <string>{python}</string>\n    </dict>\n</dict>\n</plist>\n")
+        return plist
 
     def test_a_host_without_a_pin_bootstraps_from_its_lanes_under_launchd(self) -> None:
         # m3 and m5s, 2026-10-15: no python.pin had been written yet, and the
@@ -132,7 +134,31 @@ class Picker(unittest.TestCase):
         self.lane(self.pinned)
         result = self.pick(XPC_SERVICE_NAME="com.danielraffel.tartci.self-update")
         self.assertEqual((result.returncode, result.stdout.strip()), (0, str(self.pinned)))
-        self.assertEqual(result.stderr, "")
+        # Never silent: the job's log names the borrowed interpreter.
+        self.assertIn("com.danielraffel.tartci.self-update uses the fleet lanes' interpreter "
+                      f"{self.pinned}", result.stderr)
+        self.assertIn("python.pin", result.stderr)
+
+    def test_the_pin_is_not_announced_as_a_bootstrap(self) -> None:
+        # Control, same instrument: with a pin, no bootstrap line.
+        self.lane(self.pinned)
+        self.pin(str(self.pinned))
+        result = self.pick(XPC_SERVICE_NAME="com.danielraffel.tartci.self-update")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+
+    def test_the_newest_lane_wins_when_lanes_disagree(self) -> None:
+        older = self.interpreter(self.root / "older" / "python3.12")
+        old_plist = self.lane(older, "aaa-gate")
+        new_plist = self.lane(self.pinned, "zzz-gate")
+        os.utime(old_plist, (2_000_000_000, 2_000_000_000))
+        os.utime(new_plist, (1_000_000_000, 1_000_000_000))
+        result = self.pick(TARTCI_LAUNCHD="1")
+        self.assertEqual(result.stdout.strip(), str(older))
+        # The same lanes with the times swapped pick the other one.
+        os.utime(old_plist, (1_000_000_000, 1_000_000_000))
+        os.utime(new_plist, (2_000_000_000, 2_000_000_000))
+        result = self.pick(TARTCI_LAUNCHD="1")
+        self.assertEqual(result.stdout.strip(), str(self.pinned))
 
     def test_a_lane_pin_whose_binary_is_gone_still_refuses(self) -> None:
         self.lane(self.root / "gone" / "python3.12")
@@ -393,6 +419,46 @@ class DoctorLastExit(unittest.TestCase):
 
 
 @NEEDS_TOMLLIB
+class DoctorPythonPin(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            import fleet_doctor  # noqa: PLC0415
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+        self.fd = fleet_doctor
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.pin = Path(tmp.name) / "python.pin"
+
+    def test_a_managed_host_without_a_pin_is_a_problem(self) -> None:
+        finding = self.fd.check_python_pin(self.pin, managed=True)
+        self.assertEqual((finding.code, finding.state), ("python_pin_missing", self.fd.PROBLEM))
+        self.assertIn("reinstall", finding.detail)
+
+    def test_a_pin_naming_an_executable_is_ok(self) -> None:
+        self.pin.write_text(sys.executable + "\n")
+        self.assertEqual(self.fd.check_python_pin(self.pin, managed=True).code, "python_pin_ok")
+
+    def test_a_pin_naming_nothing_usable_is_a_problem(self) -> None:
+        for value in ("python3", str(Path(self.pin.parent) / "gone"), str(self.pin.parent), ""):
+            with self.subTest(value=value):
+                self.pin.write_text(value + "\n")
+                self.assertEqual(self.fd.check_python_pin(self.pin, managed=True).code,
+                                 "python_pin_unusable")
+
+    def test_an_unmanaged_host_is_not_judged(self) -> None:
+        self.assertEqual(self.fd.check_python_pin(self.pin, managed=False).code,
+                         "python_pin_not_applicable")
+
+    def test_every_pin_code_and_the_failing_code_carry_a_reason(self) -> None:
+        reasons = self.fd.load_reasons()
+        for code in ("python_pin_missing", "python_pin_unusable", "python_pin_ok",
+                     "python_pin_not_applicable", "host_agents_failing"):
+            with self.subTest(code=code):
+                self.assertIn(code, self.fd.CODES)
+                self.assertIn(code, reasons)
+
+
 class SelfUpdateLauncher(unittest.TestCase):
     def test_the_launcher_is_built_with_the_profile_interpreter(self) -> None:
         try:

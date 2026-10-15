@@ -2653,7 +2653,12 @@ class Run:
         fence = self._writer_fence()
         env = census_env(self.repository)
         if python:
+            # Only a rollback names one. TARTCI_ROLLBACK_PYTHON outranks the
+            # snapshot profile's host.python, which may name the switch the
+            # preflight refused; an older installer reads TARTCI_PYTHON only.
             env["TARTCI_PYTHON"] = python
+            if python.startswith("/"):
+                env["TARTCI_ROLLBACK_PYTHON"] = python
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
                                            cwd=str(self.cfg.checkout), env=env,

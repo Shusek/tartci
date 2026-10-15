@@ -72,10 +72,30 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # launcher builder and the installed launchd helpers.
 # shellcheck disable=SC1091
 . "$ROOT/providers/common/toml-python.lib.sh"
+# A self-update rollback reinstalls the interpreter the previous generation's
+# lanes ran (fleet_self_update sets TARTCI_ROLLBACK_PYTHON). It wins over the
+# snapshot profile's host.python, which may name a switch the preflight
+# refused; the profile itself is not rewritten, because a sealed launcher's
+# policy digest covers it.
+if [ -n "${TARTCI_ROLLBACK_PYTHON:-}" ]; then
+  case "$TARTCI_ROLLBACK_PYTHON" in
+    /*) ;;
+    *) echo "fleet install: TARTCI_ROLLBACK_PYTHON must be an absolute path: $TARTCI_ROLLBACK_PYTHON" >&2
+       exit 2 ;;
+  esac
+  [ -x "$TARTCI_ROLLBACK_PYTHON" ] && [ ! -d "$TARTCI_ROLLBACK_PYTHON" ] || {
+    echo "fleet install: the rollback interpreter is not an executable file: $TARTCI_ROLLBACK_PYTHON" >&2
+    exit 127
+  }
+  if PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")" \
+      && [ "$PROFILE_PYTHON" != "$TARTCI_ROLLBACK_PYTHON" ]; then
+    echo "fleet install (rollback) uses the previous lanes' interpreter $TARTCI_ROLLBACK_PYTHON, not the profile's host.python $PROFILE_PYTHON" >&2
+  fi
+  export TARTCI_PYTHON="$TARTCI_ROLLBACK_PYTHON"
 # A profile's host.python is the interpreter this host runs, full stop: it
 # wins over the environment, the previous pin and any PATH search, and a
 # missing or unusable one refuses the install rather than falling back.
-if PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")"; then
+elif PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")"; then
   if [ -n "${TARTCI_PYTHON:-}" ] && [ "$TARTCI_PYTHON" != "$PROFILE_PYTHON" ]; then
     echo "fleet install uses the profile's host.python $PROFILE_PYTHON, not TARTCI_PYTHON=$TARTCI_PYTHON" >&2
   fi
@@ -137,16 +157,18 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
 # naming the grant (scripts/interpreter_alert.py). m5s, 2026-10-15.
 SWITCH_RECORD="${TARTCI_HOME:-$HOME/.tartci}/state/interpreter-switch-refused"
 PREVIOUS_PYTHON="$(tartci_lane_pinned_python 2>/dev/null || true)"
-if [ -n "$PREVIOUS_PYTHON" ] && [ "$PREVIOUS_PYTHON" != "$PYTHON_BIN" ] \
+# A rollback restores an interpreter the previous generation already ran, so
+# it is not a switch to prove. There is no skip for tests: they stub launchctl
+# or name a preflight with TARTCI_INTERPRETER_PREFLIGHT.
+if [ -z "${TARTCI_ROLLBACK_PYTHON:-}" ] && [ -n "$PREVIOUS_PYTHON" ] \
+    && [ "$PREVIOUS_PYTHON" != "$PYTHON_BIN" ] \
     && [ -x "$PREVIOUS_PYTHON" ] && "$PREVIOUS_PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
   preflight_rc=0
   if [ -n "${TARTCI_INTERPRETER_PREFLIGHT:-}" ]; then
     preflight_text="$("$TARTCI_INTERPRETER_PREFLIGHT" "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
-  elif [ "${TARTCI_TESTING:-0}" != 1 ]; then
+  else
     preflight_text="$("$PREVIOUS_PYTHON" "$ROOT/scripts/interpreter_preflight.py" \
       "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
-  else
-    preflight_text="interpreter preflight skipped (TARTCI_TESTING)"
   fi
   if [ "$preflight_rc" -ne 0 ]; then
     echo "fleet install keeps the lane interpreter $PREVIOUS_PYTHON: $preflight_text" >&2
