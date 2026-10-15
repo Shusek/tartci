@@ -3452,8 +3452,9 @@ path, never a PATH search. The installer uses it over `TARTCI_PYTHON`, the old
 pin and any search, refuses the install if it is missing, renders it into
 every lane as `TARTCI_PYTHON`, and writes it to `~/.config/tartci/python.pin`.
 LaunchAgents rendered without their own `TARTCI_PYTHON` (the watchdog,
-reclaim, self-update) resolve through that pin. A tartci LaunchAgent
-(`XPC_SERVICE_NAME` `com.danielraffel.tartci.*`) with neither refuses to run
+reclaim, self-update) resolve through that pin. Any LaunchAgent tartci ships
+(`XPC_SERVICE_NAME` `com.danielraffel.*`: tartci, pulp lanes, the network
+relay, shipyard and forge helpers) with neither refuses to run
 and logs `refusing an unpinned interpreter`; it never takes whatever
 `/opt/homebrew/bin/python3` is today. Interactive commands keep the search.
 
@@ -3476,4 +3477,9 @@ A refusal is loud: the job's log gets `refusing an unpinned interpreter` (or
 `~/.tartci/state/interpreter-refused`, and the watchdog opens
 `[tartci] <host> refused to run an unpinned interpreter` (class
 `interpreter_unpinned`), which closes itself once the installer writes a
-working pin and removes that record.
+working pin and removes that record. When the watchdog itself is refused,
+`tartci launchd heal` still runs that alert alone under `/usr/bin/python3`
+(`scripts/interpreter_alert.py`, stdlib only; Homebrew never replaces it) and
+then exits 127, so a host with a broken pin reports it instead of going
+dark. `tartci doctor fleet` reports a loaded watchdog or self-update agent
+whose last exit is nonzero (`host_agents_failing`; 127 is a refusal).

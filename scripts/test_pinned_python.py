@@ -70,6 +70,21 @@ class Picker(unittest.TestCase):
         self.assertIn("refusing an unpinned interpreter under launchd job "
                       "com.danielraffel.tartci.launchd-watchdog", result.stderr)
 
+    def test_every_launchagent_tartci_ships_refuses_without_a_pin(self) -> None:
+        # The labels come from the templates, so a new template is covered.
+        import re  # noqa: PLC0415
+        labels = sorted({re.search(r"<key>Label</key>\s*<string>([^<]+)</string>",
+                                   path.read_text()).group(1)
+                         for path in (ROOT / "launchd").glob("*.plist.template")})
+        self.assertIn("com.danielraffel.network.http-connect-ssh-relay", labels)
+        self.assertIn("com.danielraffel.pulp.tart-runner-linux", labels)
+        labels.append("com.danielraffel.tartci.tart-runner-macos-fleet.m5studio.pulp-gate")
+        for label in labels:
+            with self.subTest(label=label):
+                result = self.pick(XPC_SERVICE_NAME=label)
+                self.assertEqual((result.returncode, result.stdout), (127, ""))
+                self.assertIn("refusing an unpinned interpreter", result.stderr)
+
     def test_without_launchd_the_same_search_still_finds_the_bait(self) -> None:
         # Control, same instrument: an interactive shell keeps the search.
         result = self.pick()
@@ -178,9 +193,66 @@ class WatchdogIssue(unittest.TestCase):
         self.assertIsNone(self.run_pass())
         self.assertEqual(self.closed, ["61"])
 
+    def test_a_watchdog_run_as_launchd_does_reports_its_own_refusal(self) -> None:
+        # The pin names a binary a Homebrew cleanup removed. launchd runs the
+        # watchdog as `/bin/bash ~/.local/bin/tartci launchd heal`; the heal is
+        # refused, and the alert still runs, under /usr/bin/python3.
+        if not Path("/usr/bin/python3").exists():
+            self.skipTest("no /usr/bin/python3")
+        (self.home / ".config" / "tartci").mkdir(parents=True)
+        (self.home / ".config" / "tartci" / "python.pin").write_text(
+            str(self.home / "gone" / "python3.12") + "\n")
+        env = {"HOME": str(self.home), "TARTCI_HOME": str(self.home),
+               "PATH": "/usr/bin:/bin", "XPC_SERVICE_NAME":
+               "com.danielraffel.tartci.launchd-watchdog",
+               "TARTCI_FLEET_PROFILE": str(self.home / "profile.toml")}
+        (self.home / "profile.toml").write_text('[host]\nid = "m5studio"\n')
+        result = subprocess.run(["/bin/bash", str(ROOT / "tartci"), "launchd", "heal"],
+                                capture_output=True, text=True, env=env, check=False,
+                                timeout=120)
+        self.assertEqual(result.returncode, 127, result.stdout + result.stderr)
+        self.assertIn("pinned interpreter", result.stderr)
+        self.assertIn("WARN interpreter: com.danielraffel.tartci.launchd-watchdog refused",
+                      result.stdout)
+        events = (self.home / "state" / "events.jsonl").read_text()
+        self.assertIn("interpreter_refused", events)
+        state = (self.home / "state" / "interpreter-refused-alert.json").read_text()
+        # The issue write itself is refused from a scratch home (a test run);
+        # the alert reached it.
+        self.assertIn("scratch", state)
+
     def test_no_refusal_is_quiet(self) -> None:
         self.assertIsNone(self.run_pass())
         self.assertEqual(self.opened, [])
+
+
+class DoctorLastExit(unittest.TestCase):
+    def test_a_loaded_agent_that_keeps_failing_is_a_problem(self) -> None:
+        try:
+            import fleet_doctor as fd  # noqa: PLC0415
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+        rows = [{"label": label, "last_exit": 0} for label in fd.REQUIRED_HOST_AGENTS]
+        self.assertEqual(fd.check_host_agents(rows, managed=True).code, "host_agents_ok")
+        rows[0]["last_exit"] = 127
+        finding = fd.check_host_agents(rows, managed=True)
+        self.assertEqual(finding.code, "host_agents_failing")
+        self.assertIn("last exit 127", finding.detail)
+        self.assertIn("interpreter-refused", finding.detail)
+
+    def test_last_exit_is_read_from_launchctl_print(self) -> None:
+        try:
+            import fleet_doctor as fd  # noqa: PLC0415
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+        label = "com.danielraffel.tartci.launchd-watchdog"
+
+        def run(argv):
+            if argv[1] == "list":
+                return 0, f"PID\tStatus\tLabel\n-\t127\t{label}\n", ""
+            return 0, f"{label} = {{\n\tpath = /x.plist\n\tlast exit code = 127\n}}\n", ""
+        rows, _ = fd.launchd_registrations(run)
+        self.assertEqual(rows, [{"label": label, "path": "/x.plist", "last_exit": 127}])
 
 
 @NEEDS_TOMLLIB

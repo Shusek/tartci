@@ -67,8 +67,11 @@ tartci_toml_python_path() {
     return 127
   fi
   if [ -z "$configured" ]; then
+    # Every LaunchAgent tartci ships is labelled com.danielraffel.* (tartci,
+    # pulp lanes, the network relay, shipyard and forge helpers); interactive
+    # shells carry 0, application.* or nothing.
     case "${XPC_SERVICE_NAME:-}" in
-      com.danielraffel.tartci.*)
+      com.danielraffel.*)
         # A LaunchAgent must never run whatever python3 PATH resolves to
         # today: a Homebrew upgrade would swap the binary under launchd, and
         # macOS privacy grants (Local Network) do not follow it.

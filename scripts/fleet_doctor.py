@@ -980,8 +980,19 @@ def check_host_agents(rows: list[dict] | None, *, managed: bool,
         return Finding("host_agents", PROBLEM, "host_agents_missing",
                        f"not loaded: {', '.join(missing)}; this host never refreshes skew "
                        "or tool freshness and never updates itself", facts)
+    # Loaded is not running: an agent refused by the interpreter pin (exit 127)
+    # stays loaded and fails every start.
+    failing = {row["label"]: row.get("last_exit") for row in rows
+               if row.get("label") in REQUIRED_HOST_AGENTS and row.get("last_exit") not in (None, 0)}
+    facts["failing"] = failing
+    if failing:
+        detail = ", ".join(f"{label} last exit {code}" for label, code in sorted(failing.items()))
+        hint = ("; exit 127 is an interpreter refusal: see ~/.tartci/state/interpreter-refused "
+                "and ~/.config/tartci/python.pin") if 127 in failing.values() else ""
+        return Finding("host_agents", PROBLEM, "host_agents_failing",
+                       f"loaded but failing: {detail}{hint}", facts)
     return Finding("host_agents", OK, "host_agents_ok",
-                   "watchdog and self-update agents are loaded", facts)
+                   "watchdog and self-update agents are loaded and last exited 0", facts)
 
 
 def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | None = None
@@ -1008,7 +1019,9 @@ def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | Non
         if code != 0:
             continue  # listed in another domain or gone since the list
         match = re.search(r"^\tpath = (.+)$", text, re.M)
-        rows.append({"label": label, "path": match.group(1).strip() if match else None})
+        exited = re.search(r"^\tlast exit code = (-?\d+)", text, re.M)
+        rows.append({"label": label, "path": match.group(1).strip() if match else None,
+                     "last_exit": int(exited.group(1)) if exited else None})
     return rows, ""
 
 

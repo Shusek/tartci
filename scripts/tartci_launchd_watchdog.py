@@ -1330,71 +1330,16 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
-INTERPRETER_TITLE = "[tartci] {host} refused to run an unpinned interpreter"
-
-
 def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
-    """Raise one issue while a tartci LaunchAgent on this host refuses to run.
-
-    providers/common/toml-python.lib.sh refuses an unpinned interpreter under
-    launchd (or a pin whose binary vanished) and records the first refusal in
-    state/interpreter-refused; the installer removes it once a working pin is
-    in place. A refusal on a job's stderr alone is read by nobody. Never raises.
-    """
+    """Raise one issue while a tartci LaunchAgent on this host refuses to run
+    an unpinned interpreter (scripts/interpreter_alert.py). Never raises."""
     try:
-        import host_off  # noqa: PLC0415 - sibling module
-        import tartci_incident  # noqa: PLC0415
-        import vm_boot_alert  # noqa: PLC0415 - owns this host's id
-        current = utcnow() if now is None else now
-        home = Path(os.environ.get("TARTCI_HOME", os.path.join(os.path.expanduser("~"), ".tartci")))
-        marker = home / "state" / "interpreter-refused"
-        try:
-            stamp, job, reason = (marker.read_text().strip().split("\t") + ["", "", ""])[:3]
-        except OSError:
-            stamp = job = reason = ""
-        host, _ = vm_boot_alert._alert_host()
-        detected = _iso(current)
-
-        def render():
-            body = "\n".join([
-                "## What happened",
-                f"A tartci LaunchAgent on `{host}` ({job}) refused to start at {stamp}: {reason}. "
-                "It will not run until the interpreter is pinned.", "",
-                "## Evidence", f"- `{marker}`: {stamp} {job} {reason}",
-                f"- the job's own log has the line `refusing an unpinned interpreter` or "
-                "`the pinned interpreter … is unusable`", "",
-                "## Likely cause",
-                "The host has no `~/.config/tartci/python.pin`, or the pinned binary is gone "
-                "(a Homebrew upgrade or cleanup removed its Cellar directory).", "",
-                "## Fix", "```sh",
-                "brew install python@3.12 && brew pin python@3.12   # if the binary is gone",
-                "# set host.python in this host's fleet profile, then:",
-                "tartci fleet-macos self-update --apply",
-                "```", "",
-                "## Safe to auto-apply",
-                "No. Choosing the interpreter is a host decision, and a new binary needs its "
-                "privacy grants (Local Network) again.", "",
-                "## How to verify",
-                f"`cat ~/.config/tartci/python.pin` names an existing binary, and `{marker}` is "
-                "gone (the installer removes it); this issue then closes itself.",
-            ])
-            line = tartci_incident.marker(host, "interpreter_unpinned", stamp or detected, detected)
-            return INTERPRETER_TITLE.format(host=host), tartci_incident.with_marker(body, line)
-
-        out = host_off.episode_alert(
-            home / "state" / "interpreter-refused-alert.json", active=bool(stamp),
-            resolved=not stamp, since=stamp or None,
-            raise_event=lambda: host_off.event(home / "state", "interpreter_refused",
-                                               f"{job}: {reason}", {"job": job}, current),
-            render=render, issue=issue, close=close)
+        import interpreter_alert  # noqa: PLC0415 - sibling module
+        return interpreter_alert.alert_pass(utcnow() if now is None else now,
+                                            issue=issue, close=close)
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter check FAILED "
                 f"({type(exc).__name__}: {exc})")
-    if stamp:
-        return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN interpreter: "
-                f"{job} refused to run an unpinned interpreter since {stamp}: {reason}"
-                + (f" (issue #{out.get('issue')})" if out.get("issue") else ""))
-    return None
 
 
 def tailnet_pass(now: float | None = None) -> str | None:
