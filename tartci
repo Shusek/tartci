@@ -565,6 +565,15 @@ cmd_launchd() {
     guard) tartci_verified_python_run "$HERE/scripts/launchctl_guard.py" "$@" ;;
     status) tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
     heal)
+      # A refused interpreter must not silence the alert about it: run only the
+      # interpreter alert under Apple's Python (stdlib, never replaced by
+      # Homebrew), then fail like the refusal did.
+      local heal_python_error
+      if ! heal_python_error="$(tartci_toml_python_path 2>&1 >/dev/null)"; then
+        printf '%s\n' "$heal_python_error" >&2
+        /usr/bin/python3 "$HERE/scripts/interpreter_alert.py" || true
+        return 127
+      fi
       # Reboot/offline rejoin convergence includes the optional per-host relay
       # profile. Keep the watchdog's JSON output singular and pass dry-run
       # through without forwarding unrelated watchdog flags.

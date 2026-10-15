@@ -1330,6 +1330,18 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
+    """Raise one issue while a tartci LaunchAgent on this host refuses to run
+    an unpinned interpreter (scripts/interpreter_alert.py). Never raises."""
+    try:
+        import interpreter_alert  # noqa: PLC0415 - sibling module
+        return interpreter_alert.alert_pass(utcnow() if now is None else now,
+                                            issue=issue, close=close)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter check FAILED "
+                f"({type(exc).__name__}: {exc})")
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1691,6 +1703,9 @@ def main(argv: list[str] | None = None) -> int:
         tailnet_line = tailnet_pass()
         if tailnet_line:
             print(tailnet_line)
+        interpreter_line = interpreter_refusal_pass()
+        if interpreter_line:
+            print(interpreter_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

@@ -72,6 +72,19 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # launcher builder and the installed launchd helpers.
 # shellcheck disable=SC1091
 . "$ROOT/providers/common/toml-python.lib.sh"
+# A profile's host.python is the interpreter this host runs, full stop: it
+# wins over the environment, the previous pin and any PATH search, and a
+# missing or unusable one refuses the install rather than falling back.
+if PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")"; then
+  if [ -n "${TARTCI_PYTHON:-}" ] && [ "$TARTCI_PYTHON" != "$PROFILE_PYTHON" ]; then
+    echo "fleet install uses the profile's host.python $PROFILE_PYTHON, not TARTCI_PYTHON=$TARTCI_PYTHON" >&2
+  fi
+  [ -x "$PROFILE_PYTHON" ] && [ ! -d "$PROFILE_PYTHON" ] || {
+    echo "fleet install: the profile's host.python is not an executable file: $PROFILE_PYTHON" >&2
+    exit 127
+  }
+  export TARTCI_PYTHON="$PROFILE_PYTHON"
+fi
 if [ -n "${TARTCI_PYTHON:-}" ] && [[ "$TARTCI_PYTHON" == */* ]]; then
   python_probe="$TARTCI_PYTHON"
   python_probe_hops=0
@@ -954,6 +967,21 @@ fi
 loaded_receipt_touched=1
 maybe_test_crash receipt
 
+# Every tartci LaunchAgent without its own TARTCI_PYTHON (the watchdog,
+# reclaim, self-update) resolves the interpreter through this pin, so they run
+# the same binary as the lanes. Written before the entrypoint swap, so no
+# LaunchAgent of the new generation ever starts without it; the old
+# generation's picker never reads it, so a rollback is unaffected.
+pin_file="$(tartci_python_pin_file)"
+pin_tmp="$(mktemp "$(dirname "$pin_file")/.python.pin.XXXXXX")"
+printf '%s\n' "$PYTHON_BIN" >"$pin_tmp"
+chmod 644 "$pin_tmp"
+durable_file "$pin_tmp"
+mv -f "$pin_tmp" "$pin_file"
+durable_file "$pin_file"
+# A working pin is in place: the watchdog's unpinned-interpreter issue closes.
+rm -f "$(tartci_interpreter_refusal_file)"
+
 if [ -d "$ENTRYPOINT" ] && [ ! -L "$ENTRYPOINT" ]; then
   echo "fleet install refuses a directory at the canonical TartCI entrypoint: $ENTRYPOINT" >&2
   exit 3
@@ -982,5 +1010,6 @@ lock_owned=0
 trap - EXIT
 rm -rf "$stage_dir" "$plan_dir"
 echo "installed ${#changed_targets[@]} profile-rendered LaunchAgents; retired ${#retired_paths[@]} declared legacy LaunchAgents"
+echo "pinned interpreter $PYTHON_BIN in $pin_file"
 echo "verified receipt $RECEIPT; pool admission remains closed"
 echo "run 'tartci pool on' at an approved idle boundary"

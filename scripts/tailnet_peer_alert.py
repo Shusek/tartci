@@ -597,8 +597,9 @@ def lan_blind_text(host: str, blind: Dict[str, Any], now: float,
         "off the LAN while the tailnet works. Not yet established; candidates to check: the "
         "route the kernel picks for a LAN address (another interface, such as a Thunderbolt "
         "bridge or a link-local address), a firewall (the application firewall or LuLu) "
-        "holding the probe binary, or macOS privacy settings for the process that runs "
-        "tartci's watchdog. An interactive ssh session is a different process tree, so a "
+        "holding the probe binary, or macOS privacy settings (Local Network) for the binary "
+        "that runs the probe, for example Homebrew Python, which needs a re-grant after each "
+        "upgrade. An interactive ssh session is a different process tree, so a "
         "probe by hand can succeed while this one fails.", "",
         "## Fix", "```sh",
         f"# on {host}, from the watchdog's own context (not an interactive shell):",

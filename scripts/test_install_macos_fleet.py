@@ -377,6 +377,42 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual(env["SHIPYARD_GHAPP_PYTHON_BINARY"], expected)
         self.assertTrue(env["PATH"].startswith(str(Path(expected).parent) + ":"))
 
+    def set_profile_python(self, path: Path) -> None:
+        self.config.write_text(self.config.read_text().replace(
+            f'log_root = "{self.home}/logs"\n',
+            f'log_root = "{self.home}/logs"\npython = "{path}"\n'))
+
+    def test_profile_host_python_wins_and_is_pinned_for_every_agent(self) -> None:
+        declared = self.root / "declared-python3.12"
+        shutil.copy2(sys.executable, declared)
+        declared.chmod(0o755)
+        other = self.root / "env-python3"
+        shutil.copy2(sys.executable, other)
+        other.chmod(0o755)
+        self.set_profile_python(declared)
+        refused = self.home / ".tartci/state/interpreter-refused"
+        refused.parent.mkdir(parents=True, exist_ok=True)
+        refused.write_text("2026-10-15T09:00:00Z\tcom.danielraffel.tartci.reclaim\tno pin\n")
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(other))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("uses the profile's host.python", result.stderr)
+        expected = os.path.realpath(declared)
+        installed = list(self.agents.glob("*macos-fleet*.plist"))
+        env = plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]
+        self.assertEqual(env["TARTCI_PYTHON"], expected)
+        pin = self.home / ".config/tartci/python.pin"
+        self.assertEqual(pin.read_text().strip(), expected)
+        self.assertFalse((self.home / ".tartci/state/interpreter-refused").exists())
+        self.assertIn(f"pinned interpreter {expected}", result.stdout)
+
+    def test_a_missing_profile_python_refuses_without_falling_back(self) -> None:
+        self.set_profile_python(self.root / "gone" / "python3.12")
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 127, result.stdout + result.stderr)
+        self.assertIn("host.python is not an executable file", result.stderr)
+        self.assertEqual(list(self.agents.glob("*macos-fleet*.plist")), [])
+        self.assertFalse((self.home / ".config/tartci/python.pin").exists())
+
     def test_slow_pinned_interpreter_fails_fast_with_path(self) -> None:
         interpreter = self.root / "slow-python"
         interpreter.write_text(textwrap.dedent(f"""\

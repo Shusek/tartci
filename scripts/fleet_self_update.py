@@ -1735,6 +1735,18 @@ def restore_writable(root: Path) -> None:
                 os.chmod(path, (path.stat().st_mode & 0o7777) | 0o200)
 
 
+def launch_python(profile: Path) -> str:
+    """The interpreter a launcher is built and verified with: the profile's
+    host.python when it declares one (the installer will pin exactly that),
+    else the render handoff, TARTCI_PYTHON, or this process's own."""
+    host = _toml(profile).get("host") or {}
+    declared = host.get("python") if isinstance(host, dict) else None
+    if isinstance(declared, str) and declared.startswith("/"):
+        return os.path.realpath(declared)
+    return os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON")
+                            or os.environ.get("TARTCI_PYTHON") or sys.executable)
+
+
 def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, target: str,
                    out_dir: Path) -> tuple[Path, Path]:
     live = Path(helper["path"])
@@ -1746,8 +1758,7 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
-        launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-            "TARTCI_PYTHON") or sys.executable)
+        launcher_python = launch_python(profile)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
                            "--support-root", ".", "--profile", str(profile),
@@ -1776,8 +1787,7 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
-    launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-        "TARTCI_PYTHON") or sys.executable)
+    launcher_python = launch_python(profile)
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
                        "--output", str(rendered)], cwd=str(cfg.checkout),
                       env={"TARTCI_RENDER_PYTHON": launcher_python,

@@ -2077,7 +2077,10 @@ several hosts report this at once, suspect the LAN itself (router or switch).
 Otherwise something on the host keeps its tartci process off the LAN while
 the tailnet works; check, from the watchdog's own context, the route the
 kernel picks for a LAN address (`route -n get`), any firewall holding the
-probe binary, and the host's privacy settings for the launcher.
+probe binary, and the host's privacy settings for the binary that runs the
+probe (for example Homebrew Python, which needs a re-grant after each
+upgrade; on m5s, 2026-10-15, Local Network was denied to Homebrew Python
+3.15, the interpreter its watchdog picked). See "Pinned interpreter" below.
 
 `python3 scripts/tailnet_peer_alert.py --status` prints which routes reached
 each host in the last pass. `TARTCI_TAILNET_ISSUE=0` keeps the events and
@@ -3441,3 +3444,42 @@ detection floor, enablement and remedy: [build-disagreement.md](build-disagreeme
 #### Install-time interpreter pin
 
 On macOS fleet installs, the installer resolves one regular interpreter, probes api.github.com through that exact path, and records it as TARTCI_PYTHON. LaunchAgents, sealed TartCILauncher lane bundles, and the ghapp token minter carry the same path; TARTCI_RENDER_PYTHON is the render-time handoff used while building a launcher. A probe failure names the interpreter and must be repaired before admission.
+
+### Pinned interpreter (`host.python`)
+
+A profile's `host.python` names the one interpreter the host runs: an absolute
+path, never a PATH search. The installer uses it over `TARTCI_PYTHON`, the old
+pin and any search, refuses the install if it is missing, renders it into
+every lane as `TARTCI_PYTHON`, and writes it to `~/.config/tartci/python.pin`.
+LaunchAgents rendered without their own `TARTCI_PYTHON` (the watchdog,
+reclaim, self-update) resolve through that pin. Any LaunchAgent tartci ships
+(`XPC_SERVICE_NAME` `com.danielraffel.*`: tartci, pulp lanes, the network
+relay, shipyard and forge helpers) with neither refuses to run
+and logs `refusing an unpinned interpreter`; it never takes whatever
+`/opt/homebrew/bin/python3` is today. Interactive commands keep the search.
+
+Why: macOS privacy grants follow the binary. On m5s (2026-10-15) the watchdog
+picked Homebrew Python 3.15, Local Network was denied to it, and every LAN
+probe failed with `EHOSTUNREACH` while the tailnet worked. A Homebrew upgrade
+replaces the binary and needs a fresh grant, so pin a path an upgrade does not
+replace, and grant Local Network once for that binary.
+
+The fleet pins Homebrew `python@3.12` 3.12.13_2, and every host runs `brew pin
+python@3.12` so `brew upgrade` neither replaces that binary nor removes its
+Cellar directory. To change the interpreter deliberately: `brew unpin`, install
+the new one, set `host.python` to its absolute Cellar path, self-update, then
+grant Local Network for the new binary (System Settings > Privacy & Security >
+Local Network, entry "Python"). If the pinned binary vanishes anyway, the pin
+fails closed: every tartci LaunchAgent refuses to run rather than fall back.
+
+A refusal is loud: the job's log gets `refusing an unpinned interpreter` (or
+`the pinned interpreter … is unusable`), the first refusal is recorded in
+`~/.tartci/state/interpreter-refused`, and the watchdog opens
+`[tartci] <host> refused to run an unpinned interpreter` (class
+`interpreter_unpinned`), which closes itself once the installer writes a
+working pin and removes that record. When the watchdog itself is refused,
+`tartci launchd heal` still runs that alert alone under `/usr/bin/python3`
+(`scripts/interpreter_alert.py`, stdlib only; Homebrew never replaces it) and
+then exits 127, so a host with a broken pin reports it instead of going
+dark. `tartci doctor fleet` reports a loaded watchdog or self-update agent
+whose last exit is nonzero (`host_agents_failing`; 127 is a refusal).
