@@ -455,9 +455,10 @@ def judge(read: Dict[str, Any], hosts: Any, me: Optional[str],
                           detail="this host reaches no peer over the tailnet")
 
     # Every fallback route of two or more hosts the tailnet reaches is dead
-    # from here, so the LAN is unreachable from this host, not from them. On
-    # macOS that is most often a launcher without Local Network permission:
-    # the tailnet (utun) still works and the LAN is refused (m5s, 2026-10-15).
+    # from here, so the LAN is unreachable from this host's tartci, not from
+    # them, while the tailnet (utun) still works (m5s, 2026-10-15, with an
+    # interactive shell on the same host reaching the LAN). One other host is
+    # not enough: a single dead LAN is that host's own fault.
     lan_hosts = [h for h, v in out.items()
                  if h != me and v["state"] == "online" and v["routes"]]
     if me in out and len(lan_hosts) >= 2 and all(
@@ -591,17 +592,23 @@ def lan_blind_text(host: str, blind: Dict[str, Any], now: float,
         f"- `tailnet_peer_alert.py --status` on {host} lists every -lan/-wifi route `unchecked`",
         f"- read by {host} itself at {iso(now)}", "",
         "## Likely cause",
-        "macOS Local Network privacy: the process that runs tartci's watchdog (on a sealed "
-        "host, TartCILauncher.app) was never allowed to reach the local network. The tailnet "
-        "interface is not covered, which is why only the LAN fails. An interactive ssh "
-        "session is a different process tree, so `ssh-keyscan` by hand still works.", "",
+        "If several hosts report this at once, suspect the LAN itself (router or switch) "
+        "rather than this host. Otherwise something on this host keeps its tartci process "
+        "off the LAN while the tailnet works. Not yet established; candidates to check: the "
+        "route the kernel picks for a LAN address (another interface, such as a Thunderbolt "
+        "bridge or a link-local address), a firewall (the application firewall or LuLu) "
+        "holding the probe binary, or macOS privacy settings for the process that runs "
+        "tartci's watchdog. An interactive ssh session is a different process tree, so a "
+        "probe by hand can succeed while this one fails.", "",
         "## Fix", "```sh",
-        f"# on {host}, at the machine: System Settings > Privacy & Security > Local Network,",
-        "# allow TartCILauncher (or the tartci helper listed there)",
+        f"# on {host}, from the watchdog's own context (not an interactive shell):",
+        "route -n get <a LAN address from fleet-ssh hosts.tsv>   # interface and gateway",
+        "ssh-keyscan -T 5 -t ed25519 <that address>   # the exact error",
+        "/usr/libexec/ApplicationFirewall/socketfilterfw --listapps",
+        "# then correct whichever of route, firewall or privacy setting is refusing it",
         "```", "",
         "## Safe to auto-apply",
-        "No. Granting Local Network access is a privacy setting only someone at the machine "
-        "can change.", "",
+        "No. The cause is a host network or security setting; someone has to look at it.", "",
         "## How to verify",
         f"The next pass on {host} lists -lan and -wifi routes as up; this issue records the "
         "fix time on its marker and closes itself.",

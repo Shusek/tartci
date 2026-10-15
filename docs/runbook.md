@@ -2071,11 +2071,13 @@ pass.
 A host that reaches no Ethernet or Wi-Fi route of two or more hosts the
 tailnet does reach is LAN-blind: the fault is its own, not theirs. Its routes
 read `unchecked`, it attributes nothing to them, and after 10 min it opens
-`[tartci] <host> cannot reach the LAN from tartci` (`lan_blind`). On macOS
-the usual cause is Local Network privacy: the launcher that runs tartci's
-watchdog (TartCILauncher.app on a sealed host) was never allowed onto the
-local network, which leaves the tailnet working and the LAN refused. Allow it
-in System Settings > Privacy & Security > Local Network, at the machine.
+`[tartci] <host> cannot reach the LAN from tartci` (`lan_blind`). One other
+host with dead routes is never enough; that is the other host's fault. If
+several hosts report this at once, suspect the LAN itself (router or switch).
+Otherwise something on the host keeps its tartci process off the LAN while
+the tailnet works; check, from the watchdog's own context, the route the
+kernel picks for a LAN address (`route -n get`), any firewall holding the
+probe binary, and the host's privacy settings for the launcher.
 
 `python3 scripts/tailnet_peer_alert.py --status` prints which routes reached
 each host in the last pass. `TARTCI_TAILNET_ISSUE=0` keeps the events and

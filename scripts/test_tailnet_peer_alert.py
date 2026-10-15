@@ -331,8 +331,33 @@ class LanBlindTests(Base):
                           for r in v["routes"].values()}, {"unchecked"})
         self.assertEqual(self.issues.titles(), ["[tartci] m1 cannot reach the LAN from tartci"])
         body = self.issues.opened[0][1]
-        self.assertIn("Local Network", body)
+        self.assertIn("If several hosts report this at once, suspect the LAN itself", body)
+        self.assertIn("route -n get", body)
         self.assertEqual(tartci_incident.parse(body)["class"], "lan_blind")
+
+    def test_a_first_or_short_blind_pass_opens_nothing(self) -> None:
+        net = Net(down=self.LAN)
+        for at in (OFFLINE_SINCE, OFFLINE_SINCE + 9 * 60):
+            out = self.tick(net, at, me="m1")
+            self.assertFalse(out["hosts"]["m1"]["lan_blind"]["active"])
+            self.assertEqual(self.issues.titles(), [])
+        self.tick(net, OFFLINE_SINCE + 11 * 60, me="m1")
+        self.assertEqual(self.issues.titles(), ["[tartci] m1 cannot reach the LAN from tartci"])
+
+    def test_one_other_host_with_a_dead_lan_is_its_fault_not_ours(self) -> None:
+        # Exactly one other tailnet-online host has routes, and all of them
+        # are down: that host's LAN died; this host is not blind.
+        table = "\n".join(line for line in TABLE.splitlines()
+                          if line.startswith(("#", "m1|", "m5|")))
+        net = Net(down={"192.0.2.81", "192.0.2.60"})
+        for at in (OFFLINE_SINCE, OFFLINE_SINCE + 11 * 60):
+            out = tna.alert_pass(now=at, directory=self.dir / "m1", hosts=HOSTS, me="m1",
+                                 run=net, issue=self.issues.open, close=self.issues.close,
+                                 table_text=table)
+        self.assertNotIn("lan_blind", out["hosts"]["m1"])
+        self.assertEqual(sorted(self.issues.titles()),
+                         ["[tartci] m5-lan fallback route to m5 is broken",
+                          "[tartci] m5-wifi fallback route to m5 is broken"])
 
     def test_one_hosts_dead_lan_is_still_that_hosts_route(self) -> None:
         # Control, same instrument: only m5's routes are down, so the LAN is
