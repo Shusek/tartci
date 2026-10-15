@@ -3462,3 +3462,18 @@ picked Homebrew Python 3.15, Local Network was denied to it, and every LAN
 probe failed with `EHOSTUNREACH` while the tailnet worked. A Homebrew upgrade
 replaces the binary and needs a fresh grant, so pin a path an upgrade does not
 replace, and grant Local Network once for that binary.
+
+The fleet pins Homebrew `python@3.12` 3.12.13_2, and every host runs `brew pin
+python@3.12` so `brew upgrade` neither replaces that binary nor removes its
+Cellar directory. To change the interpreter deliberately: `brew unpin`, install
+the new one, set `host.python` to its absolute Cellar path, self-update, then
+grant Local Network for the new binary (System Settings > Privacy & Security >
+Local Network, entry "Python"). If the pinned binary vanishes anyway, the pin
+fails closed: every tartci LaunchAgent refuses to run rather than fall back.
+
+A refusal is loud: the job's log gets `refusing an unpinned interpreter` (or
+`the pinned interpreter … is unusable`), the first refusal is recorded in
+`~/.tartci/state/interpreter-refused`, and the watchdog opens
+`[tartci] <host> refused to run an unpinned interpreter` (class
+`interpreter_unpinned`), which closes itself once the installer writes a
+working pin and removes that record.

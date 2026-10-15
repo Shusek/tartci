@@ -38,6 +38,22 @@ tartci_profile_python() {
   ' "$1"
 }
 
+# A refusal must be seen, not only logged to a job's stderr: record the first
+# one (time, job, reason) for the watchdog's interpreter check, which opens an
+# issue. The installer clears it once a working pin is in place.
+tartci_interpreter_refusal_file() {
+  printf '%s\n' "${TARTCI_HOME:-$HOME/.tartci}/state/interpreter-refused"
+}
+
+tartci_note_interpreter_refusal() {
+  local marker
+  marker="$(tartci_interpreter_refusal_file)"
+  [ -e "$marker" ] && return 0
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || return 0
+  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${XPC_SERVICE_NAME:-interactive}" "$1" \
+    >"$marker" 2>/dev/null || true
+}
+
 tartci_toml_python_path() {
   local candidate configured="${TARTCI_PYTHON:-}" pinned
   if [ -z "$configured" ] && pinned="$(tartci_pinned_python)"; then
@@ -47,6 +63,7 @@ tartci_toml_python_path() {
     fi
     echo "tartci: the pinned interpreter in $(tartci_python_pin_file) is unusable: $pinned" \
          "(missing, or without tomllib); reinstall with a working host.python" >&2
+    tartci_note_interpreter_refusal "pinned interpreter unusable: $pinned"
     return 127
   fi
   if [ -z "$configured" ]; then
@@ -58,6 +75,7 @@ tartci_toml_python_path() {
         echo "tartci: refusing an unpinned interpreter under launchd job $XPC_SERVICE_NAME:" \
              "no TARTCI_PYTHON and no $(tartci_python_pin_file); set host.python in the" \
              "fleet profile and reinstall" >&2
+        tartci_note_interpreter_refusal "no TARTCI_PYTHON and no $(tartci_python_pin_file)"
         return 127
         ;;
     esac

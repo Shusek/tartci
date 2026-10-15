@@ -82,6 +82,23 @@ class Picker(unittest.TestCase):
         result = self.pick(XPC_SERVICE_NAME="com.danielraffel.tartci.launchd-watchdog")
         self.assertEqual((result.returncode, result.stdout.strip()), (0, str(self.pinned)))
 
+    def test_a_refusal_is_recorded_for_the_watchdog(self) -> None:
+        marker = self.home / ".tartci" / "state" / "interpreter-refused"
+        self.pick(XPC_SERVICE_NAME="com.danielraffel.tartci.reclaim")
+        stamp, job, reason = marker.read_text().strip().split("\t")
+        self.assertEqual(job, "com.danielraffel.tartci.reclaim")
+        self.assertIn("no TARTCI_PYTHON", reason)
+        # The first refusal is kept: a later one does not move its time.
+        marker.write_text(f"2000-01-01T00:00:00Z\t{job}\t{reason}\n")
+        self.pick(XPC_SERVICE_NAME="com.danielraffel.tartci.launchd-watchdog")
+        self.assertEqual(marker.read_text().split("\t")[:2],
+                         ["2000-01-01T00:00:00Z", "com.danielraffel.tartci.reclaim"])
+
+    def test_an_interactive_search_records_nothing(self) -> None:
+        # Control: the same picker outside launchd neither refuses nor records.
+        self.pick()
+        self.assertFalse((self.home / ".tartci" / "state" / "interpreter-refused").exists())
+
     def test_a_vanished_pin_refuses_rather_than_falling_back(self) -> None:
         # A Homebrew cleanup removed the pinned Cellar path: fail loudly.
         self.pin(str(self.root / "gone" / "python3.12"))
@@ -123,6 +140,47 @@ class ProfilePython(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         lanes.load(path)
+
+
+@NEEDS_TOMLLIB
+class WatchdogIssue(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.marker = self.home / "state" / "interpreter-refused"
+        self.opened: list = []
+        self.closed: list = []
+
+    def run_pass(self):
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        import vm_boot_alert  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+        with mock.patch.dict(os.environ, {"TARTCI_HOME": str(self.home)}), \
+                mock.patch.object(vm_boot_alert, "_alert_host", return_value=("m5studio", "m5s")):
+            return watchdog.interpreter_refusal_pass(
+                now=1792050000.0,
+                issue=lambda t, b: self.opened.append((t, b)) or (0, "61"),
+                close=lambda n: self.closed.append(n) or (0, "closed"))
+
+    def test_a_refusal_opens_one_issue_and_its_removal_closes_it(self) -> None:
+        self.marker.parent.mkdir(parents=True)
+        self.marker.write_text("2026-10-15T09:00:00Z\tcom.danielraffel.tartci.reclaim\t"
+                               "no TARTCI_PYTHON and no /x/python.pin\n")
+        line = self.run_pass()
+        self.assertIn("WARN interpreter: com.danielraffel.tartci.reclaim refused", line)
+        self.run_pass()
+        self.assertEqual([t for t, _ in self.opened],
+                         ["[tartci] m5studio refused to run an unpinned interpreter"])
+        import tartci_incident  # noqa: PLC0415
+        self.assertEqual(tartci_incident.parse(self.opened[0][1])["class"], "interpreter_unpinned")
+        self.marker.unlink()
+        self.assertIsNone(self.run_pass())
+        self.assertEqual(self.closed, ["61"])
+
+    def test_no_refusal_is_quiet(self) -> None:
+        self.assertIsNone(self.run_pass())
+        self.assertEqual(self.opened, [])
 
 
 @NEEDS_TOMLLIB

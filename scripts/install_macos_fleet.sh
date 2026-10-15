@@ -979,6 +979,8 @@ chmod 644 "$pin_tmp"
 durable_file "$pin_tmp"
 mv -f "$pin_tmp" "$pin_file"
 durable_file "$pin_file"
+# A working pin is in place: the watchdog's unpinned-interpreter issue closes.
+rm -f "$(tartci_interpreter_refusal_file)"
 
 if [ -d "$ENTRYPOINT" ] && [ ! -L "$ENTRYPOINT" ]; then
   echo "fleet install refuses a directory at the canonical TartCI entrypoint: $ENTRYPOINT" >&2

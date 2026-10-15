@@ -390,6 +390,9 @@ class InstallMacosFleetTests(unittest.TestCase):
         shutil.copy2(sys.executable, other)
         other.chmod(0o755)
         self.set_profile_python(declared)
+        refused = self.home / ".tartci/state/interpreter-refused"
+        refused.parent.mkdir(parents=True, exist_ok=True)
+        refused.write_text("2026-10-15T09:00:00Z\tcom.danielraffel.tartci.reclaim\tno pin\n")
         result = self.run_installer("--apply", TARTCI_PYTHON=str(other))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uses the profile's host.python", result.stderr)
@@ -399,6 +402,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual(env["TARTCI_PYTHON"], expected)
         pin = self.home / ".config/tartci/python.pin"
         self.assertEqual(pin.read_text().strip(), expected)
+        self.assertFalse((self.home / ".tartci/state/interpreter-refused").exists())
         self.assertIn(f"pinned interpreter {expected}", result.stdout)
 
     def test_a_missing_profile_python_refuses_without_falling_back(self) -> None:
