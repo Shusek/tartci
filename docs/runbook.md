@@ -3511,7 +3511,10 @@ and restores its `python.pin`, never the new generation's: it passes
 `TARTCI_ROLLBACK_PYTHON`, which outranks the snapshot profile's `host.python`
 (that profile may name the switch the preflight refused, and it is not
 rewritten because a sealed launcher's policy digest covers it). A rollback is
-not preflighted; it restores a binary the lanes already ran. When the watchdog itself is refused,
+not preflighted; it restores a binary the lanes already ran. The installer
+honours `TARTCI_ROLLBACK_PYTHON` only when it equals `python.pin` (self-update
+pins it first) or an installed lane's `TARTCI_PYTHON`, and refuses any other
+value, so a stray export cannot skip the preflight. When the watchdog itself is refused,
 `tartci launchd heal` still runs that alert alone under `/usr/bin/python3`
 (`scripts/interpreter_alert.py`, stdlib only; Homebrew never replaces it) and
 then exits 127, so a host with a broken pin reports it instead of going
