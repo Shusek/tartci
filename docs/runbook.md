@@ -243,7 +243,13 @@ possibly torn profile.
 
 The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
 all point at the same Tart store. If one uses default `tart` state and another
-uses `TART_HOME`, capacity and cleanup will disagree.
+uses `TART_HOME`, capacity and cleanup will disagree. `tartci doctor` (including
+`doctor --reap`, which Shipyard's health probe runs) and `tartci observe` hold
+that invariant for you: with no `TART_HOME` in the environment they export the
+fleet profile's `[host].tart_home`, and they print `tart store: <path> (<why>)`.
+An explicit `TART_HOME` that differs from the profile's wins but is printed with
+a WARNING. Raw `tart` over ssh still reads `~/.tart` unless you pass the store
+(see gotchas: "`ssh <host> 'tart list'` shows no gate VMs").
 Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
 host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
 Do not diagnose installation state from raw `ssh host 'command -v tart'` output:
@@ -804,6 +810,13 @@ providers/proxmox-linux/bake-pulp-golden.sh \
   --guest-host <candidate-ip>
 ```
 
+The bake, `tart-linux/provision.sh` and `tart-macos/provision.sh pulp-readiness`
+read their TOML manifests through `tartci_toml_python`
+(`providers/common/toml-python.lib.sh`, the resolver the `tartci` shim sources),
+not a bare `python3`: an operator's ssh login shell on m1 resolves `python3` to
+`/usr/bin/python3` 3.9.6, which has no tomllib. With no 3.11+ interpreter found,
+they stop and say `set TARTCI_PYTHON`.
+
 > **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under
 > Prism, but the cross-build toolchain story there (MSVC x64 cross + x64 deps) is
 > heavier and not yet wired — `--target-arch` is Linux/Rosetta today. Tracked
@@ -969,9 +982,10 @@ Install the toolchain over SSH:
 # Git bash: fetch deps only
 ssh pulp-win 'C:\path\to\bash setup.sh --ci --deps-only'
 
-# Configure under the MSVC env, GPU off (no Windows Skia yet)
+# Configure under the MSVC env. Use GPU=ON for the published Windows Skia
+# slice; use GPU=OFF only for a deliberately CPU-only smoke.
 ssh pulp-win 'vcvarsall arm64 && cmake -S pulp -B pulp\build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=OFF'
+  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=ON'
 
 ssh pulp-win 'cmake --build pulp\build'
 ssh pulp-win 'ctest --test-dir pulp\build'   # apply the CI exclude set (gpu/visual labels)
@@ -1526,7 +1540,8 @@ ordered exclusive workflow classes), `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`
 `TARTCI_RUNNER_SHA256` (required with a non-default runner version),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
-`TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
+`TARTCI_WIN_GPU` (`on`/`off`, default `off` for the on-demand lane),
+`TARTCI_WIN_CTEST_JOBS`, `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
 `TARTCI_WIN_LOGS`. Defaults target `Generous-Corp/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
@@ -1546,20 +1561,20 @@ consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
 debugging.
 
 A lane may also declare `process_type`, which sets the rendered LaunchAgent's
-`ProcessType`. The accepted values are the four `launchd.plist(5)` documents:
-`Background`, `Standard`, `Adaptive`, `Interactive`. A lane that omits the key
-renders `Background`, which is what every lane had before the key existed. The
-key matters because launchd throttles a `Background` job: the exhaustive
-event-class queue scan is a long chain of short GitHub API calls, and the
-per-call latency -- not the `assignment_scan_timeout_seconds` budget -- is what
-decides whether the scan finishes. A supervisor cannot lift its own
-classification (`taskpolicy -B` on itself does not restore the latency), so the
-value has to be in the plist, which is rendered from the profile: editing an
-installed plist by hand is reverted by the next render. Pulp's gate lanes
-declare `Adaptive`; release lanes stay `Background`. Promotion out of the
-background band is a launchd heuristic, so treat a declared `Adaptive` as a
-request, and confirm what the host actually did with
-`launchctl print gui/$(id -u)/<label> | grep 'spawn type'`.
+`ProcessType`. A fleet supervisor accepts only `Standard` (the default) or
+`Interactive`; the validator refuses `Background` and `Adaptive`. Every lane's
+queue scan holds the host-global observation lock, so a supervisor in the
+darwinbg band is a priority inversion for the whole host: launchd puts a
+`Background` job there always, and an `Adaptive` job whenever it holds no XPC
+transaction, which a supervisor never does. In that band the task runs at
+scheduling priority 4 on efficiency cores, each `ghapp` call costs 4-22 s
+instead of about 2 s, and one exhaustive scan held the lock for 154 s on a
+loaded host (18 s for the same scan at `Standard`) -- past the 120 s every other
+lane waits, so every lane on the host went SCAN BLIND. `taskpolicy -B` cannot
+lift launchd's role from outside or inside the job; the value has to be in the
+plist, which is rendered from the profile (a hand edit is reverted by the next
+render). Confirm a host with `ps -o pri= -p <supervisor pid>`: 20 or above is
+out of the band, 4 is in it.
 
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
@@ -1617,6 +1632,446 @@ Do not create one supervisor per workflow or point release jobs at
 the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
+
+### Lane python3 cannot import tomllib (`lane_python_no_tomllib`)
+
+Lanes run `gate_supply.py decide` (gate placement), `macos_fleet_lanes.py
+render` and `host_profile.py` with a bare `python3`. That is correct only while
+the lane plist's PATH puts a 3.11+ python3 (Homebrew's `/opt/homebrew/bin`)
+ahead of `/usr/bin`, because macOS's `/usr/bin/python3` is 3.9 and has no
+tomllib. `tartci doctor fleet` takes the PATH from each installed lane plist,
+resolves `python3` on it the way a shell would, runs it once, and reports
+`lane_python_no_tomllib` with the interpreter path, its version and the lanes
+that use it when it cannot import tomllib (`scripts/lane_python.py`). Fix the
+interpreter (reinstall Homebrew's python3), not the helpers: they read the
+fleet profile, and a guess in its place is a mis-placed gate. An interactive
+ssh shell has a different PATH and is not what this checks.
+
+### VM DHCP not answering (`vm_dhcp_unanswered`)
+
+A booted VM gets its address from the host's DHCP server: bootpd, a
+socket-activated system daemon that macOS Internet Sharing manages. When bootpd
+stops answering, every boot waits 120 s for an address (`boot_failed no_ip`) and
+is discarded. On m5 this happened on 2026-09-23 (13 VMs in 47 min) and
+2026-10-04 (10 VMs in 40 min). On 10-04, bootpd ran nothing from 20:53Z until
+macOS itself disabled and re-enabled it at 21:48:51Z.
+
+Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
+`~/.tartci/state/vm-dhcp/breaker.json`):
+
+- **Opens** on two `no_ip` in a row within 15 min, with no address in between.
+  A single `no_ip` has never been an outage. `vm_dhcp_unanswered` records
+  bootpd's state, run count and last exit at that moment, and the `no_ip`
+  times.
+- **While open,** no lane clones. Each pass is idle, not blocked, and takes no
+  job claim: the breaker is the first pre-boot check, before the job claim and
+  the pre-clone demand check. One lane probes with a single VM every 300 s, or
+  at once when the VM-network chain changes (bootpd loaded or its run count,
+  `/etc/bootpd.plist`'s mtime, or InternetSharing's pid, all readable without
+  root), or at once after `tartci vm-dhcp probe-now`
+  (`vm_dhcp_probe result=ip|no_ip cause=…`).
+- **Closes** on the first address any VM on the host gets.
+  `vm_dhcp_recovered` reports `reason`,
+  `open_s`, `vms_spent`, `probes`, and `latency_s` (time since the last probe,
+  or since the chain last changed).
+- **The trade:** an outage costs about one VM per 300 s instead of one per lane
+  every 2 to 4 min. Recovery is noticed within 300 s plus a boot instead of
+  within minutes. `latency_s` above 300 s plus boot p99 means the cadence is
+  wrong.
+- **Verifies after a boot** (`verifying`, doctor `vm_dhcp_verifying`): when
+  kern.boottime differs from the one recorded, when no boot time is recorded
+  (first run, or a breaker file from before this state), and after a
+  self-update's `pool on` (receipt step `vm-dhcp-verify`, which runs
+  `tartci vm-dhcp verify --reason self_update`), exactly one lane probes and
+  the others idle. Its address closes the breaker (`vm_dhcp_verified`); its
+  `no_ip` opens it at once with the failing layer
+  (`streak=1 trigger=post_boot alert=now`). A probe that reports nothing within
+  960 s opens it with `cause=probe_unreported` and frees the slot; a later
+  address still closes it. A reboot used to close the breaker outright, and on
+  m5 on 2026-10-07 every lane cloned again into a broken VM network (about 56
+  VMs). The cost is one serialised boot, about 3 min, per reboot or
+  self-update. **On first deploy every host verifies once** (no boot time is
+  recorded yet). The self-update trigger runs from the installed
+  orchestrator, so it takes effect one update after deploy.
+- **The 960 s bound** is twice the slowest probe report on current lane code
+  (clone_start to `boot_failed no_ip`, which ends the 120 s address wait),
+  rounded up to the minute. `TARTCI_VM_DHCP_VERIFY_SECS` overrides it. Measured
+  2026-10-07 from every lane's `events.jsonl`:
+
+  | Host | n | p50 | p90 | p99 | max (s) |
+  |---|---|---|---|---|---|
+  | m3 | 6 | 197 | 200 | 200 | 200 |
+  | m1 | 298 | 199 | 353 | 392 | 1129 (one 2026-07-09 event in the retired pre-fleet `macos` lane; next 400) |
+  | m5 | 303 | 205 | 220 | 316 | 464 |
+  | m5s | 0 | — | — | — | — (1032 clones, never a `no_ip`) |
+
+  The success report comes earlier. `boot_ip clone_to_ip_s=` (logged at the
+  address since this change) gives clone_start to address directly; before
+  it, clone_start to `boot_ok`, which also counts SSH and the JIT mint,
+  passed 960 s in 5 of 5215 boots over 30 days. **Re-derive the 960 s default
+  once 30 days of `boot_ip` exist**: on each host,
+  `tartci vm-dhcp boot-times --days 30` reads every lane log (at any depth:
+  m5studio nests them under `macos-fleet/<lane>/`) and prints both report
+  distributions and `suggested_verify_secs`; take the fleet-wide maximum.
+- **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
+  `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
+  the same once-per-episode path as a host left OFF, closed when a VM gets an
+  address. Its title is the host and the episode's start only
+  (`[tartci] m5: cannot boot VMs since 2026-10-09T01:33:48Z`), and its first
+  three lines are the statement,
+  `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
+  fleet_reasons, so it is usable from a phone notification. It is raised when
+  the breaker is open and:
+  - a post-boot probe got no address (`alert=now`): within one pass, at most
+    300 s;
+  - it has been open 300 s and a probe failed since, or no lane has probed at
+    all (an idle host would otherwise stay silent): about 14 min after it
+    opens;
+  - two consecutive probes never reported, whatever opened it. A probe is
+    unreported once the next is granted before it reported, so this holds at
+    the third grant: about 10 to 15 min after the breaker opens. One unreported
+    probe is a slow boot and raises nothing; neither does a closed or
+    `verifying` breaker.
+  **One issue per episode, keyed by host and start.** A reboot and a
+  self-update re-verify both send the breaker through `verifying` and reopen
+  it with a fresh `opened_at`, and a probe often reclassifies the cause. None
+  of those ends the outage, so none opens a second issue: the episode's start
+  is kept in `alert.json` while it is open (a new episode starts from the
+  breaker's running outage, which a reboot carries), a cause change is posted
+  once as a comment on the open issue (`Cause changed: <old> -> <new>`, with
+  the new remedy; a failed comment is retried next pass), and the issue
+  closes only when a VM got an address after the episode began. Before this,
+  m5's outage of 2026-10-09 became three issues (#427, #428, #430), each
+  closed and reopened 2 s apart; `test_m5_on_2026_10_09_is_one_issue` replays
+  that sequence and asserts one.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`, from the
+  episode's start) go to the breaker's `events.jsonl`. A close that fails at
+  recovery is kept as `stale_issues` in the alert state and retried every
+  pass, so no issue is left open.
+  `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
+  opens no issue.
+- **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
+  boot to its UTC hour (kept 14 days), and every outage that ends is appended
+  to a history of the last 50 (`opened_at`, `closed_at`, `duration_s`,
+  `vms_spent`, `cause`, `closed_by`: `probe`, `boot_ok`, `verified` or `late`).
+  An outage that runs across a reboot is one outage, from its first opening.
+  The breaker keeps these through every change of state (`CARRIED_KEYS`).
+  `vm_boot_ok` reports the 24 h and 7 d boots that got an address, with the
+  rate, and the outages of the last week; `vm_boot_degraded` means at least
+  `max(2, lanes)` boots got no address in the last 24 h, where `lanes` is the
+  host's installed lane agents (the same count the home-volume floor uses).
+  The threshold is a count, not a rate, from 30 days of the fleet's lane logs
+  (2026-10-07):
+
+  | Host | days | days with any no_ip | worst days (ok/no_ip) |
+  |---|---|---|---|
+  | m3 | 31 | 0 | — |
+  | m1 | 29 | 0 | — |
+  | m5s | 9 | 0 | — |
+  | m5 | 31 | 8 | 0/172, 0/122 (2026-10-06/07), 63/13 (09-23), 53/10 (10-04), 51/2 (09-22) |
+
+  One failed boot per lane in a day trips every m5 outage day and leaves its
+  isolated 2-in-53 day OK; `max(2, …)` keeps a one- or two-lane host from
+  reading degraded on one isolated failure. The rate is reported and never
+  judged: at these volumes one failure moves it.
+- **Fails open:** an unreadable breaker reads as closed and never verifies.
+  Writes are atomic under a lock.
+- **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
+  it for one host, including the post-boot verification.
+
+Recovery needs root, and tartci never runs it. Each `no_ip` records which
+layer failed (`cause`), read while that VM is still up, and `tartci doctor
+fleet` names the most fundamental one. Fix the layers in this order; a lower
+one cannot help until the one above it works.
+
+**Never kickstart the `com.apple.NetworkSharing` job.** System Integrity
+Protection refuses it ("150: Operation not permitted while System Integrity
+Protection is engaged", m5, 2026-10-07).
+
+**Never move `/etc/bootpd.plist` or
+`/Library/Preferences/SystemConfiguration/com.apple.vmnet.plist` aside.**
+`dhcp_enabled = false` there is the normal state while no VM runs: an idle
+healthy host (m3) reads exactly that, and InternetSharing rewrites the file
+with `dhcp_enabled = [bridge100]` and a `Subnets` entry when a VM's network
+comes up. It is not stale configuration.
+
+1. **pfd crash-looping** (`vm_dhcp_pfd_crash_loop`): no `bridge100`, and
+   `launchctl print system/com.apple.pfd` (no root) shows it not running with a
+   non-zero last exit and a climbing run count. InternetSharing waits on pfd
+   before it creates the VM network, and pfd exits 3 when pf holds no enable
+   reference, logging "no pf starter references held". A healthy pfd serves
+   its requests and then idle-exits with last exit 0. On m5 on 2026-10-07,
+   after a reboot, `sudo pfctl -s info` read "Status: Disabled" with no
+   starter references, and pfd exited 3 every 10 s. **Fix: `sudo pfctl -E`.**
+   It takes one ref-counted enable reference and prints a token; keep the
+   token, which is the undo key (`sudo pfctl -X <token>`). On m5 pfd then ran
+   and idle-exited 0, bridge100 came up on the next VM, and the breaker closed
+   on its probe's address; `tartci vm-dhcp probe-now` makes that probe
+   immediate. A reference taken by hand does not survive a reboot; hold one
+   at boot with the LaunchDaemon below. Never `pfctl -d`: it drops every
+   holder's references.
+
+   **pf enable reference at boot** (doctor `pf_reference`). m5 lost its VM
+   network after reboots on 2026-10-07 and 2026-10-09; on 10-09 Daniel
+   installed a LaunchDaemon that takes a reference at every boot, and it has
+   not recurred. The doctor's `pf_reference` check reads pfd's launchd record
+   on every run (no root, no VM needed) on any host with VM lanes, and reports
+   `pf_reference_missing` (PROBLEM) while pfd exits 3, before a lane spends a
+   VM on it. Applicability is the host's VM lanes, not InternetSharing:
+   InternetSharing is launched on demand and reads "not running" between jobs.
+   The finding also names any boot-time holder. m3, m5s and m1 have none and
+   a healthy pfd, so a missing holder alone is a fact, not a problem. On a
+   host whose breaker history records a `pfd_crash_loop` outage it is a
+   problem, `pf_boot_holder_missing`: the fault is proven to recur at the next
+   reboot there.
+
+   **Install the holder** (tartci never does this; it needs sudo). From the
+   host's tartci checkout:
+
+   ```sh
+   sudo scripts/install_pf_enable_ref.sh            # plan: what would change
+   sudo scripts/install_pf_enable_ref.sh --install  # write, bootstrap, verify
+   ```
+
+   It installs `launchd/system/com.danielraffel.pf-enable-ref.plist` (the
+   plist m5 has run since 2026-10-09) as
+   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`, root:wheel
+   0644. The daemon runs `/sbin/pfctl -E` at each boot and keeps the token in
+   `/var/run/pf-enable-ref.token`; bootstrapping it takes a reference now too.
+   The installer verifies launchd ran it with exit 0 and the token exists, and
+   is a no-op when the same plist is already loaded, so it never stacks
+   references on a re-run. Then `tartci vm-dhcp probe-now`, and
+   `tartci doctor fleet` reads `pf_reference_ok ... taken at boot by
+   com.danielraffel.pf-enable-ref`. The token is the undo key
+   (`sudo pfctl -X <token>`); Never `pfctl -d`.
+2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
+   existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
+   shared mode, which InternetSharing creates per VM. Restarting the
+   InternetSharing process did not bring it back on m5. No verified remedy
+   yet: run `tartci vm-dhcp probe-now` after any change and capture
+   `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the
+   InternetSharing pid. The Internet Sharing toggle in System Settings and a
+   reboot are the known resets.
+3. **bootpd not loaded** (`vm_dhcp_bootpd_not_loaded`): `launchctl print
+   system/com.apple.bootpd` exits 113 ("Could not find service"; no root
+   needed to check). bootpd's plist ships Disabled and Internet Sharing
+   normally loads it. `sudo launchctl bootstrap system
+   /System/Library/LaunchDaemons/bootps.plist` (proven on m5 with SIP on). A
+   bootpd kickstart, or disable/enable, cannot load a job launchd does not
+   have.
+4. **DHCP not enabled on the VM network** (`vm_dhcp_config_disabled`):
+   `bridge100` exists but `/etc/bootpd.plist` does not list it in
+   `dhcp_enabled`. InternetSharing did not finish configuring it: same capture
+   as layer 2, no verified remedy yet.
+5. **bootpd loaded but silent** (`vm_dhcp_unanswered`):
+   `sudo launchctl kickstart -k system/com.apple.bootpd`; if no address within
+   2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl
+   enable system/com.apple.bootpd`; a reboot also clears it.
+
+After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
+instead of waiting out the 300 s cadence; a fix that changes the chain usually
+triggers it on its own.
+
+### Holding a failed gate VM for debugging (`tartci held`, `[debug_hold]`)
+
+Off by default. Turning it on is a host behaviour change, so it is on per
+host only with Daniel's OK:
+
+```toml
+[debug_hold]
+enabled = true
+min_free_gb = 100        # required; derived below
+# ttl_hours = 24, max_per_host = 3, inspect_idle_minutes = 60 (defaults)
+```
+
+When a served gate job's runner log closes with `result: Failed`, the lane
+(`providers/tart-macos/debug-hold.lib.sh`) keeps the VM instead of deleting
+it, in this order, and deletes it as usual if any step cannot be proved:
+
+1. Admission (`scripts/debug_hold.py admit`): the key is on, fewer than
+   `max_per_host` VMs are held (a new failure never evicts an older hold), and
+   free disk is at least `min_free_gb`. A refusal is a `debug_hold_refused`
+   event naming the reason; with the key off nothing is logged.
+2. The guest's runner service, JIT config and runner state are removed, and
+   no `Runner.Listener` is left in the guest.
+3. GitHub is read again and must list no runner of that name (it is deleted
+   first when listed). A read that fails proves nothing and refuses.
+4. `tart stop` (disk kept, no guest change), `tart rename` to
+   `held-<vm>`, then the lane releases its lease and slot as after a delete.
+   `debug_hold_kept` names the run and job; `~/.tartci/state/debug-hold/held/`
+   holds a record with its PRs (a merge-queue run's PR comes from its
+   `gh-readonly-queue/.../pr-<n>-...` branch).
+
+A stopped VM uses no slot: Apple's limit counts running guests, and so does
+`tart_inventory`. `held-` is a declared prefix: `vm_reap` and
+`tart_image_prune` never select a `held-` VM.
+
+```sh
+tartci held list
+tartci held inspect held-<vm>   # boots it, waits for SSH, prints the ssh command
+tartci held stop held-<vm>      # stopped automatically after inspect_idle_minutes
+tartci held delete held-<vm>
+```
+
+`inspect` is refused when no slot is free, and while running the held VM
+counts as one. It boots without `--dir` shares, so the logs, build tree and
+test artifacts on its own disk are what you see, and it trusts an address
+only once SSH answers on it (`tart ip` can return the failed run's stale
+3600 s lease). It never registers: its runner service and JIT config are
+gone and nothing mints one.
+
+The launchd watchdog expires holds: at `ttl_hours`, or once every PR the
+failed run belonged to is merged or closed (one batched GraphQL read per
+repository, at most every 15 min), and it stops an inspection left running.
+
+**Deriving `min_free_gb`.** A held VM keeps the blocks its job wrote. On m3 on
+2026-10-09 one pulp gate job (slot2) grew the guest's data volume from
+25.2 GB at boot to 36.7 GB (11.0 GiB) and then stayed flat; the VM's disk
+image never shrinks, so that is a lower bound on what a hold keeps. With the
+host's VM disk floor (`TARTCI_VM_DISK_FREE_FLOOR_GB`, 25 GB), room for two
+running gate VMs and the new hold, each at twice the measured growth rounded up to 24 GB (one sample),
+`min_free_gb` = 25 + 3 x 24 = 97, so 100. Re-derive it from the first holds'
+recorded sizes once a host has some.
+
+Suspend (`tart run --suspendable`) is not used: it changes every gate VM's
+device set (output-only audio, no entropy device) for every job, whether it
+fails or not. A lane may opt into it only after its parity canary (the Pulp
+suite on `--suspendable` against cold boots, same results and timings within
+noise) passes, and its restore path then needs the virtiofs remount and the
+cpu/mem pin, each with a test (planning `2026-10-08-vm-saved-state-trial.md`).
+### launchd stalled on a peer (`peer_launchd_stalled`)
+
+A stalled macOS automatic install can leave a host's launchd refusing every
+non-demand spawn. The interval guard (`scripts/launchd_interval_guard.py`)
+keeps the timers running from inside a lane supervisor, but it pauses
+self-update for the whole episode, and the stalled host opened no issue: m3
+was stalled from 2026-10-05T05:41Z for 97 h and 44 commits behind before
+anyone looked. A host in that state is the wrong one to rely on for its own
+alert, so its peers raise it.
+
+- **Who reads.** Every fleet host's launchd watchdog runs
+  `scripts/peer_stall_alert.py` after its heal work, at most once every
+  30 min (`TARTCI_PEER_STALL_READ_SECS`). It reads each published peer (the
+  same list and SSH targets self-update uses) with one SSH command that prints
+  the peer's clock and its guard receipt
+  (`~/.tartci/state/launchd-interval-guard/status.json`), and judges the
+  receipt with the guard's own `classify` on the peer's clock, so clock skew
+  cannot make a fresh receipt look stale.
+- **When it alerts.** A stall episode open for 6 h
+  (`TARTCI_PEER_STALL_ALERT_SECS`) opens one issue:
+  `[tartci] <peer> launchd stalled / self-update paused since <episode start>`.
+  The body says whether self-update is paused, gives
+  `Run: ssh <peer> 'tartci doctor fleet'`, and the fix: reboot the host when
+  its lanes are idle (a reboot clears the stall), and do not kickstart
+  self-update while it lasts. The watchdog log prints a
+  `WARN peer-stall` line each read while it holds.
+- **One reader acts.** Every watchdog runs on the same cadence, so reads of a
+  peer line up. The peer's primary reader, the lowest published host id other
+  than the peer, is the one that opens and closes its issue. The same SSH
+  command that reads a host's guard receipt also reads that host's own last
+  peer-stall pass, so every other reader can see whether the primary read the
+  peer within two read intervals. After two consecutive reads where it did not
+  (unreachable, stale, or it could not read the peer), the next reader acts.
+  Before opening, any reader adopts an open issue with the exact title, which
+  covers a fallback and a returning primary overlapping. A host that opened
+  or adopted an issue keeps closing it.
+  A host whose own id is unknown (no readable profile) reads and reports but
+  never opens or closes an issue.
+- **When it closes.** When a reader sees a fresh receipt, written after the
+  episode began, that reports no stall. A stale receipt (no guard running
+  there; that host's doctor `launchd_timers` says so) never closes it, and an
+  unreachable peer (often a host mid-reboot) or a guard that never ran decides
+  nothing, so the issue stays as it is.
+- **Where to look.** The reader's `~/.tartci/state/peer-stall/` holds
+  `last-read.json` (every peer's last verdict, whether this host acted and
+  why, and its count of primary misses), one `<peer>.json` per alert,
+  and `events.jsonl` (`peer_launchd_stalled`, once per episode).
+  `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
+  issue.
+- **Host-vitals timer stall.** The same peer tick reads
+  `~/.local/state/pulp/host_vitals.json` using the peer's clock. A sample older
+  than `TARTCI_HOST_VITALS_ALERT_SECS` (default 300 seconds) opens one issue
+  titled `[tartci] <peer> host-vitals stalled since <sample time>`; its remedy
+  is `ssh <peer> 'tartci launchd heal'`. A fresh sample closes the episode.
+  This check is deliberately peer-driven because a watchdog cannot report its
+  own StartInterval stall. Its receipt is recorded beside the existing peer
+  alert state as `<peer>.host-vitals.json`.
+
+### System resolver dead while TCP is alive (`resolver_dead`)
+
+The same watchdog tick also runs `scripts/resolver_health.py`. It looks up
+`github.com` through the system resolver and connects to the known GitHub IP
+literal `140.82.112.3:443`; it never gives a name to the TCP probe. The four
+results are `resolver_dead` (lookup fails, TCP works), `network_down` (both
+fail), `upstream_unreachable` (lookup works, TCP fails), and `healthy`.
+
+The host publishes `~/.tartci/state/resolver-health/state.json` only after
+three consecutive non-healthy ticks. A peer reads that state through the
+existing peer-alert SSH path and the primary reader opens or updates one issue:
+`[tartci] <peer> resolver dead while TCP alive since <time>`. The first remedy
+line is to restart Tailscale through the LAN fallback (`scutil --nc stop/start
+Tailscale`, then `tailscale up` with no flags); expect `scan_recovered`. The
+fallback is `sudo killall -HUP mDNSResponder`. The issue closes when a peer
+reads a later non-`resolver_dead` state. The watchdog never changes host
+network configuration itself.
+
+### A fleet host off the tailnet, or a dead fallback route (`tailnet_offline`, `fallback_route_broken`)
+
+Every watchdog tick also runs `scripts/tailnet_peer_alert.py`. Everything it
+does is read-only: it never starts, stops or reconfigures Tailscale, never
+touches tailnet DNS or ACLs, and never edits ssh config or the fleet-ssh
+table. Per tick it runs:
+
+- this host's own `tailscale status --json` (the CLI at
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, or
+  `TARTCI_TAILSCALE_CLI`);
+- one `ssh-keyscan -T 5` per route of every other host. The routes are the
+  ones the fleet SSH table lists (`danielraffel/fleet-ssh`
+  `fleet/hosts.tsv`, read through ghapp at most hourly and cached in
+  `~/.tartci/state/tailnet/hosts.tsv`): the tailnet address, the Ethernet
+  address (`<host>-lan`) and the Wi-Fi address (`<host>-wifi`). A route is
+  `up` only when it answers with the host key known_hosts holds for that
+  host. An address now owned by another machine is `wrong_host`, and an ssh
+  alias that resolves somewhere other than the table says is `stale_alias`.
+
+Every address comes from that table; tartci, a public repository, holds
+none. A host is matched to its tailnet node by the table's tailscale address
+(table names map to tartci host ids as m3 is `studio`, m5s is `m5studio`).
+A published host the table does not list is reported as `unmapped`.
+Machines without a tartci profile (macmini, macpro) are checked too.
+
+A route can be marked optional in the table's eighth column, `optional`
+(space-separated: `lan`, `wifi`), for an interface that is legitimately
+absent, such as a laptop's Ethernet when it is undocked. An optional route
+is still probed and shown by `--status` as `down (optional)`, but opens no
+issue. The tailnet route is never optional.
+
+Each of these is an episode, alerted after 10 min:
+
+| state | meaning |
+|---|---|
+| `offline` | the host's node reads Online=false (from its `LastSeen`) |
+| `route_down` | the node reads Online=true, but this host's tailnet probe to it fails. fleet-ssh falls back to the LAN, so only this check sees it |
+| `local` | this host's own tailscaled is Stopped, logged out or unreadable |
+| `local_route_down` | control lists two or more peers online and none answers over the tailnet from here: the broken path is this host's |
+| a fallback route | a `-lan` or `-wifi` route the table lists is down, `wrong_host` or `stale_alias` |
+
+A host whose own tailscaled is down judges no peers' tailnet state. For any
+other host, one published host acts: the lowest published host id, other
+than that host, whose tailnet route reads up from here. Issues go through
+the peer-alert open-or-adopt path: `[tartci] <host> is off the tailnet` per
+host and `[tartci] <host>-<lan|wifi> fallback route to <host> is broken` per
+route. A broken route's issue names the address that failed, what this
+host's alias resolves to, and the addresses the host reports for itself (read
+with a read-only `ipconfig getifaddr` per interface over its default route).
+Each body ends with the tartci-incident marker. On recovery `fixed_at` is
+PATCHed in and the issue closes; a failed PATCH or close is retried every
+pass.
+
+`python3 scripts/tailnet_peer_alert.py --status` prints which routes reached
+each host in the last pass. `TARTCI_TAILNET_ISSUE=0` keeps the events and
+WARN lines without opening issues; `TARTCI_TAILNET_OFFLINE_ALERT_SECS` changes
+the 10 min bound.
 
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
@@ -1688,6 +2143,9 @@ fleet`), and check GitHub's job history against it with
   min) **and whose check runs are all green**; a red commit is skipped for an
   older green one, and with none green nothing happens (`unverified`). An
   explicit `--target` must be on main's first-parent chain and meet both.
+- Recovery from an off-history receipt may move a host to an older soaked,
+  green commit when that is the explicit target; skew remains unknown until a
+  verified apply records a generation in the tartci history.
 - **Prepare** (changes nothing on the host): `support-manifest write`,
   `fleet-macos validate`, install dry-run; on a sealed host the signing
   identity is **extracted** from the live bundle's leaf certificate and proven
@@ -1695,6 +2153,11 @@ fleet`), and check GitHub's job history against it with
   hang an unattended run; the refusal says to run `pulp ship doctor`), then the
   launcher is built under the reseal runbook's immutability preconditions and
   verified.
+- **Skew after a verified apply.** The run re-measures skew for the generation
+  it just installed and verified, and rewrites `skew.json` (`recorded_by:
+  verified_apply`) before finishing, so status reads current at once instead
+  of the pre-update skew until the watchdog's next refresh. Checks are not
+  re-queried; a failure to record never fails the update.
 - **Which code runs which step (and why a change lands one update late).**
   The self-update agent runs `~/.local/bin/tartci`, so the **installed**
   generation orchestrates: the gates (one host at a time, capacity floor,
@@ -1711,15 +2174,109 @@ fleet`), and check GitHub's job history against it with
   `~/.tartci/state/self-update/attempts/*.json` shows which code orchestrated
   each step. A PR that changes orchestration should say "effective from the
   update after next".
+- **Gate-reserve ratchet.** Prepare runs `fleet-macos validate <profile>
+  --check-reserve`, which fits each gate lane (no explicit priority, or
+  `priority = "gate"`) into THIS host's gate reserve from its live
+  host-profile, per axis: `supervisors x` the lane's VM cores (an explicit
+  `vm_cores`, else the reserve share for `vm_cores_from = "gate-reserve"`, else
+  `vm_pool_cores`) against `reserved_gate_cores`, and `supervisors x` the derived VM memory
+  against `reserved_gate_mem_mb` (`scripts/gate_reserve_fit.py`). Every
+  overcommitted pair is printed as `gate_reserve_overcommitted lane=...
+  axis=... demand=... reserve=...` on every update, and `tartci pool status`
+  and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
+  the installed profile. The update is refused only when the target profile's
+  overcommit on some (lane, axis) is strictly greater than the installed
+  profile's, both against the same live reserve (`gate_reserve_worse`). This is
+  a ratchet because a host whose installed profile overcommits (m1: 2 x 3
+  against 3) must still be able to update; a check that let the overcommit
+  grow would be no check (m3, 2026-10-04: 2 x 12 against 14 lease-denied the
+  second Pulp slot while jobs queued, #373). Resizing is a profile decision
+  with the host's owner and must not take agent cores. The resize that keeps
+  the reserve and the agent cores as they are is `vm_cores_from =
+  "gate-reserve"` on the lane: each slot's VM gets the largest core count, at
+  most `vm_pool_cores`, at which all of the lane's slots fit the reserve on
+  cores and on derived memory (`gate_reserve_fit.share_cores`; `python3
+  scripts/gate_reserve_fit.py share-cores --slots N` prints it for this host).
+  The plist carries the rule (`TARTCI_MACOS_VM_CORES_FROM`,
+  `TARTCI_MACOS_VM_CORES_SLOTS`), not a number, and the lease helper, `tartci
+  gate-supply` and this fit all compute the size the same way. m5 sizes its two
+  Pulp slots this way (2 x 4 against 8); on m3's facts the rule gives the 7 that
+  #373 chose by hand. A host that reserves no gate cores (a CI runner, or a role
+  that keeps none for gates) has no reserve to fit lanes into, so the check
+  reads `gate reserve: n/a (this host reserves no gate cores)` and the doctor
+  `gate_reserve_not_applicable`, never "fits"; a missing memory reserve beside
+  a cores reserve adds a `memory axis n/a` line. The flag is passed by the orchestrating (installed)
+  generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
-  SSH. The marker's age is measured on the peer's own clock.
+  SSH at every attempt (the read is never cached). The marker's age is
+  measured on the peer's own clock. The marker is read before the pool state:
+  a self-update announces and then drains, so a peer mid-update is reported
+  as `peer X is self-updating to <commit> (N min in)`, never as plain
+  `draining`. A peer that is not serving for any other reason is reported with
+  how long its pool state has been unchanged (the mtime of its
+  `~/.config/tartci/pool-state`).
+- **A long markerless drain stops holding the turn.** A peer that is
+  `draining` with no live update marker, whose pool state has not changed for
+  `PEER_DRAIN_STALE_SECONDS` (3 h, the marker's own TTL), is treated like an
+  off peer: it holds no turn and the capacity floor counts it as serving
+  nothing. A self-update holds a live marker through its whole drain, so this
+  is an operator drain or an update that died after draining. A drain of
+  unknown age (the peer's pool-state file could not be read) still holds the
+  turn, and a peer that is `on` but not participating always does.
+- **The recorded reason is as old as the last attempt.** `waiting.json`'s
+  `reason` is the survey of the last attempt, up to one 30 min interval old.
+  A reason that names a peer which now reads `on` is not a stale view: the
+  next attempt reads the peer afresh. On 2026-10-09 m5studio finished its
+  update at 06:10Z and m5's next attempt, which took the turn, ran at 06:36Z;
+  each hand-off between hosts costs up to one interval.
 - **Update queue.** A host that defers keeps a ticket in
   `~/.tartci/state/self-update/waiting.json` whose `since` records when it
   joined the queue and survives new targets. Hosts take turns in `since`
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A peer that stays unreachable stops holding the turn.** An unreadable
+  peer counts as busy, because it may be mid-update. Each survey records the
+  peers it could not read in `~/.tartci/state/self-update/peer-unreadable.json`
+  (`since`, `reads`, `last`); any readable read, whether the peer is on, off,
+  draining or updating, drops its row. A peer is excluded from turn-taking,
+  and only from turn-taking, when all of these hold:
+  - this host has read it unreadable at least 4 times in a row over at least
+    3 h. That is `ACTIVE_MARKER_TTL`, the age at which a peer's own update
+    marker already counts as stale, so a dark peer gets no more trust than a
+    seen one. It also outlasts the longest legitimate update;
+  - this host reads more than half the published fleet, counting itself. A
+    host cut off from the rest excludes nobody, and neither half of an even
+    split can proceed;
+  - at least one peer is readable, and every readable peer's own record shows
+    the same host unreadable at its last read, within the last hour on that
+    peer's clock. One peer that can still reach it means it is alive.
+
+  An excluded peer still serves nothing for the capacity floor, so a drain
+  that would leave a required label unserved still refuses. At the
+  post-announce re-read it is skipped only while it stays unreadable; if it
+  answers, the normal protocol applies. Events: `peer_unreachable_excluded`
+  once per episode, and `peer_unreachable_rejoined` on its first readable
+  read. Doctor: `peer_unreachable` (dark, still holding the turn) and
+  `peer_unreachable_excluded`. A host that flaps between readable and
+  unreadable never qualifies and keeps blocking; `self_update_starved`
+  reports after 4 h when gate jobs this host serves are queued (one hour past
+  the 3 h exclusion, so one dark peer cannot raise issues on every other host
+  before the queue heals), and after 6 h otherwise or when the demand read
+  fails. Demand is a queued self-hosted *job* whose labels a registration of
+  this host serves, for a workflow it names, at most 12 h old
+  (`scripts/gate_job_demand.py`); runs carry no labels, so a run-level read
+  would count hosted-only runs and the 2026-08-19 zombie merge group. The
+  starvation issue names the peer holding the turn and why, the queued jobs,
+  the fix per cause and how to verify, and ends with a `tartci-incident`
+  marker line whose `fixed_at` is written before the issue closes. If that
+  PATCH or the close fails, the fix time waits in
+  `~/.tartci/state/self-update/pending-fix.json` and the next run retries it;
+  the issue is never closed with `fixed_at` still null. An issue GitHub
+  reports gone (404 or 410) is dropped from the record and logged once as
+  `self_update_issue_gone`; no retry could reach it. Recovery of
+  the dark host itself is manual: it needs someone at the machine.
 - **A change to the queue or peer gates cannot fix a wedge it caused.** Each
   host decides with its *installed* tartci, so a fix to the deciding code only
   takes effect after some host updates. If the queue itself is wedged, unwedge
@@ -1763,6 +2320,12 @@ fleet`), and check GitHub's job history against it with
   host runs) is written as such in the receipt.
   `pool on` itself now waits up to 45 s for a just-kickstarted persistent
   Actions runner to reach `running` instead of failing on the first read.
+  Self-update recovery passes `pool on --restore-receipt` when restoring the
+  previous serving generation. That mode intentionally skips both
+  network-profile convergence and the fresh relay proof; it reuses the
+  previously receipted serving set so a transient relay failure cannot strand
+  a recovered host out of service. A normal operator `pool on` still performs
+  convergence and the relay proof.
 - **macOS updates.** A macOS update replaces `/usr/bin/python3`, so the
   install receipt's interpreter hash stops matching. When the OS-managed
   interpreter changed (still root-owned, same path and mode) and the OS build
@@ -1815,6 +2378,26 @@ fleet`), and check GitHub's job history against it with
   08:40Z to 17:16Z: two updates and their rollbacks could not `pool on`
   because the launch helper's volume probe timed out on a stalled Workshop
   volume, and the same-target guard then refused every scheduled run.
+- **Serving truth: is this host taking the gate work it serves?**
+  (`scripts/serving_truth_alarm.py`). Every watchdog pass, each host judges
+  only itself, never a peer: its own lane event logs
+  (`~/.tartci/state/macos-fleet/*/events.jsonl`, read back 6 h from the end,
+  not whole) against the queued self-hosted jobs its own registrations in
+  `fleet/advertised-labels.json` serve (`scripts/gate_job_demand.py`: jobs,
+  not runs, so hosted-only and zombie runs are not demand). Its host_id is
+  `TARTCI_HOST_ID` or the installed profile's `host.id`; neither is a WARN,
+  never a guess. Rules: a served job waited 20 min with no `job_assigned` here
+  while a serving lane was free; a serving lane scan-blind 3 cycles while a
+  served job waits; 3 admission errors in a row; one first error on 3 heads in
+  30 min; a lane holding a job killed by a quarantining signal. Each
+  (rule, host) is an episode with its own receipt under
+  `state/serving-truth/` and, with `TARTCI_SERVING_TRUTH_ALARM=on` (default
+  shadow: receipts and the rendered issue body only; `0` disables), its own
+  issue: what happened, evidence, likely cause, the fix to run, whether it is
+  safe to auto-apply, how to verify, and the tartci-incident marker. An episode
+  is fixed only by evidence on that host after detection (`job_assigned`, or a
+  successful terminal receipt for the failure rules); the marker's `fixed_at`
+  is PATCHed in before the issue closes.
 - **Disk pressure.** `pool status` prints a `disk:` line for the VM store
   volume (`host.tart_home`) and the home volume: `WARN` at 85% used. At 92%
   the VM store volume is a readiness problem (`disk_pressure`, fleet ready: NO),
@@ -1888,6 +2471,17 @@ arrive, and a host that did not get it is loud:
   `sudo killall fseventsd`, which nothing here runs.
 - **When it refreshes.** Every watchdog pass, at most every 30 minutes;
   `tartci fleet-macos tool-freshness --refresh` measures now.
+- **Cached lines carry an age limit.** Every status line read from a cached
+  measurement is flagged once it is older than three of its refresher's
+  intervals (`scripts/state_age.py`, `STALE_FACTOR = 3`): tartci skew and tool
+  freshness against the watchdog's 30 minutes, fseventsd against the
+  host-vitals sensor's 60 s. The line then reads `STALE (measured N ago, older
+  than 3 x <interval>; is the <refresher> running?)`, the same text becomes the
+  surface's problem (doctor `self_update_problem` / `tool_freshness_stale`, the
+  watchdog WARN), and an unreadable time counts as stale. One missed run is
+  ordinary; three in a row mean the refresher is not running, which is how m3's
+  skew read "1 commits behind main" for two days while the watchdog's pass
+  never ran.
 - **Automatic apply.** Shipyard updates itself from here by default: once its
   newest release is 30 minutes old, `shipyard runner fleet-update --to <tag>
   --host-class <this host> --apply --json`, the governed rollout that stages
@@ -1998,10 +2592,16 @@ unless the heredoc feeds `bash|sh|zsh|dash|ksh` or `ssh`. It sees through `&&`, 
 paths or bare labels. A target it cannot resolve statically (a loop variable,
 a glob, labels piped into `xargs`, `bootout gui/<uid>` of the whole domain)
 is blocked too. Read-only verbs (`print`, `list`, `print-disabled`) and
-services outside those families pass silently. The explicit, auditable escape
-hatch is `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself
-(allowed with a warning). Malformed hook input exits 0 with a note so a broken
-hook never breaks the agent's shell.
+  services outside those families pass silently. The explicit, auditable escape
+  hatch is `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself
+  (allowed with a warning). Malformed hook input exits 0 with a note so a broken
+  hook never breaks the agent's shell.
+
+The same Claude and Codex hook formats refuse broad process kills: bare-name
+`pkill` or `killall` of `bash`, `sh`, `zsh`, `python`, `python3`, or `node`,
+`-f` patterns naming shell snapshots, and `kill -9 -1`. These commands can
+remove every agent shell and leave forking lane supervisors behind. Kill the
+tree's top PID when a specific process must stop, or run `tartci launchd heal`.
 
 `tartci hooks print` prints (never writes) the settings snippet for Claude
 Code (`~/.claude/settings.json`, PreToolUse matcher `Bash`) and for Codex
@@ -2023,8 +2623,9 @@ authoritative gate.
 
 - **Linux:** done — green build + 99% ctest + 99.93% warm ccache, golden tagged.
 - **Windows:** 24H2-ARM golden boots headless + auto-boots; toolchain installs;
-  non-GPU build/test is the MVP target. GPU/Skia lane is a tracked follow-up
-  (needs Windows skia-builder slices + the Windows GPU-host product work).
+  the published ARM64 and x64 Skia slices now support a GPU-linked build. A
+  headless compile and scan prove the binary path; headed UTM plus a DAW is
+  still required for UI/audio acceptance.
 - **macOS:** the proven lane this toolkit generalizes from.
 - **Pool serving:** `tartci serve macos|linux|windows` wired (ported from Pulp's
   proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent
@@ -2203,8 +2804,8 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 
       [reclaim]
       pulp_worktree_builds = true
-      repo = "/Volumes/Workshop/Code/pulp"
-      worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+      repo = "/Volumes/<data-volume>/Code/pulp"
+      worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
       pressure_free_gb = 200          # optional
       worktree_build_idle_hours = 2   # optional, 2..24
 
@@ -2287,6 +2888,33 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   loaded tartci LaunchAgent registered from a plist outside
   `~/Library/LaunchAgents` (a leaked test registration shadowing the real one).
 
+  **The home volume has its own floor.** The disk axis above judges the
+  volume holding the Tart store. When the store is on another volume
+  (m5studio's `/Volumes/<data-volume>`), a VM lease also judges the home volume,
+  which holds every supervisor's temp files and the build trees
+  (`scripts/home_volume_floor.py`). m5studio, 2026-10-04: the boot Data volume
+  reached 99% with coverage build dirs, ENOSPC killed a merge-group runner and
+  every lane supervisor, and leases kept being granted. The floor is computed
+  per host: `clamp(max(30 GiB, fill_rate x hours to the next reclaim pass),
+  30 GiB, 20% of the volume)`, with the fill rate measured over at least 6 h of
+  admission samples so a transient spike cannot inflate it. The profile's
+  `[host] home_volume_floor_mode` decides what happens below it, and every
+  shipped profile is `report`: the lease is admitted and the supervisor logs
+  `home_volume_would_refuse volume=home free=... floor=...`. In `refuse` mode a
+  NEW clone is denied instead (`lease_denied axis=disk
+  reason=home_volume_below_floor volume=home free=... floor=...`). Flip a host
+  to `refuse` only after a day of report data shows no would-refuse event that
+  was not a genuinely full volume, and with Daniel's OK. Either way, running
+  jobs and supervisors are never touched. An unreadable volume admits the lease and logs `disk_axis_unread`
+  on every such admission. `tartci doctor fleet` reports `disk_floor_refusing`
+  when the refusals run as long as the host's lane count (a floor that refuses
+  everything looks exactly like a full disk; would-refusals count in report
+  mode), and `disk_axis_unread` when the
+  volume has been unreadable for a reclaim cadence. State:
+  `~/.tartci/state/leases/home-volume.json`. `TARTCI_HOME_VOLUME_FLOOR=0` turns
+  it off for a lane; `TARTCI_HOME_VOLUME_FLOOR_HOURS` (default 1, the reclaim
+  agent's interval) sets the pass horizon.
+
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
   exceeds the approximately 19 GiB store growth observed during a Pulp full
@@ -2341,6 +2969,50 @@ expires, and is reported by `tartci pool status` and `tartci doctor`. No host
 enables it. Design, events, and the runbook for trying it on a new high-RAM
 host (prerequisites, exact profile lines, idle-cost and minutes-saved
 measurement, turning it off): [warm-vm.md](warm-vm.md).
+
+## Retention of per-boot state and support generations (`tartci retention`)
+
+Two trees grow without bound on every fleet host. `~/.tartci/state` gets one
+actions-runner log, one admission-clean receipt and one repository-access
+receipt per VM boot, and `~/.local/share/tartci-generations` gets one
+generation per self-update. Neither is large (under 200 MB a host), but every
+scan of them grows forever. On 2026-10-09 the plan below found these:
+
+| host | old per-boot files | generations kept / to delete |
+|---|---|---|
+| m1 | 5,362 | skipped: m1 was mid self-update |
+| m3 | 4,780 | 10 / 40 |
+| m5 | 5,585 | 10 / 54 |
+| m5studio | 0 | 10 / 29 |
+
+`tartci retention` prints the plan and changes nothing. `tartci retention
+--apply` deletes, and `--json` gives the machine-readable form. It deletes only:
+
+- **Per-boot files** named `<runner>-<pid>-<seq>.<kind>`, where kind is
+  `actions-runner.log`, `admission-clean.json`, `repository-access.json`,
+  `repository-access-error` or `jit-error`, that are older than
+  `--max-age-days` (default 30) and outside the newest `--keep-per-dir`
+  (default 50) of their directory. Per-lane files without a boot suffix
+  (`*.state.json`, `events.jsonl`, `*.disk-admission.json`, locks) and
+  self-update receipts are never touched.
+- **Generations** outside the newest `--keep-generations` (default 10, at
+  least 3) and older than `--generation-grace-days` (default 2), that nothing
+  names: not the wrapper `~/.local/bin/tartci`, not any LaunchAgent plist,
+  not a `~/.config/tartci/*.json` receipt, not the `previous` commit of any
+  rollback snapshot, not the generation running the pass. Generations are kept
+  by count, not age, because a host deploys several times a day. A rollback
+  that needs a deleted generation re-stages it from source.
+
+Idle safety: a per-boot file whose `<runner>-<pid>-<seq>` appears on any
+running command line, and a generation that any process names in its command
+line or holds as its working directory, is kept. If `ps` or `lsof` cannot be
+read, nothing is deleted. While a self-update marker
+(`~/.tartci/state/self-update/active.json`) exists, generations are left alone
+for that pass, since an install may be staging one. Generations are installed
+read-only; `--apply` makes a doomed one writable before removing it.
+
+No agent runs this yet. Run the plan on a host, read it, then `--apply`.
+Scheduling it (for example from the reclaim agent) is a separate decision.
 
 ## Fleet scheduling boundary
 
@@ -2489,6 +3161,17 @@ lanes change.
   runner census the real transition takes (two paginated GitHub API calls per
   protected repository). Do not run it in a tight loop; poll no faster than
   once a minute, and never on a host whose census CLI is anonymous (see below).
+- **`fleet_not_ready` names each problem's lane and age.** `tartci doctor
+  fleet` prints every readiness problem as `code (lane, detail)`, for example
+  `heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`. A stale
+  heartbeat on one lane makes the whole host count as not serving for its
+  peers' capacity floor, so read the lane, then its state file under
+  `~/.tartci/state/macos-fleet/<lane>/` and its `events.jsonl`. A lane stuck
+  in `booting` after `boot_ip` is the guest's sshd not answering; the boot
+  helper gives it `TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180) of wall-clock
+  time, killing each attempt at `TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15),
+  then discards the VM with `boot_failed no_ssh` (gotchas: "A gate lane sits
+  in `booting` for over an hour").
 - **Capacity-floor refusals come in two kinds, and only one is overridable.**
   `last serving host` (the floor's exit 3) means the census answered and no
   other host serves the label: none has an online runner carrying it, and no
@@ -2655,3 +3338,7 @@ one exact admission retry is eligible.
 compile or link what another gate host builds green: the signature of a
 poisoned shared compiler cache. Read-only, never schedules, default off. Rules,
 detection floor, enablement and remedy: [build-disagreement.md](build-disagreement.md).
+
+#### Install-time interpreter pin
+
+On macOS fleet installs, the installer resolves one regular interpreter, probes api.github.com through that exact path, and records it as TARTCI_PYTHON. LaunchAgents, sealed TartCILauncher lane bundles, and the ghapp token minter carry the same path; TARTCI_RENDER_PYTHON is the render-time handoff used while building a launcher. A probe failure names the interpreter and must be repaired before admission.

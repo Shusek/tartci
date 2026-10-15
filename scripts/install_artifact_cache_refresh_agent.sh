@@ -17,6 +17,7 @@ TEMPLATE="$HERE/launchd/$LABEL.plist.template"
 AGENTS_DIR="${TARTCI_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 TARGET="$AGENTS_DIR/$LABEL.plist"
 LAUNCHCTL="${TARTCI_LAUNCHCTL_BIN:-/bin/launchctl}"
+PROFILE="${TARTCI_FLEET_PROFILE:-$HOME/.config/tartci/macos-fleet-profile.toml}"
 # shellcheck source=scripts/launchd_domain_guard.sh
 . "$HERE/scripts/launchd_domain_guard.sh"
 APPLY=0
@@ -32,9 +33,38 @@ esac
 # real gui/<uid> domain, where this label would replace the host's agent.
 tartci_launchd_domain_guard "$TARGET" "$LAUNCHCTL" || exit 4
 
+# The runners mount the installed profile's [host].cache_root, rendered into
+# their plists as TARTCI_CI_CACHE. A host that moves its CI cache off the home
+# default declares it there, and this agent must refresh that same cache. The
+# profile needs tomllib; /usr/bin/python3 (3.9) has none.
+cache_root=""
+if [ -f "$PROFILE" ]; then
+  PY=""
+  for candidate in ${TARTCI_PYTHON:-} python3.13 python3.12 python3.11 python3; do
+    candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      PY="$candidate"; break
+    fi
+  done
+  if [ -z "$PY" ]; then
+    echo "install_artifact_cache_refresh_agent: no Python with tomllib to read $PROFILE;" \
+      "refusing to guess the CI cache" >&2
+    exit 5
+  fi
+  cache_root="$("$PY" - "$PROFILE" <<'PYEOF'
+import sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    value = (tomllib.load(handle).get("host") or {}).get("cache_root", "")
+print(value if isinstance(value, str) and value.startswith("/") else "")
+PYEOF
+)"
+fi
+render_args=(--set "HOME=$HOME")
+[ -n "$cache_root" ] && render_args+=(--environment "TARTCI_CI_CACHE=$cache_root")
+
 rendered="$(mktemp)"
 trap 'rm -f "$rendered"' EXIT
-python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" --set "HOME=$HOME" >"$rendered"
+python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" "${render_args[@]}" >"$rendered"
 plutil -lint "$rendered" >/dev/null 2>&1 ||
   python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$rendered"
 

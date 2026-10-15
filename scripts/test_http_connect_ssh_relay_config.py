@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import tomllib
 import unittest
 from pathlib import Path
+
+import testing_support
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # the contract checks below need it; the relay does not
+    tomllib = None  # type: ignore[assignment]
 
 
 ROOT = Path(__file__).parents[1]
@@ -19,6 +25,7 @@ SPEC.loader.exec_module(relay)
 
 
 class HttpConnectSshRelayConfigTests(unittest.TestCase):
+    @testing_support.requires_tomllib
     def test_launchd_covers_protected_macos_bootstrap_host_contract(self) -> None:
         template = (
             ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
@@ -54,6 +61,7 @@ class HttpConnectSshRelayConfigTests(unittest.TestCase):
         self.assertNotIn("<string>brew.sh</string>", template)
         self.assertNotIn("<string>homebrew.org</string>", template)
 
+    @testing_support.requires_tomllib
     def test_launchd_covers_release_node_bootstrap_host_contract(self) -> None:
         template = (
             ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"

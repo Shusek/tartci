@@ -9,6 +9,7 @@ Run:  python3 scripts/test_build_disagreement_watch.py
 """
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import io
 import json
 import os
@@ -73,6 +74,7 @@ class WatchCase(unittest.TestCase):
 
 @unittest.skipUnless(INCIDENT.exists(), "incident fixture absent")
 class EnabledIncident(WatchCase):
+    @testing_support.requires_tomllib
     def test_one_alarm_deduplicated_across_two_cycles(self):
         self.profile.write_text(ENABLED)
         first, r1 = self.cycle(T0, replay=replay())
@@ -94,6 +96,7 @@ class EnabledIncident(WatchCase):
         state = json.loads(self.state.read_text())
         self.assertEqual(state["runs"], 2)
 
+    @testing_support.requires_tomllib
     def test_a_cycle_inside_fifteen_minutes_does_not_run(self):
         self.profile.write_text(ENABLED + "interval_minutes = 1\n")  # floored at 15
         self.cycle(T0, replay=replay())
@@ -102,12 +105,14 @@ class EnabledIncident(WatchCase):
         report, runner = self.cycle(T0 + 15 * 60, replay=replay())
         self.assertEqual(len(runner.calls), 1, "control: due again after 15 minutes")
 
+    @testing_support.requires_tomllib
     def test_realerts_after_the_pair_has_been_absent(self):
         self.profile.write_text(ENABLED)
         self.cycle(T0, replay=replay())
         later, _ = self.cycle(T0 + 25 * 3600, replay=replay())
         self.assertEqual(len(later["alarms"]), 1)
 
+    @testing_support.requires_tomllib
     @unittest.skipUnless(CONTROL.exists(), "control fixture absent")
     def test_clean_window_is_zero_alarms(self):
         self.profile.write_text(ENABLED)
@@ -117,6 +122,7 @@ class EnabledIncident(WatchCase):
         self.assertGreater(report["jobs_considered"], 0, "control: the window held jobs")
         self.assertEqual(report["alarms"], [])
 
+    @testing_support.requires_tomllib
     def test_never_invokes_a_reset_or_any_other_command(self):
         self.profile.write_text(ENABLED)
         bin_dir = self.root / "bin"
@@ -164,6 +170,7 @@ class Disabled(WatchCase):
         self.profile.write_text(ENABLED.replace("true", '"true"'))
         self.assert_no_run()
 
+    @testing_support.requires_tomllib
     def test_control_enabled_runs(self):
         self.profile.write_text(ENABLED)
         report, runner = self.cycle(T0, replay=replay())
@@ -172,6 +179,7 @@ class Disabled(WatchCase):
 
 @unittest.skipUnless(INCIDENT.exists(), "incident fixture absent")
 class Unreadable(WatchCase):
+    @testing_support.requires_tomllib
     def test_unreadable_logs_are_unknown_without_alarm(self):
         self.profile.write_text(ENABLED)
         empty = self.root / "no-logs"
@@ -182,6 +190,7 @@ class Unreadable(WatchCase):
         self.assertEqual(report["alarms"], [])
         self.assertFalse(any(" ALARM " in line for line in bdw.render(report, T0)))
 
+    @testing_support.requires_tomllib
     def test_github_unreadable_exit_3_is_unknown_not_a_failure(self):
         self.profile.write_text(ENABLED)
         out = json.dumps({"state": "unknown", "code": "github_unreadable", "detail": "HTTP 502"})
@@ -191,6 +200,7 @@ class Unreadable(WatchCase):
                          ("unknown", "github_unreadable", 3))
         self.assertEqual(report["alarms"], [])
 
+    @testing_support.requires_tomllib
     def test_findings_from_an_abnormal_exit_never_alarm(self):
         self.profile.write_text(ENABLED)
         finding = {"state": "problem", "host": "m3", "rule": "streak",
@@ -203,6 +213,7 @@ class Unreadable(WatchCase):
                                 replay=replay())
         self.assertEqual(len(control["alarms"]), 1, "control: the same JSON at exit 1 alarms")
 
+    @testing_support.requires_tomllib
     def test_unparseable_and_timeout_are_unknown(self):
         self.profile.write_text(ENABLED)
         runner = Recorder(subprocess.CompletedProcess([], 2, "Traceback", "boom"))
@@ -215,6 +226,7 @@ class Unreadable(WatchCase):
         report, _ = self.cycle(T0 + 3600, runner=slow, replay=replay())
         self.assertEqual((report["state"], report["code"]), ("unknown", "detector_timeout"))
 
+    @testing_support.requires_tomllib
     def test_no_plain_gh_is_unknown_and_the_detector_is_not_run(self):
         self.profile.write_text(ENABLED)
         bin_dir = self.root / "bin"

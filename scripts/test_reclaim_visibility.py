@@ -8,6 +8,7 @@ healthy host.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import pathlib
@@ -249,6 +250,7 @@ class DiskPressure(unittest.TestCase):
                 mock.patch.object(pathlib.Path, "stat", fake_stat):
             return fleet.disk_pressure(config, home)
 
+    @testing_support.requires_tomllib
     def test_thresholds(self):
         rows = {row["role"]: row for row in self.run_with(84.0)}
         self.assertEqual(rows["vm_store"]["state"], "ok")
@@ -257,11 +259,13 @@ class DiskPressure(unittest.TestCase):
         self.assertEqual({row["role"]: row["state"] for row in self.run_with(93.0)}["vm_store"],
                          "problem")
 
+    @testing_support.requires_tomllib
     def test_a_full_home_volume_warns_but_is_not_a_readiness_problem(self):
         rows = {row["role"]: row for row in self.run_with(50.0, home_percent=94.0)}
         self.assertEqual(rows["home"]["state"], "warn")
         self.assertEqual(rows["vm_store"]["state"], "ok")
 
+    @testing_support.requires_tomllib
     def test_a_home_volume_full_enough_to_break_builds_is_a_problem(self):
         # m3, 2026-10-01: its internal data volume at 99% failed a Shipyard
         # release build with ENOSPC while pool status only warned.
@@ -270,6 +274,7 @@ class DiskPressure(unittest.TestCase):
         self.assertEqual({r["role"]: r for r in self.run_with(50.0, home_percent=96.0)}
                          ["home"]["state"], "warn")
 
+    @testing_support.requires_tomllib
     def test_readiness_turns_a_full_store_into_a_problem_and_pool_status_prints_it(self):
         import macos_fleet_lanes as fleet
         source = (HERE / "macos_fleet_lanes.py").read_text()

@@ -11,6 +11,7 @@ Three layers, each with its control beside it:
 """
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import argparse
 import datetime as dt
 import json
@@ -122,9 +123,27 @@ class ClassifyAndFitTests(unittest.TestCase):
                 self.assertEqual(int(shell), gate_supply.derived_vm_mem_mb(cores))
 
 
+    def test_lane_request_resolves_like_the_lease_helper(self) -> None:
+        share = {"TARTCI_MACOS_VM_CORES_FROM": "gate-reserve", "TARTCI_MACOS_VM_CORES_SLOTS": "2"}
+        seen = []
+
+        def share_cores(slots: int) -> int:
+            seen.append(slots)
+            return 4
+
+        self.assertEqual(gate_supply.lane_request(share, 6, share_cores),
+                         (4, gate_supply.derived_vm_mem_mb(4)))
+        self.assertEqual(seen, [2])
+        explicit = dict(share, TARTCI_MACOS_VM_CORES="5")
+        self.assertEqual(gate_supply.lane_request(explicit, 6, share_cores)[0], 5)
+        self.assertEqual(gate_supply.lane_request({}, 6, share_cores)[0], 6)
+        self.assertEqual(gate_supply.lane_request(share, 6)[0], 6)
+
+
 class BuildReportTests(unittest.TestCase):
     def _report(self, lanes: dict, *, running: int = 0, cap: int = 2, reserved: int = 0,
-                capacity: dict | None = None, pool: str = "on", running_error: bool = False):
+                capacity: dict | None = None, pool: str = "on", running_error: bool = False,
+                share_cores=None):
         rows = [Lane(label, label, Path(f"/state/{label}"), "") for label in lanes]
         envs = {label: value[0] for label, value in lanes.items()}
         beats = {Path(f"/state/{label}"): value[1] for label, value in lanes.items()}
@@ -138,7 +157,7 @@ class BuildReportTests(unittest.TestCase):
             capacity_reader=lambda: capacity if capacity is not None else {
                 "total_cores": 26, "used_cores": 0},
             running_reader=running_reader, default_cores_reader=lambda: 12,
-            pool_reader=lambda: pool, cap_reader=lambda: cap, reservations_reader=lambda: reserved,
+            share_cores_reader=share_cores, pool_reader=lambda: pool, cap_reader=lambda: cap, reservations_reader=lambda: reserved,
             host="studio")
 
     def test_free_is_capped_by_vm_slots_and_lease_fit(self) -> None:
@@ -152,6 +171,17 @@ class BuildReportTests(unittest.TestCase):
         full = {"total_cores": 26, "used_cores": 24}
         report = self._report(lanes, capacity=full)
         self.assertEqual((report["verdict"], report["free"]), ("ok", 0))
+
+    def test_gate_reserve_sized_lanes_lease_at_their_share(self) -> None:
+        env = {"TARTCI_MACOS_VM_CORES_FROM": "gate-reserve", "TARTCI_MACOS_VM_CORES_SLOTS": "2"}
+        lanes = {"a": (dict(lane_env(1, cores=None), **env), {"ts": stamp(5), "phase": "waiting"}),
+                 "b": (dict(lane_env(2, cores=None), **env), {"ts": stamp(5), "phase": "waiting"})}
+        agents_hold_six = {"total_cores": 14, "used_cores": 6}
+        self.assertEqual(self._report(lanes, capacity=agents_hold_six,
+                                      share_cores=lambda slots: 8 // slots)["free"], 2)
+        # Control: without the share the lanes ask the 12-core default, and
+        # neither fits beside the agents' 6.
+        self.assertEqual(self._report(lanes, capacity=agents_hold_six)["free"], 0)
 
     def test_lanes_for_another_repo_or_class_are_ignored(self) -> None:
         lanes = {"forge": (lane_env(1, repo="Generous-Corp/forge"), {"ts": stamp(5), "phase": "waiting"}),
@@ -432,6 +462,7 @@ class ProfileRenderTests(unittest.TestCase):
                                    "validate", str(path), *args],
                                   text=True, capture_output=True, check=False)
 
+    @testing_support.requires_tomllib
     def test_the_knob_renders_resolved_ssh_targets(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         data = fleet.tomllib.loads(self._profile('fallback_preferred_hosts = ["studio", "m5"]\n'))
@@ -442,6 +473,7 @@ class ProfileRenderTests(unittest.TestCase):
         lane = next(row for row in control["lane"] if row["id"] == "pulp-gate")
         self.assertNotIn("TARTCI_FALLBACK_PEERS", fleet.lane_plist(control, lane)["EnvironmentVariables"])
 
+    @testing_support.requires_tomllib
     def test_validation_rejects_self_and_min_age_zero(self) -> None:
         self.assertEqual(self._run(self._profile('fallback_preferred_hosts = ["studio"]\n')).returncode, 0)
         bad_self = self._run(self._profile('fallback_preferred_hosts = ["m1"]\n'))
@@ -451,6 +483,7 @@ class ProfileRenderTests(unittest.TestCase):
             "min_queued_age_seconds = 600", "min_queued_age_seconds = 0", 1)
         self.assertNotEqual(self._run(zero_age).returncode, 0)
 
+    @testing_support.requires_tomllib
     def test_only_m1_pulp_gate_falls_back_and_only_to_m3(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         enabled = []

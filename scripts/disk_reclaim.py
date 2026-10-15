@@ -75,6 +75,7 @@ import threading
 import time
 from typing import Any, Iterable
 
+import boot_usage
 import pulp_reapers
 import gate_ccache_trim
 import scratch_dirs
@@ -422,7 +423,7 @@ def free_bytes(path: pathlib.Path) -> int | None:
     root before any measurement is taken. It is not: the post-fix re-measure
     runs after a whole pass has walked and deleted, which on a loaded host is
     minutes after that check, and the volume it re-measures is a mount point
-    (m3 scans /Volumes/Workshop). An unmount inside that window, or an EIO off
+    (m3 scans /Volumes/<data-volume>). An unmount inside that window, or an EIO off
     a failing disk, reaches here. Deleting this branch would turn that into a
     traceback out of the janitor instead of an honest "unknown".
     """
@@ -1064,7 +1065,7 @@ def main(argv: list[str] | None = None) -> int:
 
     The receipt is what makes a dead janitor visible. m3's reclaim agent was
     shadowed by a leaked registration for a day and exited 127 every hour
-    without writing a line anywhere tartci looks; `tartci status` kept printing
+    without writing a line anywhere tartci looks; tartci status kept printing
     "installed and loaded" because a job with that label WAS loaded. A pass
     that does not leave a fresh receipt is now the signal, whatever launchd
     believes.
@@ -1267,6 +1268,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     gate_ccache = gate_ccache_trim.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
                                        state_dir=state_dir(args))
     receipt["gate_ccache_trim"] = gate_ccache
+    # Which CI and agent paths hold the boot volume, sampled once a day after
+    # the reapers above (boot_usage.py). Read-only.
+    progress.emit("boot usage: sampling CI and agent paths on the boot volume", force=True)
+    receipt["boot_usage"] = boot_usage.run(
+        state_dir=state_dir(args), profile=pulp_reapers.default_profile_path(),
+        boot_volume=boot_path, user_tmp=scratch_dirs.user_temp_dir())
 
     remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed")
                      or scratch.get("removed"))

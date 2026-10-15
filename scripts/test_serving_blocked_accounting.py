@@ -65,6 +65,7 @@ class ShippedAccounting:
     """Runs the real blocks out of runner.sh against a scripted work sequence."""
 
     def __init__(self) -> None:
+        self.clock_paths: list[str] = []
         self.source = RUNNER.read_text()
         accounting = ACCOUNTING_RE.search(self.source)
         assert accounting is not None, (
@@ -75,7 +76,7 @@ class ShippedAccounting:
         assert idle is not None, "the idle pass no longer clears the streak"
         self.idle = idle.group("block")
 
-    def run(self, entries: list[str]) -> dict:
+    def run(self, entries: list[str], phase: str = "admission-error") -> dict:
         """`entries` is a script of 'served', 'unserved' and 'idle' passes."""
         steps = []
         for entry in entries:
@@ -88,12 +89,26 @@ class ShippedAccounting:
                 'run_rc=0\n'
                 + self.accounting
             )
+        # A stepping clock in place of `date`: call N returns second N, so
+        # every stamp the accounting takes is distinct and known in advance,
+        # and the result never depends on where the real second boundary
+        # falls. `$(date ...)` runs in a subshell, so the count lives in a file.
+        clock = tempfile.NamedTemporaryFile("w", suffix=".clock", delete=False)
+        clock.write("0")
+        clock.close()
+        self.clock_paths.append(clock.name)
         script = (
             "set -euo pipefail\n"
+            "tartci_boundary_proof_abandon(){ :; }\n"
+            "tartci_job_claim_release(){ :; }\n"
+            f"CLOCK_FILE='{clock.name}'\n"
+            'date(){ local n; n=$(( $(cat "$CLOCK_FILE") + 1 )); '
+            'printf \'%s\' "$n" > "$CLOCK_FILE"; '
+            'printf \'2026-01-01T00:00:%02dZ\\n\' "$n"; }\n'
             'SERVING_BLOCKED_SINCE=""\n'
             "SERVING_BLOCKED_STREAK=0\n"
             'SERVING_BLOCKED_LAST_PHASE=""\n'
-            'LAST_HEARTBEAT_PHASE="admission-error"\n'
+            'LAST_HEARTBEAT_PHASE="' + phase + '"\n'
             "CURRENT_SERVED=0\n"
             "q=1\n"
             + "\n".join(steps)
@@ -103,7 +118,7 @@ class ShippedAccounting:
             ' "$SERVING_BLOCKED_LAST_PHASE"\n'
         )
         result = subprocess.run(
-            ["/bin/bash", "-c", script], text=True, capture_output=True,
+            ["/bin/bash"], input=script, text=True, capture_output=True,
             check=False, timeout=120,
         )
         if result.returncode != 0:
@@ -117,6 +132,11 @@ class ServeLessStreakTests(unittest.TestCase):
     def setUp(self) -> None:
         self.accounting = ShippedAccounting()
         self.source = self.accounting.source
+        self.addCleanup(self._remove_clocks)
+
+    def _remove_clocks(self) -> None:
+        for path in self.accounting.clock_paths:
+            Path(path).unlink(missing_ok=True)
 
     # -- counting ------------------------------------------------------------
 
@@ -134,14 +154,76 @@ class ServeLessStreakTests(unittest.TestCase):
     def test_the_streak_start_is_the_first_failure_not_the_latest(self) -> None:
         """A marker rewritten on every failure would never appear to age, so a
         three-hour outage would read as a one-cycle blip forever."""
-        first = self.accounting.run(["unserved"])["since"]
-        later = self.accounting.run(["unserved"] * 8)["since"]
-        # Same harness start, so an un-rewritten marker is byte-identical.
-        self.assertEqual(first, later)
+        value = self.accounting.run(["unserved"] * 8)
+        self.assertEqual(value["streak"], 8)
+        # The stepping clock gives the first failure second 01 and the eighth
+        # second 08, so only a marker kept from the first entry
+        # reads 01.
+        self.assertEqual(value["since"], "2026-01-01T00:00:01Z")
 
     def test_the_last_phase_travels_with_the_streak(self) -> None:
         value = self.accounting.run(["unserved"])
         self.assertEqual(value["last_phase"], "admission-error")
+
+    def test_admission_deferrals_are_not_labeled_as_failures(self) -> None:
+        for phase in ("admission-precheck-deferred", "admission-deferred"):
+            value = self.accounting.run(["unserved"], phase=phase)
+            self.assertEqual(value["streak"], 1)
+            self.assertEqual(value["last_phase"], phase)
+            # Execute the shipped accounting with the deferred phase and
+            # prove it emits the distinct non-outage cause.
+            block = self.accounting.accounting
+            script = (
+                "set -euo pipefail\n"
+                "tartci_boundary_proof_abandon(){ :; }\n"
+                "tartci_job_claim_release(){ :; }\n"
+                'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
+                'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
+                'LAST_HEARTBEAT_PHASE="%s"\nCURRENT_SERVED=0\n'
+                'JOB_CLAIM_CONTENDED=0\nPRE_CLONE_DEMAND_GONE=0\n'
+                'VM_DHCP_BACKOFF=0\nVM_DHCP_BREAKER_OPEN=0\nrun_rc=75\n'
+                '%s\nprintf "%%s\\n" "$SERVING_BLOCKED_CAUSE"\n'
+            ) % (phase, block)
+            result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                    text=True, check=True)
+            self.assertEqual(result.stdout.strip().splitlines()[-1], "admission deferred")
+
+    def test_runner_loop_produces_dhcp_breaker_cause_only_for_a_real_open_breaker(self) -> None:
+        block = self.accounting.accounting
+
+        def run(*, open_breaker: int, backoff: int, phase: str,
+                block_source: str = block) -> dict[str, str | int]:
+            script = (
+                "set -euo pipefail\n"
+                "tartci_boundary_proof_abandon(){ :; }\n"
+                "tartci_job_claim_release(){ :; }\n"
+                'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
+                'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
+                'LAST_HEARTBEAT_PHASE="%s"\nCURRENT_SERVED=0\n'
+                'JOB_CLAIM_CONTENDED=0\nPRE_CLONE_DEMAND_GONE=0\n'
+                'VM_DHCP_BACKOFF=%d\nVM_DHCP_BREAKER_OPEN=%d\nrun_rc=75\n'
+                '%s\n'
+                'printf "{\\"streak\\":%%s,\\"cause\\":\\"%%s\\"}\\n" '
+                '"$SERVING_BLOCKED_STREAK" "$SERVING_BLOCKED_CAUSE"\n'
+            ) % (phase, backoff, open_breaker, block_source)
+            result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                    text=True, check=True)
+            return json.loads(result.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(run(open_breaker=1, backoff=1, phase="admission-precheck-error"),
+                         {"streak": 1, "cause": "dhcp_breaker"})
+        # Verification backoff is not an outage and must clear the streak.
+        self.assertEqual(run(open_breaker=0, backoff=1, phase="vm-dhcp-breaker-open"),
+                         {"streak": 0, "cause": ""})
+        broken_block = block.replace(
+            'elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then',
+            'elif false; then', 1)
+        self.assertNotEqual(
+            run(open_breaker=1, backoff=0, phase="admission-precheck-error",
+                block_source=broken_block),
+            {"streak": 1, "cause": "dhcp_breaker"},
+            "removing the runner-side DHCP cause producer must break this test",
+        )
 
     # -- the ratio property --------------------------------------------------
 
@@ -265,6 +347,7 @@ class ServeLessStreakTests(unittest.TestCase):
                 'SERVING_BLOCKED_SINCE="2026-09-20T00:00:00Z"',
                 "SERVING_BLOCKED_STREAK=143",
                 'SERVING_BLOCKED_LAST_PHASE="admission-error"',
+                'SERVING_BLOCKED_CAUSE="admission failing"',
                 "heartbeat waiting",
             ])
             result = subprocess.run(
@@ -277,6 +360,7 @@ class ServeLessStreakTests(unittest.TestCase):
         self.assertEqual(state["serving_blocked_streak"], 143)
         self.assertIsInstance(state["serving_blocked_streak"], int)
         self.assertEqual(state["serving_blocked_last_phase"], "admission-error")
+        self.assertEqual(state["serving_blocked_cause"], "admission failing")
         self.assertEqual(state["phase"], "waiting")
 
     def test_the_heartbeat_records_the_phase_the_streak_will_quote(self) -> None:
@@ -290,6 +374,7 @@ class ServeLessStreakTests(unittest.TestCase):
             'SERVING_BLOCKED_SINCE=""',
             "SERVING_BLOCKED_STREAK=0",
             'SERVING_BLOCKED_LAST_PHASE=""',
+            'SERVING_BLOCKED_CAUSE=""',
             "CURRENT_SERVED=0",
             'LAST_HEARTBEAT_PHASE=""',
         ):
@@ -308,8 +393,9 @@ class PoolStatusRenderingTests(unittest.TestCase):
     @staticmethod
     def render(fleet: dict) -> str:
         source = (ROOT / "tartci").read_text()
-        start = source.index('python3 - "$fleet_readiness" <<\'PY\'\n')
-        start += len('python3 - "$fleet_readiness" <<\'PY\'\n')
+        marker = '"$status_python" - "$fleet_readiness" <<\'PY\'\n'
+        start = source.index(marker)
+        start += len(marker)
         block = source[start:source.index("\nPY\n", start)]
         result = subprocess.run(
             ["python3", "-c", block, json.dumps(fleet)],
@@ -356,6 +442,34 @@ class PoolStatusRenderingTests(unittest.TestCase):
         self.assertIn("serving: BLOCKED (disk: disk_capacity_insufficient", out)
         self.assertIn("cause=disk reason=disk_capacity_insufficient", out)
         self.assertNotIn("serving: ok", out)
+
+    def test_admission_failure_prints_not_serving_and_cause(self) -> None:
+        fleet = self._fleet({
+            "blocked": True, "blocked_lanes": [{
+                "label": "studio.pulp-gate", "blocked_seconds": 600,
+                "streak": 6, "last_phase": "admission-precheck-error",
+                "cause": "admission failing", "reason": "admission failing",
+            }], "unmeasurable_lanes": [],
+        })
+        fleet["fleet_ready"] = False
+        out = self.render(fleet)
+        self.assertIn("fleet ready: NO", out)
+        self.assertIn("serving: NOT SERVING (admission failing", out)
+        self.assertIn("cause=admission failing", out)
+
+    def test_dhcp_breaker_prints_not_serving_and_cause(self) -> None:
+        fleet = self._fleet({
+            "blocked": True, "blocked_lanes": [{
+                "label": "studio.pulp-gate", "blocked_seconds": 10,
+                "streak": 1, "last_phase": "vm-dhcp-breaker-open",
+                "cause": "dhcp_breaker", "reason": "DHCP breaker open",
+            }], "unmeasurable_lanes": [],
+        })
+        fleet["fleet_ready"] = False
+        out = self.render(fleet)
+        self.assertIn("fleet ready: NO", out)
+        self.assertIn("serving: NOT SERVING (DHCP breaker open", out)
+        self.assertIn("cause=dhcp_breaker", out)
 
     def test_a_serving_lane_prints_ok(self) -> None:
         out = self.render(self._fleet({

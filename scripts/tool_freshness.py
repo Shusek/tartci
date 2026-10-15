@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Installed-vs-released freshness for the host tools a fleet host runs.
 
-tartci measures its own skew against main (`fleet_self_update.py`). The other
+tartci measures its own skew against main (fleet_self_update.py). The other
 tools every gate and agent session on the host depends on, Shipyard and the
 pulp CLI, had no equivalent, and an installed pulp CLI sat ~2,800 hours behind
 its releases before anyone looked. This module gives each of them one line in
-`tartci pool status`, a finding in `tartci doctor fleet`, and a WARN in the
+tartci pool status, a finding in tartci doctor fleet, and a WARN in the
 launchd watchdog, and optionally applies the update itself:
 
   refresh   (the watchdog, at most every 30 minutes) reads the installed
@@ -706,13 +706,19 @@ def summary(home: Path | None = None) -> dict:
                                          "tartci fleet-macos tool-freshness --refresh)"],
                 "problem": None}
     rows = [row for row in (value.get("tools") or {}).values() if isinstance(row, dict)]
-    problems = [f"{row['tool']} {row['behind_hours']:g} h behind {row['latest_tag']}"
-                for row in rows if row.get("stale")]
+    import state_age
+    aged = state_age.stale_note(value.get("measured_at"), REFRESH_INTERVAL_S,
+                                "launchd watchdog (tartci launchd heal)")
+    problems = [f"tool freshness {aged}"] if aged else []
+    problems += [f"{row['tool']} {row['behind_hours']:g} h behind {row['latest_tag']}"
+                 for row in rows if row.get("stale")]
     problems += [f"{row['tool']} freshness unknown" for row in rows
                  if row.get("state") == "unknown"]
     problems += [row["release_incomplete"] for row in rows if row.get("release_incomplete")]
-    return {"state": value, "lines": [render_row(row) for row in rows],
-            "problem": "; ".join(problems) or None}
+    lines = [render_row(row) for row in rows]
+    if aged:
+        lines.append(f"tools: freshness {aged}")
+    return {"state": value, "lines": lines, "problem": "; ".join(problems) or None}
 
 
 def main(argv: list[str] | None = None) -> int:

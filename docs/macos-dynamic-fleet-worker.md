@@ -8,7 +8,7 @@ VM only after it sees an exact matching queued job and acquires a governed
 lease. Failed queue discovery is fail-closed.
 
 The checked-in declarations are `profiles/{m1,m3,m5}-macos-fleet.toml`. M1 and
-M5 use `$HOME/VMs`; M3 uses `/Volumes/Workshop/VMs`. M3's durable Shipyard host
+M5 use `$HOME/VMs`; M3 uses `/Volumes/<data-volume>/VMs`. M3's durable Shipyard host
 tag is `studio`, so its profile binds `host.id = "studio"` even though the file
 uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
@@ -27,7 +27,7 @@ owner, and mode. Fleet
 installation consumes an already-signed artifact; it never holds a signing
 identity. Before admission,
 `pool on` uses a temporary LaunchAgent to prove bounded write/read/delete access
-to `/Volumes/Workshop/VMs`. Failure leaves participation closed and starts no
+to `/Volumes/<data-volume>/VMs`. Failure leaves participation closed and starts no
 runner. This is private host policy encoded by the M3 profile, not a default
 imposed on TartCI users.
 
@@ -107,7 +107,7 @@ for file in "$out"/*.plist; do plutil -lint "$file"; done
 ssh m1-lan 'mkdir -p "$HOME/Library/Logs/tartci"'
 ```
 
-For M3 (and m5studio, whose store is on `/Volumes/Atelier`), stage the exact
+For M3 (and m5studio, whose store is on `/Volumes/<data-volume>`), stage the exact
 profile-pinned signed launcher alongside the immutable support cohort, then
 install only at a terminal idle boundary:
 
@@ -215,11 +215,13 @@ class derives merge-group `110` or PR-head `100`, preserving merge ordering and
 allowing either class to use reserved gate cores. Fleet validation rejects an
 explicit priority on a V2 lane.
 
-M3 alone renders `TARTCI_MACOS_VM_CORES=12` for Pulp. Its 26-core host budget can
-therefore admit two Pulp guests (`12 + 12`) or one Pulp guest alongside a
-14-core Forge/Vellum guest (`12 + 14`). M1 and M5 retain their host-profile VM
-sizes of 3 and 6 cores. The per-lane override does not resize other repositories'
-guests, reserve a slot while idle, or change Tart's two-macOS-guest hard cap.
+M3 renders `TARTCI_MACOS_VM_CORES=7` for Pulp, so its two Pulp slots fit the
+14-core gate reserve together (`7 + 7`). M5 sizes its Pulp slots from its own
+gate reserve (`vm_cores_from = "gate-reserve"`, rendered as
+`TARTCI_MACOS_VM_CORES_FROM`), which gives `4 + 4` against an 8-core reserve. M1
+retains its host-profile VM size of 3 cores. Neither per-lane setting resizes
+other repositories' guests, reserves a slot while idle, or changes Tart's
+two-macOS-guest hard cap.
 
 The GitHub App wrapper requires explicit repository authority even when the API
 endpoint is organization-scoped for a protected runner group. JIT minting
@@ -253,9 +255,9 @@ needed, run from the source host and plan first:
 ./tartci tart-image-sync \
   --name pulp-build-runner:latest \
   --destination m1-lan --fallback m1 \
-  --source-tart-home /Volumes/Workshop/VMs \
-  --destination-tart-home /Users/danielraffel/VMs \
-  --staging /Volumes/Workshop/VMs/transfers/m1
+  --source-tart-home /Volumes/<data-volume>/VMs \
+  --destination-tart-home /Users/<you>/VMs \
+  --staging /Volumes/<data-volume>/VMs/transfers/m1
 ```
 
 At an authorized idle boundary, add `--apply` to export and checksum a resumable

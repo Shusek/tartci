@@ -150,11 +150,27 @@ tartci_positive_int_or_empty(){
   esac
 }
 
+# Per-slot VM cores for a lane sized from this host's gate reserve
+# (vm_cores_from = "gate-reserve"): gate_reserve_fit.share_cores is the one
+# derivation, shared with the gate-supply and gate-reserve checks. When it
+# cannot be computed tartci_vm_lease_cores fails rather than fall back to
+# vm_pool_cores, which is the overcommitted size the rule exists to avoid.
+tartci_gate_reserve_share_cores(){
+  python3 "$TARTCI_ROOT/scripts/gate_reserve_fit.py" share-cores --slots "${1:-1}"
+}
+
 tartci_vm_lease_cores(){
   local provider="$1" fallback="${2:-}" value="" key="vm_pool_cores"
   case "$provider" in
     tart-macos)
       value="${TARTCI_MACOS_VM_CORES:-${PULP_MACOS_VM_CORES:-}}"
+      if [ -z "$value" ] && [ "${TARTCI_MACOS_VM_CORES_FROM:-}" = "gate-reserve" ]; then
+        value="$(tartci_gate_reserve_share_cores "${TARTCI_MACOS_VM_CORES_SLOTS:-1}" 2>/dev/null || true)"
+        if ! tartci_positive_int_or_empty "$value"; then
+          echo "tartci: gate-reserve VM size unavailable; refusing to size the VM" >&2
+          return 1
+        fi
+      fi
       ;;
     tart-linux)
       value="${TARTCI_LINUX_VM_CORES:-${PULP_LINUX_VM_CORES:-}}"
@@ -482,17 +498,46 @@ if not isinstance(d, dict):
 axis = d.get("exceeded_axis") if isinstance(d.get("exceeded_axis"), dict) else {}
 axes = "+".join(k for k in ("cores", "memory", "disk") if axis.get(k) is True) or "none"
 disk = d.get("disk") if isinstance(d.get("disk"), dict) else {}
+home = d.get("home_volume") if isinstance(d.get("home_volume"), dict) else {}
 def num(v):
     return v if type(v) is int else ""
-print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s" % (
+extra = ""
+if home.get("state") == "below":
+    extra = " volume=home free=%s floor=%s" % (num(home.get("free_bytes")), num(home.get("floor_bytes")))
+print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s%s" % (
     axes, str(d.get("reason") or "unreadable").replace(" ", "_"),
     num(d.get("requested_cores")), num(d.get("requested_mem_mb")),
     num(disk.get("requested_bytes")), num(disk.get("free_bytes")),
-    num(disk.get("required_bytes"))))
+    num(disk.get("required_bytes")), extra))
 ' 2>/dev/null)" || parsed="axis=none reason=unreadable"
   local fields=()
   read -r -a fields <<< "$parsed rc=$rc kind=$kind lease_cores=$cores lease_mem_mb=${mem_mb:-auto} priority=$priority"
   event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
+}
+
+# Events for a grant the home-volume floor did not refuse: `disk_axis_unread`
+# when the volume could not be read (the axis fails open, so the event keeps it
+# from failing silent), and `home_volume_would_refuse` when report mode admitted
+# a lease that refuse mode would have denied (the data that decides the flip).
+tartci_vm_lease_home_unread_event(){
+  local out="$1" line name fields
+  declare -F event >/dev/null 2>&1 || return 0
+  line="$(printf '%s' "$out" | python3 -c 'import json,sys
+try:
+    h = json.load(sys.stdin).get("home_volume") or {}
+except ValueError:
+    h = {}
+if not isinstance(h, dict):
+    h = {}
+if h.get("state") == "unread":
+    print("disk_axis_unread volume=home reason=" + str(h.get("reason") or "unknown").replace(" ", "_"))
+elif h.get("would_refuse"):
+    print("home_volume_would_refuse volume=home free=%s floor=%s" % (h.get("free_bytes"), h.get("floor_bytes")))' 2>/dev/null || true)"
+  [ -n "$line" ] || return 0
+  name="${line%% *}"
+  fields=()
+  read -r -a fields <<< "${line#* }"
+  event "$name" "${line#* }" ${fields[@]+"${fields[@]}"}
 }
 
 # The cores a VM lease of $1 at priority $2 is granted: a non-gate lane is
@@ -688,6 +733,15 @@ tartci_acquire_vm_lease(){
       --disk-floor-mb "$((disk_floor_gb * 1024))"
     )
     [ -z "$disk_expected_device_id" ] || disk_args+=(--disk-expected-device-id "$disk_expected_device_id")
+    # The home volume holds the supervisors' temp files and the build trees; a
+    # VM lease also refuses a new clone while it is below its per-host floor
+    # (scripts/home_volume_floor.py). The host profile's home_volume_floor_mode
+    # (TARTCI_HOME_VOLUME_FLOOR_MODE) is `report` until a day of would-refuse
+    # data shows no false refusals; TARTCI_HOME_VOLUME_FLOOR=0 turns it off.
+    if [ "${TARTCI_HOME_VOLUME_FLOOR:-1}" = 1 ] && [ -n "${HOME:-}" ]; then
+      disk_args+=(--home-floor-path "$HOME" --home-floor-hours "${TARTCI_HOME_VOLUME_FLOOR_HOURS:-1}"
+                  --home-floor-mode "${TARTCI_HOME_VOLUME_FLOOR_MODE:-report}")
+    fi
     [ -z "$disk_expected_mount_path" ] || disk_args+=(--disk-expected-mount-path "$disk_expected_mount_path")
   fi
   lease_id="vm-$kind-$vm_name"
@@ -752,6 +806,7 @@ tartci_acquire_vm_lease(){
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  tartci_vm_lease_home_unread_event "$out"
   if declare -F event >/dev/null 2>&1; then
     event lease_acquired "kind=$kind priority=$priority lease_cores=$cores" \
       "kind=$kind" "priority=$priority" "lease_cores=$cores" "lease_mem_mb=${mem_mb:-auto}"

@@ -73,6 +73,8 @@ class Harness:
             "jit_admission_denied(){ return 1; }\n"
             "tartci_pool_lock_absent(){ return 0; }\n"
             "tartci_job_claim_acquire(){ return 0; }\n"
+            "tartci_vm_dhcp_check(){ return 0; }\n"
+            "tartci_vm_dhcp_record(){ :; }\n"
             "tartci_vm_lease_waiter_register(){ :; }\n"
             "tartci_vm_lease_cores(){ printf '4'; }\n"
             "tartci_vm_lease_mem_mb(){ printf '8192'; }\n"

@@ -2,7 +2,7 @@
 """Refuse a pool mutation that would take the last capacity for a required
 label offline.
 
-`tartci pool drain` and `tartci pool off` stop this host from serving. When
+tartci pool drain and tartci pool off stop this host from serving. When
 this host holds the only runners carrying a required gate label, that mutation
 takes the label to zero runners and every pull request waiting on that gate
 stalls until someone notices. Nothing about the mutation looks wrong while it
@@ -637,7 +637,7 @@ def peer_resolver(
     def read(peer: str, target: str) -> PeerEvidence:
         from bounded_subprocess import ObservationError, run_bounded
 
-        argv = [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        argv = [ssh, "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none",
                 target, PEER_STATUS_COMMAND]
         try:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import datetime as dt
 import json
 import subprocess
@@ -16,6 +17,20 @@ import supply_observed as so
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHED = json.loads((ROOT / "fleet" / "advertised-labels.json").read_text())
+# Keep classifier behavior tests independent of the live publication set.  A
+# host can be intentionally unpublished during an outage, but these tests need
+# a stable m1 PR-head registration to exercise skipped-job demand handling.
+CLASSIFIER_FIXTURE = {
+    **PUBLISHED,
+    "registrations": [
+        *PUBLISHED["registrations"],
+        {"profile": "m1-macos-fleet", "host_id": "m1", "lane": "pulp-gate",
+         "repo": "Generous-Corp/pulp",
+         "assignment_mode": "event-class-v2", "class_label": "pulp-build-pr-head",
+         "labels": ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm",
+                    "pulp-build-pr-head"], "workflows": ["Build and Test"]},
+    ],
+}
 # A recorded, field-trimmed `actions/runs/35792120939/jobs` response
 # (Generous-Corp/pulp, Build and Test, merge_group, 2026-09-22).
 FIXTURE = ROOT / "tests" / "fixtures" / "pulp-build-and-test-run-35792120939-jobs.json"
@@ -74,11 +89,13 @@ class RecordedFixtureTests(unittest.TestCase):
         self.assertEqual(result["jobs_considered"], 3)
         self.assertEqual(verdict(result, "m5", "pulp-gate", "pulp-build-pr-head")["verdict"], so.IDLE)
         # Demand existed and another host served it: NOT_OBSERVED, attributed.
-        m1 = verdict(result, "m1", "pulp-gate", "pulp-build-merge-group")
-        self.assertEqual(m1["verdict"], so.NOT_OBSERVED)
-        self.assertEqual(m1["served_by"], {"studio/pulp-gate": 1})
+        # Read on m5, which declares merge-group whether or not m1 does.
+        m5 = verdict(result, "m5", "pulp-gate", "pulp-build-merge-group")
+        self.assertEqual(m5["verdict"], so.NOT_OBSERVED)
+        self.assertEqual(m5["served_by"], {"studio/pulp-gate": 1})
         self.assertEqual(result["undeclared"], [])
 
+    @testing_support.requires_tomllib
     def test_cli_on_fixture(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "supply_observed.py"), "--repo", REPO,
@@ -121,7 +138,7 @@ class ClassifierTests(unittest.TestCase):
     def test_skipped_jobs_are_not_demand_and_workflow_must_match(self) -> None:
         jobs = [job(None, GATE + ["pulp-build-pr-head"], conclusion="skipped"),
                 job("m5-pulp-gate-01-1-1", GATE + ["pulp-build-pr-head"], workflow="Other")]
-        result = so.classify(PUBLISHED, REPO, jobs)
+        result = so.classify(CLASSIFIER_FIXTURE, REPO, jobs)
         self.assertEqual(verdict(result, "m1", "pulp-gate", "pulp-build-pr-head")["verdict"], so.IDLE)
         self.assertEqual(len(result["undeclared"]), 1)
         self.assertIn("GitHub assigns by labels alone", result["undeclared"][0]["why"])

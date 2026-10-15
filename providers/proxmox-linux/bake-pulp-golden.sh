@@ -12,6 +12,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST="$ROOT/manifests/pulp.linux.toml"
 RENDER_VERIFIER="$ROOT/providers/common/pulp-render-generation.py"
 SOURCE_PIN_RESOLVER="$ROOT/providers/common/pulp-source-pin.py"
+# The resolver imports tomllib; an operator ssh shell may resolve python3 to 3.9.
+# shellcheck source=../common/toml-python.lib.sh
+. "$ROOT/providers/common/toml-python.lib.sh"
 BINDING_COMMAND="$ROOT/providers/common/pulp-vmid-binding-command.py"
 QM_BIN="${TARTCI_QM_BIN:-qm}"
 PVESH_BIN="${TARTCI_PVESH_BIN:-pvesh}"
@@ -78,7 +81,7 @@ command -v "$SSH_BIN" >/dev/null 2>&1 || die "ssh not found: $SSH_BIN"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v flock >/dev/null 2>&1 || die "flock is required"
 
-source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+source_identity="$(tartci_toml_python "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
   --require-skia-release chrome/m153 \
   --require-v8-disposition baked-provider-only)" \
   || die "could not resolve immutable Pulp source from $MANIFEST"

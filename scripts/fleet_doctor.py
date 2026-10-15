@@ -60,19 +60,32 @@ CODES: tuple[str, ...] = (
     "census_module_unavailable",
     "census_repo_unknown",
     "delivery_unknown",
+    "disk_axis_unread",
+    "disk_floor_refusing",
     "effective_generation_matches",
     "effective_generation_mismatch",
     "fleet_not_ready",
     "fleet_ready",
+    "gate_reserve_fits",
+    "gate_reserve_not_applicable",
+    "gate_reserve_overcommitted",
+    "gate_reserve_unknown",
     "generation_path_exec",
     "hold_receipt_malformed",
     "hold_receipt_present",
+    "home_volume_floor_not_judged",
+    "home_volume_floor_ok",
     "host_agents_missing",
     "host_agents_not_applicable",
     "host_agents_ok",
     "host_agents_unreadable",
     "installed_generation_unknown",
     "lane_lease_never_fits",
+    "lane_python_no_tomllib",
+    "lane_python_not_applicable",
+    "lane_python_tomllib",
+    "lane_python_unknown",
+    "lane_python_unavailable",
     "lanes_exceed_lease_capacity",
     "launchd_registration_leaked",
     "launchd_registrations_ok",
@@ -87,14 +100,20 @@ CODES: tuple[str, ...] = (
     "no_installed_profile",
     "no_managed_launchagents",
     "no_persistent_runners",
+    "peer_reachability_ok",
+    "peer_reachability_unreadable",
+    "peer_unreachable",
+    "peer_unreachable_excluded",
+    "pf_not_applicable",
+    "pf_boot_holder_missing",
+    "pf_pfd_exiting",
+    "pf_reference_missing",
+    "pf_reference_ok",
+    "pf_reference_unknown",
     "persistent_runners_without_hold_receipt",
     "power_ok",
     "power_sleeps",
     "power_unknown",
-    "signing_prompts_not_applicable",
-    "signing_prompts_ok",
-    "signing_prompts_risk",
-    "signing_prompts_unknown",
     "profile_drift",
     "profile_drift_unknown",
     "profile_in_sync",
@@ -119,21 +138,41 @@ CODES: tuple[str, ...] = (
     "reuse_canary_unreadable",
     "sealed_launcher_bundle",
     "self_update_current",
+    "self_update_paused",
     "self_update_problem",
     "self_update_unmeasured",
+    "signing_prompts_not_applicable",
+    "signing_prompts_ok",
+    "signing_prompts_risk",
+    "signing_prompts_unknown",
+    "supply_match",
+    "supply_mismatch",
+    "supply_unknown",
     "support_agents_drift",
     "support_agents_never",
     "support_agents_ok",
     "support_agents_pending",
     "support_agents_unreadable",
-    "supply_match",
-    "supply_mismatch",
-    "supply_unknown",
     "tool_freshness_current",
     "tool_freshness_stale",
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_janitor_loaded",
+    "vm_janitor_missing",
+    "vm_janitor_unknown",
+    "vm_boot_degraded",
+    "vm_boot_ok",
+    "vm_boot_unmeasured",
+    "vm_boot_unreadable",
+    "vm_dhcp_bootpd_not_loaded",
+    "vm_dhcp_config_disabled",
+    "vm_dhcp_ok",
+    "vm_dhcp_pfd_crash_loop",
+    "vm_dhcp_unanswered",
+    "vm_dhcp_unreadable",
+    "vm_dhcp_verifying",
+    "vm_dhcp_vm_network_missing",
     "warm_vm_none",
     "warm_vm_overdue",
     "warm_vm_parked",
@@ -380,7 +419,7 @@ def read_hold_receipt(path: Path) -> tuple[bool | None, str]:
 
 def check_drain_capability(agents_dir: Path, hold_file: Path,
                            *, agents_dir_readable: bool = True) -> Finding:
-    """Report whether `tartci pool drain` can complete, BEFORE a deploy starts.
+    """Report whether tartci pool drain can complete, BEFORE a deploy starts.
 
     Drain is not atomic. It writes participation=0 and pool-state=draining and
     only then discovers it cannot quiesce a persistent Actions listener, so a
@@ -547,13 +586,53 @@ def check_readiness(probes: dict[str, dict], *, authority: str) -> Finding:
         return Finding(check, OK, "fleet_ready",
                        "the installed generation reports the fleet ready", facts)
     if ready is False:
-        codes = ", ".join(
-            str(problem.get("code")) for problem in problems if isinstance(problem, dict)
+        codes = "; ".join(
+            describe_readiness_problem(problem)
+            for problem in problems if isinstance(problem, dict)
         ) or "no problem code was reported"
         return Finding(check, PROBLEM, "fleet_not_ready",
                        f"the fleet is not ready: {codes}", facts)
     return Finding(check, UNKNOWN, "readiness_probe_failed",
                    "the readiness probe returned no fleet_ready verdict", facts)
+
+
+LANE_LABEL_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
+
+
+def describe_readiness_problem(problem: dict) -> str:
+    """One readiness problem as `code (lane, detail)`.
+
+    The bare code was all the finding used to print, so m1 read
+    `heartbeat_stale, heartbeat_stale` with no word of which supervisor or how
+    stale, and the operator had to re-run the probe to learn either. The probe
+    already carries both: `label` is the lane's launchd label, `detail` is
+    `age_seconds=N` for a heartbeat problem and free text for the rest.
+    """
+    code = str(problem.get("code"))
+    parts = []
+    label = str(problem.get("label") or "")
+    if label:
+        parts.append(label[len(LANE_LABEL_PREFIX):] if label.startswith(LANE_LABEL_PREFIX)
+                     else label)
+    detail = str(problem.get("detail") or "")
+    if detail.startswith("age_seconds="):
+        try:
+            seconds = int(detail.split("=", 1)[1])
+        except ValueError:
+            parts.append(detail)
+        else:
+            parts.append(f"heartbeat {_age_words(seconds)} old")
+    elif detail:
+        parts.append(detail)
+    return f"{code} ({', '.join(parts)})" if parts else code
+
+
+def _age_words(seconds: int) -> str:
+    if seconds < 120:
+        return f"{seconds}s"
+    if seconds < 7200:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
 # ── Assembly ───────────────────────────────────────────────────────────────
@@ -728,8 +807,14 @@ def check_self_update(summary: dict | None) -> Finding:
     if not isinstance(summary, dict) or summary.get("skew") is None:
         return Finding("self_update", UNKNOWN, "self_update_unmeasured",
                        "tartci's skew against main was never measured on this host "
-                       "(run `tartci fleet-macos self-update --plan`)")
+                       "(run tartci fleet-macos self-update --plan)")
     lines = "; ".join(summary.get("lines") or [])
+    if summary.get("paused"):
+        # Not a failed update: launchd is not starting it and the interval
+        # guard holds it for the stall, so "read the receipt" finds nothing.
+        return Finding("self_update", PROBLEM, "self_update_paused",
+                       f"{summary['paused']} ({lines})", {"skew": summary.get("skew"),
+                                                          "last": summary.get("last")})
     if summary.get("problem"):
         return Finding("self_update", PROBLEM, "self_update_problem",
                        f"{summary['problem']} ({lines})", {"skew": summary.get("skew"),
@@ -738,12 +823,69 @@ def check_self_update(summary: dict | None) -> Finding:
                    {"skew": summary.get("skew"), "last": summary.get("last")})
 
 
+def check_gate_reserve(value: dict | None, *, installed_present: bool) -> Finding:
+    """Each gate lane against this host's live gate reserve (gate_reserve_fit.py)."""
+    if not installed_present:
+        return Finding("gate_reserve", NOT_APPLICABLE, "gate_reserve_not_applicable",
+                       "no installed fleet profile")
+    value = value or {}
+    lines = value.get("lines") or []
+    if value.get("problem"):
+        return Finding("gate_reserve", PROBLEM, "gate_reserve_overcommitted",
+                       f"{value['problem']}; resizing is a profile decision with the host's "
+                       "owner and must not take agent cores", {"gate_reserve": value})
+    if not lines or "UNKNOWN" in lines[0]:
+        return Finding("gate_reserve", UNKNOWN, "gate_reserve_unknown",
+                       lines[0] if lines else "not computed", {"gate_reserve": value})
+    if lines[0].startswith("gate reserve: n/a"):
+        # Gate lanes with no reserve to fit them in: unmeasurable, not a fit.
+        return Finding("gate_reserve", NOT_APPLICABLE, "gate_reserve_not_applicable",
+                       lines[0], {"gate_reserve": value})
+    return Finding("gate_reserve", OK, "gate_reserve_fits", "; ".join(lines),
+                   {"gate_reserve": value})
+
+
+def check_home_volume(value: dict | None, *, lanes: int, now: float | None = None,
+                      unread_after_s: float = 3600) -> Finding:
+    """The home-volume admission floor (scripts/home_volume_floor.py).
+
+    A floor that refuses everything looks exactly like a full disk from
+    outside, so a refusal streak as long as this host's lane count is its own
+    problem; so is an axis that has not been readable for a reclaim cadence,
+    because every admission in that time skipped it.
+    """
+    now = time.time() if now is None else now
+    if not value:
+        return Finding("home_volume", NOT_APPLICABLE, "home_volume_floor_not_judged",
+                       "no VM admission has judged the home volume (it is the Tart store's "
+                       "own volume, or no lease has been taken since this check existed)")
+    facts = {"home_volume": {k: v for k, v in value.items() if k != "samples"}}
+    since = value.get("unread_since")
+    if isinstance(since, (int, float)) and now - since >= unread_after_s:
+        return Finding("home_volume", PROBLEM, "disk_axis_unread",
+                       f"the home volume has not been readable for {(now - since) / 3600:.1f} h; "
+                       f"every VM admission in that time skipped it "
+                       f"({value.get('unread_reason')})", facts)
+    last = value.get("last") or {}
+    streak = int(value.get("consecutive_denials") or 0)
+    gib = 1024 ** 3
+    text = (f"free {last.get('free_bytes', 0) / gib:.0f} GiB, floor "
+            f"{last.get('floor_bytes', 0) / gib:.0f} GiB")
+    if streak >= max(1, lanes):
+        return Finding("home_volume", PROBLEM, "disk_floor_refusing",
+                       f"{streak} VM admissions in a row below the home-volume floor "
+                       f"({text}; refused, or would-refuse in report mode); reclaim the "
+                       f"volume, or the floor is wrong", facts)
+    return Finding("home_volume", OK, "home_volume_floor_ok",
+                   f"{text}; {streak} consecutive refusals", facts)
+
+
 def check_tool_freshness(summary: dict | None) -> Finding:
     """Shipyard and the pulp CLI against their latest releases."""
     if not isinstance(summary, dict) or summary.get("state") is None:
         return Finding("tool_freshness", UNKNOWN, "tool_freshness_unmeasured",
                        "tool freshness was never measured on this host "
-                       "(run `tartci fleet-macos tool-freshness --refresh`)")
+                       "(run tartci fleet-macos tool-freshness --refresh)")
     lines = "; ".join(summary.get("lines") or [])
     if summary.get("problem"):
         return Finding("tool_freshness", PROBLEM, "tool_freshness_stale",
@@ -792,7 +934,7 @@ def check_launchd_registrations(rows: list[dict] | None, *, home: Path,
     """Every loaded tartci LaunchAgent must come from <home>/Library/LaunchAgents.
 
     `rows` is [{"label", "path"}] for each loaded job whose label carries a
-    tartci prefix; `path` is launchd's own record of the plist it loaded (None
+    tartci prefix; path is launchd's own record of the plist it loaded (None
     when launchd holds no path for it). None means launchd could not be asked.
     """
     if rows is None:
@@ -979,6 +1121,36 @@ def check_support_agents(value: dict | None) -> list[Finding]:
     return [found, extra]
 
 
+VM_JANITOR = "reap"
+
+
+def check_vm_janitor(value: dict | None) -> Finding:
+    """Whether the VM janitor (com.danielraffel.tartci.reap) is installed and loaded.
+
+    Without it a stale VM or overlay stays until someone notices: on
+    2026-10-09 it was loaded on m3 only, while every profile declared it,
+    because `bootstrap = false` kept the support-agents step to a plan.
+    """
+    value = value or {"state": "unreadable"}
+    facts = {"vm_janitor": (value.get("agents") or {}).get(VM_JANITOR)}
+    if value.get("state") in (None, "unreadable", "never"):
+        return Finding("vm_janitor", UNKNOWN, "vm_janitor_unknown",
+                       "no readable support-agents receipt to say whether the VM janitor "
+                       "is installed", facts)
+    if VM_JANITOR not in (value.get("declared") or []):
+        return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                       "the VM janitor (reap) is not declared in this host's profile", facts)
+    entry = (value.get("agents") or {}).get(VM_JANITOR) or {}
+    # `changes` is support_agents.status's verdict, which accounts for what an
+    # apply pass installed; the per-agent state is what the pass found before.
+    if VM_JANITOR not in (value.get("changes") or []):
+        return Finding("vm_janitor", OK, "vm_janitor_loaded",
+                       "the VM janitor (reap) is installed and loaded", facts)
+    return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                   f"the VM janitor (reap) is declared but {entry.get('state') or 'unknown'}"
+                   f"{'' if entry.get('loaded') else ', not loaded'}", facts)
+
+
 def check_reuse_canary(value: dict | None) -> Finding:
     """Whether the reuse canary keeps a bindable record (scripts/reuse_canary.py)."""
     value = value or {"state": "unreadable", "error": "no status"}
@@ -1015,6 +1187,84 @@ def check_reuse_canary(value: dict | None) -> Finding:
                    f"reuse canary status unreadable: {value.get('error')}", facts)
 
 
+def check_lane_python(value: dict | None) -> Finding:
+    """`python3` on each lane's PATH imports tomllib (scripts/lane_python.py)."""
+    if value is None or value.get("error"):
+        return Finding("lane_python", UNKNOWN, "lane_python_unknown",
+                       f"lane python3 not probed: {(value or {}).get('error', 'no status')}",
+                       {"lane_python": value})
+    rows = value.get("rows") or []
+    facts = {"lane_python": value}
+    if not rows:
+        return Finding("lane_python", NOT_APPLICABLE, "lane_python_not_applicable",
+                       "no installed lane plist names a PATH", facts)
+    bad = [row for row in rows if row.get("tomllib") is False]
+    if bad:
+        parts = [(f"{row['python']} {row.get('version') or '(version unread)'}"
+                  if row.get("python") else "no python3")
+                 + f" for {', '.join(row.get('labels') or [])}" for row in bad]
+        return Finding("lane_python", PROBLEM, "lane_python_no_tomllib",
+                       "python3 on the lane PATH cannot import tomllib: " + "; ".join(parts)
+                       + ". Lanes run gate_supply decide, macos_fleet_lanes render and "
+                       "host_profile with it, and those die on import tomllib", facts)
+    unread = [row for row in rows if row.get("tomllib") is None]
+    if unread:
+        return Finding("lane_python", UNKNOWN, "lane_python_unknown",
+                       "; ".join(f"{row.get('python')}: {row.get('error')}" for row in unread),
+                       facts)
+    return Finding("lane_python", OK, "lane_python_tomllib",
+                   "; ".join(f"{row['python']} {row['version']}" for row in rows), facts)
+
+
+def check_vm_dhcp(value: dict | None) -> Finding:
+    """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py owns its codes)."""
+    import vm_dhcp_breaker  # noqa: PLC0415 - sibling module; owns the codes
+    value = value or {"state": "unreadable", "error": "no status"}
+    state, code, detail = vm_dhcp_breaker.doctor_code(value)
+    return Finding("vm_dhcp", {"ok": OK, "problem": PROBLEM}.get(state, UNKNOWN), code, detail,
+                   {"vm_dhcp": value})
+
+
+def check_vm_boot(value: dict | None, *, lanes: int, now: float | None = None) -> Finding:
+    """The host's VM boot success and outage record (vm_dhcp_breaker.boot_health)."""
+    import vm_dhcp_breaker  # noqa: PLC0415 - sibling module; owns the codes
+    value = value or {"state": "unreadable", "error": "no status"}
+    state, code, detail = vm_dhcp_breaker.boot_health(
+        value, time.time() if now is None else now, lanes)
+    return Finding("vm_boot", {"ok": OK, "problem": PROBLEM,
+                               "not_applicable": NOT_APPLICABLE}.get(state, UNKNOWN),
+                   code, detail, {"lanes": lanes, "hourly_hours": len(value.get("hourly") or {}),
+                                  "outages": (value.get("outages") or [])[-5:]})
+
+
+def check_peer_reachability(value: dict | None) -> Finding:
+    """Peers this host could not read at its last self-update survey."""
+    value = value or {"state": "unreadable", "error": "no status", "peers": {}}
+    facts = {"peer_reachability": value}
+    if value.get("state") == "unreadable":
+        return Finding("peer_reachability", UNKNOWN, "peer_reachability_unreadable",
+                       f"the unreachable-peer record is unreadable: {value.get('error')}", facts)
+    peers = value.get("peers") or {}
+    if not peers:
+        return Finding("peer_reachability", OK, "peer_reachability_ok",
+                       "every peer was readable at the last self-update survey", facts)
+
+    def since(row: dict) -> str:
+        ts = row.get("since")
+        return (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+                if isinstance(ts, (int, float)) else "?")
+
+    excluded = sorted(p for p, row in peers.items() if row.get("excluded"))
+    rows = "; ".join(f"{p} since {since(row)} ({row.get('reads')} reads"
+                     + (", excluded from update turns)" if row.get("excluded") else ")")
+                     for p, row in sorted(peers.items()))
+    if excluded:
+        return Finding("peer_reachability", PROBLEM, "peer_unreachable_excluded",
+                       f"unreachable peers no longer hold the update turn: {rows}", facts)
+    return Finding("peer_reachability", PROBLEM, "peer_unreachable",
+                   f"unreachable peers still hold the update turn: {rows}", facts)
+
+
 def check_power(value: dict | None) -> Finding:
     """Whether the host stays awake on AC (scripts/power_status.py)."""
     import power_status
@@ -1029,6 +1279,27 @@ def check_power(value: dict | None) -> Finding:
     return Finding("power", UNKNOWN, "power_unknown", detail, facts)
 
 
+def check_pf_reference(value: dict | None) -> Finding:
+    """Whether pf holds an enable reference for the VM network (scripts/pf_reference.py)."""
+    import pf_reference  # noqa: PLC0415 - sibling module; owns the states
+
+    value = value or {"state": "unknown"}
+    detail = pf_reference.describe(value)
+    facts = {"pf_reference": value}
+    state = value.get("state")
+    if state == "ok":
+        return Finding("pf_reference", OK, "pf_reference_ok", detail, facts)
+    if state == "no_reference":
+        return Finding("pf_reference", PROBLEM, "pf_reference_missing", detail, facts)
+    if state == "pfd_exiting":
+        return Finding("pf_reference", PROBLEM, "pf_pfd_exiting", detail, facts)
+    if state == "holder_missing":
+        return Finding("pf_reference", PROBLEM, "pf_boot_holder_missing", detail, facts)
+    if state == "not_applicable":
+        return Finding("pf_reference", NOT_APPLICABLE, "pf_not_applicable", detail, facts)
+    return Finding("pf_reference", UNKNOWN, "pf_reference_unknown", detail, facts)
+
+
 def check_signing_prompts(value: dict | None, home: Path) -> Finding:
     """Whether the keychain setup can raise a password dialog (signing_prompt_guard.py)."""
     import signing_prompt_guard
@@ -1037,7 +1308,8 @@ def check_signing_prompts(value: dict | None, home: Path) -> Finding:
         try:
             value = signing_prompt_guard.status(home)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
-            value = {"state": "unknown", "detail": str(exc)}
+            import secret_files
+            value = {"state": "unknown", "detail": secret_files.redact(exc, home)}
     facts = {"signing_prompts": value}
     state = value.get("state")
     if state == "not_applicable":
@@ -1270,9 +1542,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
             launchd_timers_value: dict | None = None,
+            vm_dhcp_value: dict | None = None,
+            lane_python_value: dict | None = None,
+            peer_reachability_value: dict | None = None,
             support_agents_value: dict | None = None,
             reuse_canary_value: dict | None = None,
             power_value: dict | None = None,
+            pf_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
@@ -1328,6 +1604,15 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception:  # noqa: BLE001 - reported as unmeasured
             self_update_summary = None
     findings.append(check_self_update(self_update_summary))
+    if config.is_file():
+        try:
+            import macos_fleet_lanes
+            reserve_value = macos_fleet_lanes.gate_reserve_summary(config)
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            reserve_value = {"lines": [f"gate reserve: UNKNOWN ({exc})"], "problem": None}
+    else:
+        reserve_value = None
+    findings.append(check_gate_reserve(reserve_value, installed_present=config.is_file()))
     if tool_freshness_summary is None:
         try:
             import tool_freshness
@@ -1343,6 +1628,24 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     else:
         fit_records, fit_missing, managed = [], [], False
     findings.append(check_lease_fit(fit_records, fit_missing, managed=managed))
+    if lane_python_value is None:
+        if readable:
+            try:
+                import lane_python
+                lane_python_value = lane_python.status(
+                    agents_dir, host_profile.FLEET_LABEL_PREFIX)
+            except Exception as exc:  # noqa: BLE001 - reported as unprobed
+                lane_python_value = {"error": f"{type(exc).__name__}: {exc}"}
+        else:
+            lane_python_value = {"error": "agents directory unreadable"}
+    findings.append(check_lane_python(lane_python_value))
+    try:
+        import home_volume_floor
+        import leases
+        home_value = home_volume_floor.status(leases.default_store_dir())
+    except Exception:  # noqa: BLE001 - an unreadable state reads as not judged
+        home_value = {}
+    findings.append(check_home_volume(home_value, lanes=len(fit_records)))
     try:
         import warm_vm_status
         warm_value = warm_vm_status.status(home / ".tartci/state/warm-vm")
@@ -1373,6 +1676,21 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             launchd_timers_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_launchd_timers(launchd_timers_value))
+    if vm_dhcp_value is None:
+        try:
+            import vm_dhcp_breaker
+            vm_dhcp_value = vm_dhcp_breaker.status(home / ".tartci" / "state" / "vm-dhcp")
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            vm_dhcp_value = {"state": "unreadable", "error": str(exc)}
+    findings.append(check_vm_dhcp(vm_dhcp_value))
+    findings.append(check_vm_boot(vm_dhcp_value, lanes=len(fit_records)))
+    if peer_reachability_value is None:
+        try:
+            import fleet_self_update
+            peer_reachability_value = fleet_self_update.peer_reachability(home)
+        except Exception as exc:  # noqa: BLE001 - reported as unreadable
+            peer_reachability_value = {"state": "unreadable", "error": str(exc), "peers": {}}
+    findings.append(check_peer_reachability(peer_reachability_value))
     if support_agents_value is None:
         try:
             import support_agents
@@ -1381,6 +1699,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             support_agents_value = {"state": "unreadable", "error": str(exc)}
     findings.extend(check_support_agents(support_agents_value))
+    findings.append(check_vm_janitor(support_agents_value))
     if reuse_canary_value is None:
         try:
             import reuse_canary
@@ -1398,6 +1717,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unknown
             power_value = {"state": "unknown", "error": str(exc)}
     findings.append(check_power(power_value))
+    if pf_value is None:
+        try:
+            import pf_reference
+            pf_value = pf_reference.status(len(fit_records), vm_dhcp_value)
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            pf_value = {"state": "unknown", "error": str(exc)}
+    findings.append(check_pf_reference(pf_value))
     findings.append(check_signing_prompts(signing_prompts_value, home))
 
     def default_tmp_probe(profile: Path) -> tuple[dict | None, str]:

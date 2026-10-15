@@ -7,6 +7,7 @@ Every fixture is a real git repository under a temp dir standing in for
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import pathlib
@@ -258,6 +259,7 @@ class MultiRootTests(Fixture):
         path.write_text(body)
         return path
 
+    @testing_support.requires_tomllib
     def test_both_roots_are_swept_and_reported_per_root(self) -> None:
         worktrees = self.base / "agent-worktrees"
         worktrees.mkdir()
@@ -276,12 +278,40 @@ class MultiRootTests(Fixture):
         self.assertEqual(sorted(report["by_root"]), sorted([str(self.tmp), str(worktrees)]))
         self.assertEqual(report["by_root"][str(worktrees)]["removed"], 1)
 
+    @testing_support.requires_tomllib
     def test_worktree_root_is_opt_in_and_needs_a_root(self) -> None:
         self.assertTrue(pr.validate_table({"worktree_root_checkouts": True}))
         self.assertEqual(pr.validate_table({"worktree_root_checkouts": True,
                                             "worktrees_root": "/Volumes/W/agent-worktrees"}), [])
         settings, _ = tc.load_settings(self.profile("[reclaim]\ntmp_checkouts = true\n"))
         self.assertEqual(len(settings["roots"]), 1)
+
+    @testing_support.requires_tomllib
+    def test_an_extra_root_reaps_worktrees_and_keeps_every_clone(self) -> None:
+        # m5s's internal ~/Code: agents' worktrees of an old primary checkout
+        # sit beside that checkout and other real clones.
+        code = self.base / "Code"
+        code.mkdir()
+        git(self.parent, "worktree", "add", "-q", "--detach", str(code / "pulp-done-wt"),
+            "origin/main")
+        age(code / "pulp-done-wt", 3)
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(code / "Shipyard")],
+                       check=True)
+        age(code / "Shipyard", 30)
+        profile = self.profile(f'[reclaim]\nextra_worktree_roots = ["{code}"]\n')
+        with mock.patch.object(tc, "process_cwds", return_value=["/"]):
+            report = tc.run(fix=True, profile=profile, in_use=lambda p: False,
+                            verdicts=self.base / "verdicts.json")
+        self.assertEqual(report["removed"], 1, report)
+        self.assertFalse((code / "pulp-done-wt").exists())
+        self.assertTrue((code / "Shipyard").exists())
+        self.assertEqual(report["by_root"][str(code)]["kept"], {"clone_in_shared_root": 1})
+        self.assertNotIn(str(code / "pulp-done-wt"), git(self.parent, "worktree", "list"))
+
+    def test_extra_roots_validate(self) -> None:
+        self.assertEqual(pr.validate_table({"extra_worktree_roots": ["/Users/x/Code"]}), [])
+        for bad in ("/Users/x/Code", ["Code"], ["/"], ["/Users/../etc"], [1]):
+            self.assertTrue(pr.validate_table({"extra_worktree_roots": bad}), bad)
 
     def test_only_m3_sweeps_its_worktree_root(self) -> None:
         # m1 and m5 keep worktrees beside their primary checkouts in ~/Code,

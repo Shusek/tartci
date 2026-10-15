@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
+import contextlib
+import io
 import json
 import os
 import plistlib
@@ -47,14 +51,18 @@ class FakeSystem(su.System):
         self.pool_state = "on"
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.install_rcs = [0]         # successive `install --apply` exit codes
+        self.dry_run_rc = 0
+        self.preflight_rc = 0
         self.floor = {"allowed": True, "reason": "", "findings": []}
         # Keyed by SSH target (what the peer resolves to), not host_id.
         self.peers = {"m1": {"state": "on", "participating": True},
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
+        self.peer_status_errors: dict[str, str] = {}
         self.peer_markers: dict[str, dict] = {}
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
+        self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
@@ -69,6 +77,9 @@ class FakeSystem(su.System):
         self.on_sleep = None           # called with the seconds of every sleep()
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
+        self.remote_url = su.REPO_URL + "\n"
+        self.api_repository = su.DEFAULT_REPOSITORY
+        self.unreadable_repositories: set[str] = set()
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -82,6 +93,7 @@ class FakeSystem(su.System):
 
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
+        self.cat_file_rc = 0
         self.relay = {"ok": True, "probe": "relay authenticated"}
         self.status_after_on = {"state": "on", "participating": True,
                                 "fleet": {"managed": True, "fleet_ready": True,
@@ -94,11 +106,16 @@ class FakeSystem(su.System):
         self.agents_check_rc = 0
         self.agents_rc = 0
         self.agents_raises = False
+        self.vm_verify_rc = 0
+        self.vm_verify_calls: list[list[str]] = []
         self.installed_after = None    # commit the host executes after install
         self.checked_out = None
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
+        self.launchd_print = None
+        self.target_orchestrator_rc = 0
+        self.target_orchestrator_calls: list[list[str]] = []
 
     def now(self) -> float:
         return self.clock
@@ -132,15 +149,26 @@ class FakeSystem(su.System):
 
     def run(self, argv, *, cwd=None, env=None, timeout=900):  # noqa: C901
         self.calls.append((list(argv), cwd))
+        self.env_calls = getattr(self, "env_calls", [])
+        self.env_calls.append(dict(env or {}))
         a = list(argv)
         joined = " ".join(a)
         if self.hook:
             self.hook(a)
+        if a[:2] == ["launchctl", "print"]:
+            return self.launchd_print or su.Result(1, "", "not configured")
         if a[0] == FAKE_GH:
-            sha = a[2].split("/commits/")[1].split("/")[0]
-            runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
-                                          "conclusion": "success"}])
-            return ok(json.dumps({"check_runs": runs}))
+            repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if repository in self.unreadable_repositories:
+                return su.Result(1, "", "not found")
+            if "check-runs" in a[2]:
+                sha = a[2].split("/commits/")[1].split("/")[0]
+                runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
+                                              "conclusion": "success"}])
+                return ok(json.dumps({"check_runs": runs}))
+            if "/commits/" not in a[2]:
+                return ok(json.dumps({"full_name": self.api_repository}))
+            return ok(json.dumps({"sha": a[2].split("/")[-1]}))
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
@@ -165,28 +193,43 @@ class FakeSystem(su.System):
                 ref = a[-1].split("^")[0]
                 return ok((ref if su.SHA.fullmatch(ref) else T_NEW) + "\n")
             if "cat-file" in a:
-                return ok()
+                return su.Result(self.cat_file_rc, "", "missing commit" if self.cat_file_rc else "")
             if "merge-base" in a:
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
-                return ok(self.log_lines)
+                # Honour `base..main` the way git does: commits newer than base.
+                base = next((x.split("..")[0] for x in a if ".." in x), None)
+                lines = self.log_lines.splitlines(keepends=True)
+                cut = next((i for i, line in enumerate(lines) if base and line.startswith(base)),
+                           len(lines))
+                return ok("".join(lines[:cut]))
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
-                return ok(su.REPO_URL + "\n")
+                return ok(self.remote_url)
             if "checkout" in a:
                 self.checked_out = a[-1]
             return ok()
         if a[0] == "ssh":
-            peer = a[5]
+            # The target is the first argument that is neither an option nor
+            # an option's value, wherever the options end.
+            i = 1
+            while a[i].startswith("-"):
+                i += 2 if a[i] in ("-o", "-i", "-p") else 1
+            peer = a[i]
             if "pool status" in a[-1]:
+                if peer in self.peer_status_errors:
+                    return su.Result(255, "", self.peer_status_errors[peer])
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
             ticket = self.peer_waiting.get(peer)
+            pool_since = self.peer_pool_since.get(peer)
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
-                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else ""))
+                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
+                      + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
+                         if pool_since is not None else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -197,7 +240,7 @@ class FakeSystem(su.System):
             return su.Result(self.snapshot_verify_rc, "{}", "" if self.snapshot_verify_rc == 0
                              else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
-            return self._render(a)
+            return self._render(a, env)
         if a[:3] == ["python3", "scripts/support_agents.py", "check-templates"]:
             return su.Result(self.agents_check_rc, "4 declared agents render" if
                              self.agents_check_rc == 0 else "reclaim: missing template")
@@ -210,7 +253,7 @@ class FakeSystem(su.System):
         if a[0] == "security":
             return ok(f'  1) {IDENTITY} "Developer ID Application: X (95CX6P84C4)"\n')
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
-            return self._build(a)
+            return self._build(a, env)
         if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
             if a[1:] == ["writer-domain-exec", "--help"]:
                 return ok() if self.writer_domain_exec else su.Result(2, "", "unrecognized subcommand")
@@ -229,6 +272,10 @@ class FakeSystem(su.System):
 
     # ── fakes for tartci subcommands ────────────────────────────────────
     def _tartci(self, args):
+        if args[:2] == ["fleet-macos", "self-update"]:
+            self.target_orchestrator_calls.append(list(args))
+            return su.Result(self.target_orchestrator_rc, "target orchestrator", ""
+                             if self.target_orchestrator_rc == 0 else "target refused")
         if args[:2] == ["support-manifest", "write"]:
             manifest = self.home / ".local/share/tartci/update-checkout/.tartci-support-manifest.json"
             (manifest.parent / "scripts").mkdir(parents=True, exist_ok=True)
@@ -240,7 +287,11 @@ class FakeSystem(su.System):
             return ok("valid")
         if args[:2] == ["fleet-macos", "install"]:
             if "--apply" not in args:
-                return ok("dry run")
+                if "--preflight" in args:
+                    return su.Result(self.preflight_rc, "preflight ok" if self.preflight_rc == 0 else "preflight rejected",
+                                     "" if self.preflight_rc == 0 else "installer preflight failed")
+                return su.Result(self.dry_run_rc, "dry run" if self.dry_run_rc == 0 else "preflight rejected",
+                                 "" if self.dry_run_rc == 0 else "installer preflight failed")
             if self.checked_out == INSTALLED:  # a rollback reinstall
                 if self.rollback_install_rc == 0:
                     self._set_installed(INSTALLED)
@@ -319,6 +370,10 @@ class FakeSystem(su.System):
                 raise OSError("shim vanished")
             return su.Result(self.agents_rc, "support agents: ok" if self.agents_rc == 0
                              else "support agents: drift")
+        if args[:2] == ["vm-dhcp", "verify"]:
+            self.vm_verify_calls.append(list(args))
+            return su.Result(self.vm_verify_rc, '{"action": "verifying"}' if self.vm_verify_rc == 0
+                             else "breaker unreadable")
         raise AssertionError(f"unexpected shim {args}")
 
     def _set_installed(self, commit):
@@ -329,21 +384,27 @@ class FakeSystem(su.System):
             receipt = self.home / ".config/tartci/macos-fleet-install.json"
             receipt.write_text(json.dumps({"support": {"source_commit": commit}}))
 
-    def _render(self, a):
+    def _render(self, a, env=None):
         proc = subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), *a[2:]],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env={**os.environ, **(env or {})})
         return su.Result(proc.returncode, proc.stdout, proc.stderr)
 
-    def _build(self, a):
+    def _build(self, a, env=None):
         out = Path(a[a.index("--output") + 1])
         approval = Path(a[a.index("--approval-output") + 1])
         profile = Path(a[a.index("--profile") + 1])
         rendered = out.parent / "render"
+        render_env = {**os.environ, **(env or {})}
+        render_env["TARTCI_RENDER_PYTHON"] = a[a.index("--python") + 1]
         subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), "render",
-                        str(profile), "--output", str(rendered)], check=True, capture_output=True)
+                        str(profile), "--output", str(rendered)], check=True,
+                       capture_output=True, env=render_env)
         lanes = {}
         for plist in rendered.glob("*.plist"):
             env = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
+            expected = os.path.realpath(render_env["TARTCI_RENDER_PYTHON"])
+            assert env["TARTCI_PYTHON"] == expected
+            assert env["SHIPYARD_GHAPP_PYTHON_BINARY"] == expected
             lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
         res = out / "Contents" / "Resources"
         res.mkdir(parents=True)
@@ -395,8 +456,12 @@ class Base(unittest.TestCase):
         # never call ghapp.
         import host_off
         self.issues: list[tuple[str, str]] = []
-        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t)) or (0, "77")),
-                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed"))):
+        self.bodies: list[str] = []
+        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t))
+                            or self.bodies.append(b) or (0, "77")),
+                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed")),
+                           ("_patch_issue_body", lambda n, b: self.issues.append(("patch", n))
+                            or self.bodies.append(b) or (0, n))):
             original = getattr(host_off, name)
             setattr(host_off, name, fake)
             self.addCleanup(setattr, host_off, name, original)
@@ -434,6 +499,13 @@ class Base(unittest.TestCase):
         self.assertEqual(rc, su.EXIT_DEFERRED)
         ticket = json.loads((self.cfg.state_dir / "waiting.json").read_text())
         self.assertTrue(ticket.get("reason"), ticket)
+
+    def test_scheduled_pause_refuses_real_apply_before_any_mutation(self) -> None:
+        su._write_json(self.cfg.state_dir / "scheduled-pause.json",
+                       {"at": su._iso(self.sys.now()), "reason": "bad rollout"})
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("self-update PAUSED", "\n".join(su.status_lines(self.cfg.state_dir)))
 
 
 class SkewTests(Base):
@@ -482,6 +554,54 @@ class SkewTests(Base):
         self.assertIn("UNKNOWN", su.render_skew(None))
 
 
+class SkewAfterApplyTests(Base):
+    """A verified apply records skew for the generation it installed.
+
+    m3, 2026-09-28: skew.json was measured at 05:30:43Z, the update to the
+    newest commit was verified at 05:39Z, and status went on reading "1 commits
+    behind main" because skew.json is otherwise written only before the run.
+    """
+
+    def skew(self) -> dict:
+        return json.loads((self.cfg.state_dir / "skew.json").read_text())
+
+    def test_a_verified_apply_rewrites_skew_for_the_installed_target(self) -> None:
+        self.assertUpdated(self.apply())
+        skew = self.skew()
+        self.assertEqual((skew["installed"], skew["recorded_by"]), (T_OLD, "verified_apply"))
+        # Only the still-soaking commit is ahead now, not the one just installed.
+        self.assertEqual(skew["behind"], 1)
+        steps = [step["step"] for step in json.loads(
+            Path(self.last()["receipt"]).read_text())["steps"]]
+        self.assertIn("skew", steps)
+
+    def test_the_record_does_not_requery_checks(self) -> None:
+        # Verification already proved this generation runs; the record must not
+        # depend on check runs, which can be slow, rate-limited or red later.
+        real, kwargs_seen = su.measure_skew, []
+
+        def spy(*args, **kwargs):
+            kwargs_seen.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(su, "measure_skew", side_effect=spy):
+            self.assertUpdated(self.apply())
+        self.assertEqual(kwargs_seen[-1].get("verify_checks"), False)
+
+    def test_a_failed_skew_record_never_fails_the_update(self) -> None:
+        real, calls = su.measure_skew, []
+
+        def second_call_fails(*args, **kwargs):
+            calls.append(args)
+            if len(calls) > 1:
+                raise OSError("disk")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(su, "measure_skew", side_effect=second_call_fails):
+            self.assertUpdated(self.apply())
+        self.assertEqual(len(calls), 2)
+
+
 class OrchestratorGenerationTests(Base):
     """Which code ran an update is recorded beside what it installed.
 
@@ -506,14 +626,135 @@ class OrchestratorGenerationTests(Base):
         self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
 
 
+class TargetOrchestratorHandoffTests(Base):
+    sealed = True
+
+    def test_handoff_executes_a_real_dispatcher_child(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            checkout = home / ".local/share/tartci/update-checkout"
+            checkout.mkdir(parents=True)
+            dispatcher = checkout / "tartci"
+            dispatcher.write_text("#!/bin/sh\nprintf 'HANDOFF_EXEC:%s\\n' \"$1\"\nexit 23\n")
+            dispatcher.chmod(0o755)
+            script = ("import fleet_self_update as su; from pathlib import Path; "
+                      f"cfg=su.Config(Path({str(home)!r})); "
+                      f"su.orchestrator_generation=lambda: {INSTALLED!r}; "
+                      "su.launch_helper=lambda cfg: {'path': 'sealed'}; "
+                      f"raise SystemExit(su.handoff_target_orchestrator(cfg, {T_OLD!r}, "
+                      "apply=True, scheduled=False, refresh=False) or 0)")
+            env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts")}
+            result = subprocess.run([sys.executable, "-c", script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("HANDOFF_EXEC:fleet-macos", result.stdout)
+
+    def test_missing_dispatcher_is_a_refused_receipt(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("target dispatcher unavailable", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_non_executable_dispatcher_is_a_refused_receipt(self) -> None:
+        dispatcher = self.cfg.checkout / "tartci"
+        dispatcher.write_text("#!/bin/sh\nexit 0\n")
+        dispatcher.chmod(0o644)
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("PermissionError", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_installed_orchestrator_hands_off_to_the_target_checkout(self) -> None:
+        calls = []
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve", side_effect=lambda *args: calls.append(args)):
+            self.assertTrue(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=True, refresh=False))
+        self.assertEqual(calls[0][0], str(self.cfg.checkout / "tartci"))
+        self.assertEqual(calls[0][1], [
+            str(self.cfg.checkout / "tartci"), "fleet-macos", "self-update", "--apply",
+            "--target", T_OLD, "--home", str(self.home), "--scheduled"])
+        self.assertEqual(calls[0][2]["TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR"], "1")
+
+    def test_handoff_is_disabled_for_plan_unsealed_refresh_or_marker(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve") as execve:
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=False, scheduled=False, refresh=False))
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=False, refresh=True))
+            with mock.patch.dict(os.environ, {"TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"}):
+                self.assertFalse(su.handoff_target_orchestrator(
+                    self.cfg, T_OLD, apply=True, scheduled=False, refresh=False))
+        execve.assert_not_called()
+
+    def test_apply_calls_handoff_before_the_installed_builder(self) -> None:
+        with mock.patch.object(su, "handoff_target_orchestrator", return_value=True) as handoff:
+            self.assertEqual(self.apply(), su.EXIT_OK)
+        handoff.assert_called_once_with(self.cfg, T_OLD, apply=True, scheduled=False, refresh=False)
+
+
+class HandoffNegativeSelectionTests(Base):
+    def test_unsealed_hosts_never_handoff(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve") as execve:
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=False, refresh=False))
+        execve.assert_not_called()
+
+    def test_soaking_target_never_reaches_handoff(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True),
+                su.EXIT_REFUSED)
+        handoff.assert_not_called()
+
+    def test_unverified_target_never_reaches_handoff(self) -> None:
+        self.sys.log_lines = f"{T_OLD} {int(NOW - 7200)}\n"
+        self.sys.checks[T_OLD] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_OLD, explicit=True),
+                su.EXIT_REFUSED)
+        handoff.assert_not_called()
+
+    def test_non_first_parent_target_never_reaches_handoff(self) -> None:
+        self.sys.ancestor = False
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_OLD, explicit=True),
+                su.EXIT_UNKNOWN)
+        handoff.assert_not_called()
+
+
+class ReserveCheckTests(Base):
+    def test_the_target_is_validated_with_the_gate_reserve_ratchet(self) -> None:
+        self.assertUpdated(self.apply())
+        validates = [a for a, _ in self.sys.calls if a[:3] == ["./tartci", "fleet-macos", "validate"]]
+        self.assertTrue(validates)
+        self.assertTrue(all("--check-reserve" in a for a in validates), validates)
+
+
 class HappyPathTests(Base):
     def test_apply_runs_the_procedure_in_order_and_verifies(self) -> None:
         self.assertEqual(self.apply(), su.EXIT_OK, self.sys.calls[-5:])
         joined = [" ".join(a) for a, _ in self.sys.calls]
         def first(pred):
             return next(i for i, c in enumerate(joined) if pred(c))
-        order = [first(lambda c, n=n: n in c) for n in (
-            "support-manifest write", "fleet-macos validate", "fleet-macos install", "ssh",
+        # Peer observation intentionally leads the procedure: a later gate
+        # may refuse before queue handling, but must not skip the unreadable
+        # streak that breaks a dead-peer deadlock.
+        order = [first(lambda c: c.startswith("ssh "))]
+        order += [first(lambda c, n=n: n in c) for n in (
+            "support-manifest write", "fleet-macos validate", "fleet-macos install",
             "capacity_floor.py", "pool drain", "pool off --plan")]
         order.append(first(lambda c: c.startswith("./tartci pool off") and "--plan" not in c))
         order += [first(lambda c, n=n: n in c) for n in ("--apply", "pool on")]
@@ -535,6 +776,13 @@ class HappyPathTests(Base):
 
 
 class OneAtATimeTests(Base):
+    def test_peer_authentication_failure_is_named_separately(self) -> None:
+        self.sys.peer_status_errors["m5"] = "Permission denied (publickey)."
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertFalse(peer["readable"])
+        self.assertIn("SSH authentication failed", peer["evidence"])
+        self.assertNotIn("unreachable", peer["evidence"])
+
     def test_peer_draining_refuses_before_any_mutation(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
@@ -682,6 +930,114 @@ class OnDemandSupplyTests(Base):
         self.assertEqual(self.plan(), su.EXIT_REFUSED)
 
 
+class PeerTurnReplayTests(Base):
+    """The 2026-10-09 update turn, replayed from the hosts' own records.
+
+    This fake host is m1; its peers are studio (m5studio, ssh m3) and m5.
+    Epoch values are the real ones, shifted so the last observation lands on
+    NOW.
+    """
+
+    OBSERVED = 1791529322             # date +%s when the tickets were read
+    SHIFT = NOW - OBSERVED
+
+    def at(self, epoch: float) -> float:
+        return epoch + self.SHIFT
+
+    def test_a_peer_draining_for_its_own_update_reads_as_the_turn_holder(self) -> None:
+        # m5 at 06:05:54Z read m5studio, which announced at 05:55:18Z and then
+        # drained. Read pool state first, it said only "draining".
+        self.sys.peers["m3"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m3"] = {"host_id": "studio",
+                                       "target": "1c32310463f2f5ebabed386c4417eb1653539934",
+                                       "ts": NOW - 636}
+        self.sys.peer_pool_since["m3"] = NOW - 600
+        peer = su.read_peer(self.cfg, self.sys, "studio", "m3")
+        self.assertTrue(peer["busy"])
+        self.assertEqual(peer["evidence"], "peer studio is self-updating to 1c32310463f2 (10 min in)")
+        self.assertEqual(peer["active_age"], 636)
+        self.assertNotIn("draining", peer["evidence"])
+        # The readability fix itself: the turn holder, its target and its age.
+        self.assertIn("self-updating to 1c32310463f2", peer["evidence"])
+        self.assertIn("(10 min in)", peer["evidence"])
+
+    def test_the_recorded_queue_lets_exactly_one_host_go(self) -> None:
+        # waiting.json on m1 and m5studio at 07:02Z, after m5 finished its
+        # update and came back on. Both still carried "peer m5 is draining",
+        # a reason up to one interval old; the next read must not reuse it.
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "issue": None,
+            "reason": "another fleet host is not serving normally: peer m5 is draining "
+                      "(participating=False)",
+            "since": self.at(1791526495.20782), "starved_evented": None,
+            "target": "d4158f38974c181e94efd7eb43c2767c084f533b",
+            "ts": self.at(1791528338.536526)})
+        studio_ticket = {
+            "host_id": "m5studio", "issue": None,
+            "reason": "another fleet host is not serving normally: peer m5 is draining "
+                      "(participating=False)",
+            "since": self.at(1791528023.668664), "starved_evented": None,
+            "target": "d4158f38974c181e94efd7eb43c2767c084f533b",
+            "ts": self.at(1791528023.668664)}
+        self.sys.peer_waiting["m3"] = studio_ticket
+        self.sys.peer_pool_since["m5"] = self.at(1791528936)   # m5 back on at 06:55:36Z
+        self.sys.peer_pool_since["m3"] = self.at(1791526209)
+        # m1 holds the older ticket, so m1 goes...
+        self.assertUpdated(self.apply())
+        # ...and m5studio, reading m1's ticket, yields to it.
+        ahead = su.queue_ahead("studio", studio_ticket["since"],
+                               {"m1": self.at(1791526495.20782)})
+        self.assertEqual(len(ahead), 1)
+        self.assertTrue(ahead[0].startswith("m1 "), ahead)
+
+    def test_a_markerless_drain_older_than_the_bound_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_STALE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertFalse(peer["busy"])
+        self.assertTrue(peer["off"])
+        self.assertIn("draining for 3.0 h with no update marker", peer["evidence"])
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        peers_step = next(step for step in receipt["steps"] if step["step"] == "peers")
+        self.assertIn("counted as serving nothing by the capacity floor: m5",
+                      peers_step["detail"])
+
+    def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
+        # Control, same instrument: only the drain's age changed.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+                      su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
+        # No pool-state time (an old peer, or stat failed): fail closed.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_update_that_died_after_draining_stops_holding_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
+        self.sys.peer_pool_since["m5"] = NOW - 4 * 3600 + 60
+        self.assertUpdated(self.apply())
+
+    def test_an_expired_marker_on_a_recent_drain_still_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
+        self.sys.peer_pool_since["m5"] = NOW - 3600
+        self.assertDeferred(self.apply())
+
+    def test_an_opted_out_peer_that_is_on_still_holds_the_turn(self) -> None:
+        # The drain bound is for draining only, never for a host on but not
+        # participating, however long ago its pool state changed.
+        self.sys.peers["m5"] = {"state": "on", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 30 * 86400
+        self.assertDeferred(self.apply())
+
+
 class UpdateQueueTests(Base):
     """One host at a time, in the order hosts started waiting."""
 
@@ -690,6 +1046,50 @@ class UpdateQueueTests(Base):
                  "reason": "peer m5 is draining"}
         value.update(fields)
         su._write_json(self.cfg.state_dir / "waiting.json", value)
+
+    def gate_queue(self, *, drop: tuple = (), fail: bool = False) -> list[str]:
+        """Serve the gate-demand read from the answers captured from
+        Generous-Corp/pulp at 2026-10-13 16:48 UTC
+        (scripts/fixtures/gate_job_demand/), with every time moved so that
+        capture time is the test clock. `drop` removes runs from both run
+        listings; `fail` makes every read fail. Returns the paths read."""
+        fixtures = Path(__file__).resolve().parent / "fixtures" / "gate_job_demand"
+        fleet = self.cfg.checkout / "fleet"
+        fleet.mkdir(parents=True, exist_ok=True)
+        shutil.copy(fixtures / "advertised-labels.json", fleet / "advertised-labels.json")
+        shift = NOW - su.gate_job_demand.epoch("2026-10-13T16:48:10Z")
+
+        def moved(value):
+            if isinstance(value, dict):
+                return {key: (su._iso(su.gate_job_demand.epoch(item) + shift)
+                              if key.endswith("_at") and isinstance(item, str) and item
+                              else moved(item)) for key, item in value.items()}
+            if isinstance(value, list):
+                return [moved(item) for item in value]
+            return value
+
+        paths: list[str] = []
+
+        def fetch(path: str) -> dict:
+            paths.append(path)
+            if fail:
+                raise RuntimeError("gh: Server Error (HTTP 502)")
+            if "/actions/runs?status=" in path:
+                if not path.startswith("repos/Generous-Corp/pulp/"):
+                    return {"total_count": 0, "workflow_runs": []}
+                status = path.split("status=", 1)[1].split("&", 1)[0]
+                answer = json.loads((fixtures / f"pulp-runs-{status}.json").read_text())
+                answer["workflow_runs"] = [run for run in answer["workflow_runs"]
+                                           if run["id"] not in drop]
+                answer["total_count"] = len(answer["workflow_runs"])
+                return moved(answer)
+            run = path.split("/actions/runs/", 1)[1].split("/", 1)[0]
+            return moved(json.loads((fixtures / f"pulp-jobs-{run}.json").read_text()))
+
+        original = su._demand_fetch
+        su._demand_fetch = lambda: fetch
+        self.addCleanup(setattr, su, "_demand_fetch", original)
+        return paths
 
     def test_a_peer_that_has_waited_longer_goes_first(self) -> None:
         # m3 on 2026-09-30: refused at every attempt while a peer took each turn.
@@ -763,6 +1163,7 @@ class UpdateQueueTests(Base):
 
     def test_deferral_past_the_bound_is_starvation_and_loud_once(self) -> None:
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -774,6 +1175,7 @@ class UpdateQueueTests(Base):
     def test_starvation_opens_one_issue_and_the_next_turn_closes_it(self) -> None:
         # 2026-10-01: three hosts starved for 7-9 h and wrote events nobody read.
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -784,15 +1186,270 @@ class UpdateQueueTests(Base):
         self.assertUpdated(self.apply())
         self.assertEqual(self.issues[-1], ("close", "77"))
 
+    def test_with_gate_demand_starvation_trips_an_hour_past_the_dark_peer_bound(self) -> None:
+        # Real apply entry point. A queued macOS job in a running Build and
+        # Test run is demand; the bound is one hour past the 3 h exclusion.
+        self.assertEqual(su.STARVED_AFTER_SECONDS, su.PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("self_update_starved", events)
+        self.assertIn("115420876725", events)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+
+    def test_a_dark_peer_does_not_trip_starvation_before_it_is_excluded(self) -> None:
+        # Past the old one-hour bound and past the 3 h exclusion, but inside
+        # the hour after it: quiet, with demand queued.
+        self.ticket(since=NOW - su.PEER_UNREACHABLE_EXCLUDE_SECONDS - 1800)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [])
+
+    def test_the_zombie_run_alone_is_not_demand(self) -> None:
+        # The 2026-08-19 merge_group run is still queued, with no jobs. With
+        # only it (and runs whose macOS jobs are running), the bound stays 6 h.
+        paths = self.gate_queue(drop=(38433042640,))
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [])
+        self.assertFalse(any("/runs/32218602754/" in path for path in paths), paths)
+        self.assertEqual(su.waiting_ticket(self.cfg)["demand"], [])
+
+    def test_a_failed_demand_read_falls_back_to_six_hours_and_says_so(self) -> None:
+        self.gate_queue(fail=True)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertIn("gate demand unread", out.getvalue())
+        self.assertIn("HTTP 502", su.waiting_ticket(self.cfg)["demand_error"])
+        self.assertEqual(self.issues, [])
+        # Past the fallback it still trips, and the event carries the failure.
+        self.ticket(since=NOW - su.STARVED_FALLBACK_SECONDS - 60)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("HTTP 502", events)
+        # The issue says which bound applied and why, not "gate jobs queued".
+        self.assertIn("The bound without demand is 6 h", self.bodies[-1])
+        self.assertIn("(the demand read failed)", self.bodies[-1])
+        self.assertNotIn("while gate jobs it serves were queued", self.bodies[-1])
+
+    def test_the_starvation_issue_says_what_why_how_to_fix_and_verify(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        body = self.bodies[0]
+        for needle in ("**What happened.** m1 has had no tartci self-update turn",
+                       "Queued gate job 115420876725 (Generous-Corp/pulp Build and Test: macos)",
+                       "**Likely cause and fix.**", "is not serving normally",
+                       "`tartci pool status`", "Safe to auto-apply: no",
+                       "**Verify.**", "`tartci fleet-macos self-update --plan`"):
+            self.assertIn(needle, body)
+        self.assertIn("while gate jobs it serves were queued", body)
+        marker = su.tartci_incident.parse(body)
+        self.assertEqual(marker["host"], "m1")
+        self.assertEqual(marker["class"], "self_update_starved")
+        self.assertEqual(marker["symptom_at"], su._iso(NOW - su.STARVED_AFTER_SECONDS - 60))
+        self.assertEqual(marker["detected_at"], su._iso(NOW))
+        self.assertIsNone(marker["fixed_at"])
+
+    def test_the_turn_records_fixed_at_on_the_marker_then_closes(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close"])
+        patched = self.bodies[-1]
+        self.assertEqual(patched.count("tartci-incident"), 1)
+        fixed = su.tartci_incident.parse(patched)["fixed_at"]
+        self.assertIsNotNone(fixed)
+        self.assertGreaterEqual(su.gate_job_demand.epoch(fixed), NOW)
+
+    def test_a_failed_patch_keeps_the_fix_time_and_retries_before_closing(self) -> None:
+        # A transient API error on the PATCH must not close the issue with a
+        # marker still saying fixed_at null: nothing would ever correct it.
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n, b: self.issues.append(("patch-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_patch_issue_body", failing):
+            self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed"])
+        pending = json.loads((self.cfg.state_dir / su.PENDING_FIX_NAME).read_text())["fixes"]
+        self.assertEqual([fix["issue"] for fix in pending], ["77"])
+        fixed_at = pending[0]["fixed_at"]
+        self.assertIn("HTTP 502", pending[0]["error"])
+        # The next run PATCHes the recorded fix time, then closes.
+        self.apply()
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed", "patch", "close"])
+        self.assertEqual(su.tartci_incident.parse(self.bodies[-1])["fixed_at"], fixed_at)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def test_a_failed_close_is_retried_without_patching_again(self) -> None:
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n: self.issues.append(("close-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_close_issue", failing):
+            self.assertUpdated(self.apply())
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertTrue(su.finish_pending_fixes(self.cfg))
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close-failed", "close"])
+
+    def test_a_deferred_run_still_retries_a_pending_fix(self) -> None:
+        # A run that defers never clears a ticket, so the retry has to happen
+        # at entry: the fix recorded by an earlier run still lands.
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": "41", "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+        self.ticket(since=NOW - 1800)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [("patch", "41"), ("close", "41")])
+        self.assertEqual(self.bodies[-1], body)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def pending_fix(self, issue: str = "41") -> None:
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": issue, "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+
+    def test_a_deleted_issue_is_dropped_and_logged_once_not_retried_forever(self) -> None:
+        import host_off
+        answers = {
+            "patch 404": ("_patch_issue_body", lambda n, b: (1, "gh: Not Found (HTTP 404)")),
+            "close 410": ("_close_issue",
+                          lambda n: (1, '{"message":"This issue was deleted","status":"410"}')),
+        }
+        for name, (helper, answer) in answers.items():
+            with self.subTest(name=name):
+                self.pending_fix()
+                events = self.cfg.state_dir / "events.jsonl"
+                events.unlink(missing_ok=True)
+                with mock.patch.object(host_off, helper, answer), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertTrue(su.finish_pending_fixes(self.cfg))
+                self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+                self.assertIn("#41 is gone", out.getvalue())
+                self.assertEqual(events.read_text().count("self_update_issue_gone"), 1)
+                # Nothing is left to retry: the next pass makes no calls.
+                before = len(self.issues)
+                self.assertTrue(su.finish_pending_fixes(self.cfg))
+                self.assertEqual(len(self.issues), before)
+                self.assertEqual(events.read_text().count("self_update_issue_gone"), 1)
+
+    def test_a_transient_error_is_still_retried(self) -> None:
+        # Control for the terminal case, same instrument: a 502 stays pending.
+        import host_off
+        self.pending_fix()
+        with mock.patch.object(host_off, "_patch_issue_body", lambda n, b: (1, "gh: Server Error (HTTP 502)")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(su.finish_pending_fixes(self.cfg))
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists())
+
+    def fresh_demand(self, observed: float) -> None:
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {
+            "observed_at": su._iso(observed), "host_id": "m1", "errors": [],
+            "jobs": [{"id": 1, "hosts": ["m1"], "repo": "Generous-Corp/pulp",
+                      "workflow": "Build and Test", "name": "macos",
+                      "created_at": su._iso(NOW - 600)}]})
+
+    def test_a_stale_demand_snapshot_is_no_demand(self) -> None:
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        jobs, errors = su.gate_demand(self.cfg, "m1", NOW)
+        self.assertEqual(jobs, [])
+        self.assertTrue(any("stale" in error for error in errors), errors)
+        # Control, same instrument: the same snapshot, fresh, is demand.
+        self.fresh_demand(NOW - 60)
+        self.assertEqual([job["id"] for job in su.gate_demand(self.cfg, "m1", NOW)[0]], [1])
+
+    def test_defer_on_a_stale_snapshot_keeps_the_six_hour_bound(self) -> None:
+        # A refresh that wrote nothing leaves an old snapshot behind; it is
+        # not demand, so 4 h in the queue is still only a deferral.
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        with mock.patch.object(su, "refresh_gate_demand", lambda *args: {}):
+            self.assertDeferred(self.apply())
+            self.assertEqual(self.issues, [])
+            # Control: a fresh snapshot of the same job trips the 4 h bound.
+            self.fresh_demand(NOW - 60)
+            self.assertEqual(self.apply(), su.EXIT_REFUSED)
+
+    def test_waiting_line_uses_the_demand_bound(self) -> None:
+        # 4.5 h in the queue: starved when gate jobs this host serves are
+        # queued, still only deferred without them.
+        self.ticket(since=NOW - 4.5 * 3600)
+        self.fresh_demand(NOW - 60)
+        self.assertIn("STARVED", su.waiting_line(self.cfg.state_dir, NOW))
+        (self.cfg.state_dir / "gate-queue.json").unlink()
+        self.assertIn("deferred", su.waiting_line(self.cfg.state_dir, NOW))
+
     def test_a_short_deferral_is_quiet(self) -> None:
-        # Control for the bound: the same deferral an hour in is not a problem.
-        self.ticket(since=NOW - 3600)
+        # Control for the bound: a deferral just under it, with demand queued,
+        # is not a problem.
+        self.gate_queue()
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS + 60)
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
         self.assertFalse((self.cfg.state_dir / "events.jsonl").exists()
                          and "self_update_starved" in (self.cfg.state_dir / "events.jsonl").read_text())
         self.assertIsNone(su.summary(self.home)["problem"])
         self.assertEqual(self.issues, [])
+
+
+class RefusedTurnTests(Base):
+    sealed = True
+
+    def test_a_pre_drain_refusal_releases_an_old_queue_ticket(self) -> None:
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "target": T_OLD, "since": NOW - 3 * 3600,
+            "ts": NOW - 60, "reason": "previous refusal",
+        })
+        self.sys.codesign_verify_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertIsNone(su.waiting_ticket(self.cfg))
+
+    def test_capacity_floor_refusal_keeps_the_ticket(self) -> None:
+        self.ticket = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600,
+                       "ts": NOW - 60, "reason": "capacity"}
+        su._write_json(self.cfg.state_dir / "waiting.json", self.ticket)
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], self.ticket["since"])
+
+    def test_recent_attempt_refusal_keeps_the_ticket(self) -> None:
+        ticket = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600,
+                  "ts": NOW - 60, "reason": "recent attempt"}
+        su._write_json(self.cfg.state_dir / "waiting.json", ticket)
+        attempts = self.cfg.state_dir / "attempts"
+        su._write_json(attempts / "recent.json", {
+            "mode": "apply", "target": T_OLD, "status": "failed",
+            "started_at": su._iso(NOW - 60),
+        })
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], ticket["since"])
 
 
 class AnnounceOrderTests(Base):
@@ -1187,11 +1844,49 @@ class SealedTests(Base):
         # The checkout is writable again after the immutable build.
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
 
+    def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        pinned = self.home / "pinned-python"
+        pinned.symlink_to(sys.executable)
+        with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
+            self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        build_index = next(i for i, (args, _) in enumerate(self.sys.calls)
+                           if args[:2] == ["bash", "scripts/build_macos_launcher.sh"])
+        build_env = self.sys.env_calls[build_index]
+        self.assertEqual(build_env["TARTCI_RENDER_PYTHON"], os.path.realpath(pinned))
+        build = self.sys.calls[build_index][0]
+        self.assertEqual(build[build.index("--python") + 1], os.path.realpath(pinned))
+
     def test_install_failure_restores_the_pin(self) -> None:
         self.sys.install_rcs = [1]
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
         self.assertEqual(self.sys.pool_state, "on")
+
+    def test_installer_preflight_failure_refuses_before_drain(self) -> None:
+        self.sys.preflight_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.sys.mutations(), [])
+        receipt_path = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertIn("installer preflight refused before drain", receipt["error"])
+        self.assertFalse(any("--apply" in args for args, _ in self.sys.calls
+                             if args[:2] == ["./tartci", "fleet-macos"]))
+
+    def test_pin_dependent_preflight_refusal_restores_after_drain(self) -> None:
+        self.sys.dry_run_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
+        receipt_path = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        receipt = json.loads(receipt_path.read_text())
+        names = [step["step"] for step in receipt["steps"]]
+        self.assertIn("drain", names)
+        self.assertIn("pool-on", names)
+        self.assertLess(names.index("drain"), names.index("pool-on"))
+        self.assertIn("install-dry-run", names)
+        self.assertIn("refused after drain", receipt["error"])
+        self.assertNotEqual(receipt["status"], "failed")
 
     def test_bad_bundle_refuses_before_drain(self) -> None:
         for mutate in (lambda s: setattr(s, "bundle_commit", "9" * 40),
@@ -1277,7 +1972,7 @@ class SurfaceTests(Base):
         import macos_fleet_lanes as fleet
         su._write_json(self.cfg.state_dir / "skew.json", {
             "state": "behind", "behind": 3, "oldest_undeployed": "2026-09-23T06:51:41Z",
-            "stale": False, "measured_at": "now"})
+            "stale": False, "measured_at": su._iso(time.time())})
         self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
                          "self_update_current")
         self.assertEqual(fleet_doctor.check_self_update(None).code, "self_update_unmeasured")
@@ -1296,6 +1991,90 @@ class SurfaceTests(Base):
         self.assertIn("self_update=", wd.config_problem(
             {**clean, "self_update": {"problem": "last self-update FAILED"}}))
         self.assertIsNone(wd.config_problem({**clean, "self_update": {"problem": None}}))
+
+
+class VmDhcpVerifyTests(Base):
+    """After the new generation serves, one probe proves the VM network."""
+
+    def test_an_update_asks_the_breaker_to_verify(self):
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.sys.vm_verify_calls, [["vm-dhcp", "verify", "--reason", "self_update"]])
+        steps = {s["step"]: s for s in json.loads(Path(self.last()["receipt"]).read_text())["steps"]}
+        self.assertTrue(steps["vm-dhcp-verify"]["ok"])
+
+    def test_a_failed_verify_never_fails_the_update(self):
+        self.sys.vm_verify_rc = 1
+        self.assertUpdated(self.apply())
+        steps = {s["step"]: s for s in json.loads(Path(self.last()["receipt"]).read_text())["steps"]}
+        self.assertFalse(steps["vm-dhcp-verify"]["ok"])
+
+    def test_a_refused_update_never_verifies(self):
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.apply()
+        self.assertEqual(self.sys.vm_verify_calls, [])
+
+
+class PausedByStallTests(Base):
+    """A self-update the launchd guard holds for a timer stall says so itself."""
+
+    STARTED = NOW - 4 * 86400
+
+    SELF = "com.danielraffel.tartci.self-update"
+
+    def guard(self, *, paused=(SELF,), active=True, age=60, directory=None):
+        directory = directory or self.cfg.state_dir.parent / "launchd-interval-guard"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "status.json").write_text(json.dumps({
+            "ts": time.time() - age, "agents_checked": 18, "errors": [], "kicked": [],
+            "stalled": [{"label": self.SELF, "interval": 1800}],
+            "paused": [{"label": label, "interval": 1800} for label in paused],
+            "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
+
+    def stale_skew(self):
+        su._write_json(self.cfg.state_dir / "skew.json", {
+            "state": "behind", "behind": 44, "stale": True, "installed": INSTALLED,
+            "target": T_OLD, "oldest_undeployed": "2026-10-05T05:21:21Z",
+            "measured_at": su._iso(time.time())})
+
+    def test_a_paused_self_update_says_why_everywhere(self):
+        # m3 from 2026-10-05: behind and stale, no attempt since, the guard
+        # holding it. Its status and doctor read like a failed update.
+        import fleet_doctor
+        self.stale_skew()
+        self.guard()
+        since = su._iso(self.STARTED)
+        lines = su.status_lines(self.cfg.state_dir)
+        self.assertTrue(any(l.startswith(f"self-update PAUSED by the launchd timer stall since {since}")
+                            for l in lines), lines)
+        summary = su.summary(self.home)
+        self.assertIn("a reboot resumes it", summary["paused"])
+        finding = fleet_doctor.check_self_update(summary)
+        self.assertEqual((finding.state, finding.code), (fleet_doctor.PROBLEM, "self_update_paused"))
+        self.assertIn("self_update_paused", fleet_doctor.load_reasons())
+
+    def test_the_guard_dir_override_is_honoured(self):
+        other = self.home / "guard-elsewhere"
+        self.guard(directory=other)
+        with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
+            self.assertIsNotNone(su.paused_line(self.cfg.state_dir))
+        self.assertIsNone(su.paused_line(self.cfg.state_dir))
+
+    def test_not_paused_unless_the_guard_holds_self_update_in_a_live_stall(self):
+        import fleet_doctor
+        self.stale_skew()
+        for name, kwargs in (("another agent paused, not self-update",
+                              {"paused": ("com.danielraffel.tartci.launchd-watchdog",)}),
+                             ("nothing paused", {"paused": ()}),
+                             ("no active episode", {"active": False}),
+                             ("stale guard receipt", {"age": 10 * 3600})):
+            with self.subTest(case=name):
+                self.guard(**kwargs)
+                self.assertIsNone(su.paused_line(self.cfg.state_dir))
+                self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
+                                 "self_update_problem")
+
+    def test_no_guard_receipt_is_not_paused(self):
+        self.assertIsNone(su.paused_line(self.cfg.state_dir))
 
 
 class AgentTemplateTests(unittest.TestCase):
@@ -1326,6 +2105,34 @@ class AgentTemplateTests(unittest.TestCase):
 
 
 class VerifySettleTests(Base):
+    def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
+        self.assertEqual(
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: "
+                "[{'code': 'heartbeat_missing', 'label': 'lane'}]",
+                "b" * 40,
+            ),
+            "rollback installed; verification timed out; rolled back to bbbbbbbbbbbb and verified",
+        )
+
+    def test_rollback_wording_requires_rollback_steps_to_succeed(self) -> None:
+        self.assertNotIn(
+            "rollback installed and pool on",
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: heartbeat_missing",
+                "b" * 40),
+        )
+
+    def test_heartbeat_missing_with_crashed_launchd_lane_includes_last_log_line(self) -> None:
+        log = self.home / "lane.log"
+        log.write_text("booting\nlaunchd: runner crashed\n")
+        self.sys.launchd_print = su.Result(
+            0,
+            f"last exit code = 75\nstderr path = {log}\n",
+        )
+        details = su._heartbeat_failure_diagnostics(self.sys, ["lane"])
+        self.assertEqual(details, ["lane lane last exit 75; last log line: launchd: runner crashed"])
+
     def test_a_first_heartbeat_still_pending_is_waited_for(self) -> None:
         self.sys.settling_reads = 3
         start = self.sys.clock
@@ -1367,11 +2174,38 @@ class CensusEnvTests(unittest.TestCase):
             os.environ.pop("TARTCI_PYTHON", None)
             env = su.census_env()
         self.assertEqual(env["TARTCI_PYTHON"], sys.executable)
+        self.assertEqual(env["HOME"], os.environ.get("HOME") or os.path.expanduser("~"))
         proc = subprocess.run(["/bin/sh", "-c", "python3 -c 'import sys; print(sys.executable)'"],
                               env={**os.environ, "PATH": "/usr/bin:/bin", **env},
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(os.path.realpath(proc.stdout.strip()), os.path.realpath(sys.executable))
+
+    def test_census_env_preserves_home_for_production_shaped_ghapp(self) -> None:
+        # The real ghapp wrapper uses HOME for its cache and refuses to run
+        # without it. Exercise the exact reduced census environment rather
+        # than a stub that accepts any environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            ghapp = Path(tmp) / "ghapp"
+            ghapp.write_text(
+                "#!/bin/sh\n"
+                "[ -n \"${HOME:-}\" ] || { echo 'ghapp requires HOME' >&2; exit 78; }\n"
+                "printf '%s\\n' authenticated\n"
+            )
+            ghapp.chmod(0o755)
+            env = su.census_env("danielraffel/tartci")
+            env["PATH"] = f"{tmp}:{env['PATH']}"
+            ok_run = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(ok_run.returncode, 0, ok_run.stderr)
+            self.assertEqual(ok_run.stdout.strip(), "authenticated")
+
+            mutant_env = env.copy()
+            mutant_env.pop("HOME", None)
+            denied = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=mutant_env, capture_output=True, text=True)
+            self.assertEqual(denied.returncode, 78)
+            self.assertIn("requires HOME", denied.stderr)
 
 
 class RollbackTests(Base):
@@ -1425,6 +2259,12 @@ class RollbackTests(Base):
 class RelayRollbackTests(Base):
     relay = True
 
+    def test_recovery_pool_on_reuses_receipted_serving_set(self) -> None:
+        self.sys.install_rcs = [1]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        pool_on = [a for a, _ in self.sys.calls if "pool" in a and "on" in a]
+        self.assertTrue(any("--restore-receipt" in a for a in pool_on), pool_on)
+
     def test_relay_failure_after_install_rolls_back(self) -> None:
         self.sys.relay = {"ok": False, "reason": "probe failed"}
         calls = {"n": 0}
@@ -1444,6 +2284,13 @@ class SealedRollbackTests(Base):
 
     def pin(self) -> Path:
         return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+    def test_rollback_pool_on_failure_cannot_claim_installed_and_on(self) -> None:
+        self.sys.broken_target = True
+        self.sys.on_rcs = [0, 1, 1, 1, 1, 1]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("ROLLBACK FAILED", self.last()["error"])
+        self.assertNotIn("rollback installed and pool on", self.last()["error"])
 
     def test_sealed_rollback_restores_bundle_and_pin_together(self) -> None:
         self.sys.broken_target = True
@@ -1512,6 +2359,45 @@ class RecordTests(Base):
 
 
 class ChecksAndTargetTests(Base):
+    def test_explicit_target_recovers_an_off_history_install(self) -> None:
+        self.sys.cat_file_rc = 1
+        scheduled = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW)
+        self.assertEqual(scheduled["state"], "unknown")
+        self.assertIn("not in the tartci history", scheduled["reason"])
+        explicit = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_OLD, explicit=True)
+        self.assertEqual((explicit["state"], explicit["behind"], explicit["target"],
+                          explicit["selected_target"]), ("behind", None, T_OLD, T_OLD))
+        self.assertIn("not in the tartci history", explicit["reason"])
+        self.assertIsNone(explicit["oldest_undeployed"])
+        self.assertNotIn("stale", explicit)
+        self.assertIn("skew UNKNOWN", su.render_skew(explicit))
+
+    def test_off_history_explicit_target_still_soaking_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_red_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 9000)}\n{T_OLD} {int(NOW - 10000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_off_chain_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, "d" * 40, explicit=True)
+        self.assertEqual(skew["state"], "unknown")
+        self.assertIn("first-parent", skew["reason"])
+
     def test_red_newest_soaked_commit_falls_back_to_an_older_green_one(self) -> None:
         older = "c" * 40
         self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
@@ -1527,6 +2413,64 @@ class ChecksAndTargetTests(Base):
         self.assertEqual(self.sys.mutations(), [])
         skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
         self.assertEqual(skew["state"], "unverified")
+
+    def test_explicit_main_tip_soaking_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIn("soaking until", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_explicit_main_tip_soaked_but_red_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIn("not green: ", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_default_path_falls_back_to_soaked_green_and_records_skipped(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW)
+        self.assertEqual(skew["selected_target"], T_OLD)
+        self.assertTrue(skew["skipped"])
+
+    def test_explicit_selection_is_printed_and_recorded(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=False,
+                                              target_ref=T_OLD, explicit=True), su.EXIT_OK)
+        self.assertIn(f"selected {T_OLD} (requested {T_OLD}; same)", output.getvalue())
+        self.assertIn(f"repository={su.DEFAULT_REPOSITORY}", output.getvalue())
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual({key: receipt[key] for key in
+                          ("requested_target", "selected_target", "explicit", "soak_until")},
+                         {"requested_target": T_OLD, "selected_target": T_OLD,
+                          "explicit": True, "soak_until": None})
+
+    def test_main_explicit_target_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--target", T_NEW, "--plan"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_main_without_target_keeps_default_green_fallback(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--plan"])
+        self.assertEqual(result, su.EXIT_OK)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())["target"], T_OLD)
 
     def test_explicit_target_must_be_on_the_first_parent_chain(self) -> None:
         skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, "d" * 40)
@@ -1555,7 +2499,13 @@ class ScaleTests(Base):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copytree(ROOT / "profiles", root / "profiles")
-            text = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            original = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            # This test exercises profile-to-publication alias derivation for
+            # every profile.  Keep its fixture published even when production
+            # temporarily withdraws a host from the fleet.
+            (root / "profiles/m1-macos-fleet.toml").write_text(
+                original.replace("published = false", "published = true", 1))
+            text = original.replace("published = false", "published = true", 1)
             text = text.replace('name = "m1-macos-fleet"', 'name = "x9-macos-fleet"')
             text = text.replace('id = "m1"', 'id = "x9"', 1).replace('ssh = "m1"\n', "")
             (root / "profiles/x9-macos-fleet.toml").write_text(text)
@@ -1849,6 +2799,8 @@ class IncidentTests(Base):
         self.sys.on_rc = 7
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertTrue(self.last()["host_off"])
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("left OFF", self.issues[0][1])
         self.assertIn("LEFT THIS HOST OFF", su.summary(self.home)["problem"])
         self.assertTrue(any("WAS LEFT OFF" in line for line in su.status_lines(self.cfg.state_dir)))
 
@@ -1880,6 +2832,63 @@ class IncidentTests(Base):
         self.assertUpdated(self.apply())
         ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
         self.assertEqual(len(ons), 1)
+
+
+class RepositoryIdentityTests(Base):
+    def test_repository_resolution_refusal_is_receipted_at_the_entry_point(self):
+        self.sys.unreadable_repositories.update(
+            {su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY})
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True), \
+                mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--apply"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertEqual(receipt["target"], INSTALLED)
+        self.assertIn("no accepted TartCI repository is readable", receipt["error"])
+        self.assertEqual(receipt["steps"][-1]["step"], "refused")
+        self.assertEqual(json.loads((self.cfg.state_dir / "skew.json").read_text())["state"],
+                         "unknown")
+
+    def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.unreadable_repositories.add(su.DEFAULT_REPOSITORY)
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            repository = su.configured_repository(self.cfg, self.sys)
+            run = object.__new__(su.Run)
+            run.cfg, run.sys, run.install_args, run.repository = (
+                self.cfg, self.sys, ["fleet-macos", "install", "profile"], repository)
+            run.receipt = mock.Mock()
+            run._writer_fence = lambda: []
+            su.Run._install(run, run.install_args)
+        self.assertEqual(su.LEGACY_REPOSITORY, repository)
+        self.assertEqual(su.LEGACY_REPOSITORY, self.sys.env_calls[-1]["GH_REPO"])
+
+    def test_default_resolution_uses_first_readable_accepted_slug(self):
+        self.sys.unreadable_repositories.add(su.LEGACY_REPOSITORY)
+        self.sys.api_repository = su.DEFAULT_REPOSITORY
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.DEFAULT_REPOSITORY,
+                             su.canonical_repository(self.cfg, self.sys))
+
+    def test_api_accepts_legacy_and_new_full_name(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.api_repository = repository
+            with mock.patch.dict(os.environ, {"GH_REPO": repository}):
+                self.assertEqual(su.canonical_repository(self.cfg, self.sys), repository)
+
+    def test_api_rejects_third_repository(self):
+        self.sys.api_repository = "example/other-tartci"
+        with self.assertRaises(su.Refused):
+            su.canonical_repository(self.cfg, self.sys)
+
+    def test_refresh_rejects_third_remote(self):
+        self.sys.remote_url = "https://example.invalid/other-tartci.git\n"
+        with self.assertRaises(su.Refused):
+            su.refresh_checkout(self.cfg, self.sys)
 
 
 class OsInterpreterRefreshTests(Base):

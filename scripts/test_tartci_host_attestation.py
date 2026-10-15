@@ -15,6 +15,7 @@ Run: python3 scripts/test_tartci_host_attestation.py
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import plistlib
@@ -443,6 +444,7 @@ class ProfileReadability(unittest.TestCase):
         self.assertEqual(profile, {})
         self.assertFalse(readable, detail)
 
+    @testing_support.requires_tomllib
     def test_a_valid_profile_is_readable(self):
         # The control: without it, "nothing is ever readable" passes the test
         # above and makes every attestation useless.

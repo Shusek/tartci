@@ -23,9 +23,9 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import macos_fleet_lanes as lanes  # noqa: E402
 import queue_tick_refresh as qtr  # noqa: E402
 import tartci_launchd_watchdog as wd  # noqa: E402
+import testing_support  # noqa: E402
 
 
 class Fixture(unittest.TestCase):
@@ -92,11 +92,15 @@ class DriftTests(Fixture):
         self.plist.write_bytes(plistlib.dumps(value))
         self.assertEqual(self.drift()["state"], "current")
 
-    def test_pool_status_names_a_stale_copy(self) -> None:
+    def test_the_status_line_names_a_stale_copy(self) -> None:
         self.assertIn("queue tick: DRIFT", qtr.status_line({"state": "drift", "detail": "x"}))
         self.assertIn("NOT LOADED", qtr.status_line({"state": "drift_unloaded", "detail": "x"}))
         self.assertIsNone(qtr.status_line({"state": "current"}))
         self.assertIsNone(qtr.status_line({"state": "not_installed"}))
+
+    @testing_support.requires_tomllib
+    def test_pool_status_names_a_stale_copy(self) -> None:
+        import macos_fleet_lanes as lanes
         with mock.patch.object(qtr, "status_line", return_value="queue tick: DRIFT (x)"):
             self.assertIn("queue tick: DRIFT (x)", lanes.tool_freshness_summary()["lines"])
 

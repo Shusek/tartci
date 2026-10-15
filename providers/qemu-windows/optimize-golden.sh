@@ -11,7 +11,7 @@ ARCHES="${TARTCI_WIN_VCVARS_ARCHES:-${TARTCI_WIN_VCVARS_ARCH:-arm64}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
-SSH=(ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
+SSH=(ssh -n "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 

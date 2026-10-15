@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep a fleet host on the tartci code that main has, verified.
 
-`tartci fleet-macos self-update [--target REF] [--plan] [--apply]` codifies the
+tartci fleet-macos self-update [--target REF] [--plan] [--apply] codifies the
 manual procedure that brought m1, m5 and m3 up to date on 2026-09-23. It adds
 no new mechanics; every step is a command that already exists:
 
@@ -59,6 +59,9 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
+import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate jobs
+import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
+import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 
 try:
     import tomllib
@@ -66,7 +69,13 @@ except ModuleNotFoundError:  # pragma: no cover - the launchd python is 3.9
     tomllib = None  # type: ignore[assignment]
 
 SCHEMA = "tartci.self-update/v1"
-REPO_URL = "https://github.com/danielraffel/tartci.git"
+# How often the launchd watchdog re-measures skew (tartci_launchd_watchdog.py
+# refresh_skew); a cached skew older than state_age.STALE_FACTOR of these reads STALE.
+SKEW_REFRESH_S = 1800
+DEFAULT_REPOSITORY = "Generous-Corp/tartci"
+LEGACY_REPOSITORY = "danielraffel/tartci"
+ACCEPTED_REPOSITORIES = frozenset({DEFAULT_REPOSITORY, LEGACY_REPOSITORY})
+REPO_URL = f"https://github.com/{DEFAULT_REPOSITORY}.git"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_SOAK_SECONDS = 1800
 DEFAULT_RATE_HOURS = 6
@@ -102,13 +111,44 @@ ANNOUNCE_TIE_SECONDS = 10
 # A waiting ticket not refreshed within this long belongs to a host that has
 # stopped trying (halted, off the network, profile removed) and is ignored.
 WAITING_TICKET_TTL = 2 * 3600
-# Deferred this long without a turn is starvation: loud, and exit 3.
-STARVED_AFTER_SECONDS = 6 * 3600
+# Deferred without a turn this long is starvation: loud, and exit 3. Without
+# queued gate demand for this host the bound is STARVED_FALLBACK_SECONDS; with
+# it, STARVED_AFTER_SECONDS (set below), one hour past the dark-peer exclusion.
+STARVED_FALLBACK_SECONDS = 6 * 3600
+# The self-update agent's launchd StartInterval: one survey of every peer per
+# attempt (launchd/com.danielraffel.tartci.self-update.plist.template).
+SELF_UPDATE_INTERVAL_SECONDS = 1800
+# A peer whose pool status has been unreadable this long stops holding the
+# update turn (it still serves nothing for the capacity floor). A peer that is
+# READ holding an update marker this old already counts as not updating, so a
+# dark peer, even one still mid-install, gets no more trust than a seen one
+# with a stale marker. The bound also outlasts the longest a peer can
+# legitimately be mid-update. Unreadable means unreachable; a readable peer
+# that is draining, off or updating never accrues dark time.
+PEER_UNREACHABLE_EXCLUDE_SECONDS = ACTIVE_MARKER_TTL
+# ...and at least this many consecutive unreadable reads inside that time, so
+# two reads either side of a long sleep cannot meet it alone.
+PEER_UNREACHABLE_MIN_READS = 4
+# A peer corroborates "X is dark" only from its own read of X this recent,
+# measured on its own clock.
+PEER_UNREACHABLE_FRESH_SECONDS = 3600
+PEER_UNREADABLE_NAME = "peer-unreadable.json"
+# With gate demand queued, starvation is one hour past the point a dark peer
+# stops holding the turn: a single dark host must not make every other host
+# raise an issue two hours before the queue heals itself.
+STARVED_AFTER_SECONDS = PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600
+# A peer DRAINING with no live update marker, whose pool state has not changed
+# for this long, stops holding the update turn and is left to the capacity
+# floor, like an off peer. A self-update holds a live marker for its whole
+# drain, and a drain waits only for running jobs, so a markerless drain this
+# old is an operator drain or an update that died after draining. The bound is
+# the marker's own TTL: a dead update's marker stops counting at the same age.
+PEER_DRAIN_STALE_SECONDS = ACTIVE_MARKER_TTL
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
 SIGNING_PROBE_TIMEOUT = 60
-TARTCI_REPO = "danielraffel/tartci"
+TARTCI_REPO = DEFAULT_REPOSITORY
 # A peer with no `ssh` in its profile is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
@@ -136,9 +176,10 @@ EXIT_REFUSED = 3       # a precondition refused; the host was not touched
 # A peer was busy or had waited longer, so this host deferred its turn. That is
 # the protocol working, so it exits 0 and launchd's last exit stays clean;
 # waiting.json and `pool status` carry it, and it becomes EXIT_REFUSED plus a
-# self_update_starved event once it has lasted STARVED_AFTER_SECONDS.
+# self_update_starved event once it has lasted STARVED_AFTER_SECONDS (4 h) with
+# queued gate demand, or STARVED_FALLBACK_SECONDS (6 h) without it.
 EXIT_DEFERRED = 0
-# `tartci pool off` exits these when a precondition refuses before it stops
+# tartci pool off exits these when a precondition refuses before it stops
 # anything: 11 the capacity floor (including an unreadable census), 12 a lane
 # that could not be proven idle, 13 lanes launchd still held after the unload
 # wait (m5studio, 2026-10-01: "launchd still holds ... forge-gate after 40s").
@@ -150,6 +191,10 @@ EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
 class Refused(Exception):
     """A precondition failed before anything on the host changed."""
+
+
+class HostFault(Refused):
+    """A local host/build fault that must release a stale queue ticket."""
 
 
 class Deferred(Refused):
@@ -354,6 +399,59 @@ def state_dir_for(home: Path) -> Path:
     return Path(root) / "state" / "self-update"
 
 
+def skew_stale_note(skew: dict | None, now: float | None = None) -> str | None:
+    """STALE when the cached skew is older than the watchdog refreshes it."""
+    if not skew:
+        return None
+    import state_age
+    return state_age.stale_note(skew.get("measured_at"), SKEW_REFRESH_S,
+                                "launchd watchdog (tartci launchd heal)", now)
+
+
+def peer_reachability(home: Path | None = None) -> dict:
+    """This host's record of unreachable peers, for status surfaces. Never raises.
+
+    {"state": "ok" | "dark" | "unreadable", "peers": {peer: streak}}. A host
+    that has never surveyed (or last found every peer readable) has no record.
+    """
+    path = state_dir_for(home or Path.home()) / PEER_UNREADABLE_NAME
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"state": "ok", "peers": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"state": "unreadable", "error": str(exc)[:200], "peers": {}}
+    if not isinstance(value, dict):
+        return {"state": "unreadable", "error": "not an object", "peers": {}}
+    peers = {peer: row for peer, row in value.items() if isinstance(row, dict)}
+    return {"state": "dark" if peers else "ok", "peers": peers}
+
+
+def paused_line(state_dir: Path, now: float | None = None) -> str | None:
+    """Why self-update has not run, when the launchd interval guard is holding
+    it: during a launchd timer stall launchd starts nothing on its own and the
+    guard deliberately does not kick self-update, so self-update writes no log
+    line and no attempt of its own. Read-only; None when not paused or when the
+    guard's receipt cannot be read."""
+    try:
+        import launchd_interval_guard as guard  # noqa: PLC0415 - sibling module
+        directory = (Path(os.environ["TARTCI_INTERVAL_GUARD_DIR"])
+                     if os.environ.get("TARTCI_INTERVAL_GUARD_DIR")
+                     else state_dir.parent / "launchd-interval-guard")
+        value = guard.status(directory, now=now)
+    except Exception:  # noqa: BLE001 - a status surface never raises
+        return None
+    paused = [row for row in value.get("paused") or []
+              if isinstance(row, dict) and "self-update" in str(row.get("label"))]
+    if value.get("state") != "stalled" or not paused:
+        return None
+    started = (value.get("episode") or {}).get("started_ts")
+    since = _iso(float(started)) if isinstance(started, (int, float)) else "an unknown time"
+    return (f"self-update PAUSED by the launchd timer stall since {since}: launchd has not "
+            "started it and the interval guard does not kick it during the stall, so it "
+            "has written no attempt since; a reboot resumes it")
+
+
 def summary(home: Path | None = None) -> dict:
     """Cached skew + last attempt for status surfaces. Never fetches or raises."""
     state = state_dir_for(home or Path.home())
@@ -382,7 +480,11 @@ def summary(home: Path | None = None) -> dict:
     halted = halt_reason(state)
     if halted:
         problem = f"{problem}; {halted}" if problem else halted
-    return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem}
+    aged = skew_stale_note(skew)
+    if aged:
+        problem = f"{problem}; skew {aged}" if problem else f"skew {aged}"
+    return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem,
+            "paused": paused_line(state)}
 
 
 def load_config(home: Path, settings: Path | None = None) -> Config:
@@ -482,8 +584,9 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
     if not (path / ".git").exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".update-checkout.", dir=path.parent))
-        result = sys_.run(["git", "clone", "--quiet", "--no-checkout", REPO_URL,
-                           str(staging / "clone")])
+        repository = configured_repository(cfg, sys_)
+        result = sys_.run(["git", "clone", "--quiet", "--no-checkout",
+                           repository_url(repository), str(staging / "clone")])
         if result.rc != 0 or not (staging / "clone" / ".git").exists():
             shutil.rmtree(staging, ignore_errors=True)
             raise Refused(f"cannot create the update checkout: {result.text}")
@@ -492,16 +595,47 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         os.rename(staging / "clone", path)
         shutil.rmtree(staging, ignore_errors=True)
     origin = sys_.run(["git", "-C", str(path), "remote", "get-url", "origin"])
-    if origin.rc != 0 or origin.out.strip().rstrip("/").removesuffix(".git").lower() \
-            != REPO_URL.removesuffix(".git").lower():
-        raise Refused(f"update checkout {path} is not a danielraffel/tartci clone")
+    remote = origin.out.strip().rstrip("/").removesuffix(".git").lower()
+    accepted_remotes = {repository_url(value).removesuffix(".git").lower()
+                        for value in ACCEPTED_REPOSITORIES}
+    if origin.rc != 0 or remote not in accepted_remotes:
+        raise Refused(f"update checkout {path} is not an accepted TartCI clone")
     fetched = sys_.run(["git", "-C", str(path), "fetch", "--quiet", "--prune", "origin", "main"])
     if fetched.rc != 0:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
+def configured_repository(cfg: Config, sys_: System) -> str:
+    """Resolve an explicit binding or the first readable accepted slug."""
+    bound = os.environ.get("GH_REPO", "").strip()
+    candidates = (bound,) if bound else (LEGACY_REPOSITORY, DEFAULT_REPOSITORY)
+    for repository in candidates:
+        if repository not in ACCEPTED_REPOSITORIES:
+            raise Refused(f"unsupported TartCI repository identity: {repository}")
+        result = sys_.run([gh_cli(), "api", f"repos/{repository}"],
+                          cwd=str(cfg.checkout), env={"GH_REPO": repository}, timeout=60)
+        try:
+            canonical = json.loads(result.out).get("full_name")
+        except (json.JSONDecodeError, AttributeError):
+            canonical = None
+        if result.rc == 0 and canonical in ACCEPTED_REPOSITORIES:
+            return canonical
+        if bound:
+            break
+    raise Refused("no accepted TartCI repository is readable")
+
+
+def repository_url(repository: str) -> str:
+    return f"https://github.com/{repository}.git"
+
+
 def gh_cli() -> str:
     return os.environ.get("TARTCI_GH_CLI") or ("ghapp" if shutil.which("ghapp") else "gh")
+
+
+def canonical_repository(cfg: Config, sys_: System) -> str:
+    """Resolve and validate the API's canonical full_name for a commit."""
+    return configured_repository(cfg, sys_)
 
 
 def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
@@ -510,9 +644,10 @@ def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
     Age alone is not evidence: a commit that broke main's CI soaks like any
     other. An unreadable answer is not green.
     """
-    binding = {"GH_REPO": TARTCI_REPO, "SHIPYARD_GHAPP_REPO": TARTCI_REPO,
-               "SHIPYARD_GH_APP_REPO": TARTCI_REPO}
-    result = sys_.run([gh_cli(), "api", f"repos/{TARTCI_REPO}/commits/{sha}/check-runs?per_page=100"],
+    repository = canonical_repository(cfg, sys_)
+    binding = {"GH_REPO": repository, "SHIPYARD_GHAPP_REPO": repository,
+               "SHIPYARD_GH_APP_REPO": repository}
+    result = sys_.run([gh_cli(), "api", f"repos/{repository}/commits/{sha}/check-runs?per_page=100"],
                       cwd=str(cfg.checkout), env=binding, timeout=60)
     try:
         runs = json.loads(result.out).get("check_runs")
@@ -529,12 +664,16 @@ def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
 
 
 def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
-                 target_ref: str = "origin/main", verify_checks: bool = True) -> dict:
+                 target_ref: str = "origin/main", verify_checks: bool = True,
+                 explicit: bool | None = None) -> dict:
     """First-parent commits on main the host does not run, and the target.
 
     The target is the newest first-parent main commit that is past the soak
     AND whose check runs are green. An explicit --target must itself be on
-    main's first-parent chain and meet both.
+    main's first-parent chain and meet both. If the recorded install is not
+    in the checkout, an explicit target may still recover the host, but skew
+    counts remain unknown rather than pretending the whole main history is
+    undeployed.
     """
     git = ["git", "-C", str(cfg.checkout)]
     skew: dict[str, Any] = {"installed": installed, "measured_at": _iso(now),
@@ -547,22 +686,28 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
         return skew
     skew["main"] = main.out.strip()
     head_sha = head.out.strip()
-    explicit = head_sha != skew["main"]
+    if explicit is None:
+        explicit = target_ref != "origin/main"
+    skew.update(explicit=explicit, requested_target=head_sha if explicit else None,
+                selected_target=None)
     if explicit:
         chain = sys_.run([*git, "rev-list", "--first-parent", skew["main"]])
         if head_sha not in chain.out.split():
-            skew.update(state="unknown",
+            skew.update(state="unknown", selected_target=None, selection_reason="not on first-parent chain",
                         reason=f"--target {target_ref} is not on origin/main's first-parent chain")
             return skew
-    if sys_.run([*git, "cat-file", "-e", f"{installed}^{{commit}}"]).rc != 0:
+    installed_known = sys_.run([*git, "cat-file", "-e", installed + "^{commit}"]).rc == 0
+    if not installed_known and not explicit:
         skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
         return skew
-    if sys_.run([*git, "merge-base", "--is-ancestor", installed, skew["main"]]).rc != 0:
+    if installed_known and sys_.run(
+        [*git, "merge-base", "--is-ancestor", installed, skew["main"]]
+    ).rc != 0:
         skew.update(state="diverged",
                     reason=f"installed {installed[:12]} is not an ancestor of origin/main")
         return skew
-    log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct",
-                    f"{installed}..{skew['main']}"])
+    log_ref = f"{installed}..{skew['main']}" if installed_known else skew["main"]
+    log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct", log_ref])
     if log.rc != 0:
         skew["reason"] = f"git log failed: {log.text}"
         return skew
@@ -571,12 +716,15 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
         parts = line.split()
         if len(parts) == 2 and SHA.fullmatch(parts[0]) and parts[1].isdigit():
             commits.append((parts[0], int(parts[1])))
-    skew["behind"] = len(commits)
+    skew["behind"] = None if not installed_known else len(commits)
+    if not installed_known:
+        skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
     if not commits:
-        skew["state"] = "current"
+        skew["state"] = "unknown" if not installed_known else "current"
         return skew
-    skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
-    skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
+    if installed_known:
+        skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
+        skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
     if explicit:
         commits = [(sha, ts) for sha, ts in commits if sha == head_sha]
         if not commits:
@@ -586,20 +734,30 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
     soaked = [(sha, ts) for sha, ts in commits if ts <= now - cfg.soak_seconds]
     if not soaked:
         skew["state"] = "soaking"
+        if explicit:
+            soak_until = min(ts for _, ts in commits) + cfg.soak_seconds
+            skew["soak_until"] = _iso(soak_until)
+            skew["selection_reason"] = f"soaking until {skew['soak_until']}"
         return skew
     if not verify_checks:
-        skew.update(state="behind", target=None)
+        skew.update(state="behind", target=None, selected_target=None, selection_reason="same")
         return skew
     rejected = []
     for sha, _ in soaked[:CHECK_CANDIDATES]:
         green, detail = checks_green(cfg, sys_, sha)
         if green:
-            skew.update(state="behind", target=sha)
+            skew.update(state="behind", target=sha, selected_target=sha,
+                        selection_reason="same" if explicit else None)
             if rejected:
                 skew["skipped"] = rejected
             return skew
         rejected.append(f"{sha[:12]}: {detail}")
     skew.update(state="unverified", reason="; ".join(rejected))
+    if explicit:
+        detail = rejected[0].split(": ", 1)[1]
+        if detail.startswith("not green: "):
+            detail = detail[len("not green: "):]
+        skew["selection_reason"] = "not green: " + detail
     return skew
 
 
@@ -611,13 +769,21 @@ def render_skew(skew: dict | None) -> str:
         return f"tartci: current with main (measured {skew.get('measured_at')})"
     if state == "not_applicable":
         return f"tartci: skew n/a ({skew.get('reason')})"
+    if state in ("behind", "soaking", "unverified") and skew.get("behind") is None:
+        requested = skew.get("requested_target")
+        selection = (f"; selected {skew.get('selected_target') or 'none'} (requested {requested}; "
+                     f"{skew.get('selection_reason', 'same')})" if requested else "")
+        return f"tartci: skew UNKNOWN ({skew.get('reason') or 'unknown installed commit'})" + selection
     if state in ("behind", "soaking", "unverified"):
         flag = " STALE" if skew.get("stale") else ""
+        requested = skew.get("requested_target")
+        selection = (f"; selected {skew.get('selected_target') or 'none'} (requested {requested}; "
+                     f"{skew.get('selection_reason', 'same')})" if requested else "")
         return (f"tartci: {skew['behind']} commits behind main (oldest undeployed: "
                 f"{skew['oldest_undeployed']}){flag}"
                 + {"behind": "", "soaking": " [all still soaking]",
                    "unverified": f" [no soaked commit has green checks: {skew.get('reason')}]"}[state]
-                + f" (measured {skew.get('measured_at')})")
+                + selection + f" (measured {skew.get('measured_at')})")
     return f"tartci: skew {str(state).upper()} ({skew.get('reason') or 'no reason'})"
 
 
@@ -640,7 +806,7 @@ def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
     """host_id -> SSH target for every host in the CURRENT published supply.
 
     A profile's `host.ssh` is published there; without it the alias
-    convention `tartci-<host_id>` applies; [peers] only overrides. Adding a
+    convention tartci-<host_id> applies; [peers] only overrides. Adding a
     machine therefore needs its profile and nothing on other hosts.
     """
     value = published_supply(cfg, sys_)
@@ -666,19 +832,44 @@ def self_host_id(cfg: Config) -> str:
 # Printed by the peer: its own clock, then its marker. Ages are computed on
 # the peer's clock so host clock skew cannot make a live marker look stale.
 WAITING_SEPARATOR = "--- waiting ---"
+UNREADABLE_SEPARATOR = "--- unreadable ---"
+POOL_SINCE_SEPARATOR = "--- pool-state-since ---"
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
-                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true')
+                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
+                'echo; echo "' + UNREADABLE_SEPARATOR + '"; '
+                'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/' + PEER_UNREADABLE_NAME
+                + '" 2>/dev/null || true; echo; echo "' + POOL_SINCE_SEPARATOR + '"; '
+                'stat -f %m "${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}" '
+                '2>/dev/null || true')
+
+
+def _ssh_failure_kind(result: Result) -> str:
+    """Classify a failed peer SSH probe for an actionable operator receipt."""
+    text = f"{result.text}\n{result.out}".lower()
+    if any(token in text for token in (
+            "permission denied", "publickey", "authentication failed",
+            "host key verification failed", "no supported authentication methods")):
+        return "authentication"
+    if any(token in text for token in (
+            "timed out", "timeout", "connection refused", "connection reset",
+            "network is unreachable", "no route to host", "could not resolve hostname",
+            "ssh: unreachable")):
+        return "transport"
+    return "command"
 
 
 def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str, Any]:
     """One peer's pool state, update marker and waiting ticket.
 
     {"busy": bool, "evidence": str, "active_age": seconds | None,
-     "since": epoch | None, "off": bool}. Marker ages are computed on the
+     "since": epoch | None, "off": bool, "readable": bool, "clock": epoch | None,
+     "unreadable": {host: streak} | None}. Marker ages are computed on the
     PEER's clock, so host clock skew cannot make a live marker look stale.
     `since` is when the peer's live waiting ticket joined the queue. Unreachable
-    or unreadable peers are busy: fail closed.
+    or unreadable peers are busy: fail closed. `readable` is whether its pool
+    status parsed; `unreadable` is the peer's own record of which hosts it
+    could not read, for corroboration.
 
     A peer that is OFF with no live update marker is not busy: it is out of
     service on purpose (m5studio, off for a store move on 2026-10-01, blocked
@@ -688,19 +879,37 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     refuse.
     """
     out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
-                           "off": False}
-    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
+                           "off": False, "readable": False, "clock": None, "unreadable": None}
+    ssh = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
         value = json.loads(status.out)
     except json.JSONDecodeError:
-        out["evidence"] = (f"peer {host_id} ({target}) pool status unreadable (exit {status.rc}): "
+        kind = _ssh_failure_kind(status)
+        label = {
+            "authentication": "SSH authentication failed",
+            "transport": "SSH transport failed",
+            "command": "pool status unreadable",
+        }[kind]
+        out["evidence"] = (f"peer {host_id} ({target}) {label} (exit {status.rc}): "
                            f"{status.text[:160]}")
         return out
+    out["readable"] = True
     marker = sys_.run([*ssh, _PEER_MARKER], timeout=60)
     first, _, rest = marker.out.partition("\n")
     clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
+    out["clock"] = clock
+    rest, _, pool_since_text = rest.partition(POOL_SINCE_SEPARATOR)
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
+    waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
+    pool_since = (int(pool_since_text.strip())
+                  if clock is not None and pool_since_text.strip().isdigit() else None)
+    if clock is not None and unreadable_text.strip():
+        try:
+            report = json.loads(unreadable_text)
+        except json.JSONDecodeError:
+            report = None
+        out["unreadable"] = report if isinstance(report, dict) else None
     if clock is not None and waiting_text.strip():
         try:
             ticket = json.loads(waiting_text)
@@ -711,22 +920,42 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
                 and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL):
             out["since"] = float(ticket["since"])
     is_off = value.get("state") == "off"
-    if not is_off and (value.get("state") != "on" or value.get("participating") is not True):
-        out["evidence"] = (f"peer {host_id} is {value.get('state')} "
-                           f"(participating={value.get('participating')})")
-        return out
+    serving = value.get("state") == "on" and value.get("participating") is True
+    not_serving = (f"peer {host_id} is {value.get('state')} "
+                   f"(participating={value.get('participating')})")
     if clock is None:
-        out["evidence"] = f"peer {host_id} self-update marker unreadable (exit {marker.rc})"
+        out["evidence"] = (not_serving if not (is_off or serving)
+                           else f"peer {host_id} self-update marker unreadable (exit {marker.rc})")
         return out
+    # The update marker is read BEFORE the pool state. A self-update announces,
+    # then drains, so a peer mid-update reads as draining; checked first, the
+    # pool state hid that it was the turn holder and how long it had held the
+    # turn (m5 on 2026-10-09 read "peer m5studio is draining" for an update
+    # that was 10 minutes in).
     active = None
     try:
         active = json.loads(active_text) if active_text.strip() else None
     except json.JSONDecodeError:
-        out["evidence"] = f"peer {host_id} self-update marker unreadable"
+        out["evidence"] = (not_serving if not (is_off or serving)
+                           else f"peer {host_id} self-update marker unreadable")
         return out
     if isinstance(active, dict) and clock - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
-        out.update(evidence=f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}",
-                   active_age=max(0.0, clock - float(active.get("ts", 0))))
+        age = max(0.0, clock - float(active.get("ts", 0)))
+        out.update(evidence=(f"peer {host_id} is self-updating to "
+                             f"{str(active.get('target'))[:12]} ({int(age // 60)} min in)"),
+                   active_age=age)
+        return out
+    if value.get("state") == "draining" and pool_since is not None \
+            and clock - pool_since >= PEER_DRAIN_STALE_SECONDS:
+        out.update(busy=False, off=True,
+                   evidence=(f"peer {host_id} has been draining for "
+                             f"{(clock - pool_since) / 3600:.1f} h with no update marker "
+                             "(left to the capacity floor)"))
+        return out
+    if not is_off and not serving:
+        since = (f", pool state unchanged for {int((clock - pool_since) // 60)} min"
+                 if pool_since is not None else "")
+        out["evidence"] = not_serving + since
         return out
     if is_off:
         out.update(busy=False, off=True,
@@ -743,25 +972,105 @@ def peer_state(cfg: Config, sys_: System, host_id: str, target: str) -> tuple[bo
 
 
 def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
-    return survey_peers(cfg, sys_, me)[0]
+    return survey_peers(cfg, sys_, me).busy
 
 
-def survey_peers(cfg: Config, sys_: System,
-                 me: str) -> tuple[list[str], dict[str, float], list[str]]:
-    """(why each busy peer is busy, {peer: when its ticket joined the queue},
-    off peers).
+@dataclasses.dataclass
+class Survey:
+    busy: list[str]                 # why each blocking peer blocks
+    waiting: dict[str, float]       # peer -> when its ticket joined the queue
+    off: list[str]                  # off and not updating: left to the capacity floor
+    excluded: list[str]             # unreachable long enough to stop holding the turn
+    notes: list[str]                # why each excluded peer is excluded
+
+
+def peer_streaks(cfg: Config) -> dict[str, dict]:
+    """This host's record of peers whose pool status it could not read."""
+    value = _read_json(cfg.state_dir / PEER_UNREADABLE_NAME) or {}
+    return {peer: row for peer, row in value.items() if isinstance(row, dict)
+            and isinstance(row.get("since"), (int, float)) and isinstance(row.get("reads"), int)}
+
+
+def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) -> Survey:
+    """Read every other published host once.
 
     An off peer neither blocks nor holds a place in the queue: it cannot take
     a turn while it is off, and yielding to it would stall the fleet the same
     way refusing on it did.
+
+    An unreachable peer blocks, except that one dark long enough stops holding
+    the turn (`excluded`), when all of these hold, so two hosts never go out
+    at once:
+    - this host's own streak: PEER_UNREACHABLE_MIN_READS consecutive
+      unreadable reads over at least PEER_UNREACHABLE_EXCLUDE_SECONDS; any
+      readable read, whatever it shows, ends the streak;
+    - quorum: this host reads more than half the published fleet, counting
+      itself, so a host cut off from the rest excludes nobody and the two
+      halves of an even split cannot both proceed;
+    - unanimity: at least one peer is readable, and every readable peer's own
+      read of X in the last PEER_UNREACHABLE_FRESH_SECONDS failed too. One
+      peer that can still reach X means X is alive and may be updating.
+    A host that flaps readable/unreadable never qualifies and keeps blocking;
+    STARVED_AFTER_SECONDS reports that. `record` persists the streaks and
+    emits the transition events; a plan reads them without writing.
     """
+    import host_off  # noqa: PLC0415 - sibling module; owns the event log format
+    now = sys_.now()
+    infos = {peer: read_peer(cfg, sys_, peer, target)
+             for peer, target in published_peers(cfg, sys_).items() if peer != me}
+    prior = peer_streaks(cfg)
+    streaks: dict[str, dict] = {}
+    for peer, info in infos.items():
+        was = prior.get(peer)
+        if info["readable"]:
+            if record and was and was.get("excluded"):
+                host_off.event(cfg.state_dir, "peer_unreachable_rejoined",
+                               f"peer {peer} is readable again after {int(now - was['since'])}s dark",
+                               {"peer": peer, "dark_for_s": int(now - was["since"])}, now=now)
+            continue
+        streaks[peer] = {"since": was["since"] if was else now,
+                         "reads": (was["reads"] if was else 0) + 1, "last": now,
+                         "excluded": bool(was and was.get("excluded"))}
+    readable = sorted(peer for peer, info in infos.items() if info["readable"])
+    fleet = len(infos) + 1
+    quorum = 1 + len(readable) > fleet / 2
+    excluded: list[str] = []
+    notes: list[str] = []
+    for peer, streak in sorted(streaks.items()):
+        dark = now - streak["since"]
+        corroborated_by = []
+        for other in readable:
+            report = (infos[other]["unreadable"] or {}).get(peer)
+            clock = infos[other]["clock"]
+            last = report.get("last") if isinstance(report, dict) else None
+            if (clock is not None and isinstance(last, (int, float))
+                    and 0 <= clock - last <= PEER_UNREACHABLE_FRESH_SECONDS):
+                corroborated_by.append(other)
+        unanimous = bool(readable) and corroborated_by == readable
+        qualifies = (streak["reads"] >= PEER_UNREACHABLE_MIN_READS
+                     and dark >= PEER_UNREACHABLE_EXCLUDE_SECONDS)
+        if not (qualifies and quorum and unanimous):
+            streak["excluded"] = False
+            continue
+        excluded.append(peer)
+        note = (f"{peer} unreadable since {_iso(streak['since'])} ({streak['reads']} reads; "
+                f"also dark to {', '.join(corroborated_by)}; {1 + len(readable)}/{fleet} read)")
+        notes.append(note)
+        if record and not streak["excluded"]:
+            host_off.event(cfg.state_dir, "peer_unreachable_excluded",
+                           f"peer {note}: it no longer holds the update turn",
+                           {"peer": peer, "since": _iso(streak["since"]), "reads": streak["reads"],
+                            "corroborated_by": corroborated_by,
+                            "readable": 1 + len(readable), "fleet": fleet}, now=now)
+        streak["excluded"] = True
+    if record:
+        _write_json(cfg.state_dir / PEER_UNREADABLE_NAME, streaks)
     busy: list[str] = []
     waiting: dict[str, float] = {}
     off: list[str] = []
-    for peer, target in published_peers(cfg, sys_).items():
-        if peer == me:
+    for peer, info in infos.items():
+        if peer in excluded:
             continue
-        info = read_peer(cfg, sys_, peer, target)
         if info["busy"]:
             busy.append(info["evidence"])
         elif info.get("off"):
@@ -769,7 +1078,7 @@ def survey_peers(cfg: Config, sys_: System,
             continue
         if info["since"] is not None:
             waiting[peer] = info["since"]
-    return busy, waiting, off
+    return Survey(busy, waiting, off, excluded, notes)
 
 
 def queue_ahead(me: str, my_since: float, waiting: dict[str, float]) -> list[str]:
@@ -799,21 +1108,194 @@ def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> 
     ticket = waiting_ticket(cfg) or {}
     since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
     ticket = {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
-              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue")}
+              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue"),
+              "issue_body": ticket.get("issue_body")}
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return ticket
 
 
-def clear_waiting(cfg: Config) -> None:
+PENDING_FIX_NAME = "pending-fix.json"
+
+
+def clear_waiting(cfg: Config, now: float | None = None) -> None:
+    """This host has its turn: leave the queue, and finish its starvation issue.
+
+    The fix time is recorded first (pending-fix.json), then the ticket goes.
+    The issue's marker is PATCHed with fixed_at and only then is the issue
+    closed; a failed PATCH or close is retried on the next run, so a transient
+    API error never leaves a closed issue whose marker says fixed_at null.
+    """
     ticket = waiting_ticket(cfg) or {}
     if ticket.get("issue"):
-        # The host has its turn again: the starvation issue closes itself.
-        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
-        host_off._close_issue(str(ticket["issue"]))
+        fixed_at = _iso(time.time() if now is None else now)
+        body = ticket.get("issue_body")
+        try:
+            fixed_body = tartci_incident.fixed(body, fixed_at) if isinstance(body, str) and body else None
+        except ValueError:
+            fixed_body = None
+        pending = _pending_fixes(cfg)
+        pending.append({"issue": str(ticket["issue"]), "issue_body": fixed_body,
+                        "fixed_at": fixed_at, "patched": fixed_body is None})
+        _write_json(cfg.state_dir / PENDING_FIX_NAME, {"fixes": pending})
     (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
+    finish_pending_fixes(cfg)
 
 
-def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str) -> None:
+def _pending_fixes(cfg: Config) -> list[dict]:
+    value = _read_json(cfg.state_dir / PENDING_FIX_NAME)
+    fixes = value.get("fixes") if isinstance(value, dict) else None
+    return [fix for fix in fixes if isinstance(fix, dict) and fix.get("issue")] \
+        if isinstance(fixes, list) else []
+
+
+# GitHub answers 404 for an issue that no longer exists (or that the App can
+# no longer see) and 410 for a deleted one. Neither changes on a retry.
+_ISSUE_GONE = re.compile(r"HTTP 40[4]|HTTP 410|\"status\"\s*:\s*\"?(?:404|410)\b|\b(?:Not Found|was deleted)\b")
+
+
+def _issue_gone(text: str) -> bool:
+    return bool(_ISSUE_GONE.search(text or ""))
+
+
+def finish_pending_fixes(cfg: Config) -> bool:
+    """PATCH each recorded fix time into its issue's marker, then close the
+    issue. Whatever fails stays recorded for the next run, except an issue
+    GitHub says is gone (404 or 410): that is dropped and logged once, since
+    no retry can reach it. True when none is left."""
+    pending = _pending_fixes(cfg)
+    if not pending:
+        return True
+    import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    left = []
+    for fix in pending:
+        step, rc, text = "", 0, ""
+        if not fix.get("patched"):
+            step = "patch"
+            rc, text = host_off._patch_issue_body(fix["issue"], str(fix["issue_body"]))
+            if rc == 0:
+                fix["patched"] = True
+        if rc == 0:
+            step = "close"
+            rc, text = host_off._close_issue(fix["issue"])
+        if rc == 0:
+            continue
+        fix["error"] = f"{step}: {text}"[:300]
+        if _issue_gone(text):
+            print(f"self-update: starvation issue #{fix['issue']} is gone ({fix['error']}); "
+                  f"dropping its fix time {fix.get('fixed_at')}")
+            host_off.event(cfg.state_dir, "self_update_issue_gone",
+                           f"starvation issue #{fix['issue']} is gone; fix time not recorded",
+                           {"issue": fix["issue"], "fixed_at": fix.get("fixed_at"),
+                            "error": fix["error"]})
+            continue
+        print(f"self-update: starvation issue #{fix['issue']}: "
+              + ("fixed_at not recorded" if step == "patch" else "not closed")
+              + f" ({fix['error']}); retrying next run")
+        left.append(fix)
+    path = cfg.state_dir / PENDING_FIX_NAME
+    if left:
+        _write_json(path, {"fixes": left})
+    else:
+        path.unlink(missing_ok=True)
+    return not left
+
+
+def _turn_holder(reason: str) -> tuple[str, str]:
+    """(cause, the peers named) from the reason a deferral recorded."""
+    text = reason or ""
+    if text.startswith("yielding the update turn to a host that has waited longer: "):
+        return "waited_longer", text.split(": ", 1)[1]
+    if text.startswith("another fleet host is not serving normally: "):
+        evidence = text.split(": ", 1)[1]
+        dark = any(word in evidence.lower() for word in ("unreadable", "unreachable"))
+        return ("dark" if dark else "busy"), evidence
+    if text.startswith("peer announced first") or text.startswith("peer changed after announcing"):
+        return "announced", text.split(": ", 1)[1] if ": " in text else text
+    return "unknown", text
+
+
+def starvation_body(cfg: Config, me: str, ticket: dict, waited: float, reason: str,
+                    now: float) -> str:
+    """What happened, the evidence, the likely cause, the exact fix, whether it
+    is safe to apply unattended, and how to verify: one issue a reader can act
+    on without opening a host."""
+    cause, named = _turn_holder(reason)
+    since = _iso(float(ticket["since"]))
+    demand = ticket.get("demand") or []
+    dark = _read_json(cfg.state_dir / PEER_UNREADABLE_NAME) or {}
+    if demand:
+        bound = (f"while gate jobs it serves were queued. The bound with queued gate demand "
+                 f"is {STARVED_AFTER_SECONDS // 3600} h: one hour past the "
+                 f"{PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h after which a dark peer stops "
+                 "holding the turn.")
+    else:
+        bound = (f"with no queued gate demand read for it"
+                 f"{' (the demand read failed)' if ticket.get('demand_error') else ''}. "
+                 f"The bound without demand is {STARVED_FALLBACK_SECONDS // 3600} h.")
+    lines = [
+        f"**What happened.** {me} has had no tartci self-update turn for "
+        f"{waited / 3600:.1f} h (in the update queue since {since}), {bound}",
+        "",
+        "**Evidence.**",
+        f"- Deferral reason: {reason[:300]}",
+        f"- Waiting ticket: since {since}, target {str(ticket.get('target') or '')[:12]}",
+    ]
+    for job in demand[:5]:
+        lines.append(f"- Queued gate job {job.get('id')} ({job.get('repo')} "
+                     f"{job.get('workflow')}: {job.get('name')}) since {job.get('created_at')}")
+    if len(demand) > 5:
+        lines.append(f"- ...and {len(demand) - 5} more queued gate jobs")
+    if ticket.get("demand_error"):
+        lines.append(f"- Gate demand read failed: {str(ticket['demand_error'])[:200]}")
+    for peer, streak in sorted(dark.items()) if isinstance(dark, dict) else []:
+        if isinstance(streak, dict) and isinstance(streak.get("since"), (int, float)):
+            lines.append(f"- {peer} unreadable since {_iso(float(streak['since']))} "
+                         f"({streak.get('reads')} reads; excluded: {bool(streak.get('excluded'))})")
+    lines += ["", "**Likely cause and fix.**"]
+    if cause == "dark":
+        lines += [
+            f"A peer this host cannot read holds the turn ({named[:200]}). It stops holding "
+            f"it automatically once it has been dark for {PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h, "
+            "read unreadable by every readable peer.",
+            "- Check the dark host at the machine: `tartci pool status`.",
+            f"- To update {me} now instead, on {me}: `tartci fleet-macos self-update --plan`, "
+            "then `tartci fleet-macos self-update --apply`.",
+            "- Safe to auto-apply: no. The automatic exclusion already runs; a manual "
+            "update takes this host out of service.",
+        ]
+    elif cause == "busy":
+        lines += [
+            f"A peer is not serving normally ({named[:200]}), so this host will not drain too.",
+            "- On that peer: `tartci pool status`, and let its update or drain finish.",
+            "- Safe to auto-apply: no; wait for the peer, or fix it by hand.",
+        ]
+    elif cause == "waited_longer":
+        lines += [
+            f"{named[:200]} joined the update queue first and goes first.",
+            "- On that host: `tartci fleet-macos self-update --plan` shows why it has not "
+            "updated. If its ticket is stale, move it aside there: "
+            "`mv ~/.tartci/state/self-update/waiting.json ~/.tartci/state/self-update/waiting.json.aside` "
+            "(it rejoins at the back on its next attempt).",
+            "- Safe to auto-apply: no; moving a ticket changes the queue order.",
+        ]
+    else:
+        lines += [
+            f"A peer holds the turn ({named[:200]}).",
+            "- On every host: `tartci pool status`.",
+            "- Safe to auto-apply: no.",
+        ]
+    lines += [
+        "",
+        f"**Verify.** On {me}, `tartci fleet-macos self-update --plan` takes the turn, or "
+        "`~/.tartci/state/self-update/waiting.json` is gone. This issue records the fix "
+        "time on its marker and closes itself when the host gets its turn.",
+    ]
+    marker = tartci_incident.marker(me, "self_update_starved", since, _iso(now))
+    return tartci_incident.with_marker("\n".join(lines), marker)
+
+
+def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str,
+                     now: float | None = None) -> None:
     """Once per episode, a GitHub issue: the event log alone was read by nobody.
 
     During the 2026-10-01 stall three hosts crossed the bound and wrote
@@ -823,24 +1305,93 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
     if ticket.get("issue") or os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
         return
     import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    now = time.time() if now is None else now
     title = (f"[tartci] {me} self-update starved for {waited / 3600:.1f} h "
              f"since {_iso(float(ticket['since']))}")
-    body = (f"{me} has deferred its tartci self-update for {waited / 3600:.1f} h: {reason}\n\n"
-            "A busy, unreachable or longer-waiting peer holds the update turn. Check "
-            "`tartci pool status` on every host. This issue closes itself when the host "
-            "gets its turn.")
+    body = starvation_body(cfg, me, ticket, waited, reason, now)
     rc, text = host_off._open_issue(title, body)
     if rc == 0 and text.strip().isdigit():
         ticket["issue"] = text.strip()
+        ticket["issue_body"] = body
     else:
         ticket["issue_error"] = text[:300]
 
 
+# A gate-demand snapshot older than this is not used: the bound falls back.
+GATE_DEMAND_FRESH_SECONDS = 10 * 60
+
+
+def _demand_fetch() -> gate_job_demand.Fetch:
+    return gate_job_demand.gh_fetcher(os.environ.get("TARTCI_GH_CLI") or "ghapp")
+
+
+def _gate_queue_path(cfg: Config) -> Path:
+    return _gate_queue_path_in(cfg.state_dir)
+
+
+def refresh_gate_demand(cfg: Config, me: str, now: float) -> dict:
+    """Read the queued self-hosted gate jobs this host serves and keep them in
+    gate-queue.json. A host with no published registration reads nothing."""
+    advertised = _read_json(cfg.checkout / "fleet/advertised-labels.json")
+    regs = gate_job_demand.registrations(advertised, me)
+    if not regs:
+        return {}
+    try:
+        jobs, errors = gate_job_demand.queued_jobs(_demand_fetch(), regs, now)
+    except Exception as error:  # noqa: BLE001 - a failed read is recorded, not raised
+        jobs, errors = [], [str(error)[:300]]
+    snapshot = {"observed_at": _iso(now), "host_id": me, "jobs": jobs, "errors": errors}
+    _write_json(_gate_queue_path(cfg), snapshot)
+    return snapshot
+
+
+def gate_demand(cfg: Config, me: str, now: float | None = None) -> tuple[list[dict], list[str]]:
+    """(queued gate jobs this host serves, read errors) from a fresh snapshot."""
+    return gate_demand_at(_gate_queue_path(cfg), me, now)
+
+
+def gate_demand_at(path: Path, me: str, now: float | None = None) -> tuple[list[dict], list[str]]:
+    """gate_demand for the snapshot at `path`; a stale or missing snapshot is
+    no demand, reported as an error."""
+    now = time.time() if now is None else now
+    value = _read_json(path)
+    if not isinstance(value, dict) or value.get("host_id") != me:
+        return [], ["no gate-demand snapshot for this host"]
+    observed = gate_job_demand.epoch(value.get("observed_at"))
+    if observed is None or not 0 <= now - observed <= GATE_DEMAND_FRESH_SECONDS:
+        return [], ["the gate-demand snapshot is stale"]
+    jobs = value.get("jobs") if isinstance(value.get("jobs"), list) else []
+    errors = value.get("errors") if isinstance(value.get("errors"), list) else []
+    return gate_job_demand.jobs_for(jobs, me, now), [str(error) for error in errors]
+
+
+def gate_demand_waiting(cfg: Config, me: str = "", now: float | None = None) -> bool:
+    """Whether queued gate jobs this host serves are waiting."""
+    return bool(gate_demand(cfg, me, now)[0])
+
+
+def _gate_queue_path_in(state_dir: Path) -> Path:
+    return Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(state_dir / "gate-queue.json"))
+
+
 def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
-    """Record the deferral; EXIT_DEFERRED until it has lasted STARVED_AFTER_SECONDS."""
+    """Record the deferral; become loud past the starvation bound: one hour
+    after the dark-peer exclusion when gate jobs this host serves are queued,
+    STARVED_FALLBACK_SECONDS otherwise or when the demand read failed."""
     ticket = note_waiting(cfg, me, target, reason, now)
     waited = max(0.0, now - float(ticket["since"]))
-    if waited < STARVED_AFTER_SECONDS:
+    refresh_gate_demand(cfg, me, now)
+    demand, demand_errors = gate_demand(cfg, me, now)
+    ticket["demand"] = demand[:20]
+    # A failed demand read falls back to the long bound, and says so: a blind
+    # read is not "no demand".
+    ticket["demand_error"] = "; ".join(demand_errors)[:300] or None
+    _write_json(cfg.state_dir / "waiting.json", ticket)
+    if demand_errors:
+        print(f"self-update: gate demand unread ({ticket['demand_error']}); "
+              f"starvation bound {STARVED_FALLBACK_SECONDS // 3600} h")
+    bound = STARVED_AFTER_SECONDS if demand else STARVED_FALLBACK_SECONDS
+    if waited < bound:
         print(f"self-update: DEFERRED ({waited / 3600:.1f} h in the update queue): {reason}")
         return EXIT_DEFERRED
     print(f"self-update: STARVED: no update turn for {waited / 3600:.1f} h "
@@ -849,9 +1400,11 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
         import host_off  # noqa: PLC0415 - sibling module; owns the event log format
         host_off.event(cfg.state_dir, "self_update_starved",
                        f"no update turn for {waited / 3600:.1f} h: {reason[:200]}",
-                       {"since": _iso(float(ticket["since"])), "target": target[:12]}, now)
+                       {"since": _iso(float(ticket["since"])), "target": target[:12],
+                        "gate_jobs": [job.get("id") for job in demand[:20]],
+                        "demand_error": ticket.get("demand_error")}, now)
         ticket["starved_evented"] = now
-    starvation_issue(cfg, me, ticket, waited, reason)
+    starvation_issue(cfg, me, ticket, waited, reason, now)
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return EXIT_REFUSED
 
@@ -882,14 +1435,18 @@ def python_shim_dir() -> str:
     return _PYTHON_SHIM_DIR
 
 
-def census_env() -> dict[str, str]:
+def census_env(repository: str | None = None) -> dict[str, str]:
     # The census binds its identity per call (#227); this also pins the CLI and
     # the interpreter every tartci helper runs under, including on rollback.
-    return {
+    env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
         "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
+    if repository is not None:
+        env["GH_REPO"] = repository
+    return env
 
 
 # The capacity floor owns the judgement of whether a peer can mint on demand;
@@ -917,7 +1474,7 @@ def on_demand_supply(cfg: Config, sys_: System, me: str,
     def healthy(host_id: str) -> str | None:
         if host_id not in health:
             target = peers.get(host_id) or SSH_ALIAS_CONVENTION.format(host_id=host_id)
-            status = sys_.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+            status = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
                                "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
             try:
                 value = json.loads(status.out)
@@ -999,21 +1556,36 @@ def extract_signing_identity(sys_: System, bundle: Path, workdir: Path) -> str:
 
 
 def signing_secrets(home: Path) -> dict[str, str]:
-    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env)."""
-    directory = Path(os.environ.get("PULP_SECRETS_DIR") or home / ".config" / "pulp" / "secrets")
-    values: dict[str, str] = {}
-    try:
-        lines = (directory / "keychain.env").read_text().splitlines()
-    except OSError:
-        return values
-    for line in lines:
-        key, sep, value = line.strip().partition("=")
-        if sep and key and not key.startswith("#"):
-            values[key.removeprefix("export ").strip()] = value.strip().strip('"').strip("'")
+    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env).
+
+    Only well-formed lines are returned; see secret_files.parse. Never put a
+    value from here into a message: name the key instead.
+    """
+    env = secret_files.load(home, "keychain.env")
+    values = dict(env.values) if env is not None else {}
     for key in ("PULP_SIGN_KEYCHAIN", "PULP_SIGN_KEYCHAIN_PW"):
         if os.environ.get(key):
             values[key] = os.environ[key]
     return values
+
+
+def signing_secrets_problem(home: Path) -> str | None:
+    """What is wrong with keychain.env, by key name only, or None."""
+    env = secret_files.load(home, "keychain.env")
+    if env is None:
+        return None
+    bad = list(env.malformed)
+    keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
+    if keychain and not secret_files.keychain_path_ok(_expand_home(keychain, home)):
+        bad.append("PULP_SIGN_KEYCHAIN (not a keychain path)")
+    if not bad:
+        return None
+    return ("keychain.env is malformed: " + ", ".join(bad)
+            + "; values withheld. Rewrite it with `pulp ship doctor`")
+
+
+def _expand_home(value: str, home: Path) -> str:
+    return str(Path(value.replace("$HOME", str(home))).expanduser())
 
 
 def signing_keychain(home: Path) -> str | None:
@@ -1022,12 +1594,16 @@ def signing_keychain(home: Path) -> str | None:
     keychain.env's PULP_SIGN_KEYCHAIN, or its `-unattended` sibling when that
     exists: pulp's ensure_signing_ready.sh builds the sibling when the
     configured keychain cannot be unlocked, and signs from it from then on.
+    A value that is not a keychain path is ignored (None): it is what a
+    malformed file parses as, and it may hold the password.
     """
     keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
     if not keychain:
         return None
-    path = Path(keychain.replace("$HOME", str(home))).expanduser()
-    stem = str(path)[: -len(".keychain-db")] if str(path).endswith(".keychain-db") else str(path)
+    path = _expand_home(keychain, home)
+    if not secret_files.keychain_path_ok(path):
+        return None
+    stem = path[: -len(".keychain-db")] if path.endswith(".keychain-db") else path
     sibling = Path(f"{stem}-unattended.keychain-db")
     return str(sibling if sibling.exists() else path)
 
@@ -1047,12 +1623,15 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     keychain = signing_keychain(home)
     password = signing_secrets(home).get("PULP_SIGN_KEYCHAIN_PW")
     if not keychain or not password:
-        return "no dedicated signing keychain configured in keychain.env; probing as-is"
+        problem = signing_secrets_problem(home)
+        return (f"{problem}; probing as-is" if problem else
+                "no dedicated signing keychain configured in keychain.env; probing as-is")
     result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
     if result.rc != 0:
-        return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
-                "the signing probe decides")
-    return f"unlocked {keychain} for this session"
+        return secret_files.redact(
+            f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
+            "the signing probe decides", home)
+    return secret_files.redact(f"unlocked {keychain} for this session", home)
 
 
 def keychain_args(home: Path) -> list[str]:
@@ -1084,8 +1663,8 @@ def signing_probe(sys_: System, identity: str, workdir: Path,
     if result.rc != 0:
         raise Refused(f"SIGNING KEYCHAIN LOCKED or unusable: signing identity {identity} "
                       f"cannot sign unattended (exit {result.rc}: "
-                      f"{result.text[:200]}); run `pulp ship doctor` to prepare the dedicated "
-                      "signing keychain, and never answer a keychain password prompt")
+                      f"{secret_files.redact(result.text)[:200]}); run `pulp ship doctor` to prepare "
+                      "the dedicated signing keychain, and never answer a keychain password prompt")
 
 
 def set_immutable(root: Path, manifest: Path, sys_: System) -> None:
@@ -1167,10 +1746,16 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
+        launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
+            "TARTCI_PYTHON") or sys.executable)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
-                           "--support-root", ".", "--profile", str(profile), *pinned],
-                          cwd=str(cfg.checkout), timeout=1800)
+                           "--support-root", ".", "--profile", str(profile),
+                           "--python", launcher_python, *pinned],
+                          cwd=str(cfg.checkout),
+                          env={"TARTCI_RENDER_PYTHON": launcher_python,
+                               "TARTCI_PYTHON": launcher_python},
+                          timeout=1800)
     finally:
         restore_writable(cfg.checkout)
     # The builder's cleanup trap cannot remove its read-only staging copy and
@@ -1191,8 +1776,12 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
+    launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
+        "TARTCI_PYTHON") or sys.executable)
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
-                       "--output", str(rendered)], cwd=str(cfg.checkout))
+                       "--output", str(rendered)], cwd=str(cfg.checkout),
+                      env={"TARTCI_RENDER_PYTHON": launcher_python,
+                           "TARTCI_PYTHON": launcher_python})
     if result.rc != 0:
         raise Refused(f"cannot render the profile to verify the bundle: {result.text}")
     import plistlib
@@ -1202,6 +1791,11 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
         expected[env.get("TARTCI_QUEUE_LANE_ID")] = dict(sorted(env.items()))
     if not expected or {k: (v or {}).get("environment") for k, v in lanes.items()} != expected:
         raise Refused("new launcher lanes.json does not carry the rendered lane environment")
+    for lane, environment in expected.items():
+        if environment.get("TARTCI_PYTHON") != launcher_python:
+            raise Refused(f"new launcher lane {lane} is missing pinned TARTCI_PYTHON {launcher_python}")
+        if environment.get("SHIPYARD_GHAPP_PYTHON_BINARY") != launcher_python:
+            raise Refused(f"new launcher lane {lane} is missing pinned ghapp interpreter {launcher_python}")
     check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
     if check.rc != 0:
         raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
@@ -1225,7 +1819,7 @@ def orchestrator_generation(script: Path | None = None) -> str | None:
 
     The orchestration (gates, drain, install sequencing, verify, rollback) is
     the INSTALLED generation's code: the agent runs ~/.local/bin/tartci. Only
-    the steps run through `tartci()` (support-manifest, validate, install) and
+    the steps run through tartci() (support-manifest, validate, install) and
     the template check run the TARGET's code. So a change to orchestration takes
     effect from the update after the one that installs it. Recording which code
     orchestrated each attempt makes that visible. None when the code is not
@@ -1311,8 +1905,25 @@ def halt_reason(state_dir: Path) -> str | None:
         streak = 0 if value.get("status") == "succeeded" else streak + 1
     if streak >= MAX_CONSECUTIVE_FAILURES:
         return (f"self-update HALTED after {streak} consecutive failed attempts; read the "
-                "receipts, fix the cause, then `tartci fleet-macos self-update --clear-halt`")
+                "receipts, fix the cause, then tartci fleet-macos self-update --clear-halt")
     return None
+
+
+def scheduled_pause(state_dir: Path) -> str | None:
+    value = _read_json(state_dir / "scheduled-pause.json")
+    if not isinstance(value, dict) or not value.get("reason"):
+        return None
+    return (f"self-update PAUSED by operator at {value.get('at')}: {value['reason']} "
+            "(resume with tartci fleet-macos self-update --resume)")
+
+
+def record_pause_control(state_dir: Path, action: str, reason: str | None = None) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "scheduled-pause-receipts.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"action": action, "at": _iso(time.time()),
+                                 **({"reason": reason} if reason else {})},
+                                sort_keys=True) + "\n")
 
 
 def prune_refusals(state_dir: Path, now: float) -> None:
@@ -1341,10 +1952,42 @@ def relay_enabled(cfg: Config) -> bool:
         return True  # unreadable profile: run reconcile, which will say why
 
 
-def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
+def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900,
+           repository: str | None = None) -> Result:
     """The TARGET commit's tartci, run from the managed checkout."""
-    return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(),
+    return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(repository),
                     timeout=timeout)
+
+
+def handoff_target_orchestrator(cfg: Config, target: str, *,
+                                apply: bool, scheduled: bool, refresh: bool) -> bool:
+    """Run the target checkout's orchestration code before sealed builds.
+
+    A sealed launcher starts the self-update script copied into its installed
+    generation.  That copy may predate a launcher verification fix and can
+    therefore reject the target's corrected bundle forever.  Once the
+    authenticated checkout is detached at the selected target, hand off to
+    its own dispatcher.  The environment marker prevents the target copy from
+    handing off to itself again.
+    """
+    if (not apply or refresh
+            or os.environ.get("TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR") == "1"):
+        return False
+    if orchestrator_generation() is None:
+        return False
+    if launch_helper(cfg) is None:
+        return False
+    dispatcher = cfg.checkout / "tartci"
+    args = [str(dispatcher), "fleet-macos", "self-update", "--apply",
+            "--target", target, "--home", str(cfg.home)]
+    if scheduled:
+        args.append("--scheduled")
+    # The checkout was authenticated and detached immediately before this
+    # call. Replace the installed-generation process so launchd's signal
+    # reaches the real orchestrator and its output remains attached.
+    environment = {**os.environ, "TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"}
+    os.execve(str(dispatcher), args, environment)
+    return True  # only reachable under the unit-test execve stub
 
 
 def installed_tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
@@ -1370,7 +2013,7 @@ def previous_run_state(cfg: Config, sys_: System) -> tuple[str | None, list[Path
             and _alive(sys_, installer["pgid"], installer.get("start")):
         return (f"a previous self-update's installer is still running (pgid {installer['pgid']}, "
                 f"started {installer.get('start')}); wait for it to exit, then run "
-                "`tartci fleet-macos self-update --verify`"), []
+                "tartci fleet-macos self-update --verify"), []
     interrupted = []
     for path, value in _attempts(cfg.state_dir):
         if value.get("mode") != "apply" or value.get("status") != "running":
@@ -1418,7 +2061,7 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
         message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
                    f"during {value['steps'][-1]['step'] if value.get('steps') else 'start'}; "
                    f"host runs {str(running)[:12]}; " + "; ".join(notes)
-                   + "; run `tartci fleet-macos self-update --verify`")
+                   + "; run tartci fleet-macos self-update --verify")
         value.setdefault("steps", []).append({"at": _iso(sys_.now()), "step": "interrupted",
                                               "ok": False, "detail": message})
         value.update(status="failed", error=message, finished_at=_iso(sys_.now()))
@@ -1462,7 +2105,7 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
 
 
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
-                  scheduled: bool = False) -> int:
+                  explicit: bool = False, scheduled: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
@@ -1478,6 +2121,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_FAILED
     if apply:
         recover_left_off(cfg, sys_)
+        finish_pending_fixes(cfg)
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)
@@ -1491,10 +2135,33 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         _write_json(cfg.state_dir / "skew.json", {"state": "unknown", "reason": str(exc),
                                                   "measured_at": _iso(now)})
         return EXIT_UNKNOWN
-    skew = measure_skew(cfg, sys_, installed, now, target_ref)
+    try:
+        skew = measure_skew(cfg, sys_, installed, now, target_ref, explicit=explicit)
+    except Refused as exc:
+        # Repository authentication is a normal preflight refusal.  Keep the
+        # scheduled agent alive and leave an attempt receipt behind instead of
+        # allowing a refusal from configured_repository() to escape as a
+        # traceback before Receipt has been created.
+        reason = str(exc)
+        skew = {"state": "unknown", "reason": reason, "measured_at": _iso(now),
+                "installed": installed}
+        _write_json(cfg.state_dir / "skew.json", skew)
+        receipt = Receipt(cfg, sys_, installed, "apply" if apply else "plan")
+        receipt.value["previous"] = installed
+        receipt.step("refused", reason, ok=False)
+        receipt.finish("refused", reason)
+        print(f"self-update: REFUSED {reason}")
+        return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
     print(f"self-update: {render_skew(skew)}")
+    if skew.get("explicit"):
+        print(f"self-update: selected {skew.get('selected_target') or 'none'} "
+              f"(requested {skew.get('requested_target')}; {skew.get('selection_reason', 'same')})")
+        if skew["state"] in ("soaking", "unverified"):
+            print(f"self-update: REFUSED explicit target {skew.get('requested_target')}: "
+                  f"{skew.get('selection_reason')}")
+            return EXIT_REFUSED
     if skew["state"] in ("unknown", "diverged"):
         return EXIT_UNKNOWN
     target = skew.get("target")
@@ -1512,11 +2179,36 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
+    receipt.value.update(requested_target=skew.get("requested_target"),
+                         selected_target=skew.get("selected_target"),
+                         explicit=bool(skew.get("explicit")),
+                         soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
     try:
+        if apply and launch_helper(cfg) is not None:
+            _checkout(cfg, sys_, target)
+        if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
+                                       refresh=bool(refresh)):
+            return EXIT_OK
+    except (FileNotFoundError, PermissionError) as exc:
+        reason = f"target dispatcher unavailable: {type(exc).__name__}: {exc}"
+        receipt.step("refused", reason, ok=False)
+        receipt.finish("refused", reason)
+        print(f"self-update: REFUSED {reason}", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
         me = self_host_id(cfg)
+        # Observe peers before any later gate can defer this run.  In
+        # particular, capacity-floor and installer checks may refuse before
+        # the queue decision below; skipping the survey there meant a dead
+        # peer never accumulated its unreadable-read streak and every host
+        # could wait forever for a fresh report.  Plans remain read-only.
+        survey = survey_peers(cfg, sys_, me, record=apply)
         if apply:
+            paused = scheduled_pause(cfg.state_dir)
+            if paused:
+                raise Refused(paused)
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
@@ -1531,7 +2223,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         for name, args in (
                 ("support-manifest", ["support-manifest", "write", "--root", ".",
                                       "--output", ".tartci-support-manifest.json"]),
-                ("validate", ["fleet-macos", "validate", str(profile)])):
+                ("validate", ["fleet-macos", "validate", str(profile), "--check-reserve"])):
             result = tartci(cfg, sys_, *args)
             if result.rc != 0:
                 raise Refused(f"{name} failed: {result.text}")
@@ -1548,20 +2240,26 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          "certificate; a timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
+        repository = configured_repository(cfg, sys_)
+        print(f"self-update: repository={repository}")
         if helper is None:
-            dry = tartci(cfg, sys_, *install_args)
+            dry = tartci(cfg, sys_, *install_args, repository=repository)
             if dry.rc != 0:
                 raise Refused(f"install dry-run failed: {dry.text}")
             receipt.step("install-dry-run", "ok")
         else:
-            # The installer verifies the new bundle against the approval pin,
-            # and the pin may only move once the host is out of service, so a
-            # sealed host's dry run happens right after the pin, before --apply.
-            receipt.step("install-dry-run", "deferred until the approval pin moves (after pool off)")
+            # Authenticate the repository and exact support commit while the
+            # host is still serving. Only approval-pin dependent validation is
+            # allowed to wait until after drain and the pin move.
+            preflight = tartci(cfg, sys_, *install_args, "--preflight", repository=repository)
+            if preflight.rc != 0:
+                raise Refused(f"sealed-launcher installer preflight refused before drain: {preflight.text}")
+            receipt.step("installer-preflight", "repository and exact source commit authenticated before drain")
+            install_args += ["--skip-preflight"]
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy, waiting, off = survey_peers(cfg, sys_, me)
+        busy, waiting, off = survey.busy, survey.waiting, survey.off
         ticket = waiting_ticket(cfg)
         my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
                     else sys_.now())
@@ -1582,7 +2280,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         else:
             receipt.step("peers", "every other published host is on and not updating"
                          + (f"; off and not updating, so counted as serving nothing by the "
-                            f"capacity floor: {', '.join(off)}" if off else ""))
+                            f"capacity floor: {', '.join(off)}" if off else "")
+                         + (f"; unreachable, so no longer holding the turn and counted as "
+                            f"serving nothing by the capacity floor: {'; '.join(survey.notes)}"
+                            if survey.excluded else ""))
         allow = False
         try:
             allow, rule = floor_decision(cfg, sys_, me)
@@ -1601,7 +2302,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             out_dir = builds / target
             clear_dir(out_dir)
             out_dir.mkdir(parents=True)
-            bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+            try:
+                bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+            except Refused as exc:
+                raise HostFault(str(exc)) from exc
             prune_dirs(builds, KEEP_BUILDS)
             install_args += ["--launch-helper-source", str(bundle)]
             receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
@@ -1615,13 +2319,23 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_OK
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
-                  helper=helper, approval=approval)
+                  repository=repository,
+                  helper=helper, approval=approval, excluded=survey.excluded)
         return run.execute()
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.value["deferred"] = True
         receipt.finish("refused", str(exc))
         return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
+    except HostFault as exc:
+        # A pre-drain refusal must not retain an old queue ticket forever.
+        # Leave the turn available to peers; the next scheduled attempt gets
+        # a fresh ticket and naturally backs off behind any active holder.
+        if apply:
+            clear_waiting(cfg)
+        receipt.step("refused", str(exc), ok=False)
+        receipt.finish("refused", str(exc))
+        return EXIT_REFUSED
     except Refused as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))
@@ -1670,11 +2384,15 @@ class Run:
 
     def __init__(self, cfg: Config, sys_: System, receipt: Receipt, *, me: str, target: str,
                  previous: str, profile: Path, install_args: list[str], allow: bool,
-                 helper: dict | None, approval: Path | None) -> None:
+                 helper: dict | None, approval: Path | None,
+                 repository: str | None = None,
+                 excluded: list[str] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
+        self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
+        self.repository = repository
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
@@ -1684,15 +2402,33 @@ class Run:
                              pin_path=str(self.pin_path) if self.pin_path else None)
 
     # ── entry ───────────────────────────────────────────────────────────
+    def _record_skew_after_apply(self) -> None:
+        """Rewrite skew.json for the generation this run just verified.
+
+        skew.json is otherwise written only before the run, so a successful
+        update left status reading the PRE-update skew until the watchdog's
+        next refresh, which is never when the watchdog is not running. Checks
+        are not re-queried: verification already proved this generation runs.
+        Best effort: the update has succeeded whatever this does.
+        """
+        try:
+            skew = measure_skew(self.cfg, self.sys, self.target, self.sys.now(),
+                                verify_checks=False)
+            skew["recorded_by"] = "verified_apply"
+            _write_json(self.cfg.state_dir / "skew.json", skew)
+            self.receipt.step("skew", render_skew(skew))
+        except Exception as exc:  # noqa: BLE001 - never turn a success into a failure
+            self.receipt.step("skew", f"not recorded: {type(exc).__name__}: {exc}", ok=False)
+
     def execute(self) -> int:
         import signal
         previous_handler = signal.signal(signal.SIGTERM, _raise_terminated)
         try:
-            _announce(self.cfg, self.sys, self.me, self.target)
+            _announce(self.cfg, self.sys, self.me, self.target, self.excluded)
             self.receipt.step("announce", str(self.cfg.state_dir / "active.json"))
             # This host has its turn: whatever the update's outcome, it no
             # longer holds a place in the queue.
-            clear_waiting(self.cfg)
+            clear_waiting(self.cfg, self.sys.now())
             self._snapshot()
             try:
                 self._update()
@@ -1705,6 +2441,7 @@ class Run:
                                           terminated=True)
             except Exception as exc:  # noqa: BLE001 - never leave the host out
                 return self._safe_recover(f"{type(exc).__name__} during {self.phase}: {exc}")
+            self._record_skew_after_apply()
             self.receipt.finish("succeeded")
             prune_dirs(self.cfg.state_dir / "rollback", KEEP_SNAPSHOTS)
             return EXIT_OK
@@ -1785,10 +2522,12 @@ class Run:
             self._write_pin(self.approval.read_text())
             self.pin_moved = True
             self.receipt.step("pin", "new launcher approval pinned (previous in the snapshot)")
-            dry = tartci(cfg, sys_, *self.install_args)
+            self.receipt.step("install-dry-run", "checking installer staging after the pin move; dry-run does not perform pin validation")
+            dry = tartci(cfg, sys_, *self.install_args, repository=self.repository)
             if dry.rc != 0:
-                raise Failed(f"install dry-run failed against the new pin: {dry.text}")
-            self.receipt.step("install-dry-run", "ok against the new pin")
+                self.receipt.step("install-dry-run", f"refused: {dry.text[:300]}", ok=False)
+                raise Refused(f"sealed-launcher post-pin installer staging refused: {dry.text}")
+            self.receipt.step("install-dry-run", "staging checks ok; pin validation runs in install --apply")
         self.phase = "install"
         self._install(self.install_args)
         self.receipt.step("install", f"applied {self.target[:12]}")
@@ -1801,6 +2540,7 @@ class Run:
         verify(cfg, sys_, self.target, self.receipt)
         self.phase = "support-agents"
         self._support_agents()
+        self._vm_dhcp_verify()
 
     def _support_agents(self) -> None:
         """Converge the declared support agents with the installed generation.
@@ -1808,7 +2548,7 @@ class Run:
         Non-fatal by design: the lanes are verified and serving by now, and a
         janitor's plist must not be able to take the serving generation back.
         A failure is a receipt step with ok=False, an event in the support
-        agents' own log, and a `tartci doctor fleet` finding.
+        agents' own log, and a tartci doctor fleet finding.
         """
         try:
             result = installed_tartci(self.cfg, self.sys, "fleet-macos", "support-agents",
@@ -1817,6 +2557,20 @@ class Run:
             self.receipt.step("support-agents", f"{type(exc).__name__}: {exc}", ok=False)
             return
         self.receipt.step("support-agents", result.text.strip()[-1500:], ok=result.rc == 0)
+
+    def _vm_dhcp_verify(self) -> None:
+        """Prove the VM network with one probe before the lanes clone freely.
+
+        Non-fatal: the lanes are already verified and serving, and the
+        breaker fails open if this cannot be written.
+        """
+        try:
+            result = installed_tartci(self.cfg, self.sys, "vm-dhcp", "verify",
+                                      "--reason", "self_update", timeout=60)
+        except Exception as exc:  # noqa: BLE001 - never fails the lane update
+            self.receipt.step("vm-dhcp-verify", f"{type(exc).__name__}: {exc}", ok=False)
+            return
+        self.receipt.step("vm-dhcp-verify", result.text.strip()[-500:], ok=result.rc == 0)
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
         deadline = self.sys.now() + self.cfg.wait_seconds
@@ -1861,7 +2615,7 @@ class Run:
         fence = self._writer_fence()
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
-                                           cwd=str(self.cfg.checkout), env=census_env(),
+                                           cwd=str(self.cfg.checkout), env=census_env(self.repository),
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
@@ -1903,11 +2657,16 @@ class Run:
 
     POOL_ON_BACKOFF = (15, 45, 90)
 
-    def _pool_on(self) -> bool:
+    def _pool_on(self, *, restore_receipt: bool = False) -> bool:
         for attempt in range(1, self.POOL_ON_ATTEMPTS + 1):
-            on = installed_tartci(self.cfg, self.sys, "pool", "on")
+            args = ["pool", "on"]
+            if restore_receipt:
+                args.append("--restore-receipt")
+            on = installed_tartci(self.cfg, self.sys, *args)
             if on.rc == 0:
-                self.receipt.step("pool-on", "installed shim")
+                self.receipt.step("pool-on", "installed shim" +
+                                  ("; restored prior receipted serving set without fresh relay proof"
+                                   if restore_receipt else ""))
                 return True
             self.receipt.step("pool-on", f"attempt {attempt} failed (exit {on.rc}): {on.text[:300]}",
                               ok=False)
@@ -1938,7 +2697,8 @@ class Run:
         except (json.JSONDecodeError, AttributeError):
             return "unknown"
 
-    def _ensure_on(self, *, allow_reinstall: bool = True) -> str:
+    def _ensure_on(self, *, allow_reinstall: bool = True,
+                   restore_receipt: bool = False) -> str:
         """Put the host back in service, whatever else failed. Returns the
         resulting pool state: "on", "undrained", or what the host is left in.
 
@@ -1951,7 +2711,7 @@ class Run:
         and never strands it drained. `allow_reinstall=False` (a terminated
         run, with launchd's SIGKILL pending) tries `pool on` only.
         """
-        if self._pool_on():
+        if self._pool_on(restore_receipt=restore_receipt):
             return "on"
         state = self._pool_state()
         if not allow_reinstall:
@@ -1988,7 +2748,8 @@ class Run:
         except Exception as exc:  # noqa: BLE001 - recorded; the host stays as it is
             self.receipt.step("reinstall-for-pool-on", f"{type(exc).__name__}: {exc}", ok=False)
             return self._pool_state()
-        return "on" if self._pool_on() else self._pool_state()
+        return ("on" if self._pool_on(restore_receipt=restore_receipt)
+                else self._pool_state())
 
     def _undrain_or(self, state: str) -> str:
         if state != "draining":
@@ -2020,7 +2781,7 @@ class Run:
             return self._terminal("failed", pool_state="on" if on else self._pool_state_quiet(), message=f"{reason}; RECOVERY INTERRUPTED "
                                   f"({type(exc).__name__}: {exc}); host is "
                                   f"{'on' if on else 'possibly OFF'} running "
-                                  f"{str(self._running())[:12]}; run `tartci fleet-macos "
+                                  f"{str(self._running())[:12]}; run tartci fleet-macos "
                                   "self-update --verify`")
 
     def _pool_state_quiet(self) -> str:
@@ -2046,7 +2807,7 @@ class Run:
             return None
 
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
-        self.receipt.step("failed", reason, ok=False)
+        self.receipt.step("refused" if refused else "failed", reason, ok=False)
         running = self._running()
         if terminated:
             # launchd will SIGKILL soon: no reinstall, no rollback. Get the
@@ -2055,7 +2816,7 @@ class Run:
             state = self._ensure_on(allow_reinstall=False)
             return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
                                   f"{_state_words(state)} running {str(running)[:12]}; run "
-                                  "`tartci fleet-macos self-update --verify` to check it",
+                                  "tartci fleet-macos self-update --verify to check it",
                                   pool_state=state)
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
@@ -2063,7 +2824,7 @@ class Run:
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            state = self._ensure_on()
+            state = self._ensure_on(restore_receipt=True)
             if state not in ("on", "undrained"):
                 return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
                                       f"failed (generation {self.previous[:12]} is installed)",
@@ -2079,38 +2840,70 @@ class Run:
     def _rollback(self, reason: str) -> int:
         cfg, sys_ = self.cfg, self.sys
         self.receipt.step("rollback", f"reinstalling {self.previous[:12]} from {self.snapshot}")
+        rollback_install_ok = False
+        rollback_pin_ok = self.helper is None
+        rollback_pool_on_ok = False
         try:
             self._wait_idle()
             off = tartci(cfg, sys_, "pool", "off", *self.flag)
             if off.rc != 0:
                 raise Failed(f"pool off for rollback failed: {off.text}")
             self._reinstall_previous()
+            rollback_install_ok = True
+            rollback_pin_ok = True
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
-            if not self._pool_on():
+            if not self._pool_on(restore_receipt=True):
                 raise Failed("pool on after rollback failed")
+            rollback_pool_on_ok = True
             verify(cfg, sys_, self.previous, self.receipt)
         except BaseException as exc:  # noqa: BLE001 - incl. a second SIGTERM
             # Whatever the rollback's own failure, capacity comes back: a
             # failed verification is never a reason to leave the host out.
             self._repin_to_live()
-            state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated))
-            return self._terminal("failed", f"{reason}; ROLLBACK FAILED: "
-                                  f"{type(exc).__name__}: {exc}; host is "
-                                  f"{_state_words(state)} running "
-                                  f"{str(self._running())[:12]}", pool_state=state)
-        return self._terminal("rolled_back", f"{reason}; rolled back to {self.previous[:12]} "
-                              "and verified")
+            state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated),
+                                    restore_receipt=True)
+            rollback_verify_timeout = (
+                isinstance(exc, Failed)
+                and "verification of" in str(exc)
+                and "heartbeat_missing" in str(exc)
+            )
+            if rollback_install_ok and rollback_pin_ok and rollback_pool_on_ok and rollback_verify_timeout:
+                message = (f"{reason}; rollback installed and pool on; rollback verification "
+                           f"timed out: {type(exc).__name__}: {exc}; host is "
+                           f"{_state_words(state)} running {str(self._running())[:12]}")
+            else:
+                message = (f"{reason}; ROLLBACK FAILED: {type(exc).__name__}: {exc}; host is "
+                           f"{_state_words(state)} running {str(self._running())[:12]}")
+            return self._terminal("failed", message, pool_state=state)
+        return self._terminal("rolled_back", _rollback_terminal_message(reason, self.previous))
 
     def _terminal(self, status: str, message: str, *, pool_state: str = "on") -> int:
         self.receipt.value["pool_state"] = pool_state
         self.receipt.value["host_off"] = pool_state not in ("on", "undrained")
         self.receipt.step(status, message, ok=False)
         self.receipt.finish(status, message)
+        if self.receipt.value["host_off"]:
+            # Do not wait for the watchdog's 15-minute threshold: a roll that
+            # leaves a gate host OFF needs an issue immediately, with the
+            # failure reason and the recovery command in its body.
+            try:
+                import host_off  # noqa: PLC0415 - owns the alert/issue format
+                try:
+                    host = self_host_id(self.cfg)
+                except (Refused, OSError, ValueError):
+                    host = os.uname().nodename.split(".")[0]
+                host_off.alert(host_off.state_dir(self.cfg.home),
+                               host_off.pool_state_file(self.cfg.home),
+                               host=host, now=self.sys.now(),
+                               immediate=True)
+            except Exception as exc:  # noqa: BLE001 - preserve the terminal receipt
+                print(f"self-update: host-off alert failed: {exc}", file=sys.stderr)
         print(f"self-update: {status.upper().replace('_', ' ')}: {message}", file=sys.stderr)
         return EXIT_FAILED
 
 
-def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
+def _announce(cfg: Config, sys_: System, me: str, target: str,
+              excluded: list[str] | None = None) -> None:
     marker = cfg.state_dir / "active.json"
     announced = sys_.now()
     _write_json(marker, {"host_id": me, "target": target, "ts": announced,
@@ -2128,6 +2921,10 @@ def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
         info = read_peer(cfg, sys_, peer, ssh_target)
         if not info["busy"]:
             continue
+        # Only a peer this run's survey excluded, and only while it is still
+        # unreadable: one that answers now goes through the protocol below.
+        if peer in (excluded or ()) and not info["readable"]:
+            continue
         theirs = info["active_age"]
         if theirs is None:
             marker.unlink(missing_ok=True)
@@ -2139,12 +2936,13 @@ def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
             raise Deferred(f"peer announced first (or won the tie): {info['evidence']}")
 
 
-def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool]:
+def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool, list[str]]:
     """(problems, settling). settling: every problem is a lane that has not yet
     written its first heartbeat, which a freshly loaded supervisor needs a few
     seconds to do."""
     problems = []
     settling = False
+    heartbeat_labels: list[str] = []
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         value = json.loads(status.out)
@@ -2160,6 +2958,10 @@ def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], boo
                      if not (isinstance(p, dict) and p.get("code") in HOST_CONDITION_CODES)]
             if found or not fleet.get("problems"):
                 problems.append(f"fleet not ready: {found}")
+            heartbeat_labels = [str(p.get("label")) for p in found
+                                if isinstance(p, dict)
+                                and p.get("code") == "heartbeat_missing"
+                                and p.get("label")]
             settling = bool(found) and all(
                 isinstance(p, dict) and p.get("code") in SETTLING_PROBLEM_CODES
                 for p in found)
@@ -2176,9 +2978,45 @@ def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], boo
                              "tart-runner-macos-fleet.verify.lane")
     allow = installed_tartci(cfg, sys_, "launchd", "guard", "--command", "launchctl list")
     if guard.rc != 2 or allow.rc != 0:
-        problems.append(f"installed `tartci launchd guard` missing or wrong "
+        problems.append(f"installed tartci launchd guard missing or wrong "
                         f"(block={guard.rc}, allow={allow.rc})")
-    return problems, settling and len(problems) == 1
+    return problems, settling and len(problems) == 1, heartbeat_labels
+
+
+def _heartbeat_failure_diagnostics(sys_: System, labels: list[str]) -> list[str]:
+    """Include a failed lane's final log line when launchd reports a crash."""
+    details: list[str] = []
+    domain = f"gui/{os.getuid()}"
+    for label in labels:
+        try:
+            result = sys_.run(["launchctl", "print", f"{domain}/{label}"], timeout=10)
+        except Exception:
+            continue
+        if result.rc != 0:
+            continue
+        exit_match = re.search(r"^\s*last exit (?:code|status)\s*=\s*(-?\d+)\s*$",
+                               result.out, re.MULTILINE)
+        if not exit_match or int(exit_match.group(1)) == 0:
+            continue
+        path_match = re.search(r"^\s*(?:stderr|stdout) path\s*=\s*(\S+)\s*$",
+                               result.out, re.MULTILINE)
+        if not path_match:
+            continue
+        try:
+            lines = Path(path_match.group(1)).read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        if lines:
+            details.append(f"lane {label} last exit {exit_match.group(1)}; "
+                           f"last log line: {lines[-1]}")
+    return details
+
+
+def _rollback_terminal_message(reason: str, previous: str) -> str:
+    if "verification of" in reason and "heartbeat_missing" in reason:
+        return (f"rollback installed; verification timed out; rolled back to "
+                f"{previous[:12]} and verified")
+    return f"{reason}; rolled back to {previous[:12]} and verified"
 
 
 def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
@@ -2190,10 +3028,11 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     """
     deadline = sys_.now() + VERIFY_SETTLE_SECONDS
     while True:
-        problems, settling = _verify_once(cfg, sys_, target)
+        problems, settling, heartbeat_labels = _verify_once(cfg, sys_, target)
         if not problems:
             break
         if not settling or sys_.now() >= deadline:
+            problems.extend(_heartbeat_failure_diagnostics(sys_, heartbeat_labels))
             raise Failed(f"verification of {target[:12]}: " + "; ".join(problems))
         sys_.sleep(VERIFY_SETTLE_POLL_SECONDS)
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
@@ -2201,7 +3040,15 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
 
 def status_lines(state_dir: Path) -> list[str]:
     """For pool status / doctor / watchdog: skew and the last attempt."""
-    lines = [render_skew(_read_json(state_dir / "skew.json"))]
+    skew = _read_json(state_dir / "skew.json")
+    aged = skew_stale_note(skew)
+    lines = [render_skew(skew) + (f" {aged}" if aged else "")]
+    paused = paused_line(state_dir)
+    if paused:
+        lines.append(paused)
+    scheduled = scheduled_pause(state_dir)
+    if scheduled:
+        lines.append(scheduled)
     last = _read_json(state_dir / "last.json")
     if last and last.get("status") in ("failed", "rolled_back"):
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"
@@ -2209,8 +3056,8 @@ def status_lines(state_dir: Path) -> list[str]:
                      f"{str(last.get('target'))[:12]}: {last.get('error')}")
     if last and last.get("host_off"):
         lines.append(f"self-update: THIS HOST WAS LEFT {str(last.get('pool_state') or 'off').upper()} "
-                     "(pool on failed after a failed update); check `tartci pool status`, "
-                     "then `tartci pool on`")
+                     "(pool on failed after a failed update); check tartci pool status, "
+                     "then tartci pool on")
     waiting = waiting_line(state_dir)
     if waiting:
         lines.append(waiting)
@@ -2255,7 +3102,10 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
     waited = max(0.0, now - float(ticket["since"]))
     # The run that crossed the bound records it, so a reader whose clock is
     # behind the run's still says STARVED.
-    starved = waited >= STARVED_AFTER_SECONDS or bool(ticket.get("starved_evented"))
+    has_demand = bool(gate_demand_at(_gate_queue_path_in(state_dir),
+                                      str(ticket.get("host_id") or ""), now)[0])
+    bound = STARVED_AFTER_SECONDS if has_demand else STARVED_FALLBACK_SECONDS
+    starved = waited >= bound or bool(ticket.get("starved_evented"))
     word = "STARVED" if starved else "deferred"
     return (f"self-update: {word}, {waited / 3600:.1f} h in the update queue (since "
             f"{_iso(float(ticket['since']))}): {ticket.get('reason')}")
@@ -2263,7 +3113,7 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tartci fleet-macos self-update")
-    parser.add_argument("--target", default="origin/main")
+    parser.add_argument("--target", default=None)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="read-only (default)")
     mode.add_argument("--apply", action="store_true")
@@ -2273,6 +3123,10 @@ def main(argv: list[str] | None = None) -> int:
                       "the installer says, guard present) without changing anything")
     mode.add_argument("--clear-halt", action="store_true",
                       help="resume automatic attempts after consecutive failures")
+    mode.add_argument("--pause", metavar="REASON",
+                      help="pause scheduled self-updates with an operator reason")
+    mode.add_argument("--resume", action="store_true",
+                      help="resume scheduled self-updates")
     mode.add_argument("--peers", action="store_true",
                       help="print each published peer and the SSH target it resolves to")
     mode.add_argument("--refresh-skew", action="store_true",
@@ -2302,6 +3156,20 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(cfg.state_dir / "halt-cleared.json", {"at": _iso(sys_.now())})
         print("self-update: halt cleared; automatic attempts resume")
         return 0
+    if args.pause is not None:
+        reason = args.pause.strip()
+        if not reason:
+            parser.error("--pause requires a non-empty reason")
+        _write_json(cfg.state_dir / "scheduled-pause.json",
+                    {"at": _iso(sys_.now()), "reason": reason})
+        record_pause_control(cfg.state_dir, "pause", reason)
+        print(f"self-update: scheduled attempts paused: {reason}")
+        return 0
+    if args.resume:
+        (cfg.state_dir / "scheduled-pause.json").unlink(missing_ok=True)
+        record_pause_control(cfg.state_dir, "resume")
+        print("self-update: scheduled attempts resumed")
+        return 0
     if args.peers:
         try:
             refresh_checkout(cfg, sys_)
@@ -2327,7 +3195,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             installed, _ = installed_commit(cfg)
             refresh_checkout(cfg, sys_)
-            skew = measure_skew(cfg, sys_, installed, sys_.now(), args.target)
+            target_ref = args.target or "origin/main"
+            skew = measure_skew(cfg, sys_, installed, sys_.now(), target_ref,
+                               explicit=args.target is not None)
         except NotManaged as exc:
             skew = {"state": "not_applicable", "reason": str(exc), "measured_at": _iso(sys_.now())}
         except Refused as exc:
@@ -2335,8 +3205,9 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(cfg.state_dir / "skew.json", skew)
         print(render_skew(skew))
         return 0
-    return plan_or_apply(cfg, sys_, apply=args.apply, target_ref=args.target,
-                         scheduled=args.scheduled)
+    target_ref = args.target or "origin/main"
+    return plan_or_apply(cfg, sys_, apply=args.apply, target_ref=target_ref,
+                         explicit=args.target is not None, scheduled=args.scheduled)
 
 
 if __name__ == "__main__":

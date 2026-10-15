@@ -14,6 +14,7 @@ Layers, each asserted beside its control:
 """
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import datetime as dt
 import json
 import os
@@ -569,6 +570,7 @@ class ProfileTests(unittest.TestCase):
         anchor = f'id = "{lane}"\n'
         return fleet.tomllib.loads(text.replace(anchor, anchor + extra, 1))
 
+    @testing_support.requires_tomllib
     def test_warm_vm_renders_only_on_slot_one(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         data = self._profile("warm_vm = true\nwarm_vm_max_park_seconds = 1200\n")
@@ -588,6 +590,7 @@ class ProfileTests(unittest.TestCase):
             return subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"),
                                    "validate", str(path)], text=True, capture_output=True, check=False)
 
+    @testing_support.requires_tomllib
     def test_validation(self) -> None:
         base = (ROOT / "profiles" / "m3-macos-fleet.toml").read_text()
         one = base.replace('id = "pulp-gate"\n', 'id = "pulp-gate"\nwarm_vm = true\n', 1)

@@ -18,6 +18,17 @@ github_api_timeout_seconds = 30
 
 # launchd does not inherit the interactive shell's GitHub App configuration.
 # Preserve references only; key and token contents remain private host files.
+# m1's lanes wait for a VM lease after claiming a job, so its boot claims
+# live about 26 min on average (claim to pre-mint denial, 2026-10-01..04)
+# against 4-5 min on the other hosts. Peers count its claims for up to
+# the claim TTL rather than their 15 min default (scripts/job_claim.py).
+job_claim_max_age_seconds = 1800
+
+# Home-volume admission floor (scripts/home_volume_floor.py): `report` admits
+# every VM lease and logs `home_volume_would_refuse` when the home volume is
+# below its computed floor. `refuse` denies the new clone instead; flip it only
+# after a day of report data shows no false refusals, and with Daniel's OK.
+home_volume_floor_mode = "report"
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
@@ -57,10 +68,21 @@ pressure_free_gb = 200
 # Remove finished git checkouts agents left in /private/tmp (48 h idle,
 # clean, pushed; orphaned and broken ones are only reported). scripts/tmp_checkouts.py
 tmp_checkouts = true
+# Finished agent worktrees (clean, pushed, idle 48 h, lineage not active) in
+# ~/Code and ~/Code/agent-worktrees (124 finished
+# worktrees, 77 GiB, on 2026-10-05). Worktrees only: every plain clone there is kept. scripts/tmp_checkouts.py
+extra_worktree_roots = ["/Users/danielraffel/Code", "/Users/danielraffel/Code/agent-worktrees"]
 # Remove test and validation scratch from /private/tmp, the per-user temp dir
 # and Chrome's code-sign clones (12 h idle, nothing open, no live process
 # naming it; 4 h while the boot volume is below its floor). scripts/scratch_dirs.py
 scratch_dirs = true
+# Evict gate ccache entries unused for 14 days, once a day, only while no VM
+# is running or leased (scripts/gate_ccache_trim.py). m1's gate cache held 398k entries and the guard ran out of budget on
+# 8-13% of boots. The m5 canary
+# (2026-10-03 to 10-09) cut the pre-boot guard's ok-run median from 89 s to
+# 11 s and its budget-exhausted share from 57% to 0%, with the per-job hit
+# rate held at 99.49% (99.51% before). Rollback: delete this key.
+gate_ccache_trim = true
 
 [[lane]]
 id = "pulp-gate"
@@ -112,12 +134,15 @@ assignment_idle_retarget_seconds = 120
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
-# The queue scan this supervisor runs is latency-sensitive: a Background
-# supervisor's GitHub API calls measured materially slower than the same calls
-# at normal priority, and every observed scan failure on this lane is a
-# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
-# promote the supervisor out of the background band. Gate lanes only.
-process_type = "Adaptive"
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
+# Standard, never Background or Adaptive: every lane's queue scan holds the
+# host-global observation lock, and a supervisor launchd leaves in the
+# darwinbg band (Adaptive without an XPC transaction is in that band) makes
+# each GitHub call several times slower while it holds the lock, starving
+# every other lane on the host. The validator refuses both values.
+process_type = "Standard"
 # Release-first slot (docs/assignment-v2-rollout.md, "Release event classes").
 # Slot 2 consults both release classes before the gate classes and falls back
 # to gate work whenever no release waits; slot 1 keeps gate-first order with
@@ -125,7 +150,13 @@ process_type = "Adaptive"
 # The release tiers below serve only jobs carrying a release class label, which
 # Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in. Rollback: delete this key
 # and the release tiers, re-render, reload slot 2 at an idle boundary.
-assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
+assignment_slot_tier_order = { 1 = ["pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-tagged", "pulp-release-pr-gate"], 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
+v2_gate_classes = ["pulp-build-merge-group", "pulp-build-pr-head"]
+# M1 rejoins merge-group service (2026-10-11): Daniel's reversal of #439
+# follows the fleet-wide slowdown in which merge-group became the scarce
+# resource. Slot 1 prefers merge-group so a waiting queue entry wins; slot 2
+# remains release-first, then merge-group, then PR-head. The gate guest size
+# is unchanged and remains governed by vm_cores_from.
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
@@ -163,6 +194,9 @@ min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
 workflows = ["Spectr M5 Product Acceptance"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 [[lane]]
 id = "forge-gate"
@@ -179,24 +213,41 @@ workflows = ["build", "protected macOS build"]
 # The macOS-27 stackbench credential is registry-only. JIT registration stays
 # on the default Shipyard App route; do not repurpose registry credentials.
 replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 [[lane]]
 id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
-priority = "gate"
+# Vellum is advisory to Pulp's required gate: vm=60, while Pulp
+# event-class leases derive 100 (PR head) / 110 (merge group).
+priority = "vm"
+supervisors = 1
 min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
-workflows = ["Locked macOS GPU proof", "README clean release proof"]
+workflows = ["Locked macOS GPU proof"]
+runner_idle_timeout_seconds = 60
 replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 # The support LaunchAgents this host carries (scripts/support_agents.py).
 # Self-update renders and compares them after every update; with bootstrap =
 # false it only reports, and installs or changes nothing.
+# The watchdog's frozen-lane threshold. 4500 s outlasts a gate job's longest
+# silent stretch; the 1800 default healed live supervisors (#191). It lived
+# only on hand-edited plists until it moved here (#195).
+[launchd_watchdog]
+stale_log_seconds = 4500
+
 [support_agents]
-declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "reuse-canary"]
-bootstrap = false
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "reuse-canary", "launchd-watchdog", "reap"]
+# Converge only the VM janitor; every other declared agent stays plan-only.
+bootstrap = ["reap"]
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
 # shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse

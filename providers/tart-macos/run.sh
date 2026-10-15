@@ -98,7 +98,7 @@ rm -f "$boot_log"
 
 sshok=0
 for _ in $(seq 1 90); do
-  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" true 2>/dev/null; then sshok=1; break; fi
+  if ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" true 2>/dev/null; then sshok=1; break; fi
   sleep 2
 done
 [ "$sshok" = 1 ] || die "ssh did not become ready for $VM at $IP"

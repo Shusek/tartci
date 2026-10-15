@@ -12,6 +12,8 @@ profile the source of truth:
     [support_agents]
     declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]
     bootstrap = false      # false: render, compare, report; never write
+                           # true: converge every declared agent
+                           # ["reap"]: converge only the named agents
 
 Each declared name is a REGISTRY entry. Its plist is rendered with the same
 `render_launchd_template.py` arguments its install script uses, so a host the
@@ -28,11 +30,13 @@ agent's installed plist with its render:
     differs         the receipt names each differing key path
     missing         no installed plist
 
-and lists every installed agent under the tartci and `tmp.` prefixes that no
+and lists every installed agent under the tartci and tmp. prefixes that no
 declaration, lane, or other codified installer (OTHER_OWNERS) accounts for. An
 undeclared agent is reported, never touched.
 
-`apply` acts only when the profile says `bootstrap = true`. It renders every
+`apply` acts only when the profile turns bootstrap on: `true` for every
+declared agent, or a list of declared names for only those (the others are
+planned and reported, never written, and a list never drops an agent). It renders every
 declared agent first; if any render fails it changes nothing in that pass.
 Then, per agent: a missing or differing plist is written and (re)bootstrapped,
 and kickstarted only if its template has RunAtLoad (exactly as its install
@@ -46,7 +50,7 @@ snapshot older than the table must never read as "drop everything".
 `auto` is `apply` when the profile switch is on and `plan` otherwise; it is what
 self-update runs after it verifies the lanes. `check-templates` is self-update's
 pre-drain check that the target checkout can render every declared agent.
-`status --json` is the summary `tartci doctor fleet` reads.
+status --json is the summary tartci doctor fleet reads.
 
 Exit codes: 0 converged or nothing to do, 3 refused (a render failed, or the
 profile is unreadable), 4 an apply step failed.
@@ -79,10 +83,47 @@ ROOT = Path(__file__).resolve().parents[1]
 TABLE = "support_agents"
 TABLE_KEYS = {"declared", "bootstrap"}
 LANE_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
-# Labels the undeclared scan covers: tartci's own agents, and `tmp.`, a class
+# Labels the undeclared scan covers: tartci's own agents, and tmp., a class
 # nothing of ours may ever ship under.
 SCAN_PREFIXES = ("com.danielraffel.tartci.", "com.danielraffel.tmp.")
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED = 0, 3, 4
+
+
+def _tart_home(profile: Dict[str, Any]) -> Dict[str, str]:
+    """This host's Tart store, which the watchdog and reaper must not guess.
+
+    A LaunchAgent inherits no login shell; rendered without it, the agent reads
+    Tart's default store and sees an empty inventory.
+    """
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    tart_home = host.get("tart_home")
+    return {"TART_HOME": tart_home} if isinstance(tart_home, str) and tart_home else {}
+
+
+def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The frozen-lane threshold from `[launchd_watchdog] stale_log_seconds`.
+
+    It used to live only on hand-edited plists (m1, m5 and m5studio carried
+    `--stale-log-seconds 4500`; the template rendered the 1800 default), so a
+    re-render brought back the kills it was set to stop. Absent, the watchdog
+    keeps its own default.
+    """
+    table = profile.get("launchd_watchdog") if isinstance(profile.get("launchd_watchdog"), dict) else {}
+    stale = table.get("stale_log_seconds")
+    return ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
+            if type(stale) is int else {})
+
+
+def _disk_watch_paths(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The volumes the disk watchdog probes: the Tart store and the cache root.
+
+    Rendered into the agent so its pass needs no tomllib. Absent both, the
+    placeholder stays and the watchdog drops it (it probes nothing).
+    """
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    paths = [host.get(key) for key in ("tart_home", "cache_root")]
+    paths = [p for i, p in enumerate(paths) if isinstance(p, str) and p and p not in paths[:i]]
+    return {"DISK_WATCH_PATHS": ":".join(paths)} if paths else {}
 
 
 def _backstop_env(profile: Dict[str, Any]) -> Dict[str, str]:
@@ -97,6 +138,9 @@ class Agent:
     installer: Optional[str]              # its install script; None when only declared
     kickstart: bool                       # bootstrap is followed by a kickstart
     environment: Callable[[Dict[str, Any]], Dict[str, str]] = field(
+        default=lambda profile: {})
+    # Template placeholders beyond $HOME, from the host's own profile.
+    settings: Callable[[Dict[str, Any]], Dict[str, str]] = field(
         default=lambda profile: {})
 
     @property
@@ -118,6 +162,20 @@ REGISTRY: Dict[str, Agent] = {
     # Installed only through this declaration; RunAtLoad is off because one
     # pass builds Pulp for hours, so nothing kickstarts it.
     "reuse-canary": Agent(reuse_canary.LABEL, None, kickstart=False),
+    # The self-heal watchdog (heal pass, skew and tool-freshness refresh,
+    # config warnings) and the Tier-2 reaper were rendered by hand from
+    # launchd/README.md, so a host could be brought up without them: m5studio
+    # served gate VMs with no watchdog and its freshness was never measured.
+    "launchd-watchdog": Agent("com.danielraffel.tartci.launchd-watchdog", None,
+                              kickstart=True, settings=_tart_home,
+                              environment=_watchdog_env),
+    "reap": Agent("com.danielraffel.tartci.reap", None, kickstart=True, settings=_tart_home),
+    # Write-latency watchdog for the Tart store and cache volumes (outage O10).
+    "disk-watchdog": Agent("com.danielraffel.tartci.disk-watchdog", None, kickstart=True,
+                           settings=_disk_watch_paths),
+    # A bounded history of this host's pool status, so host signals can be
+    # scored against what happened rather than only live.
+    "pool-log": Agent("com.danielraffel.tartci.pool-log", None, kickstart=True),
 }
 
 # Agents in the scanned prefixes that another codified path installs or
@@ -125,8 +183,6 @@ REGISTRY: Dict[str, Agent] = {
 # registry to exactly the templates in launchd/.
 OTHER_OWNERS: Dict[str, str] = {
     "com.danielraffel.tartci.self-update": "scripts/install_self_update_agent.sh",
-    "com.danielraffel.tartci.launchd-watchdog": "launchd/README.md (rendered by hand)",
-    "com.danielraffel.tartci.reap": "launchd/README.md (rendered by hand)",
     "com.danielraffel.tartci.http-connect-ssh-relay": "scripts/network_profile.py reconcile",
     "com.danielraffel.tartci.orchard-worker": "scripts/disable_orchard.sh (retirement)",
 }
@@ -158,8 +214,16 @@ def validate(data: Dict[str, Any]) -> List[str]:
                         f"known: {sorted(REGISTRY)}")
     if len(set(declared)) != len(declared):
         problems.append("support_agents.declared lists an agent twice")
-    if type(table.get("bootstrap", False)) is not bool:
-        problems.append("support_agents.bootstrap must be a boolean")
+    switch = table.get("bootstrap", False)
+    if isinstance(switch, list):
+        if (not switch or not all(isinstance(n, str) for n in switch)
+                or len(set(switch)) != len(switch)
+                or any(n not in declared for n in switch)):
+            problems.append("support_agents.bootstrap list must name declared agents, "
+                            "each once")
+    elif type(switch) is not bool:
+        problems.append("support_agents.bootstrap must be a boolean or a list of "
+                        "declared agent names")
     canary = data.get(reuse_canary.TABLE)
     canary_on = isinstance(canary, dict) and canary.get("enabled") is True
     if canary_on != ("reuse-canary" in declared):
@@ -223,6 +287,8 @@ class System:
         """The install script's exact render: same script, same arguments."""
         argv = ["python3", str(ROOT / "scripts" / "render_launchd_template.py"),
                 str(agent.template), "--set", f"HOME={self.home}"]
+        for name, value in agent.settings(profile).items():
+            argv += ["--set", f"{name}={value}"]
         for name, value in agent.environment(profile).items():
             argv += ["--environment", f"{name}={value}"]
         try:
@@ -356,13 +422,18 @@ class Converger:
         table = data.get(TABLE)
         present = isinstance(table, dict)
         declared: List[str] = list(table.get("declared", [])) if present else []
-        switch = bool(table.get("bootstrap", False)) if present else False
+        raw_switch = table.get("bootstrap", False) if present else False
+        # A list converges only the named agents; True converges every one.
+        only = [n for n in raw_switch if n in declared] if isinstance(raw_switch, list) else None
+        switch = bool(only) if only is not None else raw_switch is True
         acting = mode == "apply" or (mode == "auto" and switch)
         if mode == "apply" and not switch:
             acting = False
             receipt["refused"] = "bootstrap = false in the profile; plan only"
         receipt.update(table_present=present, table_sha256=table_digest(table if present else None),
                        declared=declared, bootstrap=switch, mode="apply" if acting else "plan")
+        if only is not None:
+            receipt["bootstrap_only"] = only
         receipt["undeclared"] = self.undeclared({REGISTRY[n].label for n in declared})
         # Plan everything first: one failing render changes nothing in the pass.
         renders: Dict[str, bytes] = {}
@@ -389,9 +460,10 @@ class Converger:
             return self.finish(receipt, EXIT_REFUSED)
         if not acting:
             return self.finish(receipt, EXIT_OK)
-        for name in declared:
+        for name in (only if only is not None else declared):
             self.apply_one(name, renders[name], receipt)
-        self.drop(receipt, declared, present)
+        if only is None:
+            self.drop(receipt, declared, present)
         return self.finish(receipt, EXIT_FAILED if receipt["failures"] else EXIT_OK)
 
     def apply_one(self, name: str, rendered: bytes, receipt: Dict[str, Any]) -> None:
@@ -506,13 +578,18 @@ def status(state_dir: Path) -> Dict[str, Any]:
     if value.get("refused") and value.get("table_present") is None:
         return dict(value, state="unreadable", error=value["refused"])
     agents = value.get("agents") or {}
-    if value.get("mode") == "apply":
+    only = value.get("bootstrap_only")
+    if value.get("mode") == "apply" and not only:
         # An applied pass converged everything except what it reported failing.
         changes = sorted({f.split(":")[0].replace("drop ", "") for f in value.get("failures") or []})
     else:
         changes = sorted(n for n, e in agents.items()
                          if e.get("state") not in ("match_bytes", "match_plist")
                          or not e.get("loaded") or e.get("leaked"))
+        if only and value.get("mode") == "apply":
+            # The named agents were applied: only their failures remain.
+            failed = {f.split(":")[0] for f in value.get("failures") or []}
+            changes = sorted(n for n in changes if n not in only or n in failed)
     state = "ok" if not changes else ("drift" if value.get("bootstrap") else "pending")
     return dict(value, state=state, changes=changes)
 

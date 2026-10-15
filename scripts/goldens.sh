@@ -69,14 +69,14 @@ resolve_link(){ # $1=host  $2=via_override
   local host="$1" via="$2" want user key ip h
   if [ -n "$via" ]; then LINK="thunderbolt(--via)"; echo "$via"; return; fi
   # what hostname does the alias report? (short, lowercased for compare)
-  want="$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$host" 'scutil --get LocalHostName 2>/dev/null || hostname -s' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  want="$(ssh -n -o BatchMode=yes -o ConnectTimeout=6 "$host" 'scutil --get LocalHostName 2>/dev/null || hostname -s' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
   [ -n "$want" ] || { echo "$host"; return; }   # alias unreachable? let ssh error later
   user="$(ssh_user_for "$host")"; key="$(ssh_key_for "$host")"
   # candidate TB link-local peers: bridge0 neighbors in 169.254/16 (excluding our own)
   local mine; mine="$(ipconfig getifaddr bridge0 2>/dev/null || true)"
   for ip in $(arp -an 2>/dev/null | grep -oE '169\.254\.[0-9]+\.[0-9]+' | sort -u); do
     [ "$ip" = "$mine" ] && continue
-    h="$(ssh ${key:+-i "$key"} -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+    h="$(ssh -n ${key:+-i "$key"} -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
          -o ConnectTimeout=4 "${user:+$user@}$ip" 'scutil --get LocalHostName 2>/dev/null || hostname -s' 2>/dev/null | tr '[:upper:]' '[:lower:]')" || continue
     if [ "$h" = "$want" ]; then LINK="thunderbolt"; echo "$ip"; return; fi
   done
@@ -112,7 +112,7 @@ cmd_list(){
 
 # Read a host's own $TARTCI_GOLDENS (from its runner plist; don't assume the path).
 remote_goldens_dir(){ # $1=host
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" '
+  ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$1" '
     /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:TARTCI_GOLDENS" \
       ~/Library/LaunchAgents/'"$WIN_RUNNER_LABEL"'.plist 2>/dev/null \
       || echo "${TARTCI_GOLDENS:-$HOME/.tartci/goldens}"' 2>/dev/null
@@ -195,6 +195,21 @@ echo "$newest"
 SNIP
 }
 
+cmd_doctor(){
+  local receipt="" promotion=0 max_age=14
+  while [ $# -gt 0 ]; do case "$1" in
+    --receipt) receipt="$2"; shift 2;;
+    --promotion|--release) promotion=1; shift;;
+    --max-age-days) max_age="$2"; shift 2;;
+    *) die "unknown arg: $1";;
+  esac; done
+  if [ -z "$receipt" ]; then receipt="$(find "$GOLDENS" -maxdepth 1 -type f -name '*.receipt.json' -print -quit 2>/dev/null || true)"; fi
+  [ -n "$receipt" ] || die "no golden receipt found; provide --receipt FILE"
+  local args=("$receipt" --max-age-days "$max_age")
+  [ "$promotion" = 1 ] && args+=(--promotion)
+  exec python3 "$(dirname "${BASH_SOURCE[0]}")/../providers/common/pulp-golden-receipt.py" "${args[@]}"
+}
+
 cmd_sync(){
   local TO="" FROM="" PRUNE=0 DRY=0 RELOAD=1 VIA=""
   while [ $# -gt 0 ]; do case "$1" in
@@ -231,7 +246,7 @@ cmd_sync(){
     rsync $flags -e "$rsh" "$golden" "$golden.sha256" "$pfx:$rgoldens/" || die "rsync failed"
     if [ "$DRY" = 1 ]; then note "dry-run — stopping before verify/reload/prune"; return 0; fi
     note "verifying sha256 on $HOST"
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "cd '$rgoldens' && shasum -a 256 -c '$name.sha256'" \
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "cd '$rgoldens' && shasum -a 256 -c '$name.sha256'" \
       || die "sha256 verify FAILED on $HOST — not repointing"
     ok "verified on $HOST"
     _apply_snippet | ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" bash -s -- \
@@ -270,7 +285,8 @@ sub="${1:-}"; shift || true
 case "$sub" in
   list) cmd_list "$@";;
   sync) cmd_sync "$@";;
+  doctor) cmd_doctor "$@";;
   ""|-h|--help|help)
     sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
-  *) die "unknown goldens subcommand: $sub (try: list, sync)";;
+  *) die "unknown goldens subcommand: $sub (try: list, sync, doctor)";;
 esac

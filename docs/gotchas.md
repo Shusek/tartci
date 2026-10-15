@@ -45,6 +45,19 @@ first thing to trip. Nothing on the host is broken.
 update a host, run `tartci fleet-macos self-update`. To install a specific
 tree, pass `--support-source` with a clean tartci checkout.
 
+## A support generation will not install on macOS 15 (2026-10-05)
+
+*Symptom:* `stage_install` (the self-update install step) fails with
+`PermissionError: [Errno 13]` renaming the staged generation into place.
+*Cause:* macOS 15 refuses to rename a directory whose own mode is 0555, even
+within the same parent; macOS 27 allows it. The installer used to seal the
+staged root to 0555 before the rename. Found on hosted macos-15 (15.7.9); every
+fleet host runs 27. *Guard:* the root is renamed while 0755, then chmodded 0555,
+fsynced and verified immutable under its final name; a generation that fails
+that check is removed rather than left where the next install would refuse it.
+`test_tartci_support_manifest` records the mode at the rename, so the order is
+checked on every host.
+
 ## Timer jobs stop running while the lanes look healthy (m3, 2026-10-04)
 
 **Symptom:** a host falls many commits behind main and its self-update log has
@@ -67,13 +80,134 @@ it heals on its own. To spot it, compare the age of the newest entry in
 `~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
 not the exit code.
 
+The one agent the guard does not kick is self-update, for as long as the stall
+lasts (`PAUSE_DURING_STALL`): an update stops every supervisor, so no guard
+would run and any lane restart left to launchd would pend. Self-update then
+writes no log line and no attempt for days (m3 from 2026-10-05, 44 commits
+behind). `tartci fleet-macos self-update --status` and `tartci doctor fleet`
+say so (`self_update_paused`, with the stall's start) rather than reading like
+a failed update. The remedy is the stall's: reboot when the lanes are idle.
+Do not kickstart self-update during the stall.
+
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
+
+## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
+
+**Symptom:** a lane reads `job-running` for up to two hours while its VM is
+frozen; the watchdog's frozen-lane heal skips a host with a running VM, so
+nothing frees the slot before `TARTCI_JOB_TIMEOUT_SECS` (7200).
+
+**Cause:** the host waits on the ssh session that runs the guest's listener. A
+guest that hangs can keep that TCP session open, so the host sees neither
+output nor an exit.
+
+**Fix:** the guest launcher writes `TARTCI_GUEST_HEARTBEAT <epoch>` every
+`TARTCI_GUEST_HEARTBEAT_SECS` (30) into that session. Once the first one
+arrives, the host tears the VM down when the listener log has been silent for
+`TARTCI_GUEST_HEARTBEAT_STALE_SECS`: it records `guest_heartbeat_stale`,
+cancels an assigned job's run, and frees the slot. Every lane in the shipped
+profiles sets it with `guest_heartbeat_stale_seconds = 600`. Before the first
+heartbeat (runner still starting, or a guest launcher from an older
+generation) silence proves nothing and the idle and job timeouts apply.
+Heartbeat lines are dropped from the runner log the host echoes.
+
+## A gate lane sits in `booting` for over an hour with a stale heartbeat (m1, 2026-10-09)
+
+**Symptom:** `tartci doctor fleet` reports `fleet_not_ready` with
+`heartbeat_stale`, while the host still serves jobs on its other lanes. The
+stale lane's state file shows `phase: booting`, its VM has an IP
+(`boot_ip` in the lane's `events.jsonl`), there is no actions-runner log for
+the VM, and `ps` shows the supervisor running one `ssh admin@<vm-ip> true`
+after another, each lasting about a minute.
+
+**Cause:** the boot helper waited for the guest's sshd with 90 attempts and a
+2 s sleep, meant as 180 s. `ConnectTimeout=10` bounds only the TCP connect,
+so a guest that accepts the connection but never finishes the handshake holds
+each attempt for about 60 s. The 90 attempts then take about 93 minutes, and
+nothing writes a heartbeat meanwhile. On m1, `pulp-gate.slot2` sat there for
+71+ minutes.
+
+**Fix:** the wait is bounded by wall-clock time. Each attempt is killed at
+`TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15) and the whole wait ends at
+`TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180), after which the VM is discarded
+with `boot_failed no_ssh` and `waited_s`/`attempts` fields. Each failed
+attempt refreshes the boot phase's heartbeat, which is honest because the wait
+has a hard end. The doctor's `fleet_not_ready` line now names each problem's
+lane and heartbeat age, for example
+`heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`.
+A host on a generation from before this fix discards such a VM only after the
+attempts run out; it heals once it self-updates.
+
+## A `while read` loop ends early after a peer read over ssh (2026-10-04)
+
+*Symptom:* the supervisor observed only the first class with young demand;
+every later class in `while read ... done <<< "$classes"` went unobserved, with
+no error. *Cause:* an ssh client forwards its stdin to the remote command, so
+an ssh anywhere under the loop body drains the rest of the loop's input. In
+#371 the ssh was inside a Python helper (`gate_supply.py decide`), which
+inherits stdin. shellcheck's SC2095 (run by `scripts/lint.sh`) catches only an
+ssh written directly in the loop; it cannot see through a function or a
+subprocess. *Guard:* `scripts/ssh_stdin_check.py`, run by
+`scripts/test_ssh_stdin.py` in CI, requires every ssh invocation in the repo
+to state its stdin, wherever it is:
+
+- shell: `ssh -n`, an input redirect on the same command (`</dev/null`,
+  `<<EOF`, `< file`), or ssh as the right side of a pipe (`ssh -G` is exempt);
+- Python: an argv list or tuple whose first element is the ssh client must
+  contain `"-n"`. That is the string `"ssh"` or a path ending in `/ssh`; a
+  name or attribute named like the client (`ssh`, `args.ssh`, `self.ssh_bin`,
+  `ssh_path`, `remote_ssh`); or a name, parameter or argparse option whose
+  value or default is such a string. The rule first matched only `"ssh"` and
+  a bare name `ssh`, so `[args.ssh, "-o", ...]` in `job_claim.gather_peers`
+  passed it without `-n`.
+
+A wrapper whose callers pipe a script into it is the one legitimate exception;
+mark it `# ssh-stdin: <why>` on its line or the line above.
+
+## A test passes in CI and fails on the hosts' Python (2026-10-05)
+
+*Symptom:* a change is green in CI, then its tests fail under
+`/usr/bin/python3` with `No module named 'tomllib'` (#379, #390, #383, #391 on
+one day). *Cause:* `/usr/bin/python3` is 3.9.6 on all four hosts and has no
+tomllib. It runs the tartci shim's support-manifest check, the pinned launch
+interpreter, every explicit `/usr/bin/python3` call site, and each
+`tartci_toml_exec_or_python3` fallback on a host without a tomllib Python;
+interactive ssh shells on m1 also resolve `python3` to it. (Under launchd's
+PATH a bare `python3` is a Homebrew 3.11+ on all four hosts.) CI ran the tests
+only on ubuntu's 3.12+ (`python-floor` only compiles, under 3.11); on
+2026-10-05 main itself failed 203 of 2283 tests under 3.9. *Guard:* the
+`python-39-tests` CI job runs every test module under Python 3.9 (the newest
+3.9 setup-python offers; 3.9.6 itself is not built for current ubuntu
+images), asserted to be 3.9 with no tomllib and first on PATH. A test that genuinely needs tomllib
+says so through `scripts/testing_support.py` and is skipped there, and every
+module that degrades without tomllib has a running test of that branch
+(`scripts/test_no_tomllib_fallbacks.py`):
+
+```python
+import testing_support
+testing_support.skip_module_without_tomllib()   # whole module, before its imports
+
+@testing_support.requires_tomllib                # one test or class
+def test_reads_the_profile(self): ...
+```
+
+Import a tomllib-only module (`macos_fleet_lanes`, `fleet_self_update`, ...)
+inside the test that needs it, not at module level, so the module's other
+tests still run on the hosts' Python.
+
+That skip is not available everywhere. For a module a 3.9 interpreter runs
+(reachable by import from an explicit `/usr/bin/python3` site, or declaring
+itself "3.9-safe"), a skip on 3.9 removes exactly the coverage the job exists
+for, so `scripts/test_system_python_tests_run.py` fails on any
+tomllib-conditional skip in that module's tests unless it is listed in
+`ALLOWED` with the 3.11-only behaviour it guards. Make the test run on 3.9
+first; list it only when what it asserts really needs tomllib.
 
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
-  M3 runner LaunchAgents fail or leave `/Volumes/Workshop/VMs` idle.**
+  M3 runner LaunchAgents fail or leave `/Volumes/<data-volume>/VMs` idle.**
   → *Cause:* launchd started `/bin/bash` directly. macOS attributed external-
   volume access to mutable/shared interpreter identities rather than to TartCI;
   static runner labels and free VM slots could then look healthy while the
@@ -167,6 +301,22 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   Python 3.11+ path in the host's launchd environment when the default
   Homebrew locations do not apply. Verify by *parsing the config*, not by
   checking the file exists.
+
+- **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
+  them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/<data-volume>/VMs`); a
+  shell over ssh has none, so `tart` reads its default `~/.tart`. Before
+  2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
+  doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0
+  running VMs and 2 free slots while two gate VMs ran. → *Fix:* `tartci
+  doctor` and `tartci observe` now export the fleet profile's
+  `[host].tart_home` when the shell has no `TART_HOME`, and print the store
+  they read and where it came from (`tart store: /Users/<you>/VMs
+  ([host].tart_home from ...)`); the reap digest carries it as
+  `config.tart_home`. A shell `TART_HOME` that differs from the profile's is
+  kept but flagged. For raw Tart over ssh, pass the store yourself:
+  `ssh <host> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list'`.
+  `python3 scripts/tart_home.py` prints what a command on that host resolves.
 
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
@@ -593,6 +743,23 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   that a job is terminal.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
+  The host lock remains deliberately global: it is #161's burst guard and
+  licenses `assignment_scan_max_workers` to fan out only after one observer has
+  authority. Acquisition is FIFO across repository namespaces. When a scan
+  times out, that repository records a bounded backoff in the shared state and
+  skips its next attempts, yielding the host slot to other repositories. The
+  backoff is a fairness guard, not a second lock or a per-repository authority;
+  all three scanners (`assignment_scan.py`, `queue_scan.py`, and
+  `current_job_scan.py`) use the same host lock, FIFO queue, and backoff file.
+  The lock's `<path>.owner.json` records the active holder PID, process start,
+  lane, generation, and start time. A contender that observes a holder past
+  `TARTCI_QUEUE_OBSERVATION_LOCK_MAX_AGE_SECS` (default 300 seconds) writes
+  `<path>.escalation.json` with the same evidence. The owner record is removed
+  when the flock is released. At timeout diagnostics enumerate live processes
+  that still have the lock file open, so an exec'd child that inherited the
+  descriptor can be identified when the holder probe reports it; lane and
+  generation metadata come from the owner record. Missing or stale records, or
+  an unavailable holder probe, remain fail-closed and are reported as unknown.
   → *Failure behavior:* lock acquisition is bounded by
   `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
   the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`
@@ -896,3 +1063,5 @@ machine-readable disk-axis lease denial. Do not broaden it to old receipts,
 CPU/RAM failures, mount probes, timers, arbitrary repositories, or PR scans.
 Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
+
+- **A fleet pin is an install contract, not a PATH preference.** The installer probes api.github.com before writing LaunchAgents. It records TARTCI_PYTHON, carries the same path into sealed lanes.json and ghapp, and uses TARTCI_RENDER_PYTHON while rendering. A blocked or vanished interpreter names the path and requires reinstalling the current TartCI generation; do not relink python3 underneath a live generation.

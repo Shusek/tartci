@@ -11,6 +11,7 @@ Run:  python3 -m unittest scripts.test_disk_reclaim   (or via discover)
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import errno
 import io
 import json
@@ -54,7 +55,10 @@ def setUpModule():
                        ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml")),
                        # The boot-volume watch would judge the real boot disk;
                        # test_scratch_dirs.BootVolumeWatch covers it hermetically.
-                       ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0")):
+                       ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0"),
+                       # Likewise the boot-usage sensor would measure the real
+                       # home; test_boot_usage covers it hermetically.
+                       ("TARTCI_BOOT_USAGE", "0")):
         _SAVED_ENV[key] = os.environ.get(key)
         os.environ[key] = value
 
@@ -499,8 +503,17 @@ class ClassifyTests(unittest.TestCase):
         """`pgrep` exits 1 with no output when nothing matches."""
         result = dr.active_command_lines("zzz-no-process-matches-this-zzz")
         self.assertEqual(result, "")
-        # Control: a pattern that must match this very test process.
-        self.assertNotEqual(dr.active_command_lines("python"), "")
+        # Control: a process this test starts, with a marker only it carries.
+        # Matching "python" instead depends on the host: macOS's own python
+        # runs as ".../Python.app/Contents/MacOS/Python", which pgrep -f's
+        # case-sensitive match misses, so a clean runner had nothing to find.
+        marker = f"tartci-pgrep-control-{os.getpid()}-{time.monotonic_ns()}"
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", marker])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        # Non-empty, not "contains the marker": Linux's pgrep -l prints the
+        # process name without its arguments.
+        self.assertNotEqual(dr.active_command_lines(marker), "")
 
     def test_an_unreadable_build_tree_is_never_reclaimable(self):
         """An age we could not measure must not be spent as an old age."""
@@ -1138,6 +1151,7 @@ class LeaseVolumeFloorTests(TwoRootHarness):
         self.assertEqual(code_ctl, 3)
         self.assertEqual(report_ctl["floor_scope"], "scan_volumes")
 
+    @testing_support.requires_tomllib
     def test_the_fleet_profile_names_the_lease_volume(self):
         profile = self.a / "profile.toml"
         profile.write_text(f'[host]\ntart_home = "{self.vms}"\n')
@@ -1193,6 +1207,7 @@ class RootDiscoveryTests(unittest.TestCase):
                 dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
             self.assertEqual(dr.parse_roots(None), [])
 
+    @testing_support.requires_tomllib
     def test_profile_reclaim_paths_add_the_external_volume_root(self):
         """A host whose external volume is not named Workshop is still scanned.
 

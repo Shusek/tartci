@@ -10,6 +10,7 @@ for exactly one 6-core gate VM, with several VM lanes each acquiring after a
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import datetime as dt
 import json
 import os
@@ -203,6 +204,7 @@ class ReleasePrGateRankTests(WaiterTestCase):
         self.prio = dict(zip(("tagged", "pr_gate", "merge", "pr"), proc.stdout.split()))
         self.prio["forge"] = forge
 
+    @testing_support.requires_tomllib
     def test_order_is_tagged_then_pr_gate_then_gate_work(self) -> None:
         num = {k: leases.parse_priority(v)[0] for k, v in self.prio.items()}
         self.assertGreater(num["tagged"], num["pr_gate"])
@@ -211,6 +213,7 @@ class ReleasePrGateRankTests(WaiterTestCase):
                 self.assertGreater(num["pr_gate"], num[other])
                 self.assertGreaterEqual(num[other], leases.PRIORITY_CLASSES["gate"])
 
+    @testing_support.requires_tomllib
     def test_forge_acquire_defers_to_a_waiting_release_pr_gate(self) -> None:
         """The 2026-09-27 05:42Z race on m5: slot 2 claimed a release PR gate
         job and forge's clone took the one free 6-core slot first."""
@@ -225,6 +228,7 @@ class ReleasePrGateRankTests(WaiterTestCase):
         rc, body = self.vm("vm-slot2", self.prio["pr_gate"], waiter="waiter-slot2")
         self.assertEqual(rc, 0, body)
 
+    @testing_support.requires_tomllib
     def test_release_pr_gate_defers_to_a_waiting_tagged_release(self) -> None:
         self.knob(True)
         self.agent_build()
@@ -233,6 +237,7 @@ class ReleasePrGateRankTests(WaiterTestCase):
         self.assertEqual((rc, body["reason"]), (75, "deferred_to_waiter"))
         self.assertEqual(self.vm("vm-release", self.prio["tagged"], waiter="waiter-release")[0], 0)
 
+    @testing_support.requires_tomllib
     def test_knob_off_forge_still_wins_first_come(self) -> None:
         self.agent_build()
         self.wait("waiter-slot2", self.prio["pr_gate"])

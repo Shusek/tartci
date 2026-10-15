@@ -11,8 +11,11 @@ Run:  python3 scripts/test_tartci_launchd_watchdog.py
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+import json
 import os
 import plistlib
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -22,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
 
 FAILS: list[str] = []
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def check(cond: bool, msg: str) -> None:
@@ -263,33 +267,35 @@ with tempfile.TemporaryDirectory() as td:
     check(probe.tart_home == str(tart_home),
           f"probe must report the exact Tart store it inspected: {probe}")
 
-with tempfile.TemporaryDirectory() as td:
-    tart_home = Path(td) / "custom-store"
-    tart_home.mkdir()
-    observed_home = Path(td) / "observed-home"
-    fake_tart = Path(td) / "tart"
-    fake_tart.write_text(
-        f"#!/bin/sh\nprintf '%s' \"$TART_HOME\" > '{observed_home}'\nprintf '[null]\\n'\n"
-    )
-    fake_tart.chmod(0o755)
-    profile = Path(td) / "macos-fleet-profile.toml"
-    profile.write_text(f'[host]\ntart_home = "{tart_home}"\n')
-    with mock.patch.dict(
-        os.environ,
-        {
-            "PATH": "/usr/bin:/bin",
-            "TARTCI_TART_CLI": str(fake_tart),
-            "TART_HOME": "",
-            "TARTCI_MACOS_FLEET_PROFILE": str(profile),
-        },
-    ):
-        probe = wd.probe_tart_vm_running()
-    check(observed_home.read_text() == str(tart_home),
-          "inventory command must receive the installed profile's custom Tart store")
-    check(probe.running is None,
-          f"malformed inventory entries must be unavailable, not idle: {probe}")
-    check("non-object entry" in probe.reason,
-          f"malformed inventory cause must survive the probe: {probe.reason}")
+# The installed profile names a custom Tart store; reading it needs tomllib.
+if testing_support.HAVE_TOMLLIB:
+    with tempfile.TemporaryDirectory() as td:
+        tart_home = Path(td) / "custom-store"
+        tart_home.mkdir()
+        observed_home = Path(td) / "observed-home"
+        fake_tart = Path(td) / "tart"
+        fake_tart.write_text(
+            f"#!/bin/sh\nprintf '%s' \"$TART_HOME\" > '{observed_home}'\nprintf '[null]\\n'\n"
+        )
+        fake_tart.chmod(0o755)
+        profile = Path(td) / "macos-fleet-profile.toml"
+        profile.write_text(f'[host]\ntart_home = "{tart_home}"\n')
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin:/bin",
+                "TARTCI_TART_CLI": str(fake_tart),
+                "TART_HOME": "",
+                "TARTCI_MACOS_FLEET_PROFILE": str(profile),
+            },
+        ):
+            probe = wd.probe_tart_vm_running()
+        check(observed_home.read_text() == str(tart_home),
+              "inventory command must receive the installed profile's custom Tart store")
+        check(probe.running is None,
+              f"malformed inventory entries must be unavailable, not idle: {probe}")
+        check("non-object entry" in probe.reason,
+              f"malformed inventory cause must survive the probe: {probe.reason}")
 
 with tempfile.TemporaryDirectory() as td:
     fake_tart = Path(td) / "tart"
@@ -832,6 +838,19 @@ check(wd.should_heal([NOW - 4000, NOW - 5000, NOW - 6000], NOW, WINDOW, MAXH),
 # heals_in_window prunes correctly.
 kept = wd.heals_in_window([NOW - 10, NOW - 4000], NOW, WINDOW)
 check(kept == [NOW - 10], f"heals_in_window prune: {kept}")
+
+# Smoke the real entrypoint on macOS after the serving-truth alert pass was
+# removed; Linux has no launchctl and cannot run this process-level path.
+if sys.platform == "darwin":
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "tartci_launchd_watchdog.py"),
+         "--status", "--json"], capture_output=True, text=True, check=False, timeout=30,
+    )
+    check(proc.returncode == 0, f"watchdog status entrypoint failed: {proc.stderr}")
+    try:
+        json.loads(proc.stdout)
+    except ValueError as exc:
+        check(False, f"watchdog status did not emit JSON: {exc}")
 
 
 if FAILS:

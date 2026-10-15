@@ -33,6 +33,7 @@ import network_profile
 import pulp_reapers
 import schedule_backstop_mode
 import support_agents
+import debug_hold
 import reuse_canary
 import power_status
 
@@ -41,16 +42,23 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-# launchd.plist(5) documents exactly these ProcessType values. A supervisor
-# left Background is throttled by the system for latency-insensitive work,
-# which lengthens every GitHub API call its queue scan makes.
+# launchd.plist(5) documents exactly these ProcessType values.
 PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
-DEFAULT_PROCESS_TYPE = "Background"
+# Every fleet supervisor takes the host-global queue observation lock, so a
+# supervisor in the darwinbg band is a priority inversion for the whole host:
+# its GitHub calls run several times slower (confined to efficiency cores and
+# throttled) while it holds the lock every other lane waits on. Background
+# puts a job in that band unconditionally and Adaptive does so whenever the
+# job holds no XPC transaction, which a supervisor never does. Measured on a
+# loaded host, the same exhaustive scan held the lock for 154 s in the band
+# and 18 s out of it, past the 120 s lock wait, so every lane went blind.
+SUPERVISOR_PROCESS_TYPES = ("Standard", "Interactive")
+DEFAULT_PROCESS_TYPE = "Standard"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary",
+    "reuse_canary", "debug_hold", "launchd_watchdog",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -66,12 +74,15 @@ BUILD_DISAGREEMENT_KEYS = {
     "timeout_seconds", "realert_hours",
 }
 HOST_KEYS = {
-    "id", "home", "tart_home", "cache_root", "log_root",
+    "id", "home", "tart_home", "cache_root", "log_root", "published",
     "github_api_timeout_seconds", "persistent_runner_labels",
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
     "ssh",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
+    "job_claim_max_age_seconds",
+    "home_volume_floor_mode",
+    "vm_dhcp_breaker",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -87,19 +98,20 @@ WORKTREE_CLEANUP_KEYS = {
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
 }
 LANE_KEYS = {
-    "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
+    "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
-    "jit_github_cli", "chrome_app_dir", "assignment_mode",
+    "jit_github_cli", "chrome_app_dir", "assignment_mode", "cache_root",
     "ccache_write_isolation",
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
-    "assignment_pre_clone_demand_check",
+    "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
-    "warm_vm", "warm_vm_max_park_seconds",
+    "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
+    "v2_gate_classes",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -304,6 +316,87 @@ def _verified_network_overlay(
     return body
 
 
+def _symlinked_component(path: PurePosixPath) -> str | None:
+    """The first existing component of ``path`` that is a symlink, if any."""
+    current = PurePosixPath("/")
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(mode):
+            return current.as_posix()
+    return None
+
+
+def validate_lane_cache_roots(host: dict, lanes: list) -> None:
+    """A lane-owned cache root is mounted only into that lane's runner group.
+
+    The host ``cache_root`` backs the ccache that every lane's VM mounts
+    writable, so any job on any lane can plant an object a later job links. A
+    lane that signs or publishes sets its own ``cache_root``: only VMs booted
+    for runner groups that list it mount it, so only their jobs write it. It
+    must not nest with the host root or another root (one ``--dir`` would
+    expose the other), and every lane sharing it must share its repository
+    and runner group, or an untrusted lane would write the trusted cache.
+
+    The trust boundary is the runner group, so the lane must register into an
+    organization group (never the repository-wide group 1, which any
+    workflow on any branch can target) and every tier must stay in that
+    group. Restricting that group to the protected workflows and refs is a
+    GitHub-side setting this file cannot see; the group's policy verifier
+    owns it.
+    """
+    host_root = PurePosixPath(host["cache_root"])
+    owners: dict[str, tuple] = {}
+    for lane in lanes:
+        if not isinstance(lane, dict) or "cache_root" not in lane:
+            continue
+        lane_id = lane.get("id", "")
+        value = lane["cache_root"]
+        if not isinstance(value, str):
+            fail(f"lane {lane_id}: cache_root must be an absolute path")
+        root = PurePosixPath(posixpath.normpath(value))
+        if (not root.is_absolute() or root.as_posix() != value
+                or any(char in value for char in ":,\r\n")):
+            fail(f"lane {lane_id}: cache_root must be a normalized absolute path "
+                 "without ':' or ','")
+        home = PurePosixPath(host["home"])
+        on_volume = (len(root.parts) >= 4 and root.parts[1] == "Volumes")
+        if not ((root != home and root.is_relative_to(home)) or on_volume):
+            fail(f"lane {lane_id}: cache_root must sit below host.home or a "
+                 "/Volumes/<volume>/ mount, where every component is created "
+                 "without following links")
+        linked = _symlinked_component(root)
+        if linked is not None:
+            fail(f"lane {lane_id}: cache_root component {linked} is a symlink; "
+                 "the VM would mount whatever it points at")
+        if root == host_root or root.is_relative_to(host_root) or host_root.is_relative_to(root):
+            fail(f"lane {lane_id}: cache_root must not be, contain or sit inside "
+                 "host.cache_root, which every lane mounts")
+        group = lane.get("runner_group_id")
+        if group == 1 or lane.get("registration_scope") == "repository":
+            fail(f"lane {lane_id}: a lane-owned cache_root needs an organization "
+                 "runner group restricted to protected workflows, not the "
+                 "repository-wide group 1")
+        for tier in lane.get("tier") or []:
+            if isinstance(tier, dict) and tier.get("runner_group_id", group) != group:
+                fail(f"lane {lane_id}: tier {tier.get('label')!r} leaves runner group "
+                     f"{group}, so its jobs would write the lane's cache_root")
+        owner = (lane.get("repo"), group)
+        for other, other_owner in owners.items():
+            other_root = PurePosixPath(other)
+            if other_root == root and other_owner != owner:
+                fail(f"lane {lane_id}: cache_root {value} is shared with a lane of "
+                     "another repository or runner group")
+            if other_root != root and (root.is_relative_to(other_root)
+                                       or other_root.is_relative_to(root)):
+                fail(f"lane {lane_id}: cache_root must not nest with another "
+                     "lane's cache_root")
+        owners[root.as_posix()] = owner
+
+
 def load(path: Path) -> dict:
     with path.open("rb") as handle:
         data = tomllib.load(handle)
@@ -337,6 +430,8 @@ def load(path: Path) -> dict:
     if ssh is not None and (not isinstance(ssh, str)
                             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}", ssh)):
         fail("host.ssh must be an SSH host alias or user@host other fleet hosts use to reach this one")
+    if "published" in host and type(host["published"]) is not bool:
+        fail("host.published must be a boolean")
     github_api_timeout = host.get("github_api_timeout_seconds")
     if github_api_timeout is not None and (
             type(github_api_timeout) is not int
@@ -375,9 +470,24 @@ def load(path: Path) -> dict:
     agent_floor = host.get("agent_floor_cores")
     if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
         fail("host.agent_floor_cores must be an integer from 0 through 32")
+    # How long this host's published boot claims may count on other hosts
+    # (scripts/job_claim.py). Only a host whose lanes hold claims longer than
+    # the consumers' default, such as one that waits for a lease after
+    # claiming, declares it; it can never exceed the claim TTL.
+    max_age = host.get("job_claim_max_age_seconds")
+    if max_age is not None and (type(max_age) is not int or not 60 <= max_age <= 1800):
+        fail("host.job_claim_max_age_seconds must be an integer from 60 through 1800")
+    # The host VM-DHCP breaker (scripts/vm_dhcp_breaker.py) is on by default;
+    # only `false` is ever written, to turn it off on one host.
+    dhcp_breaker = host.get("vm_dhcp_breaker")
+    if dhcp_breaker is not None and type(dhcp_breaker) is not bool:
+        fail("host.vm_dhcp_breaker must be a boolean")
     agent_floor_qos = host.get("agent_floor_qos")
     if agent_floor_qos is not None and agent_floor_qos not in ("utility", "background"):
         fail('host.agent_floor_qos must be "utility" or "background"')
+    floor_mode = host.get("home_volume_floor_mode")
+    if floor_mode is not None and floor_mode not in ("report", "refuse"):
+        fail('host.home_volume_floor_mode must be "report" or "refuse"')
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:
@@ -446,6 +556,16 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    watchdog = data.get("launchd_watchdog")
+    if watchdog is not None:
+        # The watchdog's frozen-lane threshold, rendered into its plist by the
+        # support-agents step; it lived only on hand-edited plists (#195).
+        if not isinstance(watchdog, dict) or set(watchdog) - {"stale_log_seconds"}:
+            fail("launchd_watchdog must be a table with only stale_log_seconds")
+        stale = watchdog.get("stale_log_seconds")
+        if stale is not None and (type(stale) is not int or not 600 <= stale <= 14400):
+            fail("launchd_watchdog.stale_log_seconds must be an integer from 600 "
+                 "through 14400")
     disagreement = data.get("build_disagreement")
     if disagreement is not None:
         if not isinstance(disagreement, dict):
@@ -455,7 +575,7 @@ def load(path: Path) -> dict:
             fail(f"unknown build_disagreement keys: {sorted(unknown)}")
         if type(disagreement.get("enabled", False)) is not bool:
             fail("build_disagreement.enabled must be a boolean")
-    # Opt-in: run Pulp's own build-directory reapers from `tartci reclaim`
+    # Opt-in: run Pulp's own build-directory reapers from tartci reclaim
     # (scripts/pulp_reapers.py). One validator for install time and run time,
     # so a profile that installs is a profile the reclaim pass acts on.
     reclaim = data.get("reclaim")
@@ -473,6 +593,12 @@ def load(path: Path) -> dict:
     canary = data.get(reuse_canary.TABLE)
     if canary is not None:
         problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Whether this host keeps failed gate VMs for debugging (off by default).
+    hold = data.get(debug_hold.TABLE)
+    if hold is not None:
+        problems = debug_hold.validate_table(hold)
         if problems:
             fail("; ".join(problems))
     # Which support LaunchAgents this host carries (checked after the agents'
@@ -584,6 +710,7 @@ def load(path: Path) -> dict:
                 f"{host['id']}.{lane.get('id', '')}"
                 f"{'' if slot == 1 else f'.slot{slot}'}"
             )
+    validate_lane_cache_roots(host, lanes)
     seen: set[str] = set()
     replaced: set[str] = set()
     for lane in lanes:
@@ -630,6 +757,12 @@ def load(path: Path) -> dict:
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
+        vm_cores_from = lane.get("vm_cores_from")
+        if vm_cores_from is not None:
+            if vm_cores_from != "gate-reserve":
+                fail(f"lane {lane_id}: vm_cores_from must be \"gate-reserve\"")
+            if vm_cores is not None:
+                fail(f"lane {lane_id}: set vm_cores or vm_cores_from, not both")
         priority = lane.get("priority")
         if priority is not None and (
                 not isinstance(priority, str) or priority not in LEASE_PRIORITIES):
@@ -642,6 +775,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: process_type must be one of "
                 f"{list(PROCESS_TYPES)}"
+            )
+        if process_type is not None and process_type not in SUPERVISOR_PROCESS_TYPES:
+            fail(
+                f"lane {lane_id}: process_type {process_type!r} runs the "
+                "supervisor in the darwinbg band while it holds the host "
+                "queue observation lock; use one of "
+                f"{list(SUPERVISOR_PROCESS_TYPES)}"
             )
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
@@ -696,6 +836,9 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: assignment_pre_clone_demand_check must be a "
                 "boolean on an event-class-v2 lane"
             )
+        fleet_peers = lane.get("assignment_fleet_claim_peers")
+        if fleet_peers is not None and type(fleet_peers) is not bool:
+            fail(f"lane {lane_id}: assignment_fleet_claim_peers must be a boolean")
         idle_retarget = lane.get("assignment_idle_retarget_seconds")
         if idle_retarget is not None and (
                 assignment_mode != "event-class-v2"
@@ -740,6 +883,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: warm_vm_max_park_seconds must be an integer "
                 "from 300 through 14400 beside warm_vm = true"
+            )
+        guest_stale = lane.get("guest_heartbeat_stale_seconds")
+        if guest_stale is not None and (
+                type(guest_stale) is not int or not 120 <= guest_stale <= 3600):
+            fail(
+                f"lane {lane_id}: guest_heartbeat_stale_seconds must be an "
+                "integer from 120 through 3600"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -885,7 +1035,8 @@ def load(path: Path) -> dict:
                 )
             tier_group_by_label[label] = group_id
         if assignment_mode == "event-class-v2":
-            validate_v2_tiers(lane_id, lane["repo"], tiers)
+            validate_v2_tiers(lane_id, lane["repo"], tiers,
+                              v2_gate_classes(lane_id, lane.get("v2_gate_classes")))
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
             if any(group_id != 1 for group_id in tier_groups):
@@ -969,30 +1120,53 @@ def load(path: Path) -> dict:
     return data
 
 
-def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict]) -> None:
+def v2_gate_classes(lane_id: str, declared: object) -> tuple[str, ...]:
+    """The gate classes an event-class-v2 lane serves; both unless it says so.
+
+    A lane may drop a gate class only by naming the ones it keeps, in the
+    canonical order, so an omitted tier is a stated decision and never a
+    typo. m1 serves PR-head only: its 3-core guest ran merge_group jobs in
+    33-35 min against 15-22 min elsewhere.
+    """
+    if declared is None:
+        return V2_GATE_CLASSES
+    if (not isinstance(declared, list) or not declared
+            or len(set(declared)) != len(declared)
+            or any(item not in V2_GATE_CLASSES for item in declared)
+            or list(declared) != [c for c in V2_GATE_CLASSES if c in declared]):
+        fail(
+            f"lane {lane_id}: v2_gate_classes must be a non-empty subset of "
+            f"{list(V2_GATE_CLASSES)} in that order"
+        )
+    return tuple(declared)
+
+
+def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
+                      gate_classes: tuple[str, ...] = V2_GATE_CLASSES) -> None:
     """The event-class-v2 tier contract: gate classes first, then extras.
 
-    The two gate classes lead, one workflow row each. Any further rows belong to
-    declared extra classes: each must be a known class, listed contiguously,
-    with exactly that class's workflows in order and never twice.
+    The lane's gate classes (both, unless `v2_gate_classes` names fewer) lead,
+    one workflow row each. Any further rows belong to declared extra classes:
+    each must be a known class, listed contiguously, with exactly that class's
+    workflows in order and never twice.
     """
     labels = [tier["label"] for tier in tiers]
-    if labels[:2] != list(V2_GATE_CLASSES) or len(set(labels[:2])) != 2:
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    if any(label in V2_GATE_CLASSES for label in labels[2:]):
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    extras = list(dict.fromkeys(labels[2:]))
+    n = len(gate_classes)
+    expected = " then ".join(
+        {"pulp-build-merge-group": "merge-group", "pulp-build-pr-head": "PR-head"}[c]
+        for c in gate_classes)
+    if labels[:n] != list(gate_classes):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    if any(label in V2_GATE_CLASSES for label in labels[n:]):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    extras = list(dict.fromkeys(labels[n:]))
     if not extras:
         return
     if repo != "Generous-Corp/pulp":
         fail(f"lane {lane_id}: extra event classes are Pulp classes")
-    grouped = [label for label in extras for _ in range(labels[2:].count(label))]
-    if grouped != labels[2:]:
-        fail(f"lane {lane_id}: event class {labels[2:]} rows must be contiguous and unique")
+    grouped = [label for label in extras for _ in range(labels[n:].count(label))]
+    if grouped != labels[n:]:
+        fail(f"lane {lane_id}: event class {labels[n:]} rows must be contiguous and unique")
     for label in extras:
         expected = V2_EXTRA_CLASS_WORKFLOWS.get(label)
         if expected is None:
@@ -1180,7 +1354,24 @@ def write_receipt(
     data = load(config)
     support_root = support_root.resolve()
     launch_entrypoint = launch_entrypoint.resolve()
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                installed_env = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {})
+            except (OSError, plistlib.InvalidFileException):
+                continue
+            pinned = installed_env.get("TARTCI_PYTHON")
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     digests: dict[str, str] = {}
     for name, body in expected.items():
         installed = agents_dir / name
@@ -1209,8 +1400,14 @@ def write_receipt(
         entrypoint_source, entrypoint, support_root
     )
     launch = support_manifest.launch_record(launch_entrypoint, support_root)
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    interpreter = Path(os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3"))
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter must be a regular non-symlink file")
     interpreter_record = {
@@ -1349,8 +1546,19 @@ def verify_receipt(
         != support.get("launch_entrypoint")
     ):
         fail("installed TartCI launch entrypoint does not match its receipt")
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    recorded_interpreter = support.get("interpreter")
+    interpreter = Path(
+        recorded_interpreter["path"]
+        if isinstance(recorded_interpreter, dict) and recorded_interpreter.get("path")
+        else os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3")
+    )
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     interpreter_record = {
         "path": str(interpreter),
         "mode": stat.S_IMODE(interpreter_info.st_mode),
@@ -1366,7 +1574,7 @@ def verify_receipt(
                 f"{INTERPRETER_CHANGED_BY_OS_UPDATE}: the OS-managed {interpreter} changed "
                 f"with a macOS update ({evidence}), so the receipt no longer describes it; "
                 "remedy: reinstall the same generation to refresh the receipt "
-                "(`tartci fleet-macos self-update --apply` does this at the next idle window)")
+                "(tartci fleet-macos self-update --apply does this at the next idle window)")
         fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
@@ -1374,7 +1582,26 @@ def verify_receipt(
     recorded_persistent = receipt.get("persistent_plists", {})
     if recorded_persistent != expected_persistent:
         fail("installed persistent runner plist set does not match the profile receipt")
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    # Render with the same rule as write_receipt: pin only when the installed
+    # plist cohort carries TARTCI_PYTHON. Unpinned source renders must verify
+    # as unpinned rather than being silently rewritten during verification.
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                pinned = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {}).get("TARTCI_PYTHON")
+            except (OSError, plistlib.InvalidFileException):
+                pinned = None
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
         fail("install receipt plist set does not match the profile")
@@ -1395,18 +1622,18 @@ def verify_receipt(
             installed_body = _verified_network_overlay(installed, body, config)
         if recorded.get(name) != digest or installed_body is None:
             fail(f"installed fleet plist failed receipt verification: {installed}")
-    expected_retired = replacements(data)
-    if receipt.get("retired_launchd_labels") != expected_retired:
-        fail("install receipt retired-label set does not match the profile")
-    for label in expected_retired:
-        if (agents_dir / f"{label}.plist").exists():
-            fail(f"declared legacy LaunchAgent became installable again: {label}")
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
         source_commit=verified_support["source_commit"],
         manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     )
+    expected_retired = replacements(data)
+    if receipt.get("retired_launchd_labels") != expected_retired:
+        fail("install receipt retired-label set does not match the profile")
+    for label in expected_retired:
+        if (agents_dir / f"{label}.plist").exists():
+            fail(f"declared legacy LaunchAgent became installable again: {label}")
     return receipt
 
 
@@ -1882,7 +2109,10 @@ def fleet_readiness(
                 "blocked_seconds_threshold": blocked_serving_seconds,
             },
             "problems": [{"code": INTERPRETER_CHANGED_BY_OS_UPDATE
-                          if isinstance(exc, InterpreterChangedByOSUpdate) else "receipt_mismatch",
+                          if isinstance(exc, InterpreterChangedByOSUpdate)
+                          else ("lane_python_unavailable"
+                                if "interpreter unavailable" in str(exc)
+                                else "receipt_mismatch"),
                           "detail": str(exc)}],
             "config": config_verdicts(config, support_root),
         }
@@ -2120,6 +2350,21 @@ def fleet_readiness(
                     # disk inside the current blocked streak, the lane is
                     # blocked now. Without this, a full disk read as
                     # "serving: ok" for the first 90 minutes of an outage.
+                    blocked_cause = str(matching_state.get("serving_blocked_cause", "") or "")
+                    # DHCP breaker open is a host-local hard stop: report the
+                    # lane NOT SERVING immediately, without waiting for the
+                    # generic transient streak threshold.
+                    if blocked_cause == "dhcp_breaker":
+                        serving_blocked_lanes.append({
+                            "label": label,
+                            "blocked_seconds": int(blocked_for),
+                            "streak": streak,
+                            "last_phase": str(matching_state.get("serving_blocked_last_phase", "") or ""),
+                            "cause": "dhcp_breaker",
+                            "reason": "DHCP breaker open",
+                        })
+                        verified_running += 1
+                        continue
                     disk_reason = disk_denial_during_streak(
                         (plist.get("EnvironmentVariables") or {}).get(
                             "TARTCI_DISK_DENIAL_RECEIPT_DIR", ""),
@@ -2146,9 +2391,14 @@ def fleet_readiness(
                     # TRANSIENCE gate, so an upstream blip cannot raise a
                     # fleet-wide alarm. A pre-streak generation has only the
                     # duration gate, which is the behaviour it already had.
-                    if blocked_for > blocked_serving_seconds and (
+                    admission_block = blocked_cause == "admission failing" and (
+                        (streak is not None and streak >= blocked_serving_streak)
+                        or blocked_for > blocked_serving_seconds
+                    )
+                    generic_block = blocked_for > blocked_serving_seconds and (
                         streak is None or streak >= blocked_serving_streak
-                    ):
+                    )
+                    if admission_block or generic_block:
                         serving_blocked_lanes.append({
                             "label": label,
                             "blocked_seconds": int(blocked_for),
@@ -2156,7 +2406,8 @@ def fleet_readiness(
                             "last_phase": str(
                                 matching_state.get("serving_blocked_last_phase", "") or ""
                             ),
-                            "cause": "unserved",
+                            "cause": blocked_cause or "unserved",
+                            "reason": ("admission failing" if blocked_cause == "admission failing" else ""),
                         })
                 verified_running += 1
 
@@ -2222,6 +2473,8 @@ def fleet_readiness(
             and verified_running == len(labels)
             and persistent_verified == len(persistent_labels)
             and not problems
+            and not any(lane.get("cause") in {"dhcp_breaker", "admission failing"}
+                        for lane in serving_blocked_lanes)
         ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),
@@ -2260,7 +2513,7 @@ def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
     """The SSH target a fallback lane reaches a preferred host by.
 
     The same rule self-update uses for its peers: the host's published
-    `host.ssh` from its checked-in profile, else the `tartci-<host_id>` alias
+    host.ssh from its checked-in profile, else the tartci-<host_id> alias
     convention. Resolved at render time, so the LaunchAgent carries the exact
     target and the supervisor never re-reads profiles.
     """
@@ -2306,7 +2559,7 @@ def lane_plist(
         "TARTCI_RUNNER_GROUP_ID": str(lane["runner_group_id"]),
         "TARTCI_RUNNER_LABELS": ",".join(lane["labels"]),
         "TARTCI_MACOS_GOLDEN": lane["golden"],
-        "TARTCI_CI_CACHE": host["cache_root"],
+        "TARTCI_CI_CACHE": lane.get("cache_root", host["cache_root"]),
         "TARTCI_STATE_DIR": state,
         "TARTCI_DISK_DENIAL_RECEIPT_DIR": f"{host['home']}/.tartci/state/disk-admission",
         "TARTCI_RECEIPT_HOST_ID": host["id"],
@@ -2319,6 +2572,14 @@ def lane_plist(
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    # The installer resolves and probes one interpreter before rendering. Keep
+    # that exact path in every LaunchAgent so TartCILauncher and ghapp cannot
+    # follow a later PATH relink.
+    pinned_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if pinned_python:
+        env["TARTCI_PYTHON"] = pinned_python
+        env["SHIPYARD_GHAPP_PYTHON_BINARY"] = pinned_python
+        env["PATH"] = f"{Path(pinned_python).parent}:{env['PATH']}"
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"] and lane["id"] == "pulp-gate":
         env.update({
@@ -2341,8 +2602,12 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
+    if host.get("vm_dhcp_breaker") is False:
+        env["TARTCI_VM_DHCP_BREAKER"] = "0"
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
+    if "home_volume_floor_mode" in host:
+        env["TARTCI_HOME_VOLUME_FLOOR_MODE"] = host["home_volume_floor_mode"]
     if "current_job_attempt_timeout_seconds" in host:
         env["TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"] = str(
             host["current_job_attempt_timeout_seconds"]
@@ -2357,6 +2622,12 @@ def lane_plist(
         env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
+    if "vm_cores_from" in lane:
+        # Derived at lease time from this host's live gate reserve
+        # (gate_reserve_fit.share_cores), so the rendered plist names the rule
+        # and the slot count, never a size measured on another machine.
+        env["TARTCI_MACOS_VM_CORES_FROM"] = lane["vm_cores_from"]
+        env["TARTCI_MACOS_VM_CORES_SLOTS"] = str(lane.get("supervisors", 1))
     if lane.get("tier"):
         env["TARTCI_RUNNER_WORKFLOW_TIERS"] = "\n".join(
             f"{row['label']}|{row['workflow']}" for row in lane["tier"]
@@ -2376,6 +2647,10 @@ def lane_plist(
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])
     if "jit_github_cli" in lane:
         env["TARTCI_JIT_GH_CLI"] = lane["jit_github_cli"]
+    if "cache_root" in lane:
+        # runner.sh refuses to boot when the lane root resolves into or around
+        # this one (lane-cache-root.lib.sh).
+        env["TARTCI_HOST_CI_CACHE"] = host["cache_root"]
     if "chrome_app_dir" in lane:
         env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
     if "assignment_mode" in lane:
@@ -2401,6 +2676,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
     if lane.get("assignment_pre_clone_demand_check"):
         env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "1"
+    if lane.get("assignment_fleet_claim_peers"):
+        env["TARTCI_JOB_CLAIM_FLEET_PEERS"] = "1"
     if lane.get("assignment_idle_retarget_seconds"):
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]
@@ -2424,6 +2701,8 @@ def lane_plist(
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)
+    if "guest_heartbeat_stale_seconds" in lane:
+        env["TARTCI_GUEST_HEARTBEAT_STALE_SECS"] = str(lane["guest_heartbeat_stale_seconds"])
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
@@ -2561,6 +2840,8 @@ def registrations_from_env(env: dict[str, str]) -> list[dict]:
 
 def advertised_registrations(data: dict) -> list[dict]:
     """Every JIT registration a loaded profile's lanes can mint."""
+    if data["host"].get("published", True) is False:
+        return []
     host_id = data["host"]["id"]
     profile = data.get("name") or host_id
     rows: list[dict] = []
@@ -2620,6 +2901,8 @@ def persistent_runners(data: dict) -> list[dict]:
     are set at registration outside tartci, so only the name is declared.
     """
     host_id = data["host"]["id"]
+    if data["host"].get("published", True) is False:
+        return []
     rows = []
     for label in data["host"].get("persistent_runner_labels", []) or []:
         match = _PERSISTENT_RUNNER_NAME.fullmatch(label)
@@ -2641,9 +2924,10 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         data = load(path)
         registrations.extend(advertised_registrations(data))
         persistent.extend(persistent_runners(data))
-        hosts.append({"profile": data.get("name") or data["host"]["id"],
-                      "host_id": data["host"]["id"],
-                      "ssh": data["host"].get("ssh")})
+        if data["host"].get("published", True):
+            hosts.append({"profile": data.get("name") or data["host"]["id"],
+                          "host_id": data["host"]["id"],
+                          "ssh": data["host"].get("ssh")})
     return {
         "schema": ADVERTISED_LABELS_SCHEMA,
         "generated_from": {
@@ -2655,7 +2939,7 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         # Additive to v1: runners a host owns whose labels tartci does not set.
         "persistent_runners": persistent,
         # Additive to v1: how fleet hosts reach each other (self-update's
-        # one-at-a-time check). ssh null means the alias `tartci-<host_id>`.
+        # one-at-a-time check). ssh null means the alias tartci-<host_id>.
         "hosts": hosts,
     }
 
@@ -2824,6 +3108,8 @@ def config_verdicts(config: Path, support_root: Path,
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
                 "self_update": self_update_summary(),
+                "gate_reserve": {"lines": ["gate reserve: n/a (no installed fleet profile)"],
+                                 "problem": None},
                 "tool_freshness": tool_freshness_summary(),
                 "host_vitals": host_vitals_summary()}
     value: dict = {}
@@ -2858,6 +3144,7 @@ def config_verdicts(config: Path, support_root: Path,
     except Exception as exc:  # noqa: BLE001
         value["supply"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
     value["self_update"] = self_update_summary()
+    value["gate_reserve"] = gate_reserve_summary(config)
     value["tool_freshness"] = tool_freshness_summary()
     value["host_vitals"] = host_vitals_summary()
     return value
@@ -2886,6 +3173,8 @@ def tool_freshness_summary() -> dict:
 
 
 FSEVENTSD_WARN_MB = 1024
+# The host-vitals sensor publishes every 60 s (Pulp com.pulp.host-vitals).
+HOST_VITALS_INTERVAL_S = 60
 
 
 def host_vitals_summary(path: Path | None = None) -> dict:
@@ -2920,19 +3209,81 @@ def _fseventsd_summary(path: Path | None = None) -> dict:
     except (OSError, json.JSONDecodeError):
         return {"lines": [f"fseventsd: UNKNOWN (no host-vitals reading at {path})"],
                 "problem": None}
+    import state_age
+
     sampled = reading.get("sampled_at") if isinstance(reading, dict) else None
     age = f", sampled {int(time.time() - sampled)}s ago" if isinstance(sampled, int) else ""
+    aged = state_age.stale_note(sampled, HOST_VITALS_INTERVAL_S, "host-vitals sensor")
     fsev = reading.get("fseventsd") if isinstance(reading, dict) else None
     if not isinstance(fsev, dict) or not isinstance(fsev.get("rss_mb"), int):
         return {"lines": [f"fseventsd: UNKNOWN (host-vitals reading has no fseventsd field{age}; "
                           "reinstall the sensor)"], "problem": None}
     limit = fsev.get("warn_mb") if isinstance(fsev.get("warn_mb"), int) else FSEVENTSD_WARN_MB
     text = f"fseventsd: {fsev['rss_mb']} MB RSS, {fsev.get('cpu_pct')}% CPU{age}"
+    if aged:
+        # A reading the sensor stopped refreshing says nothing about now.
+        return {"lines": [f"{text} {aged}"], "problem": f"host vitals {aged}", "fseventsd": fsev}
     if fsev["rss_mb"] > limit:
         problem = f"fseventsd {fsev['rss_mb']} MB RSS > {limit} MB"
         return {"lines": [f"{text} WARN (> {limit} MB; restart with sudo killall fseventsd)"],
                 "problem": problem, "fseventsd": fsev}
     return {"lines": [text], "problem": None, "fseventsd": fsev}
+
+
+DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
+
+
+def live_host_profile(config: Path, override: Path | None = None) -> dict:
+    if override is not None:
+        return json.loads(override.read_text())
+    import host_profile
+    return host_profile.build_profile(fleet_profile=str(config))
+
+
+def check_reserve(target: dict, installed_path: Path, host_json: Path | None,
+                  config: Path) -> int:
+    """`validate --check-reserve`: report every overcommit, refuse only a worse one."""
+    import gate_reserve_fit
+    host = live_host_profile(config, host_json)
+    installed = None
+    if installed_path.is_file():
+        with installed_path.open("rb") as fh:
+            installed = tomllib.load(fh)
+    rows, refusals = gate_reserve_fit.ratchet(installed, target, host)
+    for line in gate_reserve_fit.not_applicable_lines(target, host):
+        print(line)
+    for line in gate_reserve_fit.finding_lines(rows):
+        print(line)
+    for line in refusals:
+        print(line, file=sys.stderr)
+    if refusals:
+        print("refusing: this profile overcommits the gate reserve more than the installed "
+              "one; resizing gate lanes is a profile decision with the host's owner",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def gate_reserve_summary(config: Path) -> dict:
+    """The installed profile's fit against this host's live gate reserve."""
+    try:
+        import gate_reserve_fit
+        with config.open("rb") as fh:
+            profile = tomllib.load(fh)
+        host = live_host_profile(config)
+        lines = gate_reserve_fit.finding_lines(gate_reserve_fit.fit(profile, host))
+        not_applicable = gate_reserve_fit.not_applicable_lines(profile, host)
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
+                "problem": None}
+    if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
+        return {"lines": not_applicable, "problem": None}
+    if not lines:
+        return {"lines": ["gate reserve: every gate lane fits", *not_applicable],
+                "problem": None}
+    return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines]
+            + not_applicable,
+            "problem": "; ".join(line.split(" ", 1)[1] for line in lines)}
 
 
 def self_update_summary() -> dict:
@@ -2966,7 +3317,7 @@ def render_config_verdicts(value: dict | None) -> str:
     self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
     lines.extend(self_update.get("lines") or
                  ["tartci: skew UNKNOWN (not checked from here)"])
-    for key in ("tool_freshness", "host_vitals"):
+    for key in ("gate_reserve", "tool_freshness", "host_vitals"):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         lines.extend(row.get("lines") or [f"{key}: UNKNOWN (not checked from here)"])
     supply = value.get("supply") if isinstance(value.get("supply"), dict) else {}
@@ -3149,6 +3500,16 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("config", type=Path)
         if name == "render":
             cmd.add_argument("--output", required=True, type=Path)
+        if name == "validate":
+            cmd.add_argument(
+                "--check-reserve", action="store_true",
+                help="also fit each gate lane into THIS host's gate reserve (live host "
+                     "profile): report every overcommit, refuse only one the config makes "
+                     "worse than the installed profile (scripts/gate_reserve_fit.py)")
+            cmd.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE,
+                             help="the installed profile the ratchet compares against")
+            cmd.add_argument("--host-profile-json", type=Path, default=None,
+                             help=argparse.SUPPRESS)
     receipt = sub.add_parser("write-receipt")
     receipt.add_argument("config", type=Path)
     receipt.add_argument("--agents-dir", required=True, type=Path)
@@ -3237,7 +3598,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     if current != body:
                         print(f"fleet-macos: {args.check} is stale; regenerate with "
-                              "`tartci fleet-macos advertised-labels --publish > "
+                              "tartci fleet-macos advertised-labels --publish > "
                               "fleet/advertised-labels.json`", file=sys.stderr)
                         return 1
                     print(f"up to date: {args.check}")
@@ -3314,6 +3675,8 @@ def main(argv: list[str] | None = None) -> int:
         data = load(args.config)
         if args.command == "validate":
             print(f"valid: host={data['host']['id']} lanes={len(data['lane'])} activation=unchanged")
+            if args.check_reserve:
+                return check_reserve(data, args.installed, args.host_profile_json, args.config)
             return 0
         if args.command == "write-receipt":
             write_receipt(

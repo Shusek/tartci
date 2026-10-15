@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 from pathlib import Path
 import hashlib,json,sys,tempfile,unittest
 from unittest import mock

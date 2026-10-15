@@ -21,9 +21,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_off  # noqa: E402
-import macos_fleet_lanes as fleet  # noqa: E402
 import macos_launcher_probe  # noqa: E402
 import tartci_launchd_watchdog as wd  # noqa: E402
+import testing_support  # noqa: E402
 
 LEFT_AT = 1_790_000_000.0
 
@@ -151,6 +151,16 @@ class AlertTests(Fixture):
         self.assertEqual(closed, ["42"])
         self.assertFalse((self.sdir / "host-off-alert.json").exists())
 
+    def test_immediate_alert_opens_before_the_loudness_deadline(self) -> None:
+        self.left_off()
+        opened = []
+        host_off.alert(self.sdir, self.pool, "studio", LEFT_AT + 30,
+                       issue=lambda title, body: opened.append((title, body)) or (0, "9"),
+                       immediate=True)
+        self.assertEqual(len(opened), 1)
+        self.assertIn("studio", opened[0][0])
+        self.assertIn("Remedy:", opened[0][1])
+
     def test_a_failed_issue_is_retried_next_pass(self) -> None:
         self.left_off()
         results = iter([(1, "provenance required"), (0, "7")])
@@ -169,7 +179,9 @@ class SurfaceTests(Fixture):
         self.env.start()
         self.addCleanup(self.env.stop)
 
+    @testing_support.requires_tomllib
     def test_pool_status_names_the_reason(self) -> None:
+        import macos_fleet_lanes as fleet
         self.left_off()
         problem = fleet.host_off_problem("off")
         self.assertEqual(problem["code"], "host_off_unexpected")
@@ -177,12 +189,17 @@ class SurfaceTests(Fixture):
         self.pool.write_text("on\n")
         self.assertIsNone(fleet.host_off_problem("on"))
 
+    @testing_support.requires_tomllib
     def test_a_check_that_raises_is_a_problem_not_a_clean_bill(self) -> None:
+        import macos_fleet_lanes as fleet
         with mock.patch.object(host_off, "status", side_effect=OSError("state dir unreadable")):
             problem = fleet.host_off_problem("off")
-            line = wd.host_off_pass(now=time.time())
         self.assertEqual(problem["code"], "host_off_unverified")
         self.assertIn("state dir unreadable", problem["detail"])
+
+    def test_a_check_that_raises_warns_in_the_watchdog(self) -> None:
+        with mock.patch.object(host_off, "status", side_effect=OSError("state dir unreadable")):
+            line = wd.host_off_pass(now=time.time())
         self.assertIn("WARN host-off check FAILED", line)
 
     def test_the_watchdog_recovers_and_warns_every_pass(self) -> None:
@@ -271,7 +288,7 @@ class VolumeProbeTests(unittest.TestCase):
     def test_the_probe_is_not_background_throttled_and_says_why_it_timed_out(self) -> None:
         plists: list[dict] = []
         with mock.patch.object(macos_launcher_probe.subprocess, "run", self.fake_run(plists)):
-            with self.assertRaisesRegex(ValueError, "slow volume I/O, not an access denial"):
+            with self.assertRaisesRegex(ValueError, r"probe wait elapsed [0-9.]+s;.*volume I/O slow"):
                 macos_launcher_probe.run(self.helper, self.profile, timeout_seconds=0.3)
         self.assertEqual(plists[0]["ProcessType"], "Standard")
 

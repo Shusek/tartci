@@ -472,6 +472,38 @@ class RefreshAgentTests(unittest.TestCase):
         end = body.index("cmd_bench()", start)
         self.assertIn('install_artifact_cache_refresh_agent.sh" --install', body[start:end])
 
+    def _installed_cache(self, profile_text: str | None) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            agents = Path(tmp) / "agents"
+            double = Path(tmp) / "launchctl"
+            double.write_text("#!/bin/sh\nexit 0\n")
+            double.chmod(0o755)
+            profile = Path(tmp) / "macos-fleet-profile.toml"
+            if profile_text is not None:
+                profile.write_text(profile_text)
+            res = subprocess.run(
+                [str(REFRESH_INSTALLER), "--install"], capture_output=True, text=True,
+                check=False,
+                env={**os.environ, "HOME": str(home), "TARTCI_AGENTS_DIR": str(agents),
+                     "TARTCI_LAUNCHCTL_BIN": str(double),
+                     "TARTCI_FLEET_PROFILE": str(profile)})
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            spec = plistlib.loads((agents / f"{REFRESH_LABEL}.plist").read_bytes())
+            return spec["EnvironmentVariables"]["TARTCI_CI_CACHE"].replace(str(home), "~")
+
+    def test_installer_refreshes_the_cache_root_the_profile_declares(self) -> None:
+        # The runners mount [host].cache_root; a host that moved its CI cache
+        # off the home default must have this agent refresh the moved cache.
+        self.assertEqual(self._installed_cache(
+            '[host]\nid = "studio"\ncache_root = "/Volumes/Workshop/ci/pulp-ci"\n'),
+            "/Volumes/Workshop/ci/pulp-ci")
+
+    def test_installer_keeps_the_home_default_without_a_declared_cache_root(self) -> None:
+        self.assertEqual(self._installed_cache(None), "~/.cache/pulp-ci")
+        self.assertEqual(self._installed_cache('[host]\nid = "studio"\n'), "~/.cache/pulp-ci")
+
     def test_installer_plan_writes_nothing_and_temp_home_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             agents = Path(tmp) / "agents"

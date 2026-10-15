@@ -15,6 +15,8 @@ default would be wrong.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import tomllib
 import unittest
 from pathlib import Path

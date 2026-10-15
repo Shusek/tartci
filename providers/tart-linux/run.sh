@@ -116,7 +116,7 @@ IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$VM" 2>/dev/null || true)"; [ -n 
 [ -n "$IP" ] || die "no IP for $VM after 120s"
 GUEST_TRANSPORT=""
 for _ in $(seq 1 90); do
-  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
   if tart exec "$VM" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
   sleep 2
 done
@@ -132,6 +132,7 @@ note "guest transport: $GUEST_TRANSPORT"
 
 run_guest_script(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+    # ssh-stdin: the guest script is fed by `run_guest_script <<'GUEST'`
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
       "REF='$REF' BUILD_TYPE='$BUILD_TYPE' NO_GPU='$NO_GPU' CTEST_ARGS='$CTEST_ARGS' TARGET_ARCH='$TARGET_ARCH' CROSS='$CROSS' SELF_TEST='$SELF_TEST' X64_SKIA_DIR='$X64_SKIA_DIR' EMULATOR='$EMULATOR' bash -s"
   else

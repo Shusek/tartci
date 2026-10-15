@@ -39,7 +39,6 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import math
 import os
@@ -50,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     CLI_REFUSED,
     NO_VALID_CREDENTIALS,
@@ -80,6 +80,10 @@ class TransientApiFault(ScanError):
     a retry would have completed. Retrying is not failing open — an exhausted
     retry budget still raises, and the scan still fails closed.
     """
+
+
+class AssignmentObservationTimeout(TransientApiFault, ObservationTimeout):
+    """A retryable assignment API timeout that also marks the host backoff."""
 
 
 class WitnessAbandon(Exception):
@@ -281,10 +285,13 @@ class AssignmentScanner:
             label.strip().lower() for label in args.labels.split(",") if label.strip()
         }
         self.required_label = args.require_label.strip().lower()
+        self.require_head_repo = str(getattr(args, "require_head_repo", "") or "").strip().lower()
         if not self.workflows:
             raise ScanError("at least one workflow is required")
         if not self.required_label:
             raise ScanError("the required assignment-class label is empty")
+        if self.require_head_repo and "/" not in self.require_head_repo:
+            raise ScanError("--require-head-repo must be OWNER/REPO")
         if self.required_label not in self.runner_labels:
             raise ScanError("required assignment-class label is absent from runner labels")
         # Provisional only: --scan-timeout budgets the SCAN, and the scan has
@@ -306,42 +313,16 @@ class AssignmentScanner:
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
-        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_deadline = time.monotonic() + self.args.observation_lock_timeout
-        with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
-            while True:
-                try:
-                    fcntl.flock(
-                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= lock_deadline:
-                        raise ScanError(
-                            "host queue observation lock timed out after "
-                            f"{self.args.observation_lock_timeout}s"
-                        )
-                    time.sleep(0.05)
-            # The wait is over, so the scan begins now. Budgeting the scan from
-            # invocation instead charged it for however long the queue behind
-            # this host-global lock happened to be, which is the one quantity
-            # the scan does not control: a lane that waited most of its budget
-            # then ran an exhaustive pass on the remainder, and the leftover
-            # was handed to `gh` as a shortened per-call timeout, so the scan
-            # died mid-pass and reported the queue unobservable. The total is
-            # still bounded -- by --observation-lock-timeout plus
-            # --scan-timeout, each explicit.
+        with FairObservationLock(
+            str(self.observation_lock_path), self.args.observation_lock_timeout,
+            self.args.repo, getattr(self.args, "observation_backoff_file", None),
+            getattr(self.args, "observation_backoff_seconds", 30.0),
+            getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+        ).hold() as handle:
             self.deadline = time.monotonic() + self.args.scan_timeout
-            try:
-                self.observation_lock_fd = os.dup(handle.fileno())
-                os.set_inheritable(self.observation_lock_fd, True)
-                try:
-                    yield
-                finally:
-                    os.close(self.observation_lock_fd)
-                    self.observation_lock_fd = None
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            # Descendants must not inherit this flock: a killed scanner's
+            # slow API child cannot starve the other host lanes.
+            yield
 
     def _gh_once(self, path: str) -> dict[str, Any]:
         with self.api_calls_lock:
@@ -352,15 +333,21 @@ class AssignmentScanner:
             self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise ScanError("assignment scan exceeded its overall deadline")
+            raise AssignmentObservationTimeout("assignment scan exceeded its overall deadline")
         try:
+            started = time.monotonic()
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                timeout=min(self.args.gh_timeout, remaining),
+                timeout=min(
+                    self.args.gh_timeout,
+                    max(0.1, self.args.observation_lock_timeout / 2),
+                    remaining,
+                ),
                 operation="assignment_scan_github_api",
-                pass_fds=(self.observation_lock_fd,)
-                if self.observation_lock_fd is not None
-                else (),
+            )
+            print(
+                f"assignment-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+                file=sys.stderr,
             )
         except (OSError, ObservationError) as error:
             raise TransientApiFault(
@@ -370,6 +357,8 @@ class AssignmentScanner:
             reason = self._reason(
                 f"GitHub API failed for {path}: {result.stderr.strip()}"
             )
+            if getattr(result, "timed_out", False) or reason.reason_code == "timeout":
+                raise AssignmentObservationTimeout(str(reason))
             if reason.reason_code == NO_VALID_CREDENTIALS:
                 # Retrying cannot turn an anonymous caller into an
                 # authenticated one, and each attempt spends another request
@@ -431,6 +420,16 @@ class AssignmentScanner:
         """Name a failure against the identity this scan proved it was using."""
         return classify_failure(text, self.identity)
 
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff using only the backoff-file lock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
+
     def _retry_sleep(self, attempt: int) -> bool:
         """Back off before the next attempt, or report that none is affordable.
 
@@ -473,13 +472,19 @@ class AssignmentScanner:
         if remaining <= 0:
             return None
         try:
+            started = time.monotonic()
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                timeout=min(self.args.gh_timeout, remaining),
+                timeout=min(
+                    self.args.gh_timeout,
+                    max(0.1, self.args.observation_lock_timeout / 2),
+                    remaining,
+                ),
                 operation="assignment_scan_ref_probe",
-                pass_fds=(self.observation_lock_fd,)
-                if self.observation_lock_fd is not None
-                else (),
+            )
+            print(
+                f"assignment-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+                file=sys.stderr,
             )
         except (OSError, ObservationError):
             return None
@@ -736,6 +741,16 @@ class AssignmentScanner:
         matches: set[int] = set()
         queued_jobs = 0
         run_id = int(run["id"])
+        if self.require_head_repo:
+            head = run.get("head_repository")
+            head_name = head.get("full_name") if isinstance(head, dict) else None
+            # A fork run must never be admitted to a self-hosted lane. GitHub
+            # returns null when the fork was deleted; that run is not demand
+            # for this first-party lane and must not blind the whole scan.
+            if not isinstance(head_name, str) or not head_name.strip():
+                return 0
+            if head_name.strip().lower() != self.require_head_repo:
+                return 0
         # A run already proved stale is not fetched again. That fetch is not
         # free: a permanently queued run is re-read by every lane on every
         # pass, and that added call is what pushes an otherwise healthy scan
@@ -804,58 +819,49 @@ class AssignmentScanner:
         return len(matches)
 
     def scan(self) -> int:
-        # Every fleet supervisor shares this host-global observation slot. The
-        # exhaustive scanner can issue many GitHub calls; overlapping scans for
-        # different lanes made individually healthy ghapp requests time out and
-        # left the host scan-blind. The wait is bounded separately from the scan
-        # budget, so queueing behind other lanes costs this scan time to finish
-        # but never time to work; failure remains fail-closed either way.
-        # Reading the workflow ids from cache is file IO, so it happens
-        # before the host-global lock rather than under it.
+        # GitHub observation is deliberately lock-free.  The host-global flock
+        # is a claim/coordination primitive, not a network mutex: holding it
+        # over pagination lets one slow API call starve every other lane.
         workflow_ids = self._cached_workflow_ids()
         total = 0
-        with self._observation_lock():
-            # Inside the lock, so the identity probe is serialized, budgeted
-            # and bounded exactly like every other call this scan makes, and
-            # before the first GitHub read so an anonymous caller is refused
-            # rather than spending the shared 60/hour allowance.
-            self._preflight_identity()
-            if workflow_ids is None:
-                workflow_ids = self._workflow_ids()
+        self._preflight_identity()
+        if workflow_ids is None:
+            workflow_ids = self._workflow_ids()
+            # Publishing a resolved workflow id is the only shared mutation in
+            # this phase, so keep the host lock for that short file operation.
+            with self._observation_lock():
                 self._store_workflow_ids(workflow_ids)
-            scanned: set[int] = set()
+        scanned: set[int] = set()
 
-            # Concurrency remains opt-in for a measured host. The reliable
-            # fleet default is one call stream; raising it multiplies pressure
-            # inside the host-global scan and must not happen accidentally.
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.args.max_workers
-            ) as executor:
+        # Concurrency remains opt-in for a measured host. The reliable fleet
+        # default is one call stream; raising it multiplies API pressure but no
+        # longer blocks unrelated lanes on this host.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.args.max_workers
+        ) as executor:
 
-                def visit(page_items: list[dict[str, Any]]) -> None:
-                    nonlocal total
-                    fresh: list[dict[str, Any]] = []
-                    for run in page_items:
-                        run_id = run.get("id")
-                        if not isinstance(run_id, int):
-                            raise ScanError("configured workflow run has no integer id")
-                        # A run reachable from two listings, or re-read by a
-                        # restarted pass, is scanned once.
-                        if run_id in scanned:
-                            continue
-                        scanned.add(run_id)
-                        fresh.append(run)
-                    if not fresh:
-                        return
-                    total += sum(executor.map(self._scan_run, fresh), start=0)
-                    if self.witness.is_set():
-                        raise WitnessAbandon
+            def visit(page_items: list[dict[str, Any]]) -> None:
+                nonlocal total
+                fresh: list[dict[str, Any]] = []
+                for run in page_items:
+                    run_id = run.get("id")
+                    if not isinstance(run_id, int):
+                        raise ScanError("configured workflow run has no integer id")
+                    if run_id in scanned:
+                        continue
+                    scanned.add(run_id)
+                    fresh.append(run)
+                if not fresh:
+                    return
+                total += sum(executor.map(self._scan_run, fresh), start=0)
+                if self.witness.is_set():
+                    raise WitnessAbandon
 
-                try:
-                    for prefix in self._ordered_run_listings(workflow_ids):
-                        self._walk_listing(prefix, "workflow_runs", visit)
-                except WitnessAbandon:
-                    pass
+            try:
+                for prefix in self._ordered_run_listings(workflow_ids):
+                    self._walk_listing(prefix, "workflow_runs", visit)
+            except WitnessAbandon:
+                pass
         # Published on every exit path, including the abandoned one: a run
         # proved stale before the witness landed is still worth remembering.
         self.stale_demand.persist()
@@ -874,6 +880,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workflow", required=True, action="append")
     parser.add_argument("--labels", required=True)
     parser.add_argument("--require-label", required=True)
+    parser.add_argument(
+        "--require-head-repo",
+        default=os.environ.get("TARTCI_ASSIGNMENT_REQUIRE_HEAD_REPO", ""),
+        help="count only runs whose head_repository.full_name is this exact OWNER/REPO",
+    )
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument(
         "--exhaustive-count",
@@ -960,11 +971,30 @@ def parse_args() -> argparse.Namespace:
         or str(Path.home() / ".tartci/state/queue-observation.lock"),
     )
     parser.add_argument(
+        "--lane-id",
+        default=os.environ.get("TARTCI_QUEUE_LANE_ID")
+        or os.environ.get("TARTCI_RUNNER_SLOT")
+        or f"supervisor-{os.getppid()}",
+    )
+    parser.add_argument(
+        "--generation",
+        default=os.environ.get("TARTCI_GENERATION") or "unknown",
+    )
+    parser.add_argument(
         "--observation-lock-timeout",
         type=float,
         default=float(
             os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")
         ),
+    )
+    parser.add_argument(
+        "--observation-backoff-file",
+        default=os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE"),
+    )
+    parser.add_argument(
+        "--observation-backoff-seconds",
+        type=float,
+        default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_SECS", "30")),
     )
     args = parser.parse_args()
     if args.gh_timeout <= 0:
@@ -996,6 +1026,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--stale-demand-ttl-seconds must be positive")
     if args.stale_demand_min_age_seconds < 0:
         parser.error("--stale-demand-min-age-seconds must be non-negative")
+    if args.observation_backoff_file is None:
+        args.observation_backoff_file = str(
+            Path(args.observation_lock_file).with_name("queue-observation-backoff.json")
+        )
+    if not math.isfinite(args.observation_backoff_seconds) or args.observation_backoff_seconds <= 0:
+        parser.error("--observation-backoff-seconds must be positive")
     if args.stale_demand_quarantine_file is None:
         # Follows whatever state directory the observation lock uses, so a test
         # or a redirected fleet root does not write into the real one.
@@ -1016,7 +1052,14 @@ def main() -> int:
     except AuthPreflightError as error:
         print(f"assignment scan failed closed: {error}", file=sys.stderr)
         return 2
+    except (TimeoutError, ObservationBackoff) as error:
+        if scanner is not None:
+            scanner.record_timeout(error)
+        print(f"assignment scan failed closed: lock_contention: {error}", file=sys.stderr)
+        return 2
     except (ScanError, ValueError) as error:
+        if scanner is not None:
+            scanner.record_timeout(error)
         identity = scanner.identity if scanner is not None else None
         print(
             f"assignment scan failed closed: {classify_failure(str(error), identity)}",

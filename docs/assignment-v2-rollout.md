@@ -1,5 +1,24 @@
 # Event-class JIT assignment V2 rollout
 
+## Serving fewer gate classes
+
+M1 temporarily omitted `pulp-build-merge-group` after #439 because its
+three-core gate guest measured 33–35 minutes while other hosts measured
+15–22 minutes. On 2026-10-11 Daniel reversed that decision: other hosts now
+have a 29-minute median and merge-group capacity is the scarce resource, with
+queue-head waits reaching 95 minutes. M1 therefore serves both gate classes
+again. Slot 1 orders merge-group before PR-head; slot 2 keeps release classes
+first, followed by merge-group and PR-head. The gate guest size is unchanged;
+`vm_cores_from` continues to govern admission.
+
+An event-class-v2 lane may serve fewer classes only by naming the classes it keeps with `v2_gate_classes`. M1 now declares both classes in canonical order:
+
+```toml
+v2_gate_classes = ["pulp-build-merge-group", "pulp-build-pr-head"]
+```
+
+The list must be a non-empty subset of those two classes, and the lane's leading tiers must match it exactly. Dropping a tier without the key, or keeping a tier the key omits, fails validation. M1's published supply therefore includes merge-group again alongside the other gate hosts. Rollback is to restore the prior PR-head-only declaration and regenerate the published labels.
+
 V2 partitions Pulp's required macOS JIT capacity at GitHub's assignment
 boundary. A runner advertises the shared platform/base labels plus exactly one
 of:
@@ -234,8 +253,9 @@ fail-open clones (`_uncertain`), served jobs up from 156 to 229, no refused
 work. The per-job fall in pre-mint `own_class_empty` matched the no-knob control
 host, so the measured win is the skipped clones, not a lower discard rate. On
 that evidence the key is set on the pulp-gate lane of the m1, m3 and m5studio
-profiles. m5 follows after its ranked-lease canary read, which the check would
-otherwise confound.
+profiles. m5 joined after its ranked-lease canary read (2026-10-03 18:34Z to
+10-10 18:38Z, 168 h: 846 leases, 0 real inversions), which the check would
+otherwise have confounded, so every pulp-gate lane now runs it.
 
 What it does not fix: two hosts that both clone for the same single job inside
 the same few seconds. Neither can see the other's boot until one mints, so the
@@ -279,23 +299,62 @@ Rollback: delete `assignment_pre_clone_demand_check` from
 `profiles/m3-macos-fleet.toml`, re-render, and reload the pulp-gate slots at an
 idle boundary.
 
-## Per-slot class preference (opt-in, PR-first canary on m3)
+## Fleet-wide boot claims (opt-in, not enabled)
 
-Every slot consults the classes in configured tier order, merge-group first.
-Under a continuous merge queue that starves PR-head work, and the idle retarget
-above cannot help because the slot is never idle. Measured 2026-09-25: a slot
-selects PR-head, merge-group demand appears during the two-to-four-minute boot,
-`assignment_v2_pre_mint_denied selected_tier=1` discards the VM, and the slot
-re-boots for merge-group. PR-head jobs waited 60-80 minutes.
+A lane claims a queued job of its class before it clones (`scripts/job_claim.py`),
+but until now a claim was visible only on its own host and, fleet-wide, only
+once a runner had minted. A lane on another host that is cloning or booting was
+invisible, so every free lane on every host could boot for one queued job, and
+all but the first discarded at the pre-mint check. Measured 2026-10-01T09:19Z to
+10-04T17:18Z: pre-mint `own_class_empty` per served job was 0.27 (m1), 0.26
+(m3), 0.65 (m5) and 0.20 (m5s), and for 23/26, 61/63, 77/93 and 34/52 of those
+another host minted the same class inside the discarded VM's claim-to-denial
+window (control, the same windows shifted 1-2 h: 19/52, 20/126, 38/190, 18/104).
+
+Every host publishes its live claims, read-only:
+`tartci job-claim status --publish` (key, VM, age; the host's id; and the age
+it declares for its claims, `host.job_claim_max_age_seconds`, at most the
+1800 s claim TTL). A lane with `assignment_fleet_claim_peers = true` (env
+`TARTCI_JOB_CLAIM_FLEET_PEERS=1`) reads every other host in the published
+supply over SSH before it claims (`job_claim.py gather-peers`: parallel,
+`ConnectTimeout=2`, a hard `TARTCI_JOB_CLAIM_FLEET_READ_SECS` budget, default 5,
+after which stragglers are killed with their process group). A peer's claim for
+the same class stands like a local one while its age is within the age that host
+declares, or 900 s when it declares none; a claim whose VM already shows as an
+idle runner counts once (the runner name is the VM name).
+
+Fail open: an unreachable, slow, failing or unparsable peer counts no claims,
+and the lane boots exactly as without peers. The per-attempt count rides on
+every `job_claim` / `job_claim_contended` event (`fleet_booting=`,
+`peers_unread=`); `job_claim_peer_unread` is logged once per peer per hour. A
+host writes its claim only after reading its peers, so two lanes can never both
+refuse one job; two hosts that both read before either writes can still both
+boot (a window of seconds), and the pre-mint check catches the loser.
+
+m1 declares 1800 s: its lanes wait for a VM lease after claiming, so its claims
+live about 26 min on average against 4-5 min elsewhere. The key is off on every
+lane. Canary: m1, once it has had the pre-clone check for 72 h, with m3, m5 and
+m5studio as same-window controls; m5 joins after its ranked-lease canary read.
+
+## Per-slot class preference (merge-group first)
+
+Every slot consults the classes in configured tier order. Slots that advertise
+both Pulp gate classes put `pulp-build-merge-group` before
+`pulp-build-pr-head`, because a queued merge group blocks the PRs behind it.
+The m3 and m5studio slot-2 profiles now use that merge-group-first order. The
+PR-first order introduced by d278155 on 2026-09-25 rested on the premise that
+the merge-group job kept every other slot in the fleet. That premise expired
+when #439 made m1 PR-only. PR-head fairness now comes from m1's two dedicated
+slots, while m3 and m5studio preserve merge-group progress.
 
 `assignment_slot_tier_order` on an event-class-v2 lane reorders the class
 preference for named supervisor slots:
 
 ```toml
-assignment_slot_tier_order = { 2 = ["pulp-build-pr-head", "pulp-build-merge-group"] }
+assignment_slot_tier_order = { 2 = ["pulp-build-merge-group", "pulp-build-pr-head"] }
 ```
 
-It renders `TARTCI_ASSIGNMENT_V2_TIER_ORDER=pulp-build-pr-head,pulp-build-merge-group`
+It renders `TARTCI_ASSIGNMENT_V2_TIER_ORDER=pulp-build-merge-group,pulp-build-pr-head`
 into that slot's LaunchAgent only; other slots render nothing and keep today's
 behaviour byte for byte. The order must name every tier class exactly once, so a
 preference can never become a reservation, and the slot key must be a supervisor
@@ -305,13 +364,13 @@ supervisor refuses the env var outside `event-class-v2`.
 The same order drives all three V2 decisions, so the slot never contradicts
 itself:
 
-| decision | PR-first slot | default slot |
+| decision | merge-group-first slot | default slot |
 |---|---|---|
-| selection, both classes waiting | PR-head | merge-group |
+| selection, both classes waiting | merge-group | merge-group |
 | selection, only merge-group waiting | merge-group (work-conserving) | merge-group |
-| pre-mint of a PR-head boot, merge-group arrived | **admit** | deny |
-| pre-mint of a merge-group boot, PR-head arrived | deny, re-select PR-head | admit |
-| top-tier receipt (`assignment_top_tier_receipt_max_age_seconds`) | PR-head may use it | merge-group may use it |
+| pre-mint of a PR-head boot, merge-group arrived | deny, re-select merge-group | deny |
+| pre-mint of a merge-group boot, PR-head arrived | admit | admit |
+| top-tier receipt (`assignment_top_tier_receipt_max_age_seconds`) | merge-group may use it | merge-group may use it |
 | idle retarget (if enabled) | falls back in slot order | falls back in slot order |
 
 Tier numbers keep their configured meaning on every slot (0 is merge-group, 1
@@ -322,9 +381,10 @@ configured order, so `fleet/advertised-labels.json` does not move. The startup
 `LOOP` line prints `tier_order=` so the effective order is visible in the slot
 log.
 
-A PR-first slot still yields a merge-group boot to a PR-head arrival: that is
-the same pre-mint recheck every slot runs, applied in this slot's order, and
-the merge-group job keeps every other slot in the fleet, all of which prefer it.
+The m1 profile is an explicit exception: it declares only
+`pulp-build-pr-head` for its two dedicated slots and does not advertise
+merge-group. This keeps the slower 3-core m1 guest out of merge batches while
+the merge-capable m3, m5 and m5studio slots protect merge-group demand.
 
 ## Release event classes (declared per lane, m5 only)
 

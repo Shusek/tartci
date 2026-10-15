@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import plistlib
 import json
 import datetime as dt
@@ -26,7 +28,17 @@ HOST_CONFIGS = {
     "m1": ROOT / "profiles" / "m1-macos-fleet.toml",
     "studio": ROOT / "profiles" / "m3-macos-fleet.toml",
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
+    "m5studio": ROOT / "profiles" / "m5studio-macos-fleet.toml",
 }
+# The Pulp gate classes each host's pulp-gate serves.
+GATE_CLASSES = {}
+BOTH_GATE_CLASSES = ["pulp-build-merge-group", "pulp-build-pr-head"]
+
+
+def gate_classes(host_id: str) -> list[str]:
+    return GATE_CLASSES.get(host_id, BOTH_GATE_CLASSES)
+
+
 RUNNER_GROUP_IDS = {
     "Generous-Corp/pulp": 1,
     "danielraffel/spectr": 1,
@@ -689,6 +701,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             "m1": ("/Users/danielraffel/VMs", "vellum-host-m1", False),
             "studio": ("/Volumes/Workshop/VMs", "vellum-host-m3", False),
             "m5": ("/Users/danielraffel/VMs", "vellum-host-m5", False),
+            "m5studio": ("/Volumes/Atelier/VMs", "vellum-host-m5studio", False),
         }
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
@@ -735,11 +748,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                 ]
                 self.assertEqual(
                     [tier["label"] for tier in pulp_lane["tier"]],
-                    ["pulp-build-merge-group", "pulp-build-pr-head", *release_tiers],
+                    [*gate_classes(host_id), *release_tiers],
                 )
                 self.assertEqual(
                     [tier["runner_group_id"] for tier in pulp_lane["tier"]],
-                    [1] * (2 + len(release_tiers)),
+                    [1] * (len(gate_classes(host_id)) + len(release_tiers)),
                 )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
                 self.assertEqual(
@@ -751,7 +764,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertNotIn("priority", pulp_lane)
                 self.assertEqual(
                     pulp_lane.get("vm_cores"),
-                    7 if host_id == "studio" else None,
+                    7 if host_id == "studio" else (8 if host_id == "m5studio" else None),
                 )
                 self.assertEqual(
                     pulp_lane["supervisors"], 2
@@ -895,7 +908,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "Generous-Corp/pulp": None,
                             "danielraffel/spectr": "vm" if host_id == "m1" else "gate",
                             "Generous-Corp/forge": "gate",
-                            "Generous-Corp/vellum": "gate",
+                            "Generous-Corp/vellum": "vm",
                         },
                     )
                     for value in values:
@@ -904,11 +917,28 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "7"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
-                            else None
+                            else (
+                                "8"
+                                if host_id == "m5studio"
+                                and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+                                else None
+                            )
                         )
                         self.assertEqual(
                             env.get("TARTCI_MACOS_VM_CORES"),
                             expected_vm_cores,
+                        )
+                        # m5's Pulp slots carry the sizing rule, not a size.
+                        sized_from_reserve = (
+                            host_id == "m5"
+                            and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+                            and env.get("TARTCI_RUNNER_WORKFLOW_TIERS", "").startswith(
+                                "pulp-build-merge-group")
+                        )
+                        self.assertEqual(
+                            (env.get("TARTCI_MACOS_VM_CORES_FROM"),
+                             env.get("TARTCI_MACOS_VM_CORES_SLOTS")),
+                            ("gate-reserve", "2") if sized_from_reserve else (None, None),
                         )
                     chrome_routes = {
                         value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
@@ -954,7 +984,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"], "pulp-gate-fast")
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"], "pulp-gate-fast")
                         # Every host declares the release classes.
-                        classes = ["pulp-build-merge-group", "pulp-build-pr-head",
+                        classes = [*gate_classes(host_id),
                                    "pulp-release-tagged", "pulp-release-pr-gate"]
                         self.assertEqual(
                             env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"],
@@ -1300,7 +1330,9 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
             self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", pulp["EnvironmentVariables"])
             self.assertNotIn("TARTCI_MACOS_VM_CORES", pulp["EnvironmentVariables"])
+            # CONFIG is m1, which now serves both classes with merge-group first.
             self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
+            self.assertIn("pulp-build-merge-group", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
             self.assertEqual(
@@ -1832,9 +1864,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn("TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK", env)
                     self.assertEqual(pulp_slots, 2)
 
-    def test_pre_clone_check_is_on_the_rolled_out_pulp_gate_slots_only(self) -> None:
-        """The two pulp-gate slots of m1, m3 and m5studio, and no other lane.
-        m5 joins after its ranked-lease canary read."""
+    def test_pre_clone_check_is_on_every_pulp_gate_slot_only(self) -> None:
+        """The two pulp-gate slots of m1, m3, m5 and m5studio, and no other lane."""
         env_key = "TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertGreaterEqual(len(profiles), 4)
@@ -1853,9 +1884,53 @@ class MacosFleetLaneTests(unittest.TestCase):
             ("m1-macos-fleet.toml", "m1-pulp-gate-slot2"),
             ("m3-macos-fleet.toml", "studio-pulp-gate"),
             ("m3-macos-fleet.toml", "studio-pulp-gate-slot2"),
+            ("m5-macos-fleet.toml", "m5-pulp-gate"),
+            ("m5-macos-fleet.toml", "m5-pulp-gate-slot2"),
             ("m5studio-macos-fleet.toml", "m5studio-pulp-gate"),
             ("m5studio-macos-fleet.toml", "m5studio-pulp-gate-slot2"),
         ])
+
+    def test_fleet_claim_peers_is_a_lane_boolean_wired_to_the_env(self) -> None:
+        key = "assignment_fleet_claim_peers"
+        base = CONFIG.read_text()
+        self.assertNotIn(key, base)
+        anchor = "assignment_feed_rescue = true"
+        self.assertEqual(base.count(anchor), 1)
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.toml"
+            bad.write_text(base.replace(anchor, f'{anchor}\n{key} = "yes"', 1))
+            result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                    text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn(key, result.stderr)
+            ok = Path(td) / "ok.toml"
+            ok.write_text(base.replace(anchor, f"{anchor}\n{key} = true", 1))
+            envs = [plistlib.loads(b)["EnvironmentVariables"]
+                    for b in fleet.rendered_plists(fleet.load(ok)).values()]
+            wired = [e["TARTCI_QUEUE_LANE_ID"] for e in envs if e.get("TARTCI_JOB_CLAIM_FLEET_PEERS") == "1"]
+            self.assertEqual(sorted(wired), ["m1-pulp-gate", "m1-pulp-gate-slot2"])
+
+    def test_no_shipped_lane_reads_peers_yet(self) -> None:
+        profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertGreaterEqual(len(profiles), 4)
+        for profile in profiles:
+            for body in fleet.rendered_plists(fleet.load(profile)).values():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env, profile.name)
+
+    def test_job_claim_max_age_is_bounded_and_m1_declares_the_ttl(self) -> None:
+        base = CONFIG.read_text()
+        self.assertIn("job_claim_max_age_seconds = 1800", base)
+        with tempfile.TemporaryDirectory() as td:
+            for value in ("59", "1801", '"900"', "true"):
+                with self.subTest(value=value):
+                    bad = Path(td) / "bad.toml"
+                    bad.write_text(base.replace("job_claim_max_age_seconds = 1800",
+                                                f"job_claim_max_age_seconds = {value}", 1))
+                    result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                            text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("job_claim_max_age_seconds", result.stderr)
 
     @staticmethod
     def _profile_without_idle_retarget() -> str:
@@ -1907,7 +1982,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         """Only the trial hosts' profiles declare the retarget, and only on
         their pulp-gate slots; every other shipped host and lane is unaffected."""
         env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
-        canary = {"m1": "120", "studio": "120", "m5": "120"}
+        canary = {"m1": "120", "studio": "120", "m5": "120", "m5studio": "120"}
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(shipped=host_id):
                 rendered = fleet.rendered_plists(fleet.load(config))
@@ -1943,25 +2018,41 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn(env_key, env)
                     self.assertEqual(pulp_slots, 2)
 
-    # The exact per-slot class order every pulp-gate slot renders. None means
-    # the slot keeps the configured order (merge-group, PR-head, then the
-    # release classes). Each host has exactly one release-first slot; m3's
-    # slot 2 keeps the PR-first canary, so m3's release-first slot is slot 1.
+    # The exact per-slot class order every pulp-gate slot renders. Each host
+    # has exactly one release-first slot; the other slot keeps merge-group
+    # ahead of PR-head to protect merge order.
     RELEASE_FIRST_ORDER = ("pulp-release-tagged,pulp-release-pr-gate,"
                            "pulp-build-merge-group,pulp-build-pr-head")
     SHIPPED_SLOT_ORDERS = {
-        ".m1.pulp-gate.plist": None,
+        ".m1.pulp-gate.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
+                                 "pulp-release-tagged,pulp-release-pr-gate"),
         ".m1.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
         ".studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
-        ".studio.pulp-gate.slot2.plist": ("pulp-build-pr-head,pulp-build-merge-group,"
+        ".studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
                                           "pulp-release-tagged,pulp-release-pr-gate"),
         ".m5.pulp-gate.plist": None,
         ".m5.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
+        ".m5studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
+        ".m5studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
+                                             "pulp-release-tagged,pulp-release-pr-gate"),
     }
+
+    def test_m5studio_slot2_prefers_merge_group_before_pr_head(self) -> None:
+        rendered = fleet.rendered_plists(fleet.load(ROOT / "profiles" / "m5studio-macos-fleet.toml"))
+        slot2 = [
+            plistlib.loads(body)["EnvironmentVariables"]
+            for name, body in rendered.items()
+            if name.endswith(".m5studio.pulp-gate.slot2.plist")
+        ]
+        self.assertEqual(len(slot2), 1)
+        self.assertEqual(
+            slot2[0]["TARTCI_ASSIGNMENT_V2_TIER_ORDER"],
+            "pulp-build-merge-group,pulp-build-pr-head,pulp-release-tagged,pulp-release-pr-gate",
+        )
 
     def test_slot_tier_orders_are_pinned_exactly_on_every_pulp_gate_slot(self) -> None:
         """Every pulp-gate slot's rendered order is pinned, so neither m3's
-        PR-first canary on slot 2 nor any host's release-first slot can be
+        merge-group preference on slot 2 nor any host's release-first slot can be
         dropped or swapped by accident; no other lane renders an order."""
         env_key = "TARTCI_ASSIGNMENT_V2_TIER_ORDER"
         seen = set()
@@ -1980,7 +2071,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     # order, so runner groups and tier numbers are unchanged.
                     self.assertEqual(
                         env["TARTCI_RUNNER_WORKFLOW_TIERS"].splitlines()[0],
-                        "pulp-build-merge-group|Build and Test",
+                        f"{gate_classes(host_id)[0]}|Build and Test",
                     )
         self.assertEqual(seen, set(self.SHIPPED_SLOT_ORDERS))
 
@@ -2055,7 +2146,7 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_process_type_accepts_only_documented_launchd_values(self) -> None:
         base = CONFIG.read_text()
-        self.assertIn('process_type = "Adaptive"', base)
+        self.assertIn('process_type = "Standard"', base)
         rejected = {
             "unknown": 'process_type = "Fast"',
             "lowercase": 'process_type = "adaptive"',
@@ -2067,7 +2158,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.subTest(name=name):
                     path = Path(td) / f"{name}.toml"
                     path.write_text(
-                        base.replace('process_type = "Adaptive"', replacement, 1)
+                        base.replace('process_type = "Standard"', replacement, 1)
                     )
                     result = subprocess.run(
                         [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
@@ -2078,12 +2169,12 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertIn("process_type", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
-            for value in fleet.PROCESS_TYPES:
+            for value in fleet.SUPERVISOR_PROCESS_TYPES:
                 with self.subTest(accepted=value):
                     path = Path(td) / f"ok-{value}.toml"
                     path.write_text(
                         base.replace(
-                            'process_type = "Adaptive"',
+                            'process_type = "Standard"',
                             f'process_type = "{value}"',
                             1,
                         )
@@ -2094,8 +2185,32 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_an_undeclared_lane_still_renders_the_background_default(self) -> None:
-        body = CONFIG.read_text().replace('process_type = "Adaptive"\n', "", 1)
+    def test_background_band_process_types_are_refused(self) -> None:
+        # Background always, and Adaptive whenever launchd sees no XPC
+        # transaction, run the supervisor in the darwinbg band while it holds
+        # the host-global observation lock. That starved every lane on a host.
+        base = CONFIG.read_text()
+        with tempfile.TemporaryDirectory() as td:
+            for value in ("Background", "Adaptive"):
+                with self.subTest(refused=value):
+                    path = Path(td) / f"band-{value}.toml"
+                    path.write_text(
+                        base.replace(
+                            'process_type = "Standard"',
+                            f'process_type = "{value}"',
+                            1,
+                        )
+                    )
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("darwinbg", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_an_undeclared_lane_renders_the_standard_default(self) -> None:
+        body = CONFIG.read_text().replace('process_type = "Standard"\n', "", 1)
         self.assertNotIn("process_type", body)
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "no-process-type.toml"
@@ -2113,10 +2228,10 @@ class MacosFleetLaneTests(unittest.TestCase):
             ]
             self.assertTrue(values)
             self.assertEqual(
-                {value["ProcessType"] for value in values}, {"Background"}
+                {value["ProcessType"] for value in values}, {"Standard"}
             )
 
-    def test_only_pulp_gate_supervisors_leave_the_background_band(self) -> None:
+    def test_no_shipped_supervisor_renders_in_the_background_band(self) -> None:
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
                 with tempfile.TemporaryDirectory() as td:
@@ -2133,21 +2248,16 @@ class MacosFleetLaneTests(unittest.TestCase):
                             for plist in sorted(Path(td).glob("*.plist"))
                         )
                     }
-                promoted = {
-                    label for label, kind in by_label.items() if kind == "Adaptive"
+                self.assertTrue(by_label)
+                # Every supervisor shares the host observation lock, so none
+                # may hold it from the darwinbg band.
+                # Spelled out rather than read from the module, so loosening
+                # the module's allow-list cannot also loosen this guard.
+                in_band = {
+                    label: kind for label, kind in by_label.items()
+                    if kind in {"Background", "Adaptive"}
                 }
-                prefix = (
-                    "com.danielraffel.tartci.tart-runner-macos-fleet."
-                    f"{host_id}.pulp-gate"
-                )
-                # Both supervisors of the gate lane, and nothing else --
-                # release and the other product gates stay Background.
-                self.assertEqual(promoted, {prefix, f"{prefix}.slot2"})
-                self.assertEqual(
-                    {kind for label, kind in by_label.items()
-                     if label not in promoted},
-                    {"Background"},
-                )
+                self.assertEqual(in_band, {})
 
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
@@ -2161,6 +2271,138 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("supervisors must be 1 or 2", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def _trusted_release(self, **overrides) -> tuple[dict, list[dict]]:
+        host = {"home": "/Users/x", "cache_root": "/Users/x/.cache/pulp-ci"}
+        lane = {
+            "id": "pulp-release", "repo": "Generous-Corp/pulp", "runner_group_id": 12,
+            "cache_root": "/Users/x/.cache/pulp-ci-trusted",
+            "tier": [{"label": "pulp-release-tagged", "runner_group_id": 12}],
+        }
+        lane.update(overrides)
+        return host, [{"id": "pulp-gate", "repo": "Generous-Corp/pulp",
+                       "runner_group_id": 1}, lane]
+
+    def test_lane_cache_root_accepts_a_trusted_runner_group(self) -> None:
+        host, lanes = self._trusted_release()
+        fleet.validate_lane_cache_roots(host, lanes)
+        twin = dict(lanes[1], id="pulp-release-2")
+        fleet.validate_lane_cache_roots(host, lanes + [twin])
+
+    def test_lane_cache_root_refuses_what_an_untrusted_job_could_write(self) -> None:
+        cases = {
+            "repository group": (
+                {"runner_group_id": 1,
+                 "tier": [{"label": "pulp-release-tagged", "runner_group_id": 1}]},
+                "repository-wide group 1"),
+            "repository scope": ({"registration_scope": "repository"},
+                                 "repository-wide group 1"),
+            "tier leaves the group": (
+                {"tier": [{"label": "pulp-release-pr-gate", "runner_group_id": 1}]},
+                "leaves runner group"),
+            "the host root": ({"cache_root": "/Users/x/.cache/pulp-ci"}, "host.cache_root"),
+            "inside the host root": (
+                {"cache_root": "/Users/x/.cache/pulp-ci/trusted"}, "host.cache_root"),
+            "containing the host root": ({"cache_root": "/Users/x/.cache"}, "host.cache_root"),
+            "relative": ({"cache_root": "cache/trusted"}, "normalized absolute"),
+            "unnormalized": ({"cache_root": "/Users/x/./trusted"}, "normalized absolute"),
+            "tart --dir separator": ({"cache_root": "/Users/x/a:b"}, "normalized absolute"),
+            "not a string": ({"cache_root": 7}, "absolute path"),
+            "outside home and /Volumes": ({"cache_root": "/opt/pulp-trusted"}, "below host.home"),
+            "shared world-writable dir": ({"cache_root": "/Users/Shared/pulp-trusted"},
+                                          "below host.home"),
+            "the home itself": ({"cache_root": "/Users/x"}, "below host.home"),
+            "a volume mount point": ({"cache_root": "/Volumes/Workshop"}, "below host.home"),
+        }
+        for name, (overrides, message) in cases.items():
+            with self.subTest(name=name):
+                host, lanes = self._trusted_release(**overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    fleet.validate_lane_cache_roots(host, lanes)
+
+    def test_lane_cache_root_on_a_volume_is_accepted(self) -> None:
+        host, lanes = self._trusted_release(cache_root="/Volumes/NoSuchVolume/ci/trusted")
+        fleet.validate_lane_cache_roots(host, lanes)
+
+    def test_lane_cache_root_through_a_symlink_is_refused(self) -> None:
+        # A lane root reached through a link would mount the link's target,
+        # e.g. the host-wide root every PR gate VM writes.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(os.path.realpath(td))
+            shared = home / ".cache" / "pulp-ci"
+            (shared / "ccache").mkdir(parents=True)
+            for link, root in (("trusted", "trusted"), ("caches", "caches/trusted")):
+                with self.subTest(link=link):
+                    (home / link).symlink_to(shared)
+                    host = {"home": str(home), "cache_root": str(shared)}
+                    _, lanes = self._trusted_release(cache_root=str(home / root))
+                    with self.assertRaisesRegex(ValueError, "is a symlink"):
+                        fleet.validate_lane_cache_roots(host, lanes)
+            real = home / "real-trusted"
+            real.mkdir()
+            _, lanes = self._trusted_release(cache_root=str(real))
+            fleet.validate_lane_cache_roots({"home": str(home), "cache_root": str(shared)}, lanes)
+
+    def test_lane_cache_root_is_owned_by_one_group(self) -> None:
+        host, lanes = self._trusted_release()
+        other_group = dict(lanes[1], id="other", runner_group_id=13,
+                           tier=[{"label": "x", "runner_group_id": 13}])
+        with self.assertRaisesRegex(ValueError, "another repository or runner group"):
+            fleet.validate_lane_cache_roots(host, lanes + [other_group])
+        nested = dict(lanes[1], id="nested", cache_root="/Users/x/.cache/pulp-ci-trusted/n")
+        with self.assertRaisesRegex(ValueError, "nest"):
+            fleet.validate_lane_cache_roots(host, lanes + [nested])
+
+    def test_lane_cache_root_renders_only_into_its_own_lane(self) -> None:
+        data = fleet.load(HOST_CONFIGS["m5"])
+        release = next(lane for lane in data["lane"] if lane["id"] == "pulp-release")
+        trusted = data["host"]["home"] + "/.cache/pulp-ci-trusted"
+        release["cache_root"] = trusted
+        envs = {
+            name: plistlib.loads(body)["EnvironmentVariables"]
+            for name, body in fleet.rendered_plists(data).items()
+        }
+        release_env = envs[
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"]
+        self.assertEqual(release_env["TARTCI_CI_CACHE"], trusted)
+        self.assertEqual(release_env["TARTCI_HOST_CI_CACHE"], data["host"]["cache_root"])
+        others = {name: env for name, env in envs.items()
+                  if ".pulp-release." not in name and not name.endswith(".pulp-release.plist")}
+        self.assertEqual({env["TARTCI_CI_CACHE"] for env in others.values()},
+                         {data["host"]["cache_root"]})
+        self.assertFalse(any("TARTCI_HOST_CI_CACHE" in env for env in others.values()))
+
+    def test_every_writable_vm_mount_lives_under_the_lane_cache_root(self) -> None:
+        # A lane cache_root isolates only what runner.sh mounts from
+        # $CACHE_ROOT. ccache AND configure-checks are both writable, and the
+        # configure-check cache holds CMake that Pulp include()s, so neither
+        # may come from anywhere else. Read-only mounts may.
+        body = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text(encoding="utf-8")
+        mounts = re.findall(r'--dir="([^"]+)"', body)
+        self.assertIn("ccache:$CACHE_ROOT/ccache", mounts)
+        self.assertIn("configure-checks:$CACHE_ROOT/configure-checks", mounts)
+        writable = [m for m in mounts if not m.endswith(":ro") and m != "$CHROME_MOUNT_ARG"]
+        self.assertEqual(
+            [m for m in writable if not m.split(":", 1)[1].startswith("$CACHE_ROOT/")], [],
+            "a writable VM mount outside $CACHE_ROOT escapes a lane-owned cache_root")
+        chrome = (ROOT / "providers" / "tart-macos" / "chrome-mount.lib.sh").read_text(encoding="utf-8")
+        self.assertIn('CHROME_MOUNT_ARG="google-chrome:$CHROME_APP_DIR:ro"', chrome)
+
+    def test_shipped_release_lane_cannot_take_a_cache_root_in_group_1(self) -> None:
+        body = HOST_CONFIGS["m5"].read_text()
+        home = tomllib.loads(body)["host"]["home"]
+        anchor = 'id = "pulp-release"\n'
+        self.assertIn(anchor, body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(body.replace(
+                anchor, anchor + f'cache_root = "{home}/.cache/pulp-ci-trusted"\n', 1))
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("repository-wide group 1", result.stderr)
 
     def test_chrome_mount_is_forge_only_and_path_normalized(self) -> None:
         base = CONFIG.read_text()
@@ -2345,7 +2587,8 @@ workflows=["Product acceptance"]
                     )
 
     def test_pulp_pr_head_contract_cannot_omit_class_or_repository_scope(self) -> None:
-        base = CONFIG.read_text()
+        # m5 serves both gate classes; m1 (CONFIG) serves PR-head only.
+        base = HOST_CONFIGS["m5"].read_text()
         fixtures = {
             "missing-pr-head": base.replace(
                 '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n',
@@ -2452,6 +2695,34 @@ workflows=["Product acceptance"]
                     )
                     self.assertEqual(result.returncode, 2, result.stdout)
                     self.assertIn("vm_cores must be a positive integer", result.stderr)
+
+    def test_vm_cores_from_names_one_rule_and_excludes_vm_cores(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "unknown-rule": ('vm_cores_from = "pool"', 'vm_cores_from must be "gate-reserve"'),
+            "not-a-string": ("vm_cores_from = 4", 'vm_cores_from must be "gate-reserve"'),
+            "both": ('vm_cores_from = "gate-reserve"\nvm_cores = 4',
+                     "set vm_cores or vm_cores_from, not both"),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, (lines, message) in fixtures.items():
+                with self.subTest(name=name):
+                    body = base.replace(
+                        'golden = "pulp-build-runner:latest"',
+                        f'golden = "pulp-build-runner:latest"\n{lines}',
+                        1,
+                    )
+                    self.assertNotEqual(body, base)
+                    bad = Path(td) / f"vm-cores-from-{name}.toml"
+                    bad.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn(message, result.stderr)
 
     def test_scalar_types_fail_closed_without_traceback(self) -> None:
         fixtures = [
@@ -2665,13 +2936,13 @@ replaces_launchd_labels=REPLACEMENT
             self.M5_PR_HEAD_TIER + (self.RELEASE_TIERS if tiers is None else tiers),
             1,
         )
-        anchor = 'process_type = "Adaptive"\n\n[[lane.tier]]\nlabel = "pulp-build-merge-group"'
+        anchor = 'process_type = "Standard"\n\n[[lane.tier]]\nlabel = "pulp-build-merge-group"'
         self.assertEqual(body.count(anchor), 1)
         return body.replace(
             anchor,
             anchor.replace(
-                'process_type = "Adaptive"\n',
-                'process_type = "Adaptive"\n'
+                'process_type = "Standard"\n',
+                'process_type = "Standard"\n'
                 + (self.RELEASE_FIRST if order is None else order) + "\n",
                 1,
             ),
@@ -2691,12 +2962,12 @@ replaces_launchd_labels=REPLACEMENT
         exactly one release-first slot, and its other slot orders both gate
         classes ahead of both release classes. No other lane but m5's legacy
         pulp-release controller scans for or registers a release class."""
-        four = ("pulp-build-merge-group,pulp-build-pr-head,"
-                "pulp-release-tagged,pulp-release-pr-gate")
-        gate = {"pulp-build-merge-group", "pulp-build-pr-head"}
         release = {"pulp-release-tagged", "pulp-release-pr-gate"}
         seen = 0
         for host_id, config in HOST_CONFIGS.items():
+            gate = set(gate_classes(host_id))
+            four = ",".join([*gate_classes(host_id), "pulp-release-tagged",
+                             "pulp-release-pr-gate"])
             orders = {}
             for name, body in fleet.rendered_plists(fleet.load(config)).items():
                 env = plistlib.loads(body)["EnvironmentVariables"]
@@ -2721,18 +2992,33 @@ replaces_launchd_labels=REPLACEMENT
                 self.assertEqual(len(release_first), 1)
                 for slot, order in orders.items():
                     if slot not in release_first:
-                        self.assertEqual(set(order[:2]), gate)
-                        self.assertEqual(set(order[2:]), release)
+                        self.assertEqual(set(order[:len(gate)]), gate)
+                        self.assertEqual(set(order[len(gate):]), release)
         self.assertEqual(seen, 2 * len(HOST_CONFIGS))
-        release_rows = {
-            (row["profile"], row["lane"], row["class_label"])
-            for row in fleet.advertised_labels_snapshot(
-                list(HOST_CONFIGS.values()), None)["registrations"]
-            if (row["class_label"] or "").startswith("pulp-release-")
-        }
+        # Publication is an operational flag.  Use published copies of the
+        # profile fixtures so this declaration test always covers every host,
+        # including one temporarily withdrawn from production.
+        with tempfile.TemporaryDirectory() as td:
+            publication_paths = []
+            for config in HOST_CONFIGS.values():
+                body = config.read_text().replace(
+                    "published = false", "published = true", 1)
+                path = Path(td) / config.name
+                path.write_text(body)
+                publication_paths.append(path)
+            published_profiles = {
+                fleet.load(path)["name"] for path in publication_paths
+            }
+            release_rows = {
+                (row["profile"], row["lane"], row["class_label"])
+                for row in fleet.advertised_labels_snapshot(
+                    publication_paths, None)["registrations"]
+                if (row["class_label"] or "").startswith("pulp-release-")
+            }
         self.assertEqual(release_rows, {
             (f"{host}-macos-fleet", "pulp-gate", cls)
-            for host in ("m1", "m3", "m5")
+            for host in (profile.removesuffix("-macos-fleet")
+                         for profile in published_profiles)
             for cls in ("pulp-release-tagged", "pulp-release-pr-gate")
         } | {
             ("m5-macos-fleet", "pulp-release", cls)
@@ -3014,6 +3300,30 @@ class ServingBlockedTests(unittest.TestCase):
         )
         self.assertEqual(value["verified_running_supervisors"], 1)
         self.assertTrue(value["fleet_ready"])
+
+    def test_repeated_admission_failure_names_cause_and_clears_fleet_ready(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(600),
+            "serving_blocked_streak": 6,
+            "serving_blocked_last_phase": "admission-precheck-error",
+            "serving_blocked_cause": "admission failing",
+        })
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertFalse(value["fleet_ready"])
+        self.assertEqual(lane["cause"], "admission failing")
+        self.assertEqual(lane["reason"], "admission failing")
+
+    def test_open_dhcp_breaker_is_immediately_not_serving(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10),
+            "serving_blocked_streak": 1,
+            "serving_blocked_last_phase": "vm-dhcp-breaker-open",
+            "serving_blocked_cause": "dhcp_breaker",
+        })
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertFalse(value["fleet_ready"])
+        self.assertEqual(lane["cause"], "dhcp_breaker")
+        self.assertEqual(lane["reason"], "DHCP breaker open")
 
     def test_a_host_set_to_sleep_is_a_host_condition_not_a_readiness_problem(self) -> None:
         # m5 (AC sleep 1) rolled back every self-update once its idle sleep

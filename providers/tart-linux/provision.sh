@@ -26,6 +26,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST="$ROOT/manifests/pulp.linux.toml"
 COMMON="$ROOT/providers/common"
 SOURCE_PIN_RESOLVER="$COMMON/pulp-source-pin.py"
+# The resolver imports tomllib; an operator ssh shell may resolve python3 to 3.9.
+# shellcheck source=../common/toml-python.lib.sh
+. "$COMMON/toml-python.lib.sh"
 RENDER_VERIFIER="$COMMON/pulp-render-generation.py"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -49,7 +52,7 @@ esac; done
 for required in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
   [ -f "$required" ] || die "versioned golden input missing: $required"
 done
-source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+source_identity="$(tartci_toml_python "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
   --require-skia-release chrome/m153 \
   --require-v8-disposition baked-provider-only)" \
   || die "could not resolve immutable Pulp source from $MANIFEST"
@@ -79,7 +82,7 @@ IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$NAME" 2>/dev/null || true)"; [ -
 [ -n "$IP" ] || die "no IP for $NAME"
 GUEST_TRANSPORT=""
 for _ in $(seq 1 90); do
-  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
   if tart exec "$NAME" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
   sleep 2
 done
@@ -88,6 +91,7 @@ note "vm up at $IP via $GUEST_TRANSPORT — provisioning deps + Skia in-guest"
 
 run_guest_script(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+    # ssh-stdin: the guest script is fed by `run_guest_script <<'GUEST'`
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
       "SRC_REPO='$SRC_REPO' PULP_SHA='$PULP_SHA' SKIA_PLATFORM='$SKIA_PLATFORM' ENABLE_ROSETTA='$ENABLE_ROSETTA' PARENT_IDENTITY='$BASE' bash -s"
   else

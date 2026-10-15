@@ -2,6 +2,7 @@
 """Behavioral coverage for exclusive V2 macOS JIT assignment classes."""
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import contextlib
 import json
 import os
@@ -149,6 +150,7 @@ if state.get("release_pr"):
 
 def runs_page(run_id, name):
     runs = ([{"id": run_id, "name": name, "status": status,
+              "head_repository": {"full_name": "Generous-Corp/pulp"},
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
     # The ghost: a merge_group run whose queue entry is long gone. Nothing in
@@ -158,6 +160,7 @@ def runs_page(run_id, name):
     if run_id == 101 and state.get("ghost") and status == "queued":
         runs.append({"id": 103, "name": name, "status": status,
                      "event": "merge_group",
+                     "head_repository": {"full_name": "Generous-Corp/pulp"},
                      "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
                      "created_at": "2026-08-18T00:00:00Z",
                      "updated_at": "2026-08-18T00:00:00Z"})
@@ -1161,6 +1164,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
+    @testing_support.requires_tomllib
     def test_release_pr_gate_is_minted_while_gate_work_waits(self) -> None:
         """The 2026-09-26 shape: merge-group and PR-head work queued without a
         gap for hours beside a `Release-path PR gate` job. m5's pulp-gate lane
@@ -1193,6 +1197,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(self._decide(1, "0", pr=True, release_pr=True),
                          ("1", "pulp-build-pr-head"))
 
+    @testing_support.requires_tomllib
     def test_idle_gate_runner_on_slot2_retargets_to_a_waiting_release_first(self) -> None:
         """A parked gate runner whose own class emptied retargets to the tagged
         release before the other gate class, and the slot then boots it. Slot 1,
@@ -1210,6 +1215,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
                 # Control: slot 1's gate-first order on the same queue.
                 self.assertEqual(self._decide(1, tier, **queue), ("1", slot1_dest))
 
+    @testing_support.requires_tomllib
     def test_idle_release_runner_on_slot2_serves_gate_work_when_no_release_waits(self) -> None:
         """The order is a preference, not a reservation: an idle release runner
         with no release queued goes back to gate work in the slot's own order."""
@@ -1224,6 +1230,7 @@ class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
                 self.assertEqual(self._decide(2, tier, **queue), ("1", dest))
                 self.assertEqual(self._selected_tier(2, **queue), selected)
 
+    @testing_support.requires_tomllib
     def test_idle_release_runner_is_held_while_its_release_waits(self) -> None:
         """A tagged-release runner is about to be assigned while a tagged
         release waits, whatever gate work is also queued."""
@@ -1241,8 +1248,9 @@ class ShippedFleetReleaseFirstSlotTests(RunnerFixture, unittest.TestCase):
 
     The class-shaping environment is taken from each rendered profile, so a
     change to any host's shipped order is a change to these verdicts. Tiers are
-    merge-group (0), PR-head (1), release-tagged (2) and release PR gate (3).
-    The release-first slot is slot 2 on m1 and m5 and slot 1 on m3, whose slot
+    read from each host's rendered class labels (merge-group 0, PR-head 1,
+    release-tagged 2 and release PR gate 3 on a host serving both gate
+    classes; a host serving fewer shifts them). The release-first slot is slot 2 on m1 and m5 and slot 1 on m3, whose slot
     2 keeps the PR-first canary; the other slot on each host is the control on
     every identical queue.
     """
@@ -1272,32 +1280,37 @@ class ShippedFleetReleaseFirstSlotTests(RunnerFixture, unittest.TestCase):
             self.assertEqual(sorted(slots), [1, 2], profile)
             self.hosts[profile] = slots
 
+    @testing_support.requires_tomllib
     def test_each_host_serves_releases_first_on_exactly_one_slot(self) -> None:
         busy = {"merge": True, "pr": True}
         for profile, (_, release_slot) in self.HOSTS.items():
             with self.subTest(host=profile):
                 self.slots = self.hosts[profile]
+                classes = self.slots[1]["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"].split(",")
+                tagged = str(classes.index("pulp-release-tagged"))
+                release_pr = str(classes.index("pulp-release-pr-gate"))
+                gates = {str(i) for i, c in enumerate(classes) if c.startswith("pulp-build-")}
                 other = 3 - release_slot
                 # A tagged release outranks gate work only on the release-first slot.
                 self.assertEqual(
                     [slot for slot in (1, 2)
-                     if self._selected_tier(slot, release=True, **busy) == "2"
-                     and self._pre_mint(slot, "2", release=True, **busy) == "1"],
+                     if self._selected_tier(slot, release=True, **busy) == tagged
+                     and self._pre_mint(slot, tagged, release=True, **busy) == "1"],
                     [release_slot])
                 # The release PR gate is served while gate work waits, likewise.
                 self.assertEqual(
                     [slot for slot in (1, 2)
-                     if self._selected_tier(slot, release_pr=True, **busy) == "3"
-                     and self._pre_mint(slot, "3", release_pr=True, **busy) == "1"],
+                     if self._selected_tier(slot, release_pr=True, **busy) == release_pr
+                     and self._pre_mint(slot, release_pr, release_pr=True, **busy) == "1"],
                     [release_slot])
                 # Control: the other slot serves gate work on the identical queue.
-                self.assertIn(self._selected_tier(other, release=True, **busy), {"0", "1"})
+                self.assertIn(self._selected_tier(other, release=True, **busy), gates)
                 # Work-conserving: with only releases waiting both slots serve them.
                 for slot in (1, 2):
-                    self.assertEqual(self._selected_tier(slot, release=True), "2")
-                    self.assertEqual(self._pre_mint(slot, "2", release=True), "1")
+                    self.assertEqual(self._selected_tier(slot, release=True), tagged)
+                    self.assertEqual(self._pre_mint(slot, tagged, release=True), "1")
                 # With no release waiting the release-first slot serves gate work.
-                self.assertIn(self._selected_tier(release_slot, **busy), {"0", "1"})
+                self.assertIn(self._selected_tier(release_slot, **busy), gates)
 
 
 class IdleRetargetTests(RunnerFixture, unittest.TestCase):
@@ -1616,7 +1629,7 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         self.assertEqual(scanner.scan(), 6)
         self.assertEqual(peak, 3)
 
-    def test_cross_process_assignment_scans_share_host_observation_lock(self) -> None:
+    def test_slow_assignment_fetch_does_not_block_another_lane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "entered"
@@ -1625,11 +1638,14 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
             _write_exec(
                 fake,
                 """#!/usr/bin/env python3
-import json, os, time
+import json, os, sys, time
 from pathlib import Path
 Path(os.environ['ENTERED']).write_text('yes', encoding='utf-8')
 time.sleep(2)
-print(json.dumps({'total_count': 0, 'workflows': []}))
+if sys.argv[-1].startswith('repos/') and '/actions/workflows?' in sys.argv[-1]:
+    print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
+else:
+    print(json.dumps({'total_count': 0, 'workflow_runs': []}))
 """,
             )
             common = [
@@ -1647,12 +1663,11 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(marker.exists(), "first scanner never entered GitHub observation")
-            denied = subprocess.run(
-                [*common, "--observation-lock-timeout", "0.05"],
+            concurrent = subprocess.run(
+                [*common, "--observation-lock-timeout", "5"],
                 text=True, capture_output=True, check=False, env=env,
             )
-            self.assertEqual(denied.returncode, 2)
-            self.assertIn("observation lock timed out", denied.stderr)
+            self.assertEqual(concurrent.returncode, 0, concurrent.stderr)
             holder.terminate()
             holder.communicate(timeout=5)
 
@@ -1767,37 +1782,25 @@ else:
             assert match is not None
             return float(match.group(1)), elapsed
 
-    def test_scan_budget_is_measured_from_lock_acquisition(self) -> None:
+    def test_scan_budget_is_independent_of_host_lock(self) -> None:
         hold, scan_timeout = 2.0, 4
         budget, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
         # Control: a run where the scanner never actually queued would prove
         # nothing about what queueing costs it.
-        self.assertGreaterEqual(
-            elapsed, hold,
-            f"the scanner never waited for the lock ({elapsed:.2f}s < {hold}s), so this proved nothing",
-        )
-        self.assertGreater(
-            budget, scan_timeout - hold + 0.5,
-            f"the {hold}s lock wait was charged to the scan: it began work with only "
-            f"{budget:.2f}s of its {scan_timeout}s budget",
-        )
-        # A budget larger than the one configured would mean the deadline is
-        # being extended rather than rebased.
         self.assertLessEqual(
             budget, scan_timeout + 0.5,
-            f"the scan claimed {budget:.2f}s against a {scan_timeout}s budget",
+            f"the scan exceeded its {scan_timeout}s budget ({budget:.2f}s)",
         )
+        self.assertLess(elapsed, hold + scan_timeout + 1.0, "the host lock blocked API observation")
 
-    def test_waiting_longer_for_the_lock_does_not_shrink_the_scan(self) -> None:
-        """The same scan, queued twice as long, must get the same budget."""
+    def test_a_long_host_lock_does_not_delay_scan_start(self) -> None:
+        """A slow holder cannot make another lane wait before its API call."""
         scan_timeout = 4
         brief, _ = self._budget_after_waiting(1.0, scan_timeout, lock_timeout=20.0)
         patient, elapsed = self._budget_after_waiting(3.0, scan_timeout, lock_timeout=20.0)
-        self.assertGreaterEqual(elapsed, 3.0, "the long-wait case never queued")
-        self.assertAlmostEqual(
-            brief, patient, delta=0.75,
-            msg=f"budget tracks the lock wait: 1s wait -> {brief:.2f}s, 3s wait -> {patient:.2f}s",
-        )
+        self.assertLessEqual(brief, scan_timeout + 0.5)
+        self.assertLessEqual(patient, scan_timeout + 0.5)
+        self.assertLess(elapsed, 3.0 + scan_timeout + 1.0, "the host lock blocked API observation")
 
     def test_lock_wait_is_not_truncated_by_the_scan_budget(self) -> None:
         """--observation-lock-timeout means what it says, even when it exceeds --scan-timeout.
@@ -1854,8 +1857,8 @@ else:
         hold, scan_timeout = 2.0, 3
         _, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
         self.assertLess(
-            elapsed, hold + scan_timeout + 5.0,
-            f"the scan ran {elapsed:.2f}s, past its {hold}s wait plus {scan_timeout}s budget",
+            elapsed, scan_timeout + 5.0,
+            f"the scan ran {elapsed:.2f}s past its API budget",
         )
 
     def test_tests_never_contend_with_the_hosts_real_observation_lock(self) -> None:
@@ -2463,6 +2466,19 @@ class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
             f"{offenders}",
         )
 
+    def test_admission_scan_requires_first_party_head_repository(self) -> None:
+        source = self.LIB.read_text()
+        self.assertIn(
+            '--require-head-repo "$REPO"',
+            source,
+            "assignment admission must exclude fork head repositories",
+        )
+        self.assertIn(
+            "assignment_group_unservable",
+            source,
+            "unservable runner-group demand must not boot a VM",
+        )
+
     def test_arithmetic_on_the_count_only_happens_where_it_is_bought(self) -> None:
         """Summing counts is legitimate, but only with an exhaustive scan.
 
@@ -2700,6 +2716,9 @@ else:
         broken, _, _ = self._scan(MATCH="1", FAIL_ON="/jobs?")
         self.assertEqual(broken.returncode, 2, broken.stdout)
         self.assertNotEqual(broken.stdout.strip(), "0")
+        # The failed repository is deliberately backoff-protected; clear the
+        # fixture's persisted cooldown before the independent clean control.
+        (self.root / "queue-observation-backoff.json").unlink(missing_ok=True)
 
         working, _, _ = self._scan(MATCH="1")
         self.assertEqual(working.returncode, 0, working.stderr)
