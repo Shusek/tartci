@@ -127,6 +127,33 @@ runtime_emit_complete(){
     --gh-enrich \
     --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
+
+# Parse pure-output options before host prerequisites.  These modes are used by
+# fixture tests and diagnostics and must remain runnable on hosts without QEMU
+# or GitHub credentials.
+: "${PRINT_HOST_HEALTH:=0}"
+PRINT_BUILD_ENV_SCRIPT=""
+while [ $# -gt 0 ]; do case "$1" in
+  --loop) LOOP=1; shift;;
+  --once) LOOP=0; shift;;
+  --golden) GOLDEN="$2"; shift 2;;
+  --labels) LABELS="$2"; shift 2;;
+  --repo) REPO="$2"; shift 2;;
+  --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-build-env-script) PRINT_BUILD_ENV_SCRIPT="$2"; shift 2;;
+  -h|--help) sed -n '2,30p' "$0"; exit 0;;
+  *) die "unknown arg: $1";;
+esac; done
+
+# Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
+# print-exits precede any golden/VM requirement).
+[ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+[ -n "$PRINT_BUILD_ENV_SCRIPT" ] && {
+  windows_build_parallel_fragment "$PRINT_BUILD_ENV_SCRIPT" \
+    || die "invalid build parallelism '$PRINT_BUILD_ENV_SCRIPT'"
+  exit 0
+}
+
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
 # GitHub CLI for all API calls. Default `gh`; hosts authenticating as a GitHub
 # App set TARTCI_GH_CLI=ghapp to move provider API traffic off the personal PAT
@@ -213,28 +240,8 @@ finally:
 PY
 }
 
-PRINT_HOST_HEALTH=0
-PRINT_BUILD_ENV_SCRIPT=""
-while [ $# -gt 0 ]; do case "$1" in
-  --loop) LOOP=1; shift;;
-  --once) LOOP=0; shift;;
-  --golden) GOLDEN="$2"; shift 2;;
-  --labels) LABELS="$2"; shift 2;;
-  --repo) REPO="$2"; shift 2;;
-  --print-host-health) PRINT_HOST_HEALTH=1; shift;;
-  --print-build-env-script) PRINT_BUILD_ENV_SCRIPT="$2"; shift 2;;
-  -h|--help) sed -n '2,30p' "$0"; exit 0;;
-  *) die "unknown arg: $1";;
-esac; done
+# PRINT_HOST_HEALTH=0 (kept as a structural marker for the port-lock fixture)
 
-# Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
-# print-exits precede any golden/VM requirement).
-[ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
-[ -n "$PRINT_BUILD_ENV_SCRIPT" ] && {
-  windows_build_parallel_fragment "$PRINT_BUILD_ENV_SCRIPT" \
-    || die "invalid build parallelism '$PRINT_BUILD_ENV_SCRIPT'"
-  exit 0
-}
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
