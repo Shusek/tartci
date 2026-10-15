@@ -159,9 +159,11 @@ def foreign_runner_reason(
 
     Every doubt keeps the registration: a ghost costs one stale row, a wrong
     delete takes a live lane offline until someone re-registers it by hand.
-    Ownership is checked on two independent axes, the name this host's lanes
-    mint and the host-bound label they advertise, because macOS VM runners
-    carry no host label and Linux per-boot names carry no host.
+    Ownership is checked on two axes, the name this host's lanes mint and the
+    host-bound label they advertise. They are independent only for macOS and
+    Windows runners: Linux per-boot names carry no host, so for Linux runners
+    the label is the only axis, which is why resolve_host_labels refuses an
+    ambiguous label set outright.
     """
     name = str(runner.get("name") or "")
     if name in persistent:
@@ -184,6 +186,26 @@ LOCAL_LANE_PLISTS = {
     "com.danielraffel.pulp.tart-runner-linux.plist": "linux",
     "com.danielraffel.pulp.qemu-runner-windows.plist": "windows",
 }
+
+
+def resolve_host_labels(
+    collected: list[str], host_label_prefixes: list[str]
+) -> tuple[list[str], str]:
+    """This host's one host-bound label, or none plus a problem when it is ambiguous.
+
+    A host owns exactly one host-bound label. Linux per-boot names carry no
+    host (`linux-ephr-<pid>-<n>` on every host), so for Linux runners the label
+    is the only ownership axis; a lane plist that also advertises another
+    host's label would let this janitor delete that host's runners. More than
+    one distinct host-bound label across the plists and TARTCI_HOST_LABEL
+    (which `collected` includes, so a declared label that disagrees with a
+    plist is the same case) therefore owns none, and the conflict is reported.
+    """
+    bound = sorted({label for label in collected if starts_with_any(label, host_label_prefixes)})
+    if len(bound) > 1:
+        return ([label for label in collected if not starts_with_any(label, host_label_prefixes)],
+                f"host_label_conflict:{','.join(bound)}")
+    return collected, ""
 
 
 def host_slug() -> str:
@@ -710,6 +732,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     own_host_labels = [p for p in args.host_labels.split(",") if p]
     own_host_labels += [label for label in lane_labels
                         if starts_with_any(label, host_label_prefixes) and label not in own_host_labels]
+    own_host_labels, label_conflict = resolve_host_labels(own_host_labels, host_label_prefixes)
+    if label_conflict:
+        problems.append(label_conflict)
     own_name_prefixes = [p for p in args.own_name_prefixes.split(",") if p]
     for prefix in own_lane_name_prefixes(lanes or []) + lane_name_prefixes:
         if prefix not in own_name_prefixes:

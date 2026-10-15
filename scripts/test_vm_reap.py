@@ -585,6 +585,25 @@ class ForeignRunnerTests(unittest.TestCase):
         self.assertEqual(self.digest["config"]["host_labels"], ["pulp-host-macstudio"])
         self.assertIn("linux-ephr-", self.digest["config"]["own_name_prefixes"])
 
+    def test_a_conflicting_host_label_set_owns_no_host_bound_runner(self) -> None:
+        # m5's installed Linux plist advertised both its own label and the
+        # studio's; Linux names carry no host, so only the label separates them.
+        self.install_linux_lane("pulp-host-m5,pulp-host-macstudio")
+        studio = self.offline("linux-ephr-5150-1",
+                              ["self-hosted", "Linux", "ARM64", "pulp-build-linux", "pulp-host-macstudio"])
+        row, delete_runner = self.reap_passes(studio)
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "bound_to_other_host:pulp-host-macstudio")
+        self.assertIn("host_label_conflict:pulp-host-m5,pulp-host-macstudio", self.digest["problems"])
+        self.assertEqual(self.digest["config"]["host_labels"], [])
+
+    def test_a_plist_label_that_disagrees_with_the_declared_label_owns_nothing(self) -> None:
+        self.install_linux_lane("pulp-host-macstudio")
+        mine = self.offline("linux-ephr-4242-1", ["self-hosted", "Linux", "pulp-host-macstudio"])
+        row, delete_runner = self.reap_passes(mine, "--host-labels", "pulp-host-m5")
+        delete_runner.assert_not_called()
+        self.assertIn("host_label_conflict:pulp-host-m5,pulp-host-macstudio", self.digest["problems"])
+
     def test_another_hosts_linux_ghost_is_kept_by_label(self) -> None:
         self.install_linux_lane("pulp-host-macstudio")
         runner = self.offline("linux-ephr-4242-1",
