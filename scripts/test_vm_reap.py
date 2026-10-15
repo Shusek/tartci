@@ -449,6 +449,185 @@ else:
             delete_runner.assert_not_called()
 
 
+class ForeignRunnerTests(unittest.TestCase):
+    """A janitor deletes only offline registrations this host could have minted.
+
+    Replays 2026-09-29, found on m3: its janitor saw the bare-metal
+    `pulp-intel-macmini` runner (registered from another host) read offline for
+    one pass, found no local state for it, and deleted the registration.
+    """
+
+    MACMINI_LABELS = ["self-hosted", "X64", "macOS", "pulp-intel-native", "pulp-host-macmini"]
+    T0 = dt.datetime(2026, 10, 15, 4, 0, 0, tzinfo=dt.timezone.utc)
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.agents = self.tmp / "LaunchAgents"
+        self.agents.mkdir()
+
+    def reap(self, runner: dict, *extra: str, at: float = 0.0) -> tuple[dict, mock.MagicMock]:
+        args = vm_reap.parse_args([
+            "--repo", "Generous-Corp/pulp",
+            "--state-root", str(self.tmp / "state"),
+            "--launch-agents-dir", str(self.agents),
+            "--fix",
+            *extra,
+        ])
+        with mock.patch.object(vm_reap, "utcnow", return_value=self.T0 + dt.timedelta(seconds=at)), \
+             mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+             mock.patch.object(vm_reap, "github_runners", return_value=[runner]), \
+             mock.patch.object(vm_reap, "delete_runner", return_value="deleted") as delete_runner:
+            digest, _ = vm_reap.build_digest(args)
+        self.digest = digest
+        return digest["github_runners"][0], delete_runner
+
+    def reap_passes(self, runner: dict, *extra: str, passes: int = 3, step: float = 450.0):
+        row = delete_runner = None
+        for i in range(passes):
+            row, delete_runner = self.reap(runner, *extra, at=i * step)
+        return row, delete_runner
+
+    def offline(self, name: str, labels: list, status: str = "offline") -> dict:
+        return {"id": 27620, "name": name, "status": status, "busy": False, "labels": labels}
+
+    def install_linux_lane(self, host_label: str) -> None:
+        """Render the real Linux lane template the way its install recipe does."""
+        template = (Path(vm_reap.__file__).resolve().parent.parent
+                    / "launchd/com.danielraffel.pulp.tart-runner-linux.plist.template").read_text()
+        text = (template.replace("$TARTCI_HOST_LABEL", host_label)
+                .replace("$HOME", "/Users/ci").replace("$TART_HOME", "/Users/ci/VMs"))
+        (self.agents / "com.danielraffel.pulp.tart-runner-linux.plist").write_text(text)
+
+    def test_incident_persistent_runner_on_another_host_is_kept(self) -> None:
+        row, delete_runner = self.reap_passes(self.offline("pulp-intel-macmini", self.MACMINI_LABELS))
+        delete_runner.assert_not_called()
+        self.assertEqual(row["action"], "keep_not_minted_here")
+        self.assertEqual(row["refusal"], "not_a_per_boot_name")
+
+    def test_raw_api_label_objects_are_read(self) -> None:
+        labels = [{"id": i, "name": n, "type": "custom"} for i, n in enumerate(self.MACMINI_LABELS)]
+        name = "pulp-intel-macmini-20261015034211-73971-1"
+        row, delete_runner = self.reap_passes(
+            self.offline(name, labels), "--own-name-prefixes", "pulp-intel-macmini-",
+            "--host-labels", "pulp-host-macstudio")
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "bound_to_other_host:pulp-host-macmini")
+
+    def test_another_hosts_macos_per_boot_runner_is_kept_by_name(self) -> None:
+        # The reviewer's probe A: unlabelled, per-boot shaped, offline for many
+        # passes, minted by another host's lane.
+        row, delete_runner = self.reap_passes(
+            self.offline("m5-pulp-gate-01-17725-47", ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]),
+            "--own-name-prefixes", "studio-pulp-gate-01-", "--prefixes", "m5-", passes=5)
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "not_this_hosts_prefix")
+
+    def test_unknown_own_prefixes_keep_everything(self) -> None:
+        row, delete_runner = self.reap_passes(
+            self.offline("studio-pulp-gate-01-12345-1", ["self-hosted"]), "--prefixes", "studio-")
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "not_this_hosts_prefix")
+
+    def test_declared_persistent_runner_is_kept_even_with_a_per_boot_shape(self) -> None:
+        name = "pulp-studio-01-12345-1"
+        row, delete_runner = self.reap_passes(
+            self.offline(name, ["self-hosted"]), "--persistent-runners", f"other,{name}",
+            "--own-name-prefixes", "pulp-studio-01-")
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "persistent_runner")
+
+    def test_one_offline_reading_never_deletes(self) -> None:
+        runner = self.offline("studio-pulp-gate-01-12345-1", ["self-hosted", "macOS"])
+        own = ("--own-name-prefixes", "studio-pulp-gate-01-")
+        row, delete_runner = self.reap(runner, *own, at=0)
+        delete_runner.assert_not_called()
+        self.assertEqual((row["action"], row["refusal"]), ("wait_offline_age", "offline_too_recent"))
+        # Three passes inside the age are still too recent.
+        row, delete_runner = self.reap_passes(runner, *own, passes=3, step=60)
+        delete_runner.assert_not_called()
+
+    def test_the_age_alone_is_not_enough_without_three_passes(self) -> None:
+        runner = self.offline("studio-pulp-gate-01-12345-1", ["self-hosted", "macOS"])
+        row, delete_runner = self.reap_passes(
+            runner, "--own-name-prefixes", "studio-pulp-gate-01-", passes=2, step=1800)
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "offline_too_recent")
+
+    def test_own_ghost_is_deleted_after_three_passes_and_the_age(self) -> None:
+        # Positive control: the guard must not blind the janitor to its own residue.
+        runner = self.offline("studio-pulp-gate-01-12345-1", ["self-hosted", "macOS"])
+        row, delete_runner = self.reap_passes(runner, "--own-name-prefixes", "studio-pulp-gate-01-")
+        delete_runner.assert_called_once()
+        self.assertEqual(row["action"], "delete_offline_runner")
+        self.assertEqual(row["offline_passes"], 3)
+
+    def test_an_online_reading_resets_the_offline_clock(self) -> None:
+        name = "studio-pulp-gate-01-12345-1"
+        own = ("--own-name-prefixes", "studio-pulp-gate-01-")
+        self.reap(self.offline(name, ["self-hosted"]), *own, at=0)
+        self.reap(self.offline(name, ["self-hosted"]), *own, at=450)
+        self.reap(self.offline(name, ["self-hosted"], status="online"), *own, at=900)
+        row, delete_runner = self.reap(self.offline(name, ["self-hosted"]), *own, at=1350)
+        delete_runner.assert_not_called()
+        self.assertEqual(row["offline_passes"], 1)
+
+    def test_own_linux_ghost_is_deleted_with_the_installed_lane_environment(self) -> None:
+        # The installed reap agent carries no TARTCI_HOST_LABEL: this host's
+        # label is read from its installed Linux lane plist, nothing by hand.
+        self.install_linux_lane("pulp-host-macstudio")
+        runner = self.offline("linux-ephr-4242-1",
+                              ["self-hosted", "Linux", "ARM64", "pulp-build-linux", "pulp-host-macstudio"])
+        with mock.patch.dict(os.environ, {"TARTCI_HOST_LABEL": "", "TARTCI_REAP_OWN_NAME_PREFIXES": ""}):
+            row, delete_runner = self.reap_passes(runner)
+        delete_runner.assert_called_once()
+        self.assertEqual(self.digest["config"]["host_labels"], ["pulp-host-macstudio"])
+        self.assertIn("linux-ephr-", self.digest["config"]["own_name_prefixes"])
+
+    def test_a_conflicting_host_label_set_owns_no_host_bound_runner(self) -> None:
+        # m5's installed Linux plist advertised both its own label and the
+        # studio's; Linux names carry no host, so only the label separates them.
+        self.install_linux_lane("pulp-host-m5,pulp-host-macstudio")
+        studio = self.offline("linux-ephr-5150-1",
+                              ["self-hosted", "Linux", "ARM64", "pulp-build-linux", "pulp-host-macstudio"])
+        row, delete_runner = self.reap_passes(studio)
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "bound_to_other_host:pulp-host-macstudio")
+        self.assertIn("host_label_conflict:pulp-host-m5,pulp-host-macstudio", self.digest["problems"])
+        self.assertEqual(self.digest["config"]["host_labels"], [])
+
+    def test_a_plist_label_that_disagrees_with_the_declared_label_owns_nothing(self) -> None:
+        self.install_linux_lane("pulp-host-macstudio")
+        mine = self.offline("linux-ephr-4242-1", ["self-hosted", "Linux", "pulp-host-macstudio"])
+        row, delete_runner = self.reap_passes(mine, "--host-labels", "pulp-host-m5")
+        delete_runner.assert_not_called()
+        self.assertIn("host_label_conflict:pulp-host-m5,pulp-host-macstudio", self.digest["problems"])
+
+    def test_another_hosts_linux_ghost_is_kept_by_label(self) -> None:
+        self.install_linux_lane("pulp-host-macstudio")
+        runner = self.offline("linux-ephr-4242-1",
+                              ["self-hosted", "Linux", "ARM64", "pulp-build-linux", "pulp-host-m5"])
+        row, delete_runner = self.reap_passes(runner)
+        delete_runner.assert_not_called()
+        self.assertEqual(row["refusal"], "bound_to_other_host:pulp-host-m5")
+
+    def test_own_lane_prefixes_are_host_specific_never_the_shared_identity(self) -> None:
+        from types import SimpleNamespace
+        lanes = [SimpleNamespace(runner_name="studio-pulp-gate-01", identity="pulp-gate"),
+                 SimpleNamespace(runner_name="studio-pulp-gate-slot2-02", identity="pulp-gate.slot2")]
+        self.assertEqual(vm_reap.own_lane_name_prefixes(lanes),
+                         ["studio-pulp-gate-01-", "studio-pulp-gate-slot2-02-"])
+
+    def test_reap_template_does_not_hard_code_a_host_label(self) -> None:
+        # The janitor reads this host's label from its lane plists, so the
+        # shared reap template must not pin one host's label for every host.
+        template = (Path(vm_reap.__file__).resolve().parent.parent
+                    / "launchd/com.danielraffel.tartci.reap.plist.template").read_text()
+        self.assertNotIn("pulp-host-", template)
+        self.assertIn("TARTCI_REAP_PREFIXES", template)
+
+
 class OrphanedLaneVmTests(unittest.TestCase):
     """Stopped lane VMs whose supervisor is gone are deleted; any doubt keeps one.
 
