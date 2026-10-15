@@ -19,8 +19,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "providers" / "common" / "toml-python.lib.sh"
+# The fake interpreters exec this one, and the picker accepts only a Python
+# with tomllib (3.11+); the system Python 3.9 lane cannot stand in for them.
+NEEDS_TOMLLIB = unittest.skipIf(sys.version_info < (3, 11), "needs tomllib (Python 3.11+)")
 
 
+@NEEDS_TOMLLIB
 class Picker(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -121,6 +125,7 @@ class ProfilePython(unittest.TestCase):
                         lanes.load(path)
 
 
+@NEEDS_TOMLLIB
 class SelfUpdateLauncher(unittest.TestCase):
     def test_the_launcher_is_built_with_the_profile_interpreter(self) -> None:
         try:
