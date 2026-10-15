@@ -2161,6 +2161,30 @@ that carry no host label or carry one of this host's own labels.
   `TARTCI_REAP_PERSISTENT_RUNNERS` on every host that runs the janitor, and give
   it its own health check, because nothing else revives it.
 
+**Keeping a persistent runner alive.** Two jobs work together. Neither needs a
+long-lived credential on the runner's host.
+
+- `scripts/runner_host_health.sh` runs on the runner's own host every 5
+  minutes, at background priority
+  (`launchd/com.danielraffel.tartci.runner-host-health.plist.template`). If the
+  runner is configured but its listener is not running, the script kickstarts
+  the runner's launchd job. That job, written by svc.sh, has no KeepAlive. If
+  `.runner` is gone, the script writes a `deconfigured` marker, because only a
+  registration token can fix that.
+- `tartci runner-heal --fix` runs on one fleet host that has `ghapp` and ssh
+  access to the runner hosts
+  (`launchd/com.danielraffel.tartci.persistent-runner-heal.plist.template`). It
+  reads the runners declared in `~/.config/tartci/persistent-runners.json` and
+  compares GitHub's view with each host's view over ssh. A registered runner
+  whose listener is down gets restarted. A runner that is missing on GitHub, or
+  whose host lost `.runner`, gets re-registered: the job mints a one-hour
+  registration token and sends it over ssh stdin. The old local identity is
+  moved aside, not deleted, and each runner is re-registered at most once an
+  hour. Without `--fix`, the job only reports. An unreachable host or an
+  unreadable census is reported and never acted on.
+
+Roll out one host at a time, and run report-only for a few passes first.
+
 **If a persistent runner has vanished.** Its log in `_diag/Runner_*.log` ends
 with `Runner registration no longer exists ... Cleaning up local
 configuration.`, `.runner` is missing, and the lane's jobs wait for a runner
@@ -2171,7 +2195,8 @@ until they are cancelled.
    `action:org.remove_self_hosted_runner` in the minute before that log line.
    Then search each host's `~/Library/Logs/tartci/tartci-reap.log` for
    `github_runner_deleted:<name>`.
-2. Re-register it with a short-lived registration token
+2. `tartci runner-heal --fix` re-registers it automatically if it is declared.
+   To do it by hand, re-register it with a short-lived registration token
    (`POST repos/OWNER/REPO/actions/runners/registration-token`), then run
    `./config.sh --unattended --replace --url https://github.com/OWNER/REPO
    --token <token> --name <name> --labels <labels>` and restart its launchd job.
