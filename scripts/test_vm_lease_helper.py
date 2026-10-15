@@ -38,18 +38,36 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 class VmLeaseHelperTests(unittest.TestCase):
     def test_windows_runner_exports_granted_parallelism_to_guest_job(self) -> None:
-        body = WINDOWS_RUNNER.read_text(encoding="utf-8")
-        self.assertIn(
-            '$env:CMAKE_BUILD_PARALLEL_LEVEL="\'"$effective_win_cpus"\'"',
-            body,
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "4"],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        self.assertIn(
-            "cmake-build-parallel-level={0}",
-            body,
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL="4"\n'
+            'Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f '
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL)\n',
         )
-        # The runner must not replace the lease grant with a fixed whole-host
-        # count. Explicit workflow `-j` remains the caller's responsibility.
-        self.assertNotIn("CMAKE_BUILD_PARALLEL_LEVEL=8", body)
+
+        # A zero grant is invalid and must not produce an unusable script.
+        negative = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "8"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(negative.returncode, 0, negative.stderr)
+        self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL="8"', negative.stdout)
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "0"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(invalid.returncode, 0)
 
     def test_apply_false_cannot_enter_cleanup_provider(self) -> None:
         with tempfile.TemporaryDirectory() as td:
