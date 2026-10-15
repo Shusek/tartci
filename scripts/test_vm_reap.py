@@ -268,6 +268,53 @@ else:
             self.assertFalse((root / "windows" / "win-ephr-host-1.state.json").exists())
             self.assertIn("path_deleted", "\n".join(digest["fixed"]))
 
+    @unittest.skipUnless(sys.platform == "darwin", "immutable snapshot uses macOS flags")
+    def test_qemu_windows_reap_unseals_recorded_private_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            job = "tartci-win-job-555"
+            work = Path(td) / "tartci-win" / job
+            work.mkdir(parents=True)
+            snapshot = work / "golden.qcow2"
+            sidecar = work / "golden.qcow2.sha256"
+            snapshot.write_bytes(b"fixture")
+            sidecar.write_text("0" * 64 + "  fixture\n")
+            subprocess.run(["chflags", "uchg", str(snapshot), str(sidecar)], check=True)
+            self.addCleanup(lambda: subprocess.run(
+                ["chflags", "nouchg", str(snapshot), str(sidecar)],
+                capture_output=True, check=False))
+            write_state(root / "windows" / f"{job}.state.json",
+                        provider="qemu-windows", runner=job, vm=job,
+                        work_dir=str(work), golden_snapshot=str(snapshot),
+                        qemu_pid="999998", qemu_pid_started_at="")
+
+            digest, rc = self.run_digest(root, "--fix")
+
+            self.assertEqual(rc, 0, digest)
+            self.assertFalse(work.exists())
+            self.assertFalse((root / "windows" / f"{job}.state.json").exists())
+
+    def test_qemu_snapshot_with_missing_pid_is_preserved(self) -> None:
+        for pid, started in (("", ""), ("999998", "")):
+            with self.subTest(pid=pid), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "state"
+                job = "tartci-win-job-556"
+                work = Path(td) / "tartci-win" / job
+                work.mkdir(parents=True)
+                snapshot = work / "golden.qcow2"
+                snapshot.write_bytes(b"fixture")
+                state_file = root / "windows" / f"{job}.state.json"
+                write_state(state_file, provider="qemu-windows", runner=job, vm=job,
+                            phase="preparing", work_dir=str(work),
+                            golden_snapshot=str(snapshot), qemu_pid=pid,
+                            qemu_pid_started_at=started)
+
+                digest, _ = self.run_digest(root, "--fix")
+
+                self.assertTrue(work.exists())
+                self.assertTrue(state_file.exists())
+                self.assertIn(f"qemu_pid_unknown_preserve:{job}", digest["problems"])
+
     def test_qemu_reap_still_reports_when_tart_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "state"

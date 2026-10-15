@@ -672,6 +672,27 @@ def remove_owned_path(path_text: Any, runner_name: str) -> str | None:
     return f"path_deleted:{path}"
 
 
+def unseal_windows_snapshot(state: dict[str, Any]) -> None:
+    """Clear the immutable flag only on this job's recorded private backing file."""
+    work = safe_owned_path(state.get("work_dir"), str(state.get("runner") or ""))
+    snapshot_text = state.get("golden_snapshot")
+    if not work or not isinstance(snapshot_text, str) or not snapshot_text:
+        return
+    if work.is_symlink():
+        raise ValueError("linked Windows job directory recovery path")
+    snapshot = pathlib.Path(snapshot_text)
+    if snapshot != work / "golden.qcow2" or snapshot.is_symlink():
+        raise ValueError("unsafe Windows golden snapshot recovery path")
+    for path in (snapshot, pathlib.Path(f"{snapshot}.sha256")):
+        if path.is_symlink():
+            raise ValueError("linked Windows golden snapshot recovery path")
+        if path.exists():
+            if not path.is_file():
+                raise ValueError("non-file Windows golden snapshot recovery path")
+            if hasattr(os, "chflags"):
+                os.chflags(path, 0)
+
+
 def stop_pid(pid_value: Any, expected_start: Any) -> bool:
     try:
         pid = int(pid_value)
@@ -937,12 +958,19 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         qemu_alive = pid_alive_same(state.get("qemu_pid"), state.get("qemu_pid_started_at"))
         age = int(state.get("_age_secs") or 0)
         keep_failed = bool(state.get("keep_failed"))
+        unknown_qemu_pid = ((not state.get("qemu_pid")
+                             or not state.get("qemu_pid_started_at"))
+                            and bool(state.get("golden_snapshot"))
+                            and state.get("phase") in {"preparing", "booting"})
         action = ""
         stale = False
 
         if not owned:
             if prefix_ok and protected_name:
                 problems.append(f"owned_marker_protected_name:{name}")
+        elif unknown_qemu_pid:
+            action = "qemu_pid_unknown_preserve"
+            problems.append(f"qemu_pid_unknown_preserve:{name}")
         elif keep_failed and qemu_alive and age < args.keep_failed_age_secs:
             action = "kept_failed_wait_for_operator"
         elif qemu_alive and not owner_pid_alive and age >= args.running_age_secs:
@@ -959,8 +987,10 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if args.fix and action in ("stop_delete_qemu_vm", "delete_qemu_workdir"):
             try:
                 if qemu_alive:
-                    if stop_pid(state.get("qemu_pid"), state.get("qemu_pid_started_at")):
-                        fixed.append(f"qemu_stopped:{name}:{state.get('qemu_pid')}")
+                    if not stop_pid(state.get("qemu_pid"), state.get("qemu_pid_started_at")):
+                        raise RuntimeError("QEMU still alive; preserving Windows workdir")
+                    fixed.append(f"qemu_stopped:{name}:{state.get('qemu_pid')}")
+                unseal_windows_snapshot(state)
                 for key in ("work_dir", "port_lock"):
                     removed = remove_owned_path(state.get(key), runner_name)
                     if removed:
@@ -973,7 +1003,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         vms.append(
             {
                 "name": name,
-                "state": "running" if qemu_alive else "stopped",
+                "state": "unknown" if unknown_qemu_pid else ("running" if qemu_alive else "stopped"),
                 "provider": "qemu-windows",
                 "owned": owned,
                 "protected": protected_name,
