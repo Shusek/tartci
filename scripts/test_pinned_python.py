@@ -116,6 +116,50 @@ class Picker(unittest.TestCase):
                                capture_output=True, text=True, check=False, env=base)
         self.assertEqual(shell.returncode, 0, shell.stdout + shell.stderr)
 
+    def lane(self, python: Path) -> None:
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m5studio.pulp-gate.plist").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
+            "    <key>EnvironmentVariables</key>\n    <dict>\n"
+            "        <key>TARTCI_PYTHON</key>\n"
+            f"        <string>{python}</string>\n    </dict>\n</dict>\n</plist>\n")
+
+    def test_a_host_without_a_pin_bootstraps_from_its_lanes_under_launchd(self) -> None:
+        # m3 and m5s, 2026-10-15: no python.pin had been written yet, and the
+        # self-update agent (no TARTCI_PYTHON) handed off to the new picker,
+        # which refused, so the install that writes the pin could never run.
+        self.lane(self.pinned)
+        result = self.pick(XPC_SERVICE_NAME="com.danielraffel.tartci.self-update")
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, str(self.pinned)))
+        self.assertEqual(result.stderr, "")
+
+    def test_a_lane_pin_whose_binary_is_gone_still_refuses(self) -> None:
+        self.lane(self.root / "gone" / "python3.12")
+        result = self.pick(TARTCI_LAUNCHD="1")
+        self.assertEqual((result.returncode, result.stdout), (127, ""))
+        self.assertIn("no pinned fleet lane", result.stderr)
+
+    def test_an_operator_shell_ignores_the_lane_pin(self) -> None:
+        # Interactive commands keep the search, lane plist or not.
+        self.lane(self.pinned)
+        self.assertEqual(self.pick().stdout.strip(), str(self.bait))
+
+    def test_the_self_update_handoff_is_not_refused_on_a_host_with_lanes(self) -> None:
+        # The exact entry launchd runs; the control is the same entry on a
+        # host with no lanes and no pin, which refuses.
+        argv = ["/bin/bash", str(ROOT / "tartci"), "fleet-macos", "self-update", "--status"]
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
+               "XPC_SERVICE_NAME": "com.danielraffel.tartci.self-update",
+               "TARTCI_HOME": str(self.home / ".tartci")}
+        control = subprocess.run(argv, capture_output=True, text=True, env=env, check=False,
+                                 timeout=120)
+        self.assertIn("refusing an unpinned interpreter", control.stderr)
+        self.lane(self.pinned)
+        fixed = subprocess.run(argv, capture_output=True, text=True, env=env, check=False,
+                               timeout=120)
+        self.assertNotIn("refusing an unpinned interpreter", fixed.stderr, fixed.stderr)
+
     def test_without_launchd_the_same_search_still_finds_the_bait(self) -> None:
         # Control, same instrument: an interactive shell keeps the search.
         result = self.pick()

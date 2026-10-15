@@ -64,6 +64,26 @@ tartci_launchd_context() {
   return 1
 }
 
+# The absolute TARTCI_PYTHON the installed fleet lanes carry: what the
+# installer pinned before python.pin existed. It is the bootstrap for a host
+# whose pin was never written, so its self-update (which hands off to the new
+# generation's picker) can install, and the install writes the pin. Read from
+# the plist XML without a TOML or plist parser.
+tartci_lane_pinned_python() {
+  local dir="${TARTCI_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}" plist candidate
+  for plist in "$dir"/com.danielraffel.tartci.tart-runner-macos-fleet.*.plist; do
+    [ -f "$plist" ] || continue
+    candidate="$(awk '
+      /<key>TARTCI_PYTHON<\/key>/ { want = 1; next }
+      want && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit }
+    ' "$plist")"
+    case "$candidate" in
+      /*) printf '%s\n' "$candidate"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 tartci_toml_python_path() {
   local candidate configured="${TARTCI_PYTHON:-}" pinned
   if [ -z "$configured" ] && pinned="$(tartci_pinned_python)"; then
@@ -77,13 +97,18 @@ tartci_toml_python_path() {
     return 127
   fi
   if [ -z "$configured" ]; then
+    if tartci_launchd_context && pinned="$(tartci_lane_pinned_python)" \
+        && [ -x "$pinned" ] && "$pinned" -c 'import tomllib' >/dev/null 2>&1; then
+      printf '%s\n' "$pinned"
+      return 0
+    fi
     if tartci_launchd_context; then
       # A LaunchAgent must never run whatever python3 PATH resolves to
       # today: a Homebrew upgrade would swap the binary under launchd, and
       # macOS privacy grants (Local Network) do not follow it.
       echo "tartci: refusing an unpinned interpreter under launchd job ${XPC_SERVICE_NAME:-unset} (TARTCI_LAUNCHD=${TARTCI_LAUNCHD:-}):" \
-           "no TARTCI_PYTHON and no $(tartci_python_pin_file); set host.python in the" \
-           "fleet profile and reinstall" >&2
+           "no TARTCI_PYTHON, no $(tartci_python_pin_file) and no pinned fleet lane;" \
+           "set host.python in the fleet profile and reinstall" >&2
       tartci_note_interpreter_refusal "no TARTCI_PYTHON and no $(tartci_python_pin_file)"
       return 127
     fi

@@ -3456,7 +3456,10 @@ reclaim, self-update) resolve through that pin. Any LaunchAgent tartci ships
 (every template and rendered lane sets `TARTCI_LAUNCHD=1`; an older agent is
 recognised by its `com.danielraffel.*` label, though a wrapper such as
 Homebrew's GNU `timeout` resets `XPC_SERVICE_NAME` to `0`) with neither
-refuses to run
+refuses to run, unless its installed fleet lanes carry an absolute
+`TARTCI_PYTHON`: that bootstraps a host whose pin was never written (m3 and
+m5s, 2026-10-15, where the self-update agent was refused before the install
+that writes the pin could run). Otherwise it refuses to run
 and logs `refusing an unpinned interpreter`; it never takes whatever
 `/opt/homebrew/bin/python3` is today. The helpers that otherwise fall back to
 `/usr/bin/python3` when no TOML-capable interpreter exists (status, reclaim,
