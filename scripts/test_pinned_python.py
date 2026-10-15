@@ -459,6 +459,7 @@ class DoctorPythonPin(unittest.TestCase):
                 self.assertIn(code, reasons)
 
 
+@NEEDS_TOMLLIB
 class SelfUpdateLauncher(unittest.TestCase):
     def test_the_launcher_is_built_with_the_profile_interpreter(self) -> None:
         try:

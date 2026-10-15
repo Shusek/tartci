@@ -2737,21 +2737,24 @@ class Run:
         self._install(args, python=self._restore_previous_python())
 
     def _restore_previous_python(self) -> str | None:
-        """Put back the interpreter pin the previous generation ran with, and
-        return the interpreter its lanes used, for the rollback install."""
+        """Pin the interpreter the previous generation's lanes ran (else its
+        old pin) and return it, for the rollback install."""
         snap = (_read_json(self.snapshot / "snapshot.json") if self.snapshot else None) or {}
         previous = snap.get("python") if isinstance(snap.get("python"), str) else None
         pin_value = snap.get("python_pin") if isinstance(snap.get("python_pin"), str) else None
         pin = python_pin_path(self.cfg.home)
-        if pin_value:
+        # The pin names what the rollback installs: the installer honours
+        # TARTCI_ROLLBACK_PYTHON only when it equals the pin or a lane's.
+        restore = previous if previous and previous.startswith("/") else pin_value
+        if restore:
             pin.parent.mkdir(parents=True, exist_ok=True)
             tmp = pin.with_name(f".{pin.name}.rollback")
-            tmp.write_text(pin_value + "\n")
+            tmp.write_text(restore + "\n")
             os.replace(tmp, pin)
-        if previous or pin_value:
+        if restore or previous:
             self.receipt.step("python-restore",
-                              f"rollback runs the previous interpreter {previous or pin_value}")
-        return previous or pin_value
+                              f"rollback runs the previous interpreter {restore or previous}")
+        return restore or previous
 
     def _pool_state(self) -> str:
         status = installed_tartci(self.cfg, self.sys, "pool", "status", "--json")

@@ -76,13 +76,33 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # lanes ran (fleet_self_update sets TARTCI_ROLLBACK_PYTHON). It wins over the
 # snapshot profile's host.python, which may name a switch the preflight
 # refused; the profile itself is not rewritten, because a sealed launcher's
-# policy digest covers it.
+# policy digest covers it. It is honoured only when it is the interpreter this
+# host is pinned to (fleet_self_update restores the pin first) or one an
+# installed lane runs, so a stray export cannot skip the preflight.
+tartci_is_rollback_python() {
+  local plist candidate
+  [ "$(tartci_pinned_python 2>/dev/null || true)" = "$1" ] && return 0
+  for plist in "${TARTCI_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"/com.danielraffel.tartci.tart-runner-macos-fleet.*.plist; do
+    [ -f "$plist" ] || continue
+    candidate="$(awk '
+      /<key>TARTCI_PYTHON<\/key>/ { want = 1; next }
+      want && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit }
+    ' "$plist")"
+    [ "$candidate" = "$1" ] && return 0
+  done
+  return 1
+}
 if [ -n "${TARTCI_ROLLBACK_PYTHON:-}" ]; then
   case "$TARTCI_ROLLBACK_PYTHON" in
     /*) ;;
     *) echo "fleet install: TARTCI_ROLLBACK_PYTHON must be an absolute path: $TARTCI_ROLLBACK_PYTHON" >&2
        exit 2 ;;
   esac
+  tartci_is_rollback_python "$TARTCI_ROLLBACK_PYTHON" || {
+    echo "fleet install: TARTCI_ROLLBACK_PYTHON=$TARTCI_ROLLBACK_PYTHON is not a rollback interpreter:" \
+         "it is neither $(tartci_python_pin_file) nor any installed lane's TARTCI_PYTHON" >&2
+    exit 2
+  }
   [ -x "$TARTCI_ROLLBACK_PYTHON" ] && [ ! -d "$TARTCI_ROLLBACK_PYTHON" ] || {
     echo "fleet install: the rollback interpreter is not an executable file: $TARTCI_ROLLBACK_PYTHON" >&2
     exit 127

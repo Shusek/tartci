@@ -499,11 +499,25 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("interpreter-preflight", self.calls.read_text())
         self.assertEqual(list((self.home / "VMs").iterdir()), [])
 
+    def recording_preflight(self) -> tuple[Path, Path]:
+        calls = self.root / "preflight.calls"
+        script = self.root / "preflight-recording"
+        script.write_text(f"#!/bin/sh\necho \"$2\" >>{calls}\nexit 0\n")
+        script.chmod(0o755)
+        return script, calls
+
+    def pin_to(self, python: Path) -> Path:
+        pin = self.home / ".config/tartci/python.pin"
+        pin.write_text(os.path.realpath(python) + "\n")
+        return pin
+
     def test_a_rollback_interpreter_wins_over_the_profiles_host_python(self) -> None:
         # The snapshot profile can name the switch the preflight refused; the
-        # rollback must reinstall what the previous lanes ran.
+        # rollback must reinstall what the previous lanes ran. Self-update
+        # pins that interpreter before the rollback install.
         old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
         self.set_profile_python(new)
+        self.pin_to(old)
         result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON=os.path.realpath(old),
                                     TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(1)))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -515,6 +529,44 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply", TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(0)))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.lane_python(), os.path.realpath(new))
+
+    def test_a_rollback_is_not_preflighted_but_a_switch_is(self) -> None:
+        # The lanes run new; the rollback restores old, pinned by self-update.
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        self.assertEqual(self.run_installer("--apply", TARTCI_PYTHON=str(new),
+                                            TARTCI_INTERPRETER_PREFLIGHT=str(self.preflight(0))
+                                            ).returncode, 0)
+        stub, calls = self.recording_preflight()
+        self.pin_to(old)
+        result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON=os.path.realpath(old),
+                                    TARTCI_INTERPRETER_PREFLIGHT=str(stub))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(old))
+        self.assertFalse(calls.exists(), "a rollback must not run the preflight")
+        # Control, same stub: switching back to new is a switch, so it runs.
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(new),
+                                    TARTCI_INTERPRETER_PREFLIGHT=str(stub))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.read_text().split(), [os.path.realpath(new)])
+
+    def test_a_rollback_interpreter_a_lane_runs_is_honoured(self) -> None:
+        old, new = self.interpreter("old-python3"), self.interpreter("new-python3")
+        self.assertEqual(self.run_installer("--apply", TARTCI_PYTHON=str(old)).returncode, 0)
+        (self.home / ".config/tartci/python.pin").unlink()
+        self.set_profile_python(new)
+        result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON=os.path.realpath(old))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(old))
+
+    def test_a_stray_rollback_interpreter_is_refused(self) -> None:
+        # Neither the pin nor any lane names it: an exported variable, not a
+        # rollback, so it may not override host.python or skip the preflight.
+        old, stray = self.interpreter("old-python3"), self.interpreter("stray-python3")
+        self.assertEqual(self.run_installer("--apply", TARTCI_PYTHON=str(old)).returncode, 0)
+        result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON=os.path.realpath(stray))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("is not a rollback interpreter", result.stderr)
+        self.assertEqual(self.lane_python(), os.path.realpath(old))
 
     def test_a_relative_rollback_interpreter_is_refused(self) -> None:
         result = self.run_installer("--apply", TARTCI_ROLLBACK_PYTHON="python3")
