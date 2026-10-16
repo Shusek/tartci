@@ -258,6 +258,39 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(alarm.classify(clean, me="m5", now=BASE), [])
 
 
+    def test_a_signal_after_the_lanes_teardown_is_not_a_death(self) -> None:
+        # m1, 2026-10-16: the job ended (listener exited, workflow still
+        # running, so no terminal receipt), the VM was torn down, and 61 s
+        # later the self-update stopped the idle supervisor, which logged the
+        # last job's quarantine.
+        quarantined = "INT/TERM quarantine=listener_exited_workflow_active"
+        rows = [row(BASE - 2600, "job_assigned", runner="m5-pulp-gate-01",
+                    vm="m5-pulp-gate-01-74810-4"),
+                row(BASE - 70, "job_lifecycle_quarantine", runner="m5-pulp-gate-01",
+                    detail="runner_rc=0 observation=terminal_pending_run "
+                           "quarantine=listener_exited_workflow_active"),
+                row(BASE - 70, "teardown", runner="m5-pulp-gate-01", detail="rc=0"),
+                row(BASE - 63, "vm_lifecycle", runner="m5-pulp-gate-01", vm="",
+                    detail="served=1 rc=0"),
+                row(BASE - 10, "supervisor_signal", runner="m5-pulp-gate-01", vm="",
+                    detail=quarantined)]
+        self.assertEqual(alarm.classify(rows, me="m5", now=BASE), [])
+        # Control, same rows without the teardown: the lane still held its job.
+        held = [r for r in rows if r["event"] != "teardown"]
+        self.assertEqual(rules(alarm.classify(held, me="m5", now=BASE)), {"lane_death_by_signal"})
+
+    def test_a_death_mid_job_still_trips_though_cleanup_tears_down_after(self) -> None:
+        signal = "INT/TERM quarantine=signal_teardown_unknown"
+        rows = [row(BASE - 600, "job_assigned"),
+                row(BASE - 10, "supervisor_signal", detail=signal),
+                row(BASE - 9, "teardown", detail="rc=0")]
+        self.assertEqual(rules(alarm.classify(rows, me="m5", now=BASE)), {"lane_death_by_signal"})
+        # A teardown of an earlier VM does not clear a later assignment.
+        rows = [row(BASE - 900, "teardown", detail="rc=0"), row(BASE - 600, "job_assigned"),
+                row(BASE - 10, "supervisor_signal", detail=signal)]
+        self.assertEqual(rules(alarm.classify(rows, me="m5", now=BASE)), {"lane_death_by_signal"})
+
+
 class RealReplayTests(unittest.TestCase):
     def test_m1_on_2026_10_13_trips_within_20_minutes(self) -> None:
         # m1's last job_assigned was 01:20:32Z, its lanes went scan-blind from
@@ -546,6 +579,31 @@ class WatchdogTests(unittest.TestCase):
             self.assertIn("on m5", line)
             episodes = json.loads((home / "state" / "serving-truth" / alarm.STATE_NAME).read_text())
             self.assertEqual(list(episodes["episodes"]), ["host_queued_no_job_start:m5"])
+
+    def test_an_open_episode_is_reported_once_not_every_pass(self) -> None:
+        # m1, 2026-10-16: the same trip was logged at 03:11, 03:16 and 03:22,
+        # because its evidence stays in the lookback.
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lane = home / "state" / "macos-fleet" / "pulp-gate"
+            lane.mkdir(parents=True)
+            signal = "INT/TERM quarantine=signal_teardown_unknown"
+            (lane / "events.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
+                row(BASE - 600, "job_assigned", runner="m5-pulp-gate-01"),
+                row(BASE - 30, "supervisor_signal", runner="m5-pulp-gate-01", detail=signal))))
+            env = {"TARTCI_HOME": str(home), "TARTCI_HOST_ID": "m5",
+                   "TARTCI_ADVERTISED_LABELS": str(FIX / "gate_job_demand" / "advertised-labels.json")}
+            lines = []
+            for at in (BASE, BASE + 300, BASE + 600):
+                with mock.patch.dict("os.environ", env, clear=True), \
+                        mock.patch.object(watchdog, "utcnow", return_value=at), \
+                        mock.patch.object(alarm, "fetch_demand", lambda cli, adv, me, now: ([], [])):
+                    lines.append(watchdog.serving_truth_pass())
+            self.assertIn("1 rule trip(s) on m5 (lane_death_by_signal), evidence recorded", lines[0])
+            self.assertEqual(lines[1:], [None, None])
+            episodes = json.loads((home / "state" / "serving-truth" / alarm.STATE_NAME).read_text())
+            self.assertEqual(list(episodes["episodes"]), ["lane_death_by_signal:m5"])
 
     def test_a_failed_demand_read_is_a_warn_line(self) -> None:
         # A blind demand read reads as "no demand" to every rule; this line is
