@@ -44,6 +44,8 @@ PS_TREE = textwrap.dedent("""\
       301   300 /Users/x/actions-runner/bin/Runner.Worker spawnclient 1 2
       400     1 /bin/bash /Users/x/tartci/providers/qemu-windows/runner.sh --loop
       401   400 /opt/homebrew/bin/qemu-system-aarch64 -M virt -accel hvf -drive file=w.qcow2
+      500   450 /opt/homebrew/bin/tart run --no-graphics lv2repro-pulpimpl
+      450     1 -zsh
     """)
 
 
@@ -170,6 +172,28 @@ class LaneBusyProbeTests(unittest.TestCase):
             self.assertEqual(idle.state, lane_busy.IDLE)
             table = {1: (0, "sup"), 2: (1, "qemu-img convert a b"), 3: (1, "grep qemu-system")}
             self.assertIsNone(lane_busy.find_worker(1, table))
+
+    def test_a_foreign_vm_and_its_lease_never_make_a_lane_busy(self) -> None:
+        # A manual repro VM (m1, 2026-10-16: lv2repro-pulpimpl, started from an
+        # agent's shell) is neither a descendant of any lane supervisor nor
+        # holding a lease from one, so it can never hold up a drain.
+        with tempfile.TemporaryDirectory() as td:
+            host = FakeHost(Path(td))
+            host.loaded(SIBLING, 200)
+            foreign = [{"id": "vm-manual-lv2repro", "command_kind": "tart-linux-vm",
+                        "pid": 500, "vm_name": "lv2repro-pulpimpl"}]
+            old = os.environ["PATH"]
+            os.environ["PATH"] = f"{host.bin}:{old}"
+            try:
+                (row,) = lane_busy.probe([SIBLING], agents_dir=host.agents, leases=foreign)
+                self.assertEqual(row.state, lane_busy.IDLE, row.detail)
+                # Control, same instrument: the same lease held by the lane's
+                # own descendant makes it busy.
+                own = [dict(foreign[0], pid=201)]
+                (row,) = lane_busy.probe([SIBLING], agents_dir=host.agents, leases=own)
+                self.assertEqual(row.state, lane_busy.BUSY, row.detail)
+            finally:
+                os.environ["PATH"] = old
 
     def test_absent_is_absent_and_other_print_errors_are_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as td:
