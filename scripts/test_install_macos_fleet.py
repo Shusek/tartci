@@ -270,6 +270,11 @@ class InstallMacosFleetTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         subprocess.run(["git", "init", "-q", str(self.support_source)], check=True)
+        # No background gc: a detached auto-gc after the fixture commit repacks
+        # .git/objects while tearDown walks it ("Directory not empty").
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false")):
+            subprocess.run(["git", "-C", str(self.support_source), "config", key, value],
+                           check=True)
         subprocess.run(["git", "-C", str(self.support_source), "config", "user.email", "test@example.com"], check=True)
         subprocess.run(["git", "-C", str(self.support_source), "config", "user.name", "Test"], check=True)
         subprocess.run([
