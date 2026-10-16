@@ -95,6 +95,13 @@ The branch is published for review at
 `feat/private-profile-source-refresh-20261016`. It has not been merged or
 installed on a fleet host.
 
+The current private repository tree was rechecked after implementation. It
+still contains only `machines/<host>/tartci/config/` snapshots and no
+`profiles/` export or `fleet/advertised-labels.json`. The live m3 profile could
+not be collected because its configured SSH key is rejected. A partial export
+from the reachable hosts would omit capacity and routing authority, so it is
+not being created or rolled out.
+
 ## Stop conditions
 
 Stop and retain the public default if the private authority remains redacted,
