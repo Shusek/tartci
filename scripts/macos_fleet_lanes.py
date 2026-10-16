@@ -247,6 +247,55 @@ def interpreter_changed_by_os(receipt_path: Path, recorded: object, current: dic
     return None
 
 
+# The reviewed merged-main-v1 authority. Paths come from the (private) profile;
+# these are the limits any profile's values must stay within.
+WORKTREE_CLEANUP_FIXED = {"provider": "merged-main-v1", "repo": "Generous-Corp/pulp",
+                          "main_ref": "origin/main"}
+WORKTREE_CLEANUP_CAPS = {"max_trees": 8, "max_gib": 512, "timeout_seconds": 300}
+WORKTREE_CLEANUP_COOLDOWN = (3600, 86400)
+WORKTREE_CLEANUP_HOST = "studio"
+
+
+def _canonical_volume_path(value: object, depth: int) -> PurePosixPath | None:
+    """value as /Volumes/<volume>/... at least `depth` parts deep, or None."""
+    if not isinstance(value, str) or not value.startswith("/Volumes/"):
+        return None
+    path = PurePosixPath(value)
+    if (str(path) != value or ".." in path.parts or "." in path.parts
+            or len(path.parts) < depth):
+        return None
+    return path
+
+
+def worktree_cleanup_problem(cleanup: object, host: dict) -> str | None:
+    """Why a profile's worktree_cleanup table is outside the reviewed limits."""
+    if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
+        return "worktree_cleanup must declare the complete strict contract"
+    if (any(cleanup.get(key) != value for key, value in WORKTREE_CLEANUP_FIXED.items())
+            or type(cleanup.get("apply")) is not bool):
+        return "worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract"
+    for key, cap in WORKTREE_CLEANUP_CAPS.items():
+        if type(cleanup.get(key)) is not int or not 1 <= cleanup[key] <= cap:
+            return f"worktree_cleanup.{key} must be an integer from 1 to {cap}"
+    low, high = WORKTREE_CLEANUP_COOLDOWN
+    if type(cleanup.get("cooldown_seconds")) is not int or not low <= cleanup["cooldown_seconds"] <= high:
+        return f"worktree_cleanup.cooldown_seconds must be an integer from {low} to {high}"
+    # prefix: /Volumes/<volume>/<dir> at least; primary strictly inside it.
+    prefix = _canonical_volume_path(cleanup.get("prefix"), 4)
+    primary = _canonical_volume_path(cleanup.get("primary"), 5)
+    if prefix is None or primary is None:
+        return ("worktree_cleanup.prefix and .primary must be canonical absolute paths "
+                "below an external volume root (/Volumes/<volume>/<dir>)")
+    if prefix not in primary.parents:
+        return "worktree_cleanup.primary must be inside worktree_cleanup.prefix"
+    tart_home = _canonical_volume_path(host.get("tart_home"), 4)
+    if host.get("id") != WORKTREE_CLEANUP_HOST or tart_home is None:
+        return "worktree_cleanup is restricted to the private M3 profile"
+    if tart_home.parts[:3] != prefix.parts[:3]:
+        return "worktree_cleanup.prefix must be on the same volume as host.tart_home"
+    return None
+
+
 def fail(message: str) -> None:
     raise ValueError(message)
 
@@ -547,20 +596,9 @@ def load(path: Path) -> dict:
         fail("launch_helper is reserved for an external-volume Tart home")
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None:
-        expected = {
-            "provider": "merged-main-v1", "repo": "Generous-Corp/pulp",
-            "primary": "/Volumes/Workshop/Code/pulp",
-            "prefix": "/Volumes/Workshop/Code", "main_ref": "origin/main",
-            "apply": False, "max_trees": 8,
-            "max_gib": 512, "timeout_seconds": 300, "cooldown_seconds": 3600,
-        }
-        if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
-            fail("worktree_cleanup must declare the complete strict contract")
-        expected["apply"]=cleanup.get("apply")
-        if cleanup != expected or type(cleanup.get("apply")) is not bool:
-            fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
-        if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
-            fail("worktree_cleanup is restricted to the private M3 profile")
+        problem = worktree_cleanup_problem(cleanup, host)
+        if problem:
+            fail(problem)
     if "mise" in data:
         # The pinned mise binary (scripts/mise_pin.py); the installer verifies
         # the binary itself before writing any LaunchAgent.
@@ -2670,6 +2708,7 @@ def lane_plist(
             "TARTCI_WORKTREE_CLEANUP_MAX_GIB": str(cleanup["max_gib"]),
             "TARTCI_WORKTREE_CLEANUP_TIMEOUT_SECS": str(cleanup["timeout_seconds"]),
             "TARTCI_WORKTREE_CLEANUP_COOLDOWN_SECS": str(cleanup["cooldown_seconds"]),
+            "TARTCI_WORKTREE_CLEANUP_TART_HOME": host["tart_home"],
         })
     github_app = data.get("github_app")
     if github_app is not None:

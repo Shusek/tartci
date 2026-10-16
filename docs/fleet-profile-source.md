@@ -16,9 +16,80 @@ The source directory must contain:
 ```text
 profiles/*-macos-fleet.toml
 fleet/advertised-labels.json
+.tartci-fleet-source.json
 ```
 
-TartCI validates the source and its generated profile digest before reading it. If an explicit source
+The last file is the export marker. It names the repository and commit and the
+git blob id of every other file, and it is written when the source is exported
+at that commit. A file cannot name the commit that contains it, so the marker,
+not `generated_from.commit` in the published supply, proves which commit the
+directory holds. `generated_from.repo` and `.commit` are informational;
+`generated_from.profiles_sha256` must still match the profiles.
+
+## Self-update keeps the source
+
+Name the private repository in `~/.config/tartci/self-update.toml`:
+
+```toml
+[fleet_source]
+repository = "ORG/private-fleet-authority"
+canary = "m1"          # the host that installs a new source commit first
+```
+
+Every host names the same canary. Without a canary the setting refuses; a
+`[fleet_source]` that is not a table, or has another key, refuses the run as a
+configuration error.
+
+A move is one host first:
+
+- The canary adopts the repository's `main`. When a self-update installs that
+  commit and verifies the host (pool on and its checks), it records
+  `{repository, commit, verified_at}` in
+  `~/.tartci/state/self-update/fleet-source-verified.json`.
+- Every other host reads that record from the canary over SSH, aged on the
+  canary's clock. It adopts the canary's commit once it has served there for
+  30 minutes, and otherwise stays on the commit it was installed from (or on
+  the public profiles if it has never used the private source).
+- A commit the canary fails to install or verify is never recorded, so no
+  other host moves to it. A failed reinstall is not retried within the
+  self-update rate limit (6 h).
+
+Each self-update run then:
+
+1. reads the selected commit through the GitHub API, using the same `ghapp
+   api` path as the TartCI repository, so no git credential is needed;
+2. exports `profiles/*-macos-fleet.toml` and `fleet/advertised-labels.json` at
+   that commit into `~/.local/share/tartci/fleet-sources/<commit>/`, checking
+   each file against its blob id, and makes the export read-only;
+3. selects it by setting the three variables above for itself and for the
+   installer it runs;
+4. reinstalls the current generation when the installed receipt was built from
+   a different source commit.
+
+## Not on a sealed-launcher host
+
+A host with a sealed TartCI Launcher (`[launch_helper]` in its profile: the
+external-volume hosts) refuses `[fleet_source]` before reading the source or
+draining anything. The sealed launcher's policy digest covers the profile, and
+a source move reinstalls the same generation without rebuilding the launcher,
+so the installer would refuse the live launcher after the drain and roll back
+on every turn. The refusal names the cause and the fix (remove
+`[fleet_source]` on that host). A sealed host takes a private source once a
+source move rebuilds the launcher, which launcher v2 makes unnecessary by
+taking the policy out of the app.
+
+A plan (`--plan`) writes and prunes nothing: it uses an export that already
+exists and otherwise reports that an apply would export it.
+
+Exports are immutable per commit, so an agent installed from one commit keeps
+reading its own directory while a newer commit is exported beside it. The
+newest three exports and the installed one are kept.
+
+Once the setting is present, an unreadable or damaged source refuses the run
+(`UNKNOWN`, recorded in `skew.json`); it never falls back to the public
+profiles. Without the setting nothing changes.
+
+TartCI validates the source, its export marker and its generated profile digest before reading it. If an explicit source
 is missing, empty, or invalid, the command fails. It does not silently use the
 public checkout instead. `TARTCI_FLEET_SOURCE_COMMIT` and
 `TARTCI_FLEET_SOURCE_REPOSITORY` are required for an external source. They
