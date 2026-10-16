@@ -227,9 +227,14 @@ class Plan(Case):
             (source / "profiles").mkdir()
             (source / "profiles" / "canary-macos-fleet.toml").write_text("schema = 1\n")
             (source / "fleet").mkdir()
+            digest = sa.fleet_source.FleetSource(
+                source, source / "profiles", source / "fleet" / "advertised-labels.json", True
+            ).profiles_sha256
             (source / "fleet" / "advertised-labels.json").write_text(
                 '{"schema":"tartci.advertised-labels/v1",'
-                '"generated_from":{},"registrations":[]}\n')
+                f'"generated_from":{{"repo":"danielraffel/pulp-planning",'
+                f'"profiles":["profiles/canary-macos-fleet.toml"],'
+                f'"profiles_sha256":"{digest}"}},"registrations":[]}}\n')
             values = {
                 "TARTCI_FLEET_SOURCE_ROOT": str(source),
                 "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,

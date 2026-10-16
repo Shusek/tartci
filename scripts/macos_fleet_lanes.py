@@ -3026,11 +3026,11 @@ def published_snapshot(root: Path | None = None) -> dict:
     """
     root = root or TARTCI_ROOT
     source = fleet_source.resolve(root, allow_environment=root == TARTCI_ROOT)
-    paths = fleet_profiles(root)
+    paths = sorted(source.profiles_dir.glob(FLEET_PROFILE_GLOB))
     if not paths:
         raise ValueError(f"no macOS fleet profiles found under {source.profiles_dir}")
     snapshot = advertised_labels_snapshot(
-        paths, source.source_commit if source.configured else None, root,
+        paths, source.source_commit if source.configured else None, source.root,
         source.repository or ADVERTISED_LABELS_REPO)
     if not snapshot["registrations"] and not snapshot["hosts"]:
         raise ValueError("fleet source publishes no registrations or hosts")
