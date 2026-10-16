@@ -1,12 +1,28 @@
-# tartci runbook — from-scratch setup (macOS + Linux + Windows)
+# tartci runbook: set up a host and serve CI jobs
 
-This is the honest, command-first guide to standing up local CI build VMs on a
-fresh Apple Silicon Mac. It mirrors the proven bring-up: **Linux + macOS on Tart
-(Apple Virtualization), Windows on standalone QEMU** (AVF can't install Windows).
+This guide covers a new Apple Silicon host, the VM images it needs, and the
+commands that serve GitHub Actions jobs. It includes three lanes:
 
-What's **scripted** vs **manual** is called out per section. Where a wrapper
-exists (`./tartci up <os>`), use it; where it doesn't yet, the raw commands here
-are the ground truth.
+- macOS and Linux guests through Tart and Apple Virtualization.
+- Windows guests through QEMU and Hypervisor.framework.
+- Optional x86_64 smoke tests through emulation. These do not replace a native
+  x86_64 check on GitHub-hosted hardware.
+
+Start with `tartci doctor`, then `tartci setup`. Use the command that matches
+what you need:
+
+| Command | Use it for |
+| --- | --- |
+| `tartci prepare linux` | Build the repository's Pulp-oriented Linux golden. |
+| `tartci prepare macos <subcommand>` | Inspect, resize, tag, or check a macOS golden. It does not build a complete macOS golden. |
+| `tartci windows golden` | Snapshot and tag a prepared Windows QEMU VM as a golden. |
+| `tartci up <os>` | Run one build directly, then remove its VM. |
+| `tartci serve <os>` | Serve GitHub Actions jobs. The default is one disposable VM per job; selected macOS lanes can use warm mode. |
+
+The sections below separate commands TartCI runs from steps that still require
+manual provisioning. Where a TartCI wrapper exists, use it; the remaining
+steps are manual procedures. The images stay on the host and are never
+committed.
 
 Conventions used below (no operator-specific data — substitute your own):
 
@@ -604,7 +620,7 @@ golden is never mutated; all per-run state lives in the disposable clone.
 
 ---
 
-## 3. Linux lane (Tart) — the easy, fully-proven win
+## 3. Linux lane (Tart)
 
 End-to-end: pull base → bump resources → durable keys + mounts → deps → Skia →
 build → test. Native arm64 builds at full speed; x64 is cross+emulate (§3.8).
@@ -838,7 +854,7 @@ fails closed.
 
 ---
 
-## 4. Windows lane (QEMU) — the hard-won recipe
+## 4. Windows lane (QEMU)
 
 AVF can't install Windows (no inbox virtio-blk driver → 0 bytes written; black
 installer display), so Windows is **first-class on standalone QEMU/hvf**, not a
@@ -3445,6 +3461,115 @@ non-gate budget), **not** a redundant safety patch. Do **not** "pin
 acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
 reserve. Keep the override (or remove it for a linux lane sized to the full
 12-core budget); either way the clamp keeps the gate safe.
+## Host hygiene: disk floor and foreign VMs
+
+The watchdog runs two report-only checks (`scripts/host_hygiene.py`). They
+never delete or stop anything. They run only on a host where
+`~/.config/tartci/host-hygiene.enabled` exists. Enable one host at a time: m1
+first, then m5, m3 and m5s, one per day.
+
+- **Disk floor.** The volumes that hold `$HOME` and the VM store must keep 20%
+  and 200 GB free. Below either, the log shows `WARN host-disk` and one issue
+  opens: `[tartci] <host> is below its disk floor: <N> GB free (<P>%)`
+  (`host_disk_floor`). The issue lists the top consumers with their sizes and
+  the command to reclaim each:
+  - `~/agent-scratch`, `~/agent-worktrees` and `~/Code/agent-worktrees`.
+    Their owners remove these; use `git worktree remove`, never `rm -rf`.
+  - Both Tart stores.
+  - The build trees. `tartci reclaim --fix` is the only automatic reclaim.
+
+  Sizes are measured at most every 6 h. The issue closes when the floor holds
+  again.
+- **Foreign VMs.** Hourly, the VM store and `~/.tart` are judged with the
+  image pruner's own ownership rule (`tart_image_prune.plan()`):
+  - An image is reported only when that plan would delete it. Every
+    `:latest` tag, golden, Pulp vm-image manifest image, newest rollback, and
+    image a tartci file names is tartci's.
+  - A non-image VM is reported when it is not this host's lane clone,
+    nothing tartci installed names it, and it has been running more than
+    4 h or stopped more than 14 days.
+
+  It opens one issue: `[tartci] <host> has <N> VM(s) nothing tartci uses`
+  (`host_foreign_vms`), with name, store, state, age, size and reason, plus
+  stop and delete commands for an operator to run after the owner agrees.
+  If the fleet profile is unreadable, nothing is judged. A store that cannot
+  be judged is logged as `WARN foreign-vms: could not list <store>`.
+- **Measuring cost.** `du` runs as a background task (`taskpolicy -b`), with
+  one 300 s deadline for the whole measurement inside the heal pass.
+
+```sh
+touch ~/.config/tartci/host-hygiene.enabled
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
+ls ~/.tartci/state/host-hygiene/      # consumers.json, foreign-vms.json
+```
+
+## Scratch VMs for agents
+
+`tartci scratch-vm` is the only sanctioned way for an agent, or a person, to
+make a test VM on a fleet host. A VM made any other way has no owner and no
+end: on 2026-10-16 an agent's repro VM ran on m1 for 11 h.
+
+```sh
+tartci scratch-vm create --owner <agent> --ttl <hours> [--from IMAGE] [--name scratch-...]
+TART_HOME=<store it prints> tart run <name>
+tartci scratch-vm list                       # owner, expiry, minutes left
+tartci scratch-vm extend <name> --ttl <hours> # a new TTL from now
+tartci scratch-vm delete <name>               # when done, before the TTL
+```
+
+- The TTL is at most 72 h.
+- The VM lives in the host's VM store, so the lanes' disk and VM-cap checks
+  count it.
+- Its record is `~/.tartci/state/scratch-vms/<name>.json`.
+- 30 minutes before the TTL, the watchdog logs `WARN scratch-vm: <name>
+  (owner X) is stopped and deleted at <time>`. At the TTL it stops and deletes
+  the VM, then the record. A failed delete keeps the record and retries on the
+  next pass.
+- Only VMs with such a record are ever touched, and only when the record's own
+  name starts with `scratch-`.
+- `tartci scratch-vm enforce --dry-run` prints what the next pass would warn
+  about or delete.
+- The default image is pinned by digest
+  (`ghcr.io/cirruslabs/ubuntu@sha256:cb46e376...`); pass `--from` for a local
+  golden.
+
+## Leaked lane clones
+
+`vm_reap` deletes a stopped clone of a loaded lane, `<runner>-<pid>-<n>`,
+once its supervisor is gone and no state file or lease names it.
+
+A clone left by a retired lane is a separate case. It is deleted only when
+every one of these holds:
+
+- **The retired lane's own state record names it.** A file
+  `~/.tartci/state/<lane>/*.state.json` records exactly that VM, a `tart-*`
+  provider, the same runner and the same supervisor pid. A name alone proves
+  nothing: an agent's `pulp-m1-repro-20261016-1` is kept. m1 had kept
+  `pulp-preamble-m1-target-06-99292-1` for two months, and its lane's state
+  file still recorded it.
+- **The name is shaped like this host's clone.** The runner carries the host
+  id as one of its words, and starts with an allowed CI prefix or the host id.
+- **Nothing tartci owns claims it.** It is not an image (no `:` tag), and the
+  image pruner's ownership rule does not claim it: the fleet profile, a
+  tartci config file or a LaunchAgent does not name it. An unreadable profile
+  keeps everything.
+- **It is truly abandoned.** Supervisor gone, no lease, stopped, and untouched
+  for 24 h.
+
+Deleting is off on each host until `~/.config/tartci/reap-retired-clones.enabled`
+exists. Until then the digest lists the clone under
+`orphans.retired_would_delete` and deletes nothing.
+
+Roll out one host per day, in this order: m1, m5, m3, m5s. On each host, run
+the dry run first and check that it names only clones you expect:
+
+```sh
+tartci doctor --reap --dry-run
+touch ~/.config/tartci/reap-retired-clones.enabled
+```
+
+`--dry-run` changes nothing, even combined with `--fix`.
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
