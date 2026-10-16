@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_self_update as su
+import fleet_source
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED = "1" * 40
@@ -64,6 +65,8 @@ class FakeSystem(su.System):
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
         self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
+        self.peer_paused: set[str] = set()   # peers whose self-update an operator paused
+        self.peer_halted: set[str] = set()   # peers whose self-update halted on failures
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
@@ -234,7 +237,11 @@ class FakeSystem(su.System):
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
                       + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
                       + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
-                         if pool_since is not None else ""))
+                         if pool_since is not None else "")
+                      + ("\n" + su.PAUSED_SEPARATOR + "\n"
+                         + ("paused\n" if peer in self.peer_paused else "")
+                         + ("halted\n" if peer in self.peer_halted else "")
+                         if peer in self.peer_paused | self.peer_halted else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -1020,13 +1027,111 @@ class PeerTurnReplayTests(Base):
                       peers_step["detail"])
 
     def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
-        # Control, same instrument: only the drain's age changed.
+        # Control, same instrument: only the drain's age changed. Inside the
+        # grace a self-update's marker may have been written between the reads.
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
-        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.sys.peer_pool_since["m5"] = NOW - 600
         self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
-        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 10 min",
                       su.waiting_ticket(self.cfg)["reason"])
+
+    def test_an_operator_drain_past_the_grace_no_longer_holds_the_turn(self) -> None:
+        # No update marker at all: a self-update writes its marker before it
+        # drains, so this is an operator's drain (a containment drain).
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("an operator drain: no update marker for more than 15 min",
+                      peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_paused_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60       # inside the grace
+        self.sys.peer_paused.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is paused, so no update is in this drain",
+                      peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_halted_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60
+        self.sys.peer_halted.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is halted, so no update is in this drain",
+                      peer["evidence"])
+
+    def test_the_evidence_names_the_rule_that_released_the_peer(self) -> None:
+        # The deferred host's log must say WHICH rule let it go, so an operator
+        # reading it knows whether to look for a pause, a halt or a drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        cases = (({"m5"}, set(), NOW - 60, "self-update is paused,"),
+                 (set(), {"m5"}, NOW - 60, "self-update is halted,"),
+                 ({"m5"}, {"m5"}, NOW - 60, "self-update is halted and paused,"),
+                 (set(), set(), NOW - su.PEER_DRAIN_GRACE_SECONDS - 60,
+                  "an operator drain: no update marker for more than 15 min"))
+        for paused, halted, since, rule in cases:
+            with self.subTest(rule=rule):
+                self.sys.peer_paused = {"m5"} if paused else set()
+                self.sys.peer_halted = set(halted)
+                self.sys.peer_pool_since["m5"] = since
+                evidence = su.read_peer(self.cfg, self.sys, "m5", "m5")["evidence"]
+                self.assertIn(rule, evidence)
+                self.assertIn("left to the capacity floor", evidence)
+
+    def test_the_peer_command_reports_a_pause_and_the_halt_rule_like_halt_reason(self) -> None:
+        # The real marker command, run in a shell against a fixture state dir:
+        # its halted verdict must agree with halt_reason on the same receipts.
+        import subprocess  # noqa: PLC0415
+        state = self.home / "peer" / ".tartci" / "state" / "self-update"
+        (state / "attempts").mkdir(parents=True)
+        env = {"HOME": str(self.home / "peer"), "TARTCI_HOME": str(self.home / "peer/.tartci"),
+               "PATH": "/usr/bin:/bin"}
+
+        def words() -> set[str]:
+            out = subprocess.run(["/bin/bash", "-c", su._PEER_MARKER], env=env,
+                                 capture_output=True, text=True, check=True).stdout
+            return set(out.partition(su.PAUSED_SEPARATOR)[2].split())
+        self.assertEqual(set(), words())
+        for n, status in enumerate(("failed", "rolled_back", "failed")):
+            (state / "attempts" / f"2027010{n}T000000Z.json").write_text(json.dumps(
+                {"mode": "apply", "status": status, "started_at": f"2027-01-0{n + 1}T00:00:00Z"}))
+        self.assertTrue(su.halt_reason(state))
+        self.assertEqual({"halted"}, words())
+        (state / "halt-cleared.json").write_text(json.dumps({"at": "2027-01-02T12:00:00Z"}))
+        self.assertIsNone(su.halt_reason(state))
+        self.assertEqual(set(), words())
+        (state / "scheduled-pause.json").write_text(json.dumps({"at": "x", "reason": "held"}))
+        self.assertEqual({"paused"}, words())
+
+    def test_a_peer_mid_update_still_holds_the_turn_even_paused(self) -> None:
+        # Control: a live update marker wins over the drain's age and the pause.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_NEW, "ts": NOW - 1800}
+        self.sys.peer_pool_since["m5"] = NOW - 2 * 3600
+        self.sys.peer_paused.add("m5")
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is self-updating", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_the_capacity_floor_still_gates_a_turn_past_an_operator_drain(self) -> None:
+        # Control: m5 no longer holds the turn, but this host is the last
+        # server of a required label, so it still may not drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"label": "pulp-build-pr-head", "verdict": "last_serving_host"}]}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        receipt = json.loads(receipts[-1].read_text())
+        self.assertIn("last server of pulp-build-pr-head", json.dumps(receipt))
+        self.assertIn("counted as serving nothing by the capacity floor: m5", json.dumps(receipt))
 
     def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
         # No pool-state time (an old peer, or stat failed): fail closed.
@@ -3496,8 +3601,11 @@ class FleetSourceSyncTests(FleetSourceFixture):
     def test_the_configured_source_is_exported_and_selected(self) -> None:
         selected = su.sync_fleet_source(self.cfg, self.sys)
         root = self.cfg.fleet_source_store / self.fixture.COMMIT
+        source = fleet_source.FleetSource(
+            root, root / "profiles", root / fleet_source.PUBLISHED_SUPPLY, True)
         self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
-                          "root": str(root), "why": "canary: main's head"}, selected)
+                          "root": str(root), "why": "canary: main's head",
+                          **source.provenance}, selected)
         self.assertEqual(str(root), os.environ["TARTCI_FLEET_SOURCE_ROOT"])
         self.assertEqual(self.fixture.COMMIT, os.environ["TARTCI_FLEET_SOURCE_COMMIT"])
         self.assertEqual(self.fixture.PRIVATE, os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"])

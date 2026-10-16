@@ -96,6 +96,12 @@ CODES: tuple[str, ...] = (
     "launchd_timers_ok",
     "launchd_timers_stalled",
     "launchd_timers_unreadable",
+    "launcher_layout_not_applicable",
+    "launcher_layout_unreadable",
+    "launcher_layout_v1",
+    "launcher_layout_v2",
+    "launcher_opt_in_missing",
+    "launcher_opt_in_refused",
     "lease_fit_ok",
     "lease_fit_unmeasured",
     "no_installed_profile",
@@ -1033,6 +1039,34 @@ def check_python_pin(pin: Path, *, managed: bool) -> Finding:
     return Finding("python_pin", OK, "python_pin_ok", f"pinned interpreter {value}", facts)
 
 
+def check_launcher_layout(value: dict | None) -> Finding:
+    """Which launcher layout this host runs (v1 or v2) and its v2 opt-in file
+    (scripts/launcher_layout.py)."""
+    check = "launcher_layout"
+    if not isinstance(value, dict):
+        return Finding(check, UNKNOWN, "launcher_layout_unreadable",
+                       "the install receipt or the v2 opt-in file could not be read")
+    facts = {key: value.get(key) for key in ("layout", "opt_in", "opt_in_path")}
+    if value.get("opt_in") == "refused":
+        return Finding(check, PROBLEM, "launcher_opt_in_refused",
+                       value.get("problem") or "the v2 opt-in file is refused", facts)
+    if value.get("problem"):
+        return Finding(check, PROBLEM, "launcher_opt_in_missing", value["problem"], facts)
+    layout = value.get("layout")
+    if layout is None:
+        return Finding(check, NOT_APPLICABLE, "launcher_layout_not_applicable",
+                       "no launch helper is installed on this host"
+                       + ("; the v2 opt-in file is present but unused"
+                          if value.get("opt_in") == "present" else ""), facts)
+    if layout == "v2":
+        return Finding(check, OK, "launcher_layout_v2",
+                       "launcher v2: lanes run the signed launch set the pointer names", facts)
+    return Finding(check, OK, "launcher_layout_v1",
+                   "launcher v1" + ("; v2 opt-in present: the next install moves this host "
+                                    "to v2, a launcher change that needs its approval and grant"
+                                    if value.get("opt_in") == "present" else ""), facts)
+
+
 def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | None = None
                           ) -> tuple[list[dict] | None, str]:
     """(rows, error) for every loaded job with a tartci label, read from launchd."""
@@ -1709,6 +1743,12 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     findings.append(check_python_pin(
         Path(os.environ.get("TARTCI_PYTHON_PIN") or home / ".config" / "tartci" / "python.pin"),
         managed=config.is_file()))
+    try:
+        import launcher_layout
+        launcher_value = launcher_layout.status(home, launcher_layout.read_receipt(receipt_path))
+    except Exception:  # noqa: BLE001 - reported as unreadable
+        launcher_value = None
+    findings.append(check_launcher_layout(launcher_value))
     if reclaim_value is None:
         try:
             import reclaim_status

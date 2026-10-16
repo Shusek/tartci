@@ -131,6 +131,12 @@ def export(api: Api, repository: str, commit: str, tree: str, store: Path) -> Pa
             target = staging / entry["path"]
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
+        if fleet_source.tomllib is None:
+            raise SyncError("fleet source export requires Python 3.11+ TOML support")
+        for profile in sorted((staging / "profiles").glob(fleet_source.PROFILE_GLOB)):
+            problem = fleet_source._profile_problem(profile)
+            if problem:
+                raise SyncError(f"exported profile is invalid: {problem}")
         fleet_source.write_marker(staging, repository, commit)
         problem = fleet_source.marker_problem(staging, repository, commit)
         if problem:

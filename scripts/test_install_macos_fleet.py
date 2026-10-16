@@ -1778,6 +1778,183 @@ class InstallMacosFleetTests(unittest.TestCase):
                     Path(fixture["support"]["root"]),
                 )
 
+    # Launcher v2 (scripts/launcher_layout.py, scripts/launch_set.py).
+
+    V2_SIGNING = ("--launch-set-identity", "Developer ID Application: Example",
+                  "--launch-set-keychain", "/nonexistent/signing.keychain-db")
+
+    def opt_in(self, mode: int = 0o600) -> Path:
+        path = self.home / ".config/tartci/launcher-v2.enabled"
+        path.write_text("")
+        path.chmod(mode)
+        return path
+
+    def mark_receipt(self, launch_helper: dict) -> None:
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["launch_helper"] = launch_helper
+        receipt_path.write_text(json.dumps(receipt))
+
+    def test_a_sealed_host_without_the_opt_in_plans_v1_unchanged(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        self.mark_receipt({"schema": 1})
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher_layout=v1 installed=v1", result.stdout)
+        self.assertNotIn("launcher_change", result.stdout)
+
+    def test_the_opt_in_plans_v2_and_names_the_launcher_change(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        self.mark_receipt({"schema": 1})
+        self.opt_in()
+        result = self.run_installer(*self.V2_SIGNING)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher_layout=v2 installed=v1", result.stdout)
+        self.assertIn("launcher_change=v1->v2", result.stdout)
+        self.assertIn("approval digest and the Removable Volumes grant", result.stdout)
+
+    def test_v2_refuses_in_the_plan_without_the_signing_keychain(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        self.opt_in()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--launch-set-keychain", result.stderr)
+        self.assertNotIn("install plan", result.stdout)
+
+    def test_signing_options_are_refused_for_a_v1_install(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        result = self.run_installer(*self.V2_SIGNING)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("only for launcher v2", result.stderr)
+
+    def test_an_untrusted_opt_in_refuses_the_install(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        self.opt_in(0o666)
+        result = self.run_installer(*self.V2_SIGNING)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("group- or world-writable", result.stderr)
+
+    def test_a_v2_host_that_lost_its_opt_in_refuses_with_the_downgrade_step(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        self.mark_receipt({"schema": 2, "layout": "v2"})
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("--launcher-layout v1", result.stderr)
+        self.assertIn("never flips back silently", result.stderr)
+        result = self.run_installer("--launcher-layout", "v1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher_change=v2->v1", result.stdout)
+
+    def test_the_layout_option_needs_a_launch_helper_profile(self) -> None:
+        result = self.run_installer("--launcher-layout", "v2")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("without launch_helper", result.stderr)
+        result = self.run_installer("--launcher-layout", "v3")
+        self.assertEqual(result.returncode, 2)
+
+    def test_a_v2_install_verifies_the_stable_app_not_the_v1_lanes(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        bundle = self.home / ".local/libexec/TartCILauncher.app"
+        lanes_path = bundle / "Contents/Resources/lanes.json"
+        lanes = json.loads(lanes_path.read_text())
+        next(iter(lanes["lanes"].values()))["environment"]["TARTCI_PYTHON"] = "/wrong/python"
+        lanes_path.write_text(json.dumps(lanes))
+        self.opt_in()
+        result = self.run_installer("--apply", "--launch-helper-source", str(bundle),
+                                    *self.V2_SIGNING)
+        self.assertNotEqual(result.returncode, 0)
+        # v1's sealed-lanes check is not v2's: a v2 app carries no lanes, and
+        # the v1 bundle is refused as a v2 app instead.
+        self.assertNotIn("launch helper lanes are missing pinned interpreter", result.stderr)
+        self.assertIn("macos launcher identity rejected", result.stderr)
+        self.assertFalse((self.home / ".config/tartci/launcher-generation.json").exists())
+
+    def v2_receipt_fixture(self) -> tuple[dict, Path]:
+        """A real install, then a v2 app record and a pointer at its generation.
+
+        The Developer ID checks (the app's own signature, the set's detached
+        one) are substituted: a test cannot mint one."""
+        import launch_set  # noqa: PLC0415
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        bundle = self.home / ".local/libexec/TartCILauncher.app"
+        shutil.rmtree(bundle / fleet.SEALED_SUPPORT)
+        (bundle / fleet.SEALED_METADATA).unlink()
+        policy = self.home / ".config/tartci/launcher-generation.json"
+        (bundle / "Contents/Resources/policy.json").write_text(json.dumps(
+            {"schema": 2, "pointer": str(policy)}))
+        support = fixture["support"]
+        generation = Path(support["root"])
+        generations = generation.parent
+        for directory in (generation, generation / "bin"):
+            if directory.is_dir():
+                directory.chmod(0o755)
+        launch_set.write_runtime(generation, "/usr/bin/python3")
+        lanes = {}
+        for plist in self.agents.glob("*macos-fleet*.plist"):
+            env = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
+            lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": {
+                key: value for key, value in env.items()
+                if key not in ("TARTCI_PYTHON", "SHIPYARD_GHAPP_PYTHON_BINARY")}}
+        launch_set.write(generation, launch_set.build(
+            generation, lanes, tart_home="/Volumes/Example/VMs", python="/usr/bin/python3",
+            sequence=3))
+        (generation / launch_set.SIG_NAME).write_text("signature\n")
+        launch_set.freeze(generation)
+        policy.write_text(json.dumps({"schema": 1, "generation": str(generation)}))
+        return fixture, generations
+
+    def write_v2_receipt(self, fixture: dict) -> dict:
+        support = fixture["support"]
+        app = {"schema": 2, "layout": "v2", "path": str(self.home / ".local/libexec/TartCILauncher.app")}
+        with mock.patch.object(macos_launcher_identity, "verify_v2", return_value=dict(app)):
+            fleet.write_receipt(
+                fixture["config"], self.agents, fixture["output"],
+                Path(support["root"]), Path(support["manifest_path"]),
+                Path(support["entrypoint"]["path"]), Path(support["entrypoint"]["path"]),
+                Path(support["launch_entrypoint"]["path"]), support["source_commit"],
+                "v2",
+            )
+        return json.loads(fixture["output"].read_text())
+
+    def test_a_v2_receipt_records_the_app_and_the_launch_set_it_runs(self) -> None:
+        fixture, _ = self.v2_receipt_fixture()
+        receipt = self.write_v2_receipt(fixture)
+        helper = receipt["launch_helper"]
+        self.assertEqual("v2", helper["layout"])
+        self.assertEqual(3, helper["launch_set"]["sequence"])
+        self.assertEqual(fixture["support"]["root"], helper["launch_set"]["generation"])
+        self.assertEqual(64, len(helper["launch_set"]["set_sha256"]))
+
+    def test_a_v2_pointer_at_another_generation_fails_the_receipt(self) -> None:
+        fixture, generations = self.v2_receipt_fixture()
+        pointer = self.home / ".config/tartci/launcher-generation.json"
+        pointer.write_text(json.dumps({"schema": 1, "generation": str(generations / "other")}))
+        with self.assertRaisesRegex(ValueError, "pointer .* does not name the installed generation"):
+            self.write_v2_receipt(fixture)
+        self.assertFalse(fixture["output"].exists())
+
+    def test_a_v2_set_that_no_longer_verifies_fails_verify_installed(self) -> None:
+        fixture, _ = self.v2_receipt_fixture()
+        receipt = self.write_v2_receipt(fixture)
+        app = {key: receipt["launch_helper"][key] for key in ("schema", "layout", "path")}
+        verify = lambda: fleet.verify_receipt(  # noqa: E731
+            fixture["output"], fixture["config"], self.agents, Path(fixture["support"]["root"]))
+        with mock.patch.object(macos_launcher_identity, "verify_v2", return_value=dict(app)):
+            verify()
+            generation = Path(fixture["support"]["root"])
+            generation.chmod(0o755)
+            (generation / "stray").write_text("x")
+            generation.chmod(0o555)
+            with self.assertRaisesRegex(ValueError, "launch set does not verify"):
+                verify()
+
 
 if __name__ == "__main__":
     unittest.main()

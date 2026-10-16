@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import os
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -66,6 +68,13 @@ class FleetSourceTests(unittest.TestCase):
             self.assertEqual(root.resolve(), source.root)
             self.assertFalse(source.configured)
 
+    def test_valid_source_remains_selectable_without_tomllib(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(fleet_source, "tomllib", None):
+            root = Path(td)
+            os.environ.update(configured_source(root))
+            source = fleet_source.resolve(Path("/public"))
+            self.assertEqual(root.resolve(), source.root)
+
     def test_explicit_source_requires_profiles_and_published_supply(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -106,6 +115,8 @@ class FleetSourceTests(unittest.TestCase):
             self.assertEqual("ORG/private-fleet-authority", source.repository)
             self.assertRegex(source.tree_sha256, r"^[0-9a-f]{64}$")
             self.assertRegex(source.published_supply_sha256, r"^[0-9a-f]{64}$")
+            self.assertEqual({"tree_sha256", "profiles_sha256", "published_supply_sha256"},
+                             set(source.provenance))
 
     def _exported(self, root, *, commit="a" * 40, generated_commit=None):
         (root / "profiles").mkdir()
@@ -150,12 +161,37 @@ class FleetSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "provenance"):
                 fleet_source.resolve(Path("/public"))
 
+    def test_explicit_source_rejects_malformed_repository(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._exported(root)
+            os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "not-a-repository"
+            with self.assertRaisesRegex(ValueError, "OWNER/REPOSITORY"):
+                fleet_source.resolve(Path("/public"))
+
     def test_a_source_without_its_export_marker_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             self._exported(root)
             (root / fleet_source.MARKER).unlink()
             with self.assertRaisesRegex(ValueError, "no readable"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_non_utf8_marker_is_refused_cleanly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._exported(root)
+            (root / fleet_source.MARKER).write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(ValueError, "no readable"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_non_utf8_published_supply_is_refused_cleanly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            supply = self._exported(root)
+            supply.write_bytes(b"\xff\xfe")
+            fleet_source.write_marker(root, "ORG/private-fleet-authority", "a" * 40)
+            with self.assertRaisesRegex(ValueError, "invalid published supply"):
                 fleet_source.resolve(Path("/public"))
 
     def test_a_file_edited_after_export_is_refused(self):
@@ -180,8 +216,93 @@ class FleetSourceTests(unittest.TestCase):
             value["generated_from"]["profiles_sha256"] = fleet_source.FleetSource(
                 root, root / "profiles", supply, True).profiles_sha256
             supply.write_text(json.dumps(value) + "\n")
-            with self.assertRaisesRegex(ValueError, "files differ"):
+            with self.assertRaisesRegex(ValueError, "profile list does not match|files differ"):
                 fleet_source.resolve(Path("/public"))
+
+    def test_profile_metadata_must_name_the_exact_exported_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            supply = self._exported(root)
+            value = json.loads(supply.read_text())
+            value["generated_from"]["profiles"].append("profiles/ghost-macos-fleet.toml")
+            supply.write_text(json.dumps(value) + "\n")
+            # Re-export the marker so the failure comes from metadata, not a
+            # post-export edit of the published supply.
+            fleet_source.write_marker(root, "ORG/private-fleet-authority", "a" * 40)
+            with self.assertRaisesRegex(ValueError, "profile list does not match"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_a_profile_that_is_not_toml_is_refused(self):
+        if fleet_source.tomllib is None:
+            self.skipTest("Python 3.9 validates immutable exports at sync time")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "profiles").mkdir(parents=True)
+            (root / "profiles" / "canary-macos-fleet.toml").write_text("schema = [\n")
+            (root / "fleet").mkdir()
+            supply = root / "fleet" / "advertised-labels.json"
+            digest = fleet_source.FleetSource(
+                root, root / "profiles", supply, True).profiles_sha256
+            supply.write_text(json.dumps({
+                "schema": "tartci.advertised-labels/v1", "registrations": [],
+                "generated_from": {
+                    "repo": "ORG/private-fleet-authority", "commit": "a" * 40,
+                    "profiles": ["profiles/canary-macos-fleet.toml"],
+                    "profiles_sha256": digest,
+                },
+            }) + "\n")
+            fleet_source.write_marker(root, "ORG/private-fleet-authority", "a" * 40)
+            os.environ.update({
+                "TARTCI_FLEET_SOURCE_ROOT": str(root),
+                "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+                "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
+            })
+            with self.assertRaisesRegex(ValueError, "profile is invalid"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_symlinked_source_files_are_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            os.environ.update(configured_source(root))
+            profile = root / "profiles" / "canary-macos-fleet.toml"
+            profile.unlink()
+            profile.symlink_to(Path(__file__))
+            with self.assertRaisesRegex(ValueError, "symlinked source files"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_symlinked_source_directories_are_refused(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as source_td:
+            root = Path(td)
+            source = Path(source_td)
+            env = configured_source(source)
+            os.environ.update(env)
+            (root / "profiles").symlink_to(source / "profiles", target_is_directory=True)
+            (root / "fleet").symlink_to(source / "fleet", target_is_directory=True)
+            os.environ["TARTCI_FLEET_SOURCE_ROOT"] = str(root)
+            with self.assertRaisesRegex(ValueError, "symlinked source files"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_real_profile_resolves_without_tomllib(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(fleet_source, "tomllib", None):
+            root = Path(td)
+            profiles = root / "profiles"
+            profiles.mkdir(parents=True)
+            original = Path(__file__).resolve().parents[1] / "profiles" / "m3-macos-fleet.toml"
+            shutil.copyfile(original, profiles / original.name)
+            (root / "fleet").mkdir()
+            supply = root / "fleet" / "advertised-labels.json"
+            digest = fleet_source.FleetSource(root, profiles, supply, True).profiles_sha256
+            supply.write_text(json.dumps({
+                "schema": "tartci.advertised-labels/v1", "registrations": [],
+                "generated_from": {"repo": PRIVATE_REPOSITORY, "commit": PRIVATE_COMMIT,
+                                   "profiles": ["profiles/m3-macos-fleet.toml"],
+                                   "profiles_sha256": digest},
+            }) + "\n")
+            fleet_source.write_marker(root, PRIVATE_REPOSITORY, PRIVATE_COMMIT)
+            os.environ.update({"TARTCI_FLEET_SOURCE_ROOT": str(root),
+                               "TARTCI_FLEET_SOURCE_COMMIT": PRIVATE_COMMIT,
+                               "TARTCI_FLEET_SOURCE_REPOSITORY": PRIVATE_REPOSITORY})
+            self.assertEqual(root.resolve(), fleet_source.resolve(Path("/public")).root)
 
     def test_blob_sha_matches_git(self):
         self.assertEqual("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", fleet_source.blob_sha(b""))
