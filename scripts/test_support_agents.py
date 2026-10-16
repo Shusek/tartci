@@ -236,6 +236,7 @@ class Plan(Case):
                 f'"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
                 f'"profiles":["profiles/canary-macos-fleet.toml"],'
                 f'"profiles_sha256":"{digest}"}},"registrations":[]}}\n')
+            sa.fleet_source.write_marker(source, "ORG/private-fleet-authority", "a" * 40)
             values = {
                 "TARTCI_FLEET_SOURCE_ROOT": str(source),
                 "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,

@@ -102,6 +102,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 },
                 "registrations": [{}],
             }))
+            fleet.fleet_source.write_marker(root, "ORG/private-fleet-authority", "a" * 40)
             with mock.patch.dict(os.environ, {
                 "TARTCI_FLEET_SOURCE_ROOT": str(root),
                 "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,

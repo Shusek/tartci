@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Exporting a private fleet source at one commit through the GitHub API."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import fleet_source
+import fleet_source_sync as sync
+
+PRIVATE = "ORG/private-fleet-authority"
+COMMIT = "c" * 40
+TREE = "d" * 40
+
+
+def source_files(profiles: dict[str, str]) -> dict[str, bytes]:
+    """Profiles plus a published supply whose profile digest matches them."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "profiles").mkdir()
+        for name, text in profiles.items():
+            (root / "profiles" / name).write_text(text)
+        supply = root / fleet_source.PUBLISHED_SUPPLY
+        digest = fleet_source.FleetSource(root, root / "profiles", supply, True).profiles_sha256
+    files = {f"profiles/{name}": text.encode() for name, text in profiles.items()}
+    files[fleet_source.PUBLISHED_SUPPLY] = (json.dumps({
+        "schema": "tartci.advertised-labels/v1",
+        "generated_from": {"repo": PRIVATE, "commit": None,
+                           "profiles": sorted(f"profiles/{name}" for name in profiles),
+                           "profiles_sha256": digest},
+        "registrations": [],
+    }, indent=2) + "\n").encode()
+    return files
+
+
+class FakeRepository:
+    """The GitHub API reads of one private repository at one commit."""
+
+    def __init__(self, files: dict[str, bytes], *, repository: str = PRIVATE,
+                 commit: str = COMMIT, tree: str = TREE) -> None:
+        self.repository, self.commit, self.tree = repository, commit, tree
+        self.files = dict(files)
+        self.calls: list[str] = []
+        self.truncated = False
+        self.unreadable = False
+        self.corrupt: set[str] = set()   # paths whose served bytes differ from the tree
+
+    def entries(self) -> list[dict]:
+        out = [{"path": "README.md", "type": "blob",
+                "sha": fleet_source.blob_sha(b"not part of the source\n")},
+               {"path": "profiles", "type": "tree", "sha": "e" * 40}]
+        out += [{"path": path, "type": "blob", "sha": fleet_source.blob_sha(data)}
+                for path, data in sorted(self.files.items())]
+        return out
+
+    def __call__(self, path: str) -> tuple[int, str, str]:
+        self.calls.append(path)
+        if self.unreadable:
+            return 1, "", "HTTP 404: Not Found"
+        base = f"repos/{self.repository}"
+        if path == f"{base}/commits/main":
+            return 0, json.dumps({"sha": self.commit,
+                                  "commit": {"tree": {"sha": self.tree}}}), ""
+        if path == f"{base}/git/trees/{self.tree}?recursive=1":
+            return 0, json.dumps({"tree": self.entries(), "truncated": self.truncated}), ""
+        for item, data in self.files.items():
+            if path == f"{base}/git/blobs/{fleet_source.blob_sha(data)}":
+                served = data + b"tampered\n" if item in self.corrupt else data
+                return 0, json.dumps({"encoding": "base64",
+                                      "content": base64.b64encode(served).decode()}), ""
+        return 1, "", f"HTTP 404: {path}"
+
+
+PROFILES = {"canary-macos-fleet.toml": "schema = 1\nname = \"canary\"\n",
+            "other-macos-fleet.toml": "schema = 1\nname = \"other\"\n"}
+
+
+class ExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.td = tempfile.TemporaryDirectory()
+        self.store = Path(self.td.name) / "fleet-sources"
+        self.repo = FakeRepository(source_files(PROFILES))
+        self._env = {name: os.environ.pop(name, None) for name in (
+            "TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+            "TARTCI_FLEET_SOURCE_REPOSITORY")}
+
+    def tearDown(self) -> None:
+        for name, value in self._env.items():
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
+        for current, dirs, _files in os.walk(self.td.name):
+            for name in dirs:
+                os.chmod(os.path.join(current, name), 0o755)
+        self.td.cleanup()
+
+    def export(self) -> Path:
+        commit, tree = sync.head(self.repo, PRIVATE)
+        return sync.export(self.repo, PRIVATE, commit, tree, self.store)
+
+    def test_export_holds_exactly_the_source_files_and_resolves(self) -> None:
+        root = self.export()
+        self.assertEqual(self.store / COMMIT, root)
+        self.assertEqual(sorted(self.repo.files), fleet_source.source_files(root))
+        self.assertFalse((root / "README.md").exists())
+        for path, data in self.repo.files.items():
+            self.assertEqual(data, (root / path).read_bytes())
+        os.environ.update({"TARTCI_FLEET_SOURCE_ROOT": str(root),
+                           "TARTCI_FLEET_SOURCE_COMMIT": COMMIT,
+                           "TARTCI_FLEET_SOURCE_REPOSITORY": PRIVATE})
+        source = fleet_source.resolve(Path("/public"))
+        self.assertEqual(root.resolve(), source.root)
+        self.assertEqual(COMMIT, source.source_commit)
+
+    def test_export_is_read_only(self) -> None:
+        root = self.export()
+        with self.assertRaises(PermissionError):
+            (root / fleet_source.PUBLISHED_SUPPLY).write_text("{}")
+        with self.assertRaises(PermissionError):
+            (root / "planted").write_text("x")
+
+    def test_an_intact_export_is_reused_without_reading_blobs(self) -> None:
+        self.export()
+        self.repo.calls.clear()
+        self.export()
+        self.assertEqual([f"repos/{PRIVATE}/commits/main"], self.repo.calls)
+
+    def test_a_damaged_export_is_replaced(self) -> None:
+        root = self.export()
+        supply = root / fleet_source.PUBLISHED_SUPPLY
+        os.chmod(supply, 0o644)
+        os.chmod(supply.parent, 0o755)
+        supply.write_text("{}\n")
+        self.assertIsNotNone(fleet_source.marker_problem(root, PRIVATE, COMMIT))
+        again = self.export()
+        self.assertIsNone(fleet_source.marker_problem(again, PRIVATE, COMMIT))
+        self.assertEqual(self.repo.files[fleet_source.PUBLISHED_SUPPLY], supply.read_bytes())
+
+    def test_bytes_that_do_not_match_their_blob_id_are_refused(self) -> None:
+        self.repo.corrupt.add("profiles/canary-macos-fleet.toml")
+        with self.assertRaisesRegex(sync.SyncError, "does not match blob"):
+            self.export()
+        self.assertFalse((self.store / COMMIT).exists())
+        self.assertEqual([], [p for p in self.store.iterdir()])  # no staging left behind
+
+    def test_a_truncated_tree_is_refused(self) -> None:
+        self.repo.truncated = True
+        with self.assertRaisesRegex(sync.SyncError, "truncated"):
+            self.export()
+
+    def test_a_source_without_its_published_supply_is_refused(self) -> None:
+        del self.repo.files[fleet_source.PUBLISHED_SUPPLY]
+        with self.assertRaisesRegex(sync.SyncError, "no fleet/advertised-labels.json"):
+            self.export()
+
+    def test_a_source_without_profiles_is_refused(self) -> None:
+        self.repo.files = {fleet_source.PUBLISHED_SUPPLY: self.repo.files[fleet_source.PUBLISHED_SUPPLY]}
+        with self.assertRaisesRegex(sync.SyncError, "no profiles"):
+            self.export()
+
+    def test_an_unreadable_repository_is_refused(self) -> None:
+        self.repo.unreadable = True
+        with self.assertRaisesRegex(sync.SyncError, "404"):
+            self.export()
+
+    def test_a_malformed_repository_name_is_refused_before_any_read(self) -> None:
+        with self.assertRaisesRegex(sync.SyncError, "OWNER/REPO"):
+            sync.head(self.repo, "../etc")
+        self.assertEqual([], self.repo.calls)
+
+    def test_prune_keeps_the_newest_and_every_named_commit(self) -> None:
+        commits = [f"{i:x}" * 40 for i in range(1, 7)]
+        for age, commit in enumerate(commits):
+            path = self.store / commit
+            path.mkdir(parents=True)
+            os.utime(path, (1000 - age, 1000 - age))   # commits[0] is newest
+        staging_old = self.store / (sync.STAGING_PREFIX + "old")
+        staging_new = self.store / (sync.STAGING_PREFIX + "new")
+        staging_old.mkdir()
+        staging_new.mkdir()
+        os.utime(staging_old, (0, 0))
+        os.utime(staging_new, (5000, 5000))
+        removed = sync.prune(self.store, {commits[5]}, keep=3, now=5000)
+        left = sorted(path.name for path in self.store.iterdir())
+        self.assertEqual(sorted([*commits[:3], commits[5], staging_new.name]), left)
+        self.assertEqual(sorted([commits[3], commits[4], staging_old.name]), sorted(removed))
+
+
+if __name__ == "__main__":
+    unittest.main()

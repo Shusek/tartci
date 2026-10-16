@@ -63,6 +63,7 @@ import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate j
 import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 import fleet_source  # noqa: E402 - resolves the optional private fleet source
+import fleet_source_sync  # noqa: E402 - exports the private fleet source per commit
 
 try:
     import tomllib
@@ -365,10 +366,15 @@ class Config:
     poll_seconds: int = DEFAULT_POLL_SECONDS
     idle_by_design: tuple[str, ...] = DEFAULT_IDLE_BY_DESIGN
     peers: dict[str, str] = dataclasses.field(default_factory=dict)
+    fleet_source_repository: str | None = None
 
     @property
     def checkout(self) -> Path:
         return self.home / ".local" / "share" / "tartci" / "update-checkout"
+
+    @property
+    def fleet_source_store(self) -> Path:
+        return self.home / ".local" / "share" / "tartci" / "fleet-sources"
 
     @property
     def state_dir(self) -> Path:
@@ -507,6 +513,9 @@ def load_config(home: Path, settings: Path | None = None) -> Config:
                 setattr(cfg, key, float(data[key]))
         if isinstance(data.get("idle_by_design_labels"), list):
             cfg.idle_by_design = tuple(str(v) for v in data["idle_by_design_labels"])
+        repository = (data.get("fleet_source") or {}).get("repository")
+        if repository is not None:
+            cfg.fleet_source_repository = str(repository).strip()
     return cfg
 
 
@@ -604,6 +613,56 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
     fetched = sys_.run(["git", "-C", str(path), "fetch", "--quiet", "--prune", "origin", "main"])
     if fetched.rc != 0:
         raise Refused(f"git fetch failed: {fetched.text}")
+
+
+FLEET_SOURCE_ENV = ("TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+                    "TARTCI_FLEET_SOURCE_REPOSITORY")
+
+
+def installed_fleet_source_commit(cfg: Config) -> str | None:
+    """The private source commit the installed generation was built from."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    if isinstance(recorded, dict) and recorded.get("configured"):
+        commit = recorded.get("commit")
+        return commit if isinstance(commit, str) else None
+    return None
+
+
+def _source_name(commit: str | None) -> str:
+    return commit[:12] if commit else "the public profiles"
+
+
+def sync_fleet_source(cfg: Config, sys_: System) -> dict | None:
+    """Export the configured private source at its main and select it.
+
+    Without `[fleet_source] repository` in self-update.toml this does nothing
+    and the public checkout stays the source. Once configured, an unreadable
+    or damaged source refuses; it never falls back to the public profiles.
+    The selection goes into this process's environment, so every helper and
+    the installer that self-update runs read the same commit.
+    """
+    repository = cfg.fleet_source_repository
+    if repository is None:
+        return None
+
+    def api(path: str) -> tuple[int, str, str]:
+        result = sys_.run([gh_cli(), "api", path], cwd=str(cfg.home),
+                          env={"GH_REPO": repository}, timeout=60)
+        return result.rc, result.out, result.err
+
+    try:
+        commit, tree = fleet_source_sync.head(api, repository)
+        root = fleet_source_sync.export(api, repository, commit, tree, cfg.fleet_source_store)
+    except (fleet_source_sync.SyncError, OSError) as exc:
+        raise Refused(f"fleet source {repository}: {exc}") from exc
+    os.environ.update(dict(zip(FLEET_SOURCE_ENV, (str(root), commit, repository))))
+    try:
+        fleet_source.resolve(cfg.checkout)
+    except ValueError as exc:
+        raise Refused(f"fleet source {repository}@{commit[:12]}: {exc}") from exc
+    keep = {commit, installed_fleet_source_commit(cfg) or ""}
+    fleet_source_sync.prune(cfg.fleet_source_store, keep, now=sys_.now())
+    return {"repository": repository, "commit": commit, "root": str(root)}
 
 
 def configured_repository(cfg: Config, sys_: System) -> str:
@@ -2247,6 +2306,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)
+        selected_source = sync_fleet_source(cfg, sys_)
     except NotManaged as exc:
         print(f"self-update: not applicable: {exc}")
         _write_json(cfg.state_dir / "skew.json", {"state": "not_applicable", "reason": str(exc),
@@ -2276,6 +2336,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
+    if selected_source:
+        print(f"self-update: fleet source {selected_source['repository']}"
+              f"@{selected_source['commit'][:12]} (installed from "
+              f"{_source_name(installed_fleet_source_commit(cfg))})")
     print(f"self-update: {render_skew(skew)}")
     if skew.get("explicit"):
         print(f"self-update: selected {skew.get('selected_target') or 'none'} "
@@ -2307,6 +2371,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
+    receipt.value["fleet_source"] = selected_source
     try:
         if apply and launch_helper(cfg) is not None:
             _checkout(cfg, sys_, target)
@@ -2477,8 +2542,16 @@ def refresh_reason(cfg: Config, sys_: System) -> str | None:
     """Why a current host must reinstall its own generation, or None.
 
     Today: its receipt no longer matches the OS-managed interpreter because
-    macOS was updated (interpreter_changed_by_os_update). Read-only.
+    macOS was updated (interpreter_changed_by_os_update), or the configured
+    private fleet source moved to a commit it was not installed from.
+    Read-only.
     """
+    if cfg.fleet_source_repository is not None:
+        selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
+        installed = installed_fleet_source_commit(cfg)
+        if selected and selected != installed:
+            return (f"fleet source moved to {selected[:12]} "
+                    f"(installed from {_source_name(installed)})")
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         problems = (json.loads(status.out).get("fleet") or {}).get("problems") or []

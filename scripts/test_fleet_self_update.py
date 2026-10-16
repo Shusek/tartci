@@ -3071,6 +3071,117 @@ class OsInterpreterRefreshTests(Base):
         self.assertEqual(self.sys.mutations(), [])
 
 
+class PrivateSourceSystem(FakeSystem):
+    """FakeSystem plus GitHub API reads of one private fleet repository."""
+
+    def __init__(self, home: Path, repository) -> None:
+        super().__init__(home)
+        self.private = repository
+
+    def run(self, argv, *, cwd=None, env=None, timeout=900):
+        if argv[:2] == [FAKE_GH, "api"] and argv[2].startswith(f"repos/{self.private.repository}/"):
+            self.calls.append((list(argv), cwd))
+            return su.Result(*self.private(argv[2]))
+        return super().run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def _set_installed(self, commit):
+        # The installer records the selected source in its receipt.
+        super()._set_installed(commit)
+        selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT")
+        self.installed_sources = getattr(self, "installed_sources", []) + [selected]
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {"configured": bool(selected), "commit": selected}
+        receipt_path.write_text(json.dumps(receipt))
+
+
+class FleetSourceSyncTests(Base):
+    def setUp(self) -> None:
+        super().setUp()
+        import test_fleet_source_sync as fixture
+        self.fixture = fixture
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        profiles = {path.name: path.read_text()
+                    for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))}
+        self.repo = fixture.FakeRepository(fixture.source_files(profiles))
+        self.sys = PrivateSourceSystem(self.home, self.repo)
+        self.cfg.fleet_source_repository = fixture.PRIVATE
+
+    def test_settings_name_the_private_repository(self) -> None:
+        self.cfg.settings.write_text('[fleet_source]\nrepository = "ORG/private-fleet-authority"\n')
+        self.assertEqual("ORG/private-fleet-authority",
+                         su.load_config(self.home).fleet_source_repository)
+        self.cfg.settings.unlink()
+        self.assertIsNone(su.load_config(self.home).fleet_source_repository)
+
+    def test_without_the_setting_nothing_is_read_or_selected(self) -> None:
+        self.cfg.fleet_source_repository = None
+        self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+        self.assertEqual([], self.repo.calls)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_the_configured_source_is_exported_and_selected(self) -> None:
+        selected = su.sync_fleet_source(self.cfg, self.sys)
+        root = self.cfg.fleet_source_store / self.fixture.COMMIT
+        self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                          "root": str(root)}, selected)
+        self.assertEqual(str(root), os.environ["TARTCI_FLEET_SOURCE_ROOT"])
+        self.assertEqual(self.fixture.COMMIT, os.environ["TARTCI_FLEET_SOURCE_COMMIT"])
+        self.assertEqual(self.fixture.PRIVATE, os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"])
+        # The profile self-update installs now comes from the private export.
+        self.assertEqual(root.resolve() / "profiles" / "m1-macos-fleet.toml",
+                         su.checked_in_profile(self.cfg))
+        # And the installer it runs inherits the selection.
+        self.assertEqual(self.fixture.COMMIT, su.census_env()["TARTCI_FLEET_SOURCE_COMMIT"])
+
+    def test_an_unreadable_source_refuses_and_never_falls_back(self) -> None:
+        self.repo.unreadable = True
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual("unknown", skew["state"])
+        self.assertIn("fleet source ORG/private-fleet-authority", skew["reason"])
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_tampered_source_refuses(self) -> None:
+        self.repo.corrupt.add(fleet_source_supply())
+        with self.assertRaisesRegex(su.Refused, "does not match blob"):
+            su.sync_fleet_source(self.cfg, self.sys)
+
+    def test_a_moved_source_is_a_refresh_reason(self) -> None:
+        su.sync_fleet_source(self.cfg, self.sys)
+        receipt = {"support": {"source_commit": INSTALLED}}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIn("fleet source moved to cccccccccccc (installed from the public profiles)",
+                      su.refresh_reason(self.cfg, self.sys))
+        receipt["fleet_source"] = {"configured": True, "commit": "9" * 40}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIn("installed from 999999999999", su.refresh_reason(self.cfg, self.sys))
+        receipt["fleet_source"]["commit"] = self.fixture.COMMIT
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_current_host_reinstalls_from_a_moved_source(self) -> None:
+        self.sys.log_lines = ""   # current with main
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(self.fixture.COMMIT, receipt["fleet_source"]["commit"])
+        # Installed from that commit, the next run has nothing to do.
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+
+
+def fleet_source_supply() -> str:
+    import fleet_source
+    return fleet_source.PUBLISHED_SUPPLY
+
+
 class RecoveryBranchTests(Base):
     """_recover when nothing new was installed (the common pre-install failure)."""
 
