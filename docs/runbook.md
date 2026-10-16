@@ -3597,3 +3597,14 @@ to mise-provided tools is a separate, flagged step, and a new tool binary goes
 through the same launchd preflight as a new interpreter first (macOS grants
 belong to the binary). Rollout is one host at a time: m1's profile carries the
 table first; m5, m5s and m3 follow only after m1's step.
+
+A pinned toolchain never queries for updates. `mise_pin.py` asks the binary
+its version with `MISE_DISABLE_UPDATE_WARNING=1`, because `mise --version`
+otherwise asks GitHub for a newer release. A profile's `[rustup]` table (`path`
+to the host's rustup, `auto_self_update = "disable"`) makes the installer run
+`rustup set auto-self-update disable` and read rustup's `settings.toml` back:
+without it rustup checks for, and by default installs, a newer rustup on every
+`toolchain install` or `update`. A failure refuses the install with exit 3,
+naming the recorded value and the fix. A profile without `[rustup]` leaves the
+host's rustup as it is; undo the setting with `rustup set auto-self-update
+enable`.

@@ -58,7 +58,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary", "debug_hold", "launchd_watchdog", "mise",
+    "reuse_canary", "debug_hold", "launchd_watchdog", "mise", "rustup",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -566,6 +566,13 @@ def load(path: Path) -> dict:
         import mise_pin  # noqa: PLC0415 - sibling script, loaded only when declared
 
         errors = mise_pin.table_errors(data["mise"])
+        if errors:
+            fail("; ".join(errors))
+    if "rustup" in data:
+        # The host's rustup never self-updates (scripts/rustup_settings.py).
+        import rustup_settings  # noqa: PLC0415 - sibling script, loaded only when declared
+
+        errors = rustup_settings.table_errors(data["rustup"])
         if errors:
             fail("; ".join(errors))
     watchdog = data.get("launchd_watchdog")
