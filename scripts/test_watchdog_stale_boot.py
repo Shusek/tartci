@@ -125,7 +125,8 @@ class StaleBootTests(unittest.TestCase):
             "com.danielraffel.tartci.qemu-runner-windows", str(qemu), 4_500,
             vm_running=False, pool_participating=True,
         )
-        self.assertNotEqual(health.verdict, "wedged", health.reason)
+        self.assertEqual(health.verdict, "unknown", health.reason)
+        self.assertIn("refusing alive-but-frozen", health.reason)
 
     def test_linux_tart_lane_never_uses_macos_identity_or_tart_idle(self) -> None:
         linux = self.root / "linux.plist"
@@ -144,7 +145,7 @@ class StaleBootTests(unittest.TestCase):
             "com.danielraffel.tartci.tart-runner-linux", str(linux), 4_500,
             vm_running=False, pool_participating=True,
         )
-        self.assertNotEqual(health.verdict, "wedged", health.reason)
+        self.assertEqual(health.verdict, "unknown", health.reason)
 
     def test_rendered_fleet_prefix_and_slot_identity_is_supported(self) -> None:
         rendered = self.root / "rendered.plist"
