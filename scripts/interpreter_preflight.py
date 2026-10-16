@@ -8,7 +8,7 @@ Network) belong to the binary. A Homebrew Python.app is its own responsible
 process, so switching the lane interpreter to a binary that was never granted
 makes every lane's first touch of an external-volume VM store hang on a
 consent nobody answers (m5s, 2026-10-15, where the store is on
-/Volumes/Atelier). The installer runs this before it changes the interpreter:
+/Volumes/Store). The installer runs this before it changes the interpreter:
 the new binary, started by launchd as the lanes will be, writes, reads back
 and removes one file in the profile's tart_home within TIMEOUT_SECONDS. Any
 other outcome keeps the previous interpreter.

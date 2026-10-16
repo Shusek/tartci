@@ -220,8 +220,8 @@ class Validation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ok = pathlib.Path(td) / "ok.toml"
             ok.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n'
-                          'repo = "/Volumes/Workshop/Code/pulp"\n'
-                          'worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"\n')
+                          'repo = "/Volumes/Example/Code/pulp"\n'
+                          'worktrees_root = "/Volumes/Example/Code/agent-worktrees"\n')
             self.assertIs(fleet.load(ok)["reclaim"]["pulp_worktree_builds"], True)
             bad = pathlib.Path(td) / "bad.toml"
             bad.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n')
@@ -591,7 +591,7 @@ class DiscoveredPulpRoots(Isolated):
 
     @testing_support.requires_tomllib
     def test_the_configured_clones_agent_worktrees_run_once_when_also_discovered(self):
-        # m3: every matching child of /Volumes/Workshop/Code is a worktree of
+        # m3: every matching child of /Volumes/Example/Code is a worktree of
         # the CONFIGURED clone, so discovery finds that clone too. Its
         # .claude/worktrees must still be reaped exactly once, as configured.
         repo = PulpRepo(self.tmp)
@@ -638,7 +638,7 @@ class DiscoveredPulpRoots(Isolated):
         self.assertNotIn("worktrees_outside_profile_root", log)
 
     def test_the_primary_checkout_is_not_a_worktree_outside_the_profile(self):
-        # m3 keeps its primary checkout in /Volumes/Workshop/Code beside
+        # m3 keeps its primary checkout in /Volumes/Example/Code beside
         # agent-worktrees; that root holds the repository itself, not worktrees.
         repo = PulpRepo(self.tmp)
         calls, out, log = self.run_with(repo, [repo.root])

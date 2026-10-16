@@ -14,8 +14,9 @@ canonical config, renders the LaunchAgent, bootstraps it, and verifies launchd
 received the expected paths and the first tick reports healthy. The default
 mode is dry-run; reap discards ship-state for merged, closed or confirmed
 nonexistent pull requests. The tick never merges: landing is the GitHub merge
-queue's job. --repo-root only sets the directory the merge-queue hold check
-runs from. Every mode requires an explicit GitHub App wrapper.
+queue's job. --repo-root sets the checkout the merge-queue hold check and the
+superseded merge-group reaper run from; without it the reaper is skipped.
+Every mode requires an explicit GitHub App wrapper.
 EOF
 }
 

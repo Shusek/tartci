@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The home-volume admission floor: computed per host, refuses only new clones.
 
-m5studio, 2026-10-04: the Tart store was on /Volumes/Atelier, so the lease disk
+m5studio, 2026-10-04: the Tart store was on /Volumes/Store, so the lease disk
 axis judged that volume while the boot Data volume filled to 99% (21 GiB free)
 with coverage build dirs. ENOSPC killed a merge-group runner and every lane
 supervisor, and VM leases kept being granted. These tests replay that, prove

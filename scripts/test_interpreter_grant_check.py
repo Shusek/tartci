@@ -137,7 +137,7 @@ class Label(unittest.TestCase):
         import interpreter_preflight  # noqa: PLC0415
         self.assertNotEqual(grant.LABEL, interpreter_preflight.LABEL)
         with mock.patch.object(interpreter_preflight, "run", return_value=None) as run:
-            grant._probe("/x/python3.12", "/Volumes/Atelier/VMs")
+            grant._probe("/x/python3.12", "/Volumes/Store/VMs")
         self.assertEqual(run.call_args.kwargs["label"], grant.LABEL)
         self.assertEqual(run.call_args.kwargs["timeout"], grant.TIMEOUT_SECONDS)
 
@@ -164,7 +164,7 @@ class Alerting(Base):
         link.symlink_to(real)
         self.lane(str(link))
         failing = self.probe({str(link)})
-        with mock.patch.object(grant, "store_path", return_value="/Volumes/Atelier/VMs"):
+        with mock.patch.object(grant, "store_path", return_value="/Volumes/Store/VMs"):
             line = self.alert(NOW, failing)
             self.alert(NOW + 300, failing)          # not due: the record stands
             self.alert(NOW + 3600, failing)         # due again, still failing

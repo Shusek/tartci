@@ -39,12 +39,12 @@ class LauncherRuntimeTests(unittest.TestCase):
             lanes[lane] = {"environment": {
                 "HOME": str(cls.root),
                 "PATH": "/usr/bin:/bin",
-                "TART_HOME": "/Volumes/Workshop/VMs",
+                "TART_HOME": "/Volumes/Example/VMs",
                 "TARTCI_TEST_MODE": mode,
                 "TARTCI_TEST_PID_FILE": str(cls.pid_file),
             }}
         (cls.app / "Contents/Resources/bundle.json").write_text(
-            json.dumps({"tart_home": "/Volumes/Workshop/VMs"})
+            json.dumps({"tart_home": "/Volumes/Example/VMs"})
         )
         (cls.app / "Contents/Resources/lanes.json").write_text(
             json.dumps({"schema": 1, "lanes": lanes})

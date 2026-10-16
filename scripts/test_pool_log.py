@@ -28,7 +28,7 @@ T0 = 1_791_900_000.0
 
 def status(state: str = "on", participating: bool = True, **problems: Any) -> Dict[str, Any]:
     return {
-        "host": "Daniels-Mac-Studio-m3",
+        "host": "studio-host-m3",
         "state": state,
         "participating": participating,
         "fleet": {"config": {

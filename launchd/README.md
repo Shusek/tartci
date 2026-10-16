@@ -1102,8 +1102,10 @@ without a tick in silence. The launchd watchdog reinstalls a loaded tick
 whose copy differs from the running tartci (`scripts/queue_tick_refresh.py`),
 and never switches an unloaded one back on. Every mode
 requires `--gh-cli` pointing to an executable GitHub App wrapper; unattended
-operation never falls back to ambient `gh`. `--repo-root` is optional and only
-sets the directory the merge-queue hold check runs from. `--mode live` and
+operation never falls back to ambient `gh`. `--repo-root` sets the checkout
+the merge-queue hold check and the superseded merge-group reaper run from. The
+reaper needs it (Shipyard resolves its GitHub credential from that checkout's
+remote), so without it the reaper is skipped and says so. `--mode live` and
 `--authority` are retired and refused. Never hand-edit the installed plist;
 re-run the installer.
 
@@ -1141,11 +1143,21 @@ that hold no runner. The tick only runs it.
   and the rest of the tick goes on. A held merge queue skips it with the rest
   of the tick.
 
-Enable it on the host whose queue tick runs (m3):
+Enable it on the host whose queue tick runs, with the tick installed from
+a checkout of the reaped repository:
 
 ```sh
+scripts/install_shipyard_queue_tick.sh --gh-cli "$HOME/.local/bin/ghapp" \
+  --mode reap --repo-root <checkout of Generous-Corp/pulp> --install
 touch ~/.config/tartci/reap-superseded-merge-groups.enabled
 ```
+
+Without `--repo-root`, each tick logs `reap-superseded <repo>: skipped: no
+repo root configured` and never runs Shipyard. An install from before the
+reaper ran from the repo root has none, so it skips every tick until the
+operator reinstalls it with `--repo-root`; that reinstall is a required step,
+not something self-update does. One root serves one repository: with more than
+one in `SHIPYARD_QUEUE_REAP_REPOS` the tick skips the reaper and says so.
 
 ## Retire Orchard on upgrades
 
