@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: resolver implementation merged; private projection approved; external-source rollout intentionally gated
+Status: M1 canary installed; standalone verification fix prepared; rollout remains gated
 
 ## Goal
 
@@ -50,9 +50,10 @@ change.
 
 ## Rollout status
 
-No fleet mutation has been performed. Current installed hosts report the
-ordinary checked-in profile path and no configured external source. The canary
-and rollback steps remain gated on a validated private export.
+Only the M1 canary has been changed. M1 has the pinned private source and its
+pool was returned to service after the canary checks. M3, M5, and M5s remain on
+the public source; widening and rollback completion remain gated on clean
+standalone verification and a soak period.
 
 ## Scope boundary
 
@@ -75,9 +76,24 @@ The branch is published for review at
 `feat/private-profile-source-refresh-20261016`. It has not been merged or
 installed on a fleet host.
 
-The private authority still lacks a complete export with the required profile
-set and published supply document. A partial export would omit routing and
-capacity authority, so it is not being created or rolled out.
+The private authority now has a complete immutable export in the private
+authority repository. M1 was selected as the least capacity-critical canary
+and installed the pinned source. Pool admission, readiness, DHCP, and the
+source/profile/supply checks passed during the canary transaction.
+
+The first independent post-canary verification exposed a real bug in the
+verification path: the apply process exported the selected source through
+environment variables, but standalone `self-update --verify` did not inherit
+them. It therefore compared the receipt with the public support root and
+reported a false `receipt_mismatch`. The fix reconstructs the selected source
+from the installed receipt, validates its marker and bytes, and restores the
+process environment after resolution. Focused source and lane tests pass after
+the fix. No additional host will be configured until the fix is reviewed,
+installed on M1, and the standalone verification passes.
+
+The fix is published for review at
+https://github.com/danielraffel/tartci/pull/602, head
+https://github.com/danielraffel/tartci/commit/7dfbebf114f2774edce01a0833304470f6b1dd84.
 
 The private desired-state projection was reconciled against exact current
 TartCI and Pulp `origin/main` checkouts on 2026-10-16. Its checker passed the
