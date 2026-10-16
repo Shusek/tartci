@@ -510,7 +510,7 @@ def probe_stale_boot(
         phase = state.get("phase")
         ts = state.get("ts")
         supervisor_pid = state.get("supervisor_pid")
-        if not isinstance(phase, str) or not isinstance(ts, (int, float)):
+        if not isinstance(phase, str) or not isinstance(ts, (int, float, str)):
             raise ValueError("missing phase or timestamp")
         if phase not in STALE_BOOT_PHASES:
             return StaleBootProbe(False, f"phase={phase}")
@@ -520,7 +520,11 @@ def probe_stale_boot(
             raise ValueError("missing supervisor pid")
         if launchd_pid is None or int(supervisor_pid) != launchd_pid:
             return StaleBootProbe(False, "state supervisor pid does not match launchd")
-        age = max(0.0, (time.time() if now is None else now) - float(ts))
+        if isinstance(ts, str):
+            parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        else:
+            parsed_ts = float(ts)
+        age = max(0.0, (time.time() if now is None else now) - parsed_ts)
         if age <= stale_after_s:
             return StaleBootProbe(False, f"phase={phase}, heartbeat age {int(age)}s")
         return StaleBootProbe(True, f"phase={phase}, heartbeat stale {int(age)}s")

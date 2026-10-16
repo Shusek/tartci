@@ -41,6 +41,11 @@ class StaleBootTests(unittest.TestCase):
         mismatch = wd.probe_stale_boot(str(self.plist), 43, now=2_000.0)
         self.assertFalse(mismatch.stale, mismatch.reason)
 
+    def test_runner_iso_heartbeat_timestamp_is_supported(self) -> None:
+        self.write_state(ts="1970-01-01T00:16:40Z")
+        probe = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
+        self.assertTrue(probe.stale, probe.reason)
+
     def test_active_job_and_fresh_heartbeat_are_safe(self) -> None:
         self.write_state(run_id="run-1")
         active = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
