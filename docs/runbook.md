@@ -3445,6 +3445,45 @@ non-gate budget), **not** a redundant safety patch. Do **not** "pin
 acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
 reserve. Keep the override (or remove it for a linux lane sized to the full
 12-core budget); either way the clamp keeps the gate safe.
+## Host hygiene: disk floor and foreign VMs
+
+The watchdog runs two report-only checks (`scripts/host_hygiene.py`). They
+never delete or stop anything. They run only on a host where
+`~/.config/tartci/host-hygiene.enabled` exists. Enable one host at a time: m1
+first, then m5, m3 and m5s, one per day.
+
+- **Disk floor.** The volumes that hold `$HOME` and the VM store must keep 20%
+  and 200 GB free. Below either, the log shows `WARN host-disk` and one issue
+  opens: `[tartci] <host> is below its disk floor: <N> GB free (<P>%)`
+  (`host_disk_floor`). The issue lists the top consumers with their sizes and
+  the command to reclaim each:
+  - `~/agent-scratch`, `~/agent-worktrees` and `~/Code/agent-worktrees`.
+    Their owners remove these; use `git worktree remove`, never `rm -rf`.
+  - Both Tart stores.
+  - The build trees. `tartci reclaim --fix` is the only automatic reclaim.
+
+  Sizes are measured with `du` at most every 6 h, each with a 180 s limit. The
+  issue closes when the floor holds again.
+- **Foreign VMs.** Hourly, every local VM in the VM store and in `~/.tart`
+  that tartci did not make is reported in one issue
+  (`[tartci] <host> has <N> VM(s) tartci did not make`, `host_foreign_vms`),
+  with name, store, state, age and size. A VM is reported when it has been
+  running longer than 4 h or stopped longer than 14 days. A VM counts as
+  tartci's when any of these holds:
+  - a fleet lane names it as a golden;
+  - a tartci or pulp LaunchAgent names it;
+  - its name has this host's lane-clone shape `<host>-<lane>-<pid>-<n>`.
+
+  The issue gives the stop and delete commands for an operator to run after
+  the VM's owner agrees. A store that cannot be listed is logged as
+  `WARN foreign-vms: could not list <store>`.
+
+```sh
+touch ~/.config/tartci/host-hygiene.enabled
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
+ls ~/.tartci/state/host-hygiene/      # consumers.json, foreign-vms.json
+```
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
