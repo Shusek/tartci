@@ -3005,6 +3005,17 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   pass's `scratch_dirs` field shows what the scratch reaper removed and why it
   kept the rest.
 
+  A reclaim pass that goes STALE because its own `git` hung is often a store
+  stall, not a reclaim problem. `pool status` (`store:`) and `doctor fleet`
+  (`store_stalled`) probe each store volume the installed profile names (the
+  Tart store listing and `tart list`, and `git rev-parse` on the `[reclaim]`
+  repository and a listing of its worktrees root) with a 15 s bound, killing
+  and never re-waiting a probe that does not finish. A stall names the volume,
+  how long the oldest `git` or `tart` on it has been hanging, the likely cause
+  (a system-wide sandbox or TCC stall, which does not clear on its own) and the
+  step: drain, let running jobs finish, reboot. The probe runs only there,
+  never in a lane.
+
   With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
   default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs
   `ccache -d $TARTCI_CI_CACHE/ccache --evict-older-than <N>d` on the gate ccache
