@@ -1,4 +1,9 @@
-# tartci gotchas — symptom → cause → fix
+# tartci gotchas: symptom, cause, fix
+
+Use this page when a command or lane behaves differently from what you expect.
+Each entry starts with the visible symptom, names the likely cause, and ends
+with a fix or a next diagnostic step. The entries describe current behavior;
+dates identify incidents that are useful for historical context.
 
 ## `tartci` looks missing over SSH after it was installed
 
@@ -89,8 +94,9 @@ say so (`self_update_paused`, with the stall's start) rather than reading like
 a failed update. The remedy is the stall's: reboot when the lanes are idle.
 Do not kickstart self-update during the stall.
 
-Hard-won, one bullet each. Grouped by lane. If a build/install behaves
-inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
+The entries are grouped by the kind of failure they describe. If a fresh host
+does not behave as expected, start with the matching symptom and run the
+diagnostic command shown in that entry.
 
 ## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
 
