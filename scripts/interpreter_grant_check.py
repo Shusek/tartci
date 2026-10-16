@@ -13,6 +13,10 @@ pool-on run that one). Whatever those paths are, Homebrew Cellar or a
 mise-installed Python, the probe launches exactly the path the lanes launch,
 so the grant it exercises is the one the lanes need.
 
+It is off unless ~/.config/tartci/interpreter-grant-check.enabled exists, so
+it can be enabled one host at a time; it probes at most MAX_PROBES_PER_PASS
+interpreters per run and records the probe time.
+
 A failure records state/interpreter-grant-lost and opens one issue naming the
 host, the binary and the grant to check. It never takes the host off: the
 lanes may still be serving, and an operator decides. The record and the issue
@@ -35,6 +39,7 @@ import tartci_incident  # noqa: E402 - sibling module
 
 LABEL = "com.danielraffel.tartci.interpreter-grant-check"
 INTERVAL_SECONDS = 3600
+MAX_PROBES_PER_PASS = 3
 TIMEOUT_SECONDS = 30.0
 TITLE = "[tartci] {host} lane interpreter can no longer use the VM store: {python}"
 CLASS = "interpreter_grant_lost"
@@ -75,6 +80,15 @@ def current_interpreters(user_home: Optional[Path] = None) -> list[str]:
     return found
 
 
+def enabled(user_home: Optional[Path] = None) -> bool:
+    """Per-host opt-in: the check runs only where this file exists, so it can
+    be enabled one host at a time (docs/runbook.md, "Pinned interpreter")."""
+    flag = os.environ.get("TARTCI_GRANT_CHECK_ENABLE_FILE") or str(
+        (user_home or Path(os.path.expanduser("~"))) / ".config" / "tartci"
+        / "interpreter-grant-check.enabled")
+    return Path(flag).is_file()
+
+
 def store_path() -> Optional[str]:
     """The VM store: TART_HOME (every tartci LaunchAgent carries it), else the
     installed fleet profile's host.tart_home."""
@@ -107,6 +121,10 @@ def check(now: float, probe: Callable[[str, str], Optional[str]] = _probe,
     sdir = home / "state"
     last_path = sdir / "interpreter-grant-check.json"
     record = sdir / "interpreter-grant-lost"
+    if not enabled(user_home):
+        # Off: probe nothing, and let an earlier episode's issue close.
+        record.unlink(missing_ok=True)
+        return {"ran": False, "enabled": False, "failures": []}
     try:
         last = json.loads(last_path.read_text()).get("checked_at", 0)
     except (OSError, ValueError, AttributeError):
@@ -116,15 +134,20 @@ def check(now: float, probe: Callable[[str, str], Optional[str]] = _probe,
     pythons = current_interpreters(user_home)
     store = store_path()
     failures: list[dict[str, str]] = []
+    started = time.monotonic()
     if pythons and store:
-        for python in pythons:
+        # Each probe can take the full timeout inside the heal pass: bound it.
+        for python in pythons[:MAX_PROBES_PER_PASS]:
             reason = probe(python, store)
             if reason:
                 failures.append({"python": python, "real": os.path.realpath(python),
                                  "store": store, "reason": reason})
     sdir.mkdir(parents=True, exist_ok=True)
-    last_path.write_text(json.dumps({"checked_at": now, "pythons": pythons, "store": store,
-                                     "failed": [f["python"] for f in failures]}) + "\n")
+    last_path.write_text(json.dumps({
+        "checked_at": now, "pythons": pythons, "store": store,
+        "probed": pythons[:MAX_PROBES_PER_PASS],
+        "probe_seconds": round(time.monotonic() - started, 1),
+        "failed": [f["python"] for f in failures]}) + "\n")
     if failures:
         # The first failure's time is the episode: keep it while it lasts.
         since = _iso(now)

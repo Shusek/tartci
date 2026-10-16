@@ -36,16 +36,21 @@ class Base(unittest.TestCase):
         self.probed: list = []
         env = {"HOME": str(self.user), "TARTCI_HOME": str(self.home),
                "TART_HOME": str(self.store)}
-        for key in ("TARTCI_LAUNCH_AGENTS_DIR", "TARTCI_PYTHON_PIN"):
+        for key in ("TARTCI_LAUNCH_AGENTS_DIR", "TARTCI_PYTHON_PIN",
+                    "TARTCI_GRANT_CHECK_ENABLE_FILE"):
             env[key] = ""
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("TARTCI_LAUNCH_AGENTS_DIR", "TARTCI_PYTHON_PIN"):
+        for key in ("TARTCI_LAUNCH_AGENTS_DIR", "TARTCI_PYTHON_PIN",
+                    "TARTCI_GRANT_CHECK_ENABLE_FILE"):
             os.environ.pop(key, None)
         host = mock.patch.object(vm_boot_alert, "_alert_host", return_value=("m5studio", "m5s"))
         host.start()
         self.addCleanup(host.stop)
+        self.enable_file = self.user / ".config" / "tartci" / "interpreter-grant-check.enabled"
+        self.enable_file.parent.mkdir(parents=True, exist_ok=True)
+        self.enable_file.write_text("")
 
     def lane(self, python: str, name: str = "pulp-gate") -> None:
         plist = self.agents / f"com.danielraffel.tartci.tart-runner-macos-fleet.m5s.{name}.plist"
@@ -93,6 +98,48 @@ class WhatIsChecked(Base):
         self.assertEqual((out["ran"], self.probed), (True, []))
         self.assertIsNone(self.alert(NOW, self.probe()))
         self.assertEqual(self.opened, [])
+
+
+class OptIn(Base):
+    def test_without_the_enable_file_it_probes_nothing(self) -> None:
+        self.lane("/x/python3.12")
+        self.enable_file.unlink()
+        self.assertIsNone(self.alert(NOW, self.probe({"/x/python3.12"})))
+        self.assertEqual((self.probed, self.opened), ([], []))
+        self.assertFalse((self.home / "state" / "interpreter-grant-check.json").exists())
+
+    def test_turning_it_off_closes_an_open_episode(self) -> None:
+        self.lane("/x/python3.12")
+        self.alert(NOW, self.probe({"/x/python3.12"}))
+        self.assertEqual(len(self.opened), 1)
+        self.enable_file.unlink()
+        self.assertIsNone(self.alert(NOW + 3600, self.probe({"/x/python3.12"})))
+        self.assertEqual(self.closed, ["77"])
+
+
+class Bounds(Base):
+    def test_it_probes_at_most_the_cap_per_pass_and_records_the_time(self) -> None:
+        for n in range(grant.MAX_PROBES_PER_PASS + 2):
+            self.lane(f"/x/python3.{n}", f"lane{n}")
+        out = grant.check(NOW, probe=self.probe(), home=self.home, user_home=self.user)
+        self.assertEqual(len(self.probed), grant.MAX_PROBES_PER_PASS)
+        self.assertEqual(len(out["pythons"]), grant.MAX_PROBES_PER_PASS + 2)
+        import json  # noqa: PLC0415
+        state = json.loads((self.home / "state" / "interpreter-grant-check.json").read_text())
+        self.assertIn("probe_seconds", state)
+        self.assertEqual(len(state["probed"]), grant.MAX_PROBES_PER_PASS)
+
+
+class Label(unittest.TestCase):
+    def test_the_check_never_uses_the_install_preflights_label(self) -> None:
+        # run() boots out whatever holds its label first: sharing the install
+        # preflight's would kill an install's probe mid-write.
+        import interpreter_preflight  # noqa: PLC0415
+        self.assertNotEqual(grant.LABEL, interpreter_preflight.LABEL)
+        with mock.patch.object(interpreter_preflight, "run", return_value=None) as run:
+            grant._probe("/x/python3.12", "/Volumes/Atelier/VMs")
+        self.assertEqual(run.call_args.kwargs["label"], grant.LABEL)
+        self.assertEqual(run.call_args.kwargs["timeout"], grant.TIMEOUT_SECONDS)
 
 
 class Cadence(Base):

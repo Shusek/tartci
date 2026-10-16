@@ -3535,3 +3535,17 @@ opens `[tartci] <host> lane interpreter can no longer use the VM store:
 access to and the grant. It never takes the host off. The issue closes on the
 next passing check; to re-check at once, remove
 `~/.tartci/state/interpreter-grant-check.json` and kickstart the watchdog.
+
+The check is off unless `~/.config/tartci/interpreter-grant-check.enabled`
+exists on that host. It probes at most three interpreters per run and records
+the probe time (`probe_seconds`) in the check's state file. Turning it off
+closes any open issue. Enable it one host at a time: m1 first, then m5, m3 and
+m5s. After each host's first run, confirm two things before enabling the next:
+the watchdog log has no `WARN interpreter-grant` line, and the state file lists
+the lanes' interpreters with an empty `failed`.
+
+```sh
+touch ~/.config/tartci/interpreter-grant-check.enabled
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
+cat ~/.tartci/state/interpreter-grant-check.json
+```
