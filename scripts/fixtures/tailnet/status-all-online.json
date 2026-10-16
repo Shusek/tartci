@@ -18,7 +18,7 @@
   },
   "nodekey:fixture-m1": {
    "Active": true,
-   "DNSName": "daniels-macbook-pro-1.example-tailnet.ts.net.",
+   "DNSName": "laptop-host-1.example-tailnet.ts.net.",
    "HostName": "Daniel\u2019s MacBook Pro",
    "KeyExpiry": "2026-12-14T02:52:02Z",
    "LastSeen": "0001-01-01T00:00:00Z",
@@ -31,8 +31,8 @@
   },
   "nodekey:fixture-m5": {
    "Active": true,
-   "DNSName": "blackbook-pro.example-tailnet.ts.net.",
-   "HostName": "BlackBook Pro",
+   "DNSName": "laptop-pro.example-tailnet.ts.net.",
+   "HostName": "Laptop Pro",
    "KeyExpiry": "2026-11-28T21:50:46Z",
    "LastSeen": "0001-01-01T00:00:00Z",
    "OS": "macOS",
@@ -57,7 +57,7 @@
   },
   "nodekey:fixture-macmini": {
    "Active": true,
-   "DNSName": "daniels-mac-mini-4.example-tailnet.ts.net.",
+   "DNSName": "mini-host-4.example-tailnet.ts.net.",
    "HostName": "Daniel\u2019s Mac mini (4)",
    "KeyExpiry": "2027-01-26T23:15:40Z",
    "LastSeen": "0001-01-01T00:00:00Z",

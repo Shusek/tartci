@@ -25,6 +25,23 @@ class Findings(unittest.TestCase):
                 f"host = \"{REAL_HOST}-m3\"\nlaptop = \"{OTHER_HOST}.local\"\n")
         self.assertEqual([n for n, _ in ppl.findings_in(text)], [1, 2, 3, 4])
 
+    def test_host_names_are_found_in_any_case_and_form(self) -> None:
+        # Built at run time so this file does not trip the lint itself.
+        black = "Black" + "Book"
+        for line in (f"{REAL_HOST.lower()}.local",          # mDNS name
+                     f"ssh {REAL_HOST.upper()}-M3",
+                     f"DNSName: {OTHER_HOST.lower()}-1.example-tailnet.ts.net.",
+                     f"{black}-Pro-5", f"HostName: {black} Pro", f"M5/{black.lower()}"):
+            with self.subTest(line=line):
+                self.assertEqual(1, len(ppl.findings_in(line)), line)
+
+    def test_ordinary_mac_words_pass(self) -> None:
+        # Negative control: model names alone, and words that merely end in s.
+        for line in ("a MacBook Pro or a Mac Studio", "the mac-studio lane", "macs-mini",
+                     "laptop-host-1.example-tailnet.ts.net", "notebook pro"):
+            with self.subTest(line=line):
+                self.assertEqual([], ppl.findings_in(line), line)
+
     def test_placeholders_pass(self) -> None:
         # Negative control: the same lines written with placeholders are clean.
         text = ("home = \"/Users/example/.config\"\nstore = \"/Volumes/Example/VMs\"\n"

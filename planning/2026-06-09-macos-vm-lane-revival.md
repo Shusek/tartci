@@ -412,7 +412,7 @@ no-Skia builds. Do not treat this as a tartci lifecycle failure, and do not edit
 while the parallel Pulp refactor agent is active.
 
 **Janitor no-VM state fix 2026-06-09:** after the pilot, report-only `doctor --reap` found an old
-owner-dead state file with no VM (`pulp-daniels-mac-studio-01.state.json`) and proposed only
+owner-dead state file with no VM (`pulp-studio-host-01.state.json`) and proposed only
 `delete_stale_state`; `--fix` deleted it, and the next report had `problems=[]`, `fixed=[]`,
 `github_runners=[]`, `capacity.free=2`, one live waiting supervisor (`pulp-vm-01`), and no stale VMs.
 

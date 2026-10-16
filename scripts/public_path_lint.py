@@ -35,8 +35,11 @@ PLACEHOLDER_VOLUMES = frozenset({
 })
 USERS = re.compile(r"/Users/([A-Za-z0-9_.-]+)")
 VOLUMES = re.compile(r"/Volumes/([A-Za-z0-9_.-]+)")
-HOST = re.compile(r"\b[A-Z][a-z]+s-(?:Mac-Studio|MacBook-Pro|MacBook-Air|Mac-mini|Mac-Pro|"
-                  r"iMac|M[0-9]+-Studio|M[0-9]+-Max)\b")
+# Host names in any case: a possessive Mac host name (its hostname, its
+# .local mDNS name, or a tailnet DNS label) and the fleet's own machine
+# names that carry no possessive.
+HOST = re.compile(r"\b[a-z]+s-(?:mac-studio|macbook-pro|macbook-air|mac-mini|mac-pro|imac|"
+                  r"m[0-9]+-studio|m[0-9]+-max)\b|\b" + "black" + r"book\b", re.IGNORECASE)
 ALLOWLIST = "scripts/public_path_allowlist.txt"
 
 
