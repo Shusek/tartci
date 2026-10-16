@@ -3562,6 +3562,17 @@ class FleetSourceCanaryTests(FleetSourceFixture):
     def canary(self, record: dict | None):
         return mock.patch.object(su, "read_canary_verified", return_value=record)
 
+    def test_a_mistyped_canary_refuses_loudly(self) -> None:
+        self.cfg.fleet_source_canary = "stuido"
+        with self.canary(None), self.assertRaisesRegex(
+                su.Refused, r"canary 'stuido' is not a published host id \(.*studio.*\)"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual([], self.repo.calls)
+        # The same mistake reaches the run's status: UNKNOWN, with the reason.
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertIn("is not a published host id", skew["reason"])
+
     def test_without_a_canary_the_setting_refuses(self) -> None:
         self.cfg.fleet_source_canary = None
         with self.assertRaisesRegex(su.Refused, "no canary"):

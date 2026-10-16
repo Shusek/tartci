@@ -195,6 +195,14 @@ class ExportTests(unittest.TestCase):
         with self.assertRaisesRegex(sync.SyncError, "404"):
             self.export()
 
+    def test_a_commit_asked_for_by_id_must_be_the_commit_answered(self) -> None:
+        other = {"sha": "d" * 40, "commit": {"tree": {"sha": "e" * 40}}}
+        api = lambda path: (0, json.dumps(other), "")
+        with self.assertRaisesRegex(sync.SyncError, "answered dddddddddddd"):
+            sync.head(api, PRIVATE, "c" * 40)
+        self.assertEqual(("d" * 40, "e" * 40), sync.head(api, PRIVATE, "main"))
+        self.assertEqual(("d" * 40, "e" * 40), sync.head(api, PRIVATE, "d" * 40))
+
     def test_a_malformed_repository_name_is_refused_before_any_read(self) -> None:
         with self.assertRaisesRegex(sync.SyncError, "OWNER/REPO"):
             sync.head(self.repo, "../etc")

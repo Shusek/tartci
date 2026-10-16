@@ -135,6 +135,8 @@ class BootHelperUsesTheBoundedWaitTests(unittest.TestCase):
         body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
         script = (
             "set -u\n"
+            "tartci_pool_admission_open(){ return 0; }\n"
+            "tartci_pool_lock_absent(){ return 0; }\n"
             "running_macos_vms(){ echo unknown; }\n"
             "note(){ :; }\n"
             "event(){ :; }\n"
@@ -157,6 +159,58 @@ class BootHelperUsesTheBoundedWaitTests(unittest.TestCase):
         self.assertNotIn("CLONE_CALLED", result.stdout)
         self.assertNotIn("DELETE_CALLED", result.stdout)
         self.assertNotIn("RELEASE_CALLED", result.stdout)
+
+    def test_drain_before_inventory_starts_no_tart_read_or_lease(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        script = (
+            "tartci_pool_admission_open(){ return 1; }\n"
+            "tartci_pool_lock_absent(){ return 0; }\n"
+            "tartci_pool_read_state(){ echo draining; }\n"
+            "running_macos_vms(){ echo INVENTORY_CALLED; }\n"
+            "tartci_acquire_vm_lease(){ echo LEASE_CALLED; }\n"
+            "note(){ :; }\n"
+            "heartbeat(){ echo \"phase=$1\"; }\n"
+            + body + "\n"
+            "boot_vm_to_ssh 1 test-vm macos normal; echo \"rc=$?\"\n"
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("phase=draining", result.stdout)
+        self.assertIn("rc=75", result.stdout)
+        self.assertNotIn("INVENTORY_CALLED", result.stdout)
+        self.assertNotIn("LEASE_CALLED", result.stdout)
+
+    def test_drain_after_lease_releases_before_clone(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        script = (
+            "checks=0\n"
+            "tartci_pool_admission_open(){ checks=$((checks + 1)); [ \"$checks\" -eq 1 ]; }\n"
+            "tartci_pool_lock_absent(){ return 0; }\n"
+            "tartci_pool_read_state(){ echo draining; }\n"
+            "running_macos_vms(){ echo 0; }\n"
+            "tartci_vm_lease_cores(){ echo 2; }\n"
+            "tartci_vm_lease_mem_mb(){ echo 4096; }\n"
+            "tartci_acquire_vm_lease(){ echo LEASE_ACQUIRED; }\n"
+            "tartci_release_vm_lease(){ echo LEASE_RELEASED; }\n"
+            "tartci_boundary_proof_start(){ :; }\n"
+            "tartci_boundary_proof_abandon(){ echo PROOF_ABANDONED; }\n"
+            "tartci_vm_lease_guard_run(){ echo CLONE_CALLED; }\n"
+            "note(){ :; }\n"
+            "heartbeat(){ echo \"phase=$1\"; }\n"
+            + body + "\n"
+            "TART_HOME=/tmp RUNNER_NAME=test SLOT=1\n"
+            "boot_vm_to_ssh 1 test-vm macos normal; echo \"rc=$?\"\n"
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LEASE_ACQUIRED", result.stdout)
+        self.assertIn("LEASE_RELEASED", result.stdout)
+        self.assertIn("PROOF_ABANDONED", result.stdout)
+        self.assertIn("phase=draining", result.stdout)
+        self.assertIn("rc=75", result.stdout)
+        self.assertNotIn("CLONE_CALLED", result.stdout)
 
     def test_unreadable_inventory_refuses_before_lease_or_clone(self) -> None:
         body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")

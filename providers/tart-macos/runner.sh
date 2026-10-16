@@ -1826,7 +1826,13 @@ boot_vm_to_ssh(){
   local lease_cores lease_mem lease_rc boot_log rpid ip="" inventory
   BOOT_LEASE_DENIED=0
   # This is the shared cold-boot boundary, including --once, warm parking and
-  # a cold fallback after warm handoff. Check before taking a lease or cloning.
+  # a cold fallback after warm handoff. The loop's pool check can be stale
+  # after a slow queue scan; refuse before touching Tart or taking a lease.
+  if ! tartci_pool_admission_open || ! tartci_pool_lock_absent; then
+    note "[$i] pool $(tartci_pool_read_state) — deferring new macOS VM clone"
+    heartbeat draining
+    return 75
+  fi
   inventory="$(running_macos_vms)"
   case "$inventory" in
     ''|*[!0-9]*)
@@ -1855,6 +1861,16 @@ boot_vm_to_ssh(){
   # why this cannot admit anything the sequential boundary would have refused.
   # A warm-VM park has no job and no class yet, so it starts none.
   [ -z "$proof_group" ] || tartci_boundary_proof_start "$vm" "$labels" "$proof_group"
+
+  # Inventory and lease admission may have taken time. Drain can close while
+  # they run, so check again before a clone writer or VM ownership exists.
+  if ! tartci_pool_admission_open || ! tartci_pool_lock_absent; then
+    tartci_boundary_proof_abandon
+    tartci_release_vm_lease
+    note "[$i] pool $(tartci_pool_read_state) before clone — deferring new macOS VM"
+    heartbeat draining
+    return 75
+  fi
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
