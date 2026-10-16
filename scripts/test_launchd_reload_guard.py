@@ -7,6 +7,7 @@ LaunchAgents directory. Nothing here reaches the real launchd domain.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -116,7 +117,13 @@ class FakeHost:
         # Hermetic: never read this machine's lease store.
         return {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                 "TARTCI_POOL_UID": str(os.getuid()),
-                "TARTCI_LEASE_DIR": str(self.root / "leases")}
+                "TARTCI_LEASE_DIR": str(self.root / "leases"),
+                "TARTCI_MANUAL_CHANGE_LOG": str(self.root / "manual-changes.log"),
+                "SSH_CONNECTION": "192.0.2.9 52344 192.0.2.5 22"}
+
+    def changes(self) -> list[dict]:
+        path = self.root / "manual-changes.log"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
 
     def reload(self, label: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -255,6 +262,25 @@ class ReloadGuardTests(unittest.TestCase):
             proc = host.reload(LANE, "--allow-mid-job")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn(f"bootout gui/{os.getuid()}/{LANE}", host.calls())
+
+    def test_force_overrides_and_every_reload_is_logged_with_its_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakeHost(Path(td))
+            host.plist(LANE)
+            host.loaded(LANE, 100)
+            self.assertEqual(host.reload(LANE).returncode, 3)
+            host.loaded(LANE, 100)
+            proc = host.reload(LANE, "--force")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"bootout gui/{os.getuid()}/{LANE}", host.calls())
+            refused, forced = host.changes()
+            self.assertEqual(refused["action"], "launchd reload")
+            self.assertTrue(refused["outcome"].startswith("refused"))
+            self.assertEqual(forced["outcome"], "forced: mid-job check skipped")
+            self.assertEqual((forced["via"], forced["ssh_client"]), ("ssh", "192.0.2.9"))
+            # A dry run changes nothing and records nothing.
+            host.reload(LANE, "--dry-run")
+            self.assertEqual(len(host.changes()), 2)
 
     def test_unknown_busy_state_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as td:

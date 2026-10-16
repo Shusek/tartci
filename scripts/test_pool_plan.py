@@ -110,6 +110,8 @@ class FakePoolHost:
             "TARTCI_POOL_TRANSITION_LOCK": str(self.lock),
             "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(root / "hold"),
             "TARTCI_POOL_UID": str(os.getuid()),
+            "TARTCI_MANUAL_CHANGE_LOG": str(root / "manual-changes.log"),
+            "SSH_CONNECTION": "192.0.2.9 52344 192.0.2.5 22",
         }
 
     def _name(self, label: str) -> str:
@@ -256,6 +258,43 @@ class PoolOffMidJobTests(unittest.TestCase):
         write = next(i for i in range(branch, len(lines))
                      if "tartci_pool_write_participation 0" in lines[i])
         self.assertLess(check, write)
+
+
+class ManualChangeLogTests(unittest.TestCase):
+    """Every pool change names its caller (m5, 2026-10-16 05:19Z: an off/on
+    over ssh killed two jobs and nothing recorded who ran it)."""
+
+    def rows(self, host: FakePoolHost) -> list[dict]:
+        path = Path(host.env["TARTCI_MANUAL_CHANGE_LOG"])
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_refused_while_busy_is_logged_with_the_ssh_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td))
+            self.assertEqual(host.pool("off").returncode, 12)
+            (row,) = self.rows(host)
+            self.assertEqual((row["action"], row["via"], row["ssh_client"]),
+                             ("pool off", "ssh", "192.0.2.9"))
+            self.assertTrue(row["outcome"].startswith("refused"))
+            self.assertTrue(row["parents"], "the parent command lines are recorded")
+            self.assertEqual(host.mutations(), [])
+
+    def test_allowed_when_idle_and_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td), busy=False)
+            self.assertEqual(host.pool("off").returncode, 0)
+            (row,) = self.rows(host)
+            self.assertEqual(row["outcome"], "proceeding: every owned lane idle")
+
+    def test_force_is_allowed_while_busy_and_logged_as_forced(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td))
+            proc = host.pool("off", "--force")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"bootout gui/{os.getuid()}/{LANE}", host.mutations())
+            (row,) = self.rows(host)
+            self.assertEqual(row["outcome"], "forced: mid-job check skipped")
+            self.assertIn("--force", row["args"])
 
 
 class PoolPlanTests(unittest.TestCase):
