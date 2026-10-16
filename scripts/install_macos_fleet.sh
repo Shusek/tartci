@@ -317,14 +317,15 @@ done
 # opt-in is gone, stops here, before the dry run reports anything.
 plan_launcher_layout=""
 plan_installed_layout=""
-if "$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
+plan_has_helper="$("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
 import macos_fleet_lanes as fleet
-raise SystemExit(0 if fleet.load(Path(sys.argv[1])).get("launch_helper") is not None else 1)
+print("yes" if fleet.load(Path(sys.argv[1])).get("launch_helper") is not None else "no")
 PY
-then
+)" || exit 2
+if [ "$plan_has_helper" = yes ]; then
   layout_args=(--home "$HOME" --receipt "$RECEIPT")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
   plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
@@ -1097,7 +1098,6 @@ if [ "$launcher_layout" = v2 ]; then
     exit 3
   }
   durable_file "$pointer_file"
-  maybe_test_crash launch-set
 fi
 
 for candidate in "${candidates[@]}"; do
