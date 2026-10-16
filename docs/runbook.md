@@ -1079,13 +1079,36 @@ gh auth status -h github.com
 mkdir -p "$HOME/.tartci/goldens" "$HOME/VMs/tmp" "$HOME/VMs/logs"
 ```
 
-Install the Windows golden on each host:
+Install a Windows golden with its separately supplied, trusted SHA-256 sidecar
+on each host. If the source has no sidecar, establish its provenance and issue
+one before this step; do not compute a new checksum from an untrusted copy.
 
 ```bash
-cp /path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2 \
-  "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
-shasum -a 256 "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+source_golden=/path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2
+test -f "$source_golden.sha256" || { echo "trusted source sidecar required" >&2; exit 1; }
+golden="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+cp "$source_golden" "$golden"
+cp "$source_golden.sha256" "$golden.sha256"
+python3 scripts/verify_windows_golden.py --no-cache "$golden"
 ```
+
+The manual clone and Windows runner require an adjacent `.qcow2.sha256`
+sidecar. The first shared-source check streams the image; subsequent checks can
+use a private cache keyed by image identity and sidecar digest. After taking a
+VM lease, each job makes a private APFS CoW snapshot, fully hashes its exact
+bytes against the sidecar, seals it, and creates the overlay against that
+snapshot. If APFS cloning or hashing fails, the job refuses to boot. Use
+`python3 scripts/verify_windows_golden.py --no-cache /path/to/base.qcow2`
+for a forensic recheck. A checksum proves that the disk matches its recorded
+bytes; the boot/toolchain probe and provenance receipt are separate admission
+requirements. Do not regenerate a mismatched sidecar to silence a refusal.
+The runner, the manual clone and the snapshot script hash with the host's
+pinned interpreter (`tartci_toml_python_path`, see "Pinned interpreter"), never
+PATH's `python3`: the hash reads the whole golden from the VM store, and macOS
+grants for that store belong to the binary. Each job logs `Windows snapshot
+hash: <N>s for <bytes> bytes (<interpreter>)`, which is the per-job cost of the
+full hash. When the Windows lane is next enabled, enable it on one host (m1 or
+m5) and see one green job before the other.
 
 Keep the runner code on a home-backed path so launchd and non-interactive SSH do
 not depend on a mounted workspace:
@@ -2422,6 +2445,16 @@ fleet`), and check GitHub's job history against it with
   reconcile, `pool on` through the installed shim, verify (pool on and fleet
   ready, serving not blocked, executed commit == target, `launchd guard`
   present).
+  The wait counts only tartci's own lanes. A lane is mid-job when its
+  supervisor has a `tart run`, `tart clone`, `qemu-system` or `Runner.Worker`
+  descendant, holds a VM lease from its own process tree, or has a fresh busy
+  heartbeat. A manual VM, or a lease taken outside every lane's process tree,
+  never blocks the drain. Each change in what it waits on is logged as
+  `wait-idle: waiting on <lane: state, detail>`. If the 90 min bound passes,
+  the attempt fails, the host goes back ON, and one issue opens:
+  `[tartci] <host> self-update drain timed out after <N> min waiting on a lane`
+  (`self_update_drain_timeout`). It names the lane and closes on the next
+  drain that completes.
 - **A failure never leaves the host off if `pool on` can work.** Every
   failure path ends with `pool on` (three attempts, 15/45/90 s apart). If it
   still refuses (for example a receipt it rejects after a macOS update), the
@@ -3565,3 +3598,39 @@ touch ~/.config/tartci/interpreter-grant-check.enabled
 launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
 cat ~/.tartci/state/interpreter-grant-check.json
 ```
+
+### Pinned mise (`[mise]`)
+
+A profile's `[mise]` table names one exact mise build: `version`, the absolute
+`path` it is installed at (the path contains the version, so two pins never
+share one), and its `sha256`. It is the binary Pulp's toolchain manifest pins
+(`tools/toolchain/manifest.toml` `[mise.binary]`): built from source once,
+copied between hosts by digest, never installed by Homebrew and never
+self-updated (its `lib/mise-self-update-instructions.toml` points at
+`pulp deps update mise`).
+
+The installer verifies it (`scripts/mise_pin.py check`) right after validating
+the profile, before any LaunchAgent, receipt or pin changes. A missing binary,
+a different sha256, or a `--version` that is not the pin refuses the install
+with exit 3 and one line naming the path, the expected and found values, and
+the fix (copy the binary from a host that has it, then confirm its sha256).
+After the interpreter pin it records `~/.config/tartci/mise.pin` (JSON:
+version, path, sha256, verified_at). A profile without `[mise]` removes that
+file, so deleting the table is the rollback.
+
+The pin changes nothing a lane runs: no PATH, no shims, no tools. Moving a lane
+to mise-provided tools is a separate, flagged step, and a new tool binary goes
+through the same launchd preflight as a new interpreter first (macOS grants
+belong to the binary). Rollout is one host at a time: m1's profile carries the
+table first; m5, m5s and m3 follow only after m1's step.
+
+A pinned toolchain never queries for updates. `mise_pin.py` asks the binary
+its version with `MISE_DISABLE_UPDATE_WARNING=1`, because `mise --version`
+otherwise asks GitHub for a newer release. A profile's `[rustup]` table (`path`
+to the host's rustup, `auto_self_update = "disable"`) makes the installer run
+`rustup set auto-self-update disable` and read rustup's `settings.toml` back:
+without it rustup checks for, and by default installs, a newer rustup on every
+`toolchain install` or `update`. A failure refuses the install with exit 3,
+naming the recorded value and the fix. A profile without `[rustup]` leaves the
+host's rustup as it is; undo the setting with `rustup set auto-self-update
+enable`.

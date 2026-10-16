@@ -24,6 +24,8 @@
 set -euo pipefail
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
@@ -53,6 +55,11 @@ note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed (brew install qemu)"
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found"
+
+# Resolve once before reading the golden. This must not follow a mutable PATH
+# entry when the provider is launched by launchd.
+TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
+export TARTCI_PYTHON
 
 while [ $# -gt 0 ]; do case "$1" in
   --golden) GOLDEN="$2"; shift 2;;
@@ -84,6 +91,8 @@ esac
 tartci_vm_leases_enabled || die "manual Windows clone requires a VM lease"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
+nice -n 20 "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN" \
+  || die "Windows clone golden failed SHA-256 admission"
 
 # Firmware code + a vars TEMPLATE. The golden's ESP is BOOTAA64-auto-boot, so a
 # fresh template-seeded efivars boots it (no custom NVRAM entry needed).
@@ -101,24 +110,52 @@ done
 
 # Pick a free host port for SSH hostfwd (per-job; no fixed 2222 collision).
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-JOB="win-job-$$"
+JOB="tartci-win-job-$$"
 JOBDIR="$WORKROOT/$JOB"
 OVERLAY="$JOBDIR/overlay.qcow2"
+JOBBASE="$JOBDIR/golden.qcow2"
 EFIVARS="$JOBDIR/efivars.fd"
+STATE_DIR="$(tartci_provider_state_dir qemu-windows)"
 
 QPID=""
+QPID_STARTED_AT=""
+JOBDIR_OWNED=0
+LEASE_OWNED=0
+STATE_WRITTEN=0
+write_state(){
+  TARTCI_STATE_REPO=Generous-Corp/pulp \
+    TARTCI_STATE_SUPERVISOR_PID="$$" \
+    TARTCI_STATE_SUPERVISOR_PID_STARTED_AT="$(tartci_pid_started_at "$$")" \
+    TARTCI_STATE_WORK_DIR="$JOBDIR" \
+    TARTCI_STATE_OVERLAY="$OVERLAY" \
+    TARTCI_STATE_GOLDEN_SNAPSHOT="$JOBBASE" \
+    TARTCI_STATE_QEMU_PID="$QPID" \
+    TARTCI_STATE_QEMU_PID_STARTED_AT="$QPID_STARTED_AT" \
+    tartci_write_vm_state qemu-windows "$JOB" "$JOB" "$1" ephemeral "$STATE_DIR"
+  STATE_WRITTEN=1
+}
 qemu_running(){
   local state
   state="$(ps -p "$QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
   case "$state" in
     ''|Z*) return 1 ;;
-    *) return 0 ;;
+    *) [ -n "$QPID_STARTED_AT" ] \
+         && [ "$(tartci_pid_started_at "$QPID")" = "$QPID_STARTED_AT" ] ;;
   esac
 }
 cleanup(){
-  local had_jobdir=0 qemu_alive=0
+  local had_jobdir=0 qemu_alive=0 state
   if [ -n "$QPID" ]; then
-    kill "$QPID" 2>/dev/null || true
+    state="$(ps -p "$QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]] \
+      && { [ -z "$QPID_STARTED_AT" ] \
+           || [ "$(tartci_pid_started_at "$QPID")" != "$QPID_STARTED_AT" ]; }; then
+      note "QEMU PID identity is unknown or changed; preserving job and lease for recovery"
+      return 1
+    fi
+  fi
+  if [ -n "$QPID" ] && [ -n "$state" ] && [[ "$state" != Z* ]]; then
+    qemu_running && kill "$QPID" 2>/dev/null || true
     for _ in 1 2 3 4 5; do
       qemu_running || break
       sleep 1
@@ -137,16 +174,33 @@ cleanup(){
       wait "$QPID" 2>/dev/null || true
     fi
   fi
-  [ "$qemu_alive" = 0 ] || return 0
-  tartci_release_vm_lease || true
-  [ ! -d "$JOBDIR" ] || had_jobdir=1
-  [ ! -d "$JOBDIR" ] || rm -r "$JOBDIR" || note "could not remove clone directory $JOBDIR"
+  [ "$qemu_alive" = 0 ] || return 1
+  if [ "$JOBDIR_OWNED" = 1 ] && [ -d "$JOBDIR" ]; then had_jobdir=1; fi
+  if [ "$JOBDIR_OWNED" = 1 ] && [ -d "$JOBDIR" ]; then
+    chflags nouchg "$JOBBASE" "$JOBBASE.sha256" 2>/dev/null || true
+    if ! rm -r "$JOBDIR" || [ -e "$JOBDIR" ]; then
+      note "could not remove clone directory $JOBDIR; preserving VM lease for recovery"
+      return 1
+    fi
+  fi
+  if [ "$LEASE_OWNED" = 1 ]; then
+    tartci_release_vm_lease || return 1
+  fi
+  if [ "$STATE_WRITTEN" = 1 ]; then
+    tartci_delete_vm_state "$JOB" "$STATE_DIR" || return 1
+  fi
   if [ "$had_jobdir" = 1 ] && [ ! -d "$JOBDIR" ]; then
     note "discarded ephemeral clone $JOB"
   fi
   return 0
 }
-trap cleanup EXIT
+on_exit(){
+  local rc=$?
+  trap - EXIT
+  cleanup || rc=1
+  exit "$rc"
+}
+trap on_exit EXIT
 if ! tartci_prepare_and_check_disk_root_observed "$WORKROOT" \
   "$(tartci_vm_lease_disk_expected_mount_path qemu-windows "$WORKROOT")" \
   "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" \
@@ -157,10 +211,15 @@ if ! tartci_acquire_vm_lease "$JOB" "$WIN_CPUS" qemu-windows-vm vm \
   spectr-windows-manual "$WIN_MEMORY_MB" "$WORKROOT" qemu-windows manual "$JOB"; then
   die "Windows clone VM lease denied"
 fi
-mkdir -p "$JOBDIR"
+LEASE_OWNED=1
+mkdir "$JOBDIR" || die "Windows job directory already exists or cannot be created: $JOBDIR"
+JOBDIR_OWNED=1
+write_state preparing
 
-note "CoW overlay off $(basename "$GOLDEN") → $OVERLAY"
-tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$OVERLAY" >/dev/null
+"$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$JOBBASE" \
+  || die "Windows clone golden failed private snapshot admission"
+note "CoW overlay off verified private snapshot → $OVERLAY"
+tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$JOBBASE" -F qcow2 "$OVERLAY" >/dev/null
 cp "$VARS_TPL" "$EFIVARS"
 
 note "booting $JOB headless (ssh: 127.0.0.1:$PORT)"
@@ -173,6 +232,8 @@ tartci_vm_lease_guard_exec qemu-system-aarch64 \
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22" -device virtio-net-pci,netdev=net0 \
   -drive file="$OVERLAY",if=none,id=nvm,format=qcow2 -device nvme,drive=nvm,serial=pulpwin \
   -display none >"$JOBDIR/qemu.log" 2>&1 & QPID=$!
+QPID_STARTED_AT="$(tartci_pid_started_at "$QPID")"
+write_state booting
 
 wsh(){ ssh -n "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$WUSER@127.0.0.1" "$@"; }
 

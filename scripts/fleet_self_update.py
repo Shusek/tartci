@@ -1317,6 +1317,79 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
         ticket["issue_error"] = text[:300]
 
 
+def mid_job_lanes(plan_text: str) -> list[str]:
+    """The `lane: state, detail` rows under `mid-job lanes:` in `pool off --plan`."""
+    rows: list[str] = []
+    inside = False
+    for line in plan_text.splitlines():
+        if line.strip() == "mid-job lanes:":
+            inside = True
+            continue
+        if inside:
+            if not line.startswith("    ") or ":" not in line:
+                break
+            rows.append(line.strip()[:300])
+    return rows
+
+
+def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: float,
+                        now: float) -> None:
+    """One issue while the self-update drain timed out waiting on a lane; it
+    closes on the next drain that completes. `busy` None means the wait ended.
+
+    The bounded wait only failed the attempt, and a human heard of it only
+    when consecutive failures halted self-update. Best effort: never raises.
+    """
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "drain-timeout-alert.json"
+        # One episode across attempts: a later timeout keeps the first's time.
+        since = (host_off._read_json(path) or {}).get("since") or _iso(now)
+        lanes = "; ".join(busy or []) or "(not named)"
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update drained the pool and then waited {waited / 60:.0f} min "
+                f"(the bound) for its own lanes to finish, and they did not: {lanes}. "
+                "The attempt failed and the host was put back ON; the update did not land.", "",
+                "## Evidence",
+                f"- the self-update receipt's `wait-idle` steps name what it waited on: {lanes}",
+                "- `tartci pool off --plan` on the host lists `mid-job lanes:`", "",
+                "## Likely cause",
+                "A lane job that runs longer than the bound (a long build, or a hung job "
+                "that is not timing out), or a lane supervisor whose VM lease or heartbeat "
+                "outlived its work. Only tartci's own lanes count: a manual VM never "
+                "blocks the drain.", "",
+                "## Fix", "```sh",
+                "tartci pool off --plan        # which lane, which pid",
+                "# a real job: let it finish; self-update retries on its next tick",
+                "# a hung job: cancel it in GitHub Actions, then let the lane tear down",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Killing a lane mid-job kills someone's CI run.", "",
+                "## How to verify",
+                "The next self-update logs `wait-idle: no owned lane mid-job`; this issue "
+                "then closes itself.",
+            ])
+            title = (f"[tartci] {me} self-update drain timed out after {waited / 60:.0f} min "
+                     f"waiting on a lane")
+            marker = tartci_incident.marker(me, "self_update_drain_timeout", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=busy is not None,
+            resolved=busy is None, since=since if busy is not None else None,
+            raise_event=lambda: host_off.event(cfg.state_dir, "self_update_drain_timeout",
+                                               f"waited {waited:.0f}s on {lanes}"[:300],
+                                               {"lanes": busy or []}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: drain-timeout alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
 # A gate-demand snapshot older than this is not used: the bound falls back.
 GATE_DEMAND_FRESH_SECONDS = 10 * 60
 
@@ -2611,7 +2684,9 @@ class Run:
         self.receipt.step("vm-dhcp-verify", result.text.strip()[-500:], ok=result.rc == 0)
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
-        deadline = self.sys.now() + self.cfg.wait_seconds
+        started = self.sys.now()
+        deadline = started + self.cfg.wait_seconds
+        waiting_on: list[str] | None = None
         while True:
             plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
             if plan.rc == 0:
@@ -2625,9 +2700,21 @@ class Run:
                               f"{plan.text[:300]}")
             if plan.rc != 12:
                 raise Failed(f"pool off --plan refused (exit {plan.rc}): {plan.text[:300]}")
+            # Say what the drain waits on, once per change: a receipt that
+            # reads only "drain" for half an hour looks stuck (m1, 2026-10-16,
+            # waiting on one Forge gate job).
+            busy = mid_job_lanes(f"{plan.out}\n{plan.err}")
+            if busy != waiting_on:
+                waiting_on = busy
+                self.receipt.step("wait-idle", "waiting on " + ("; ".join(busy) or
+                                                                 "an owned lane (not named)"))
             if self.sys.now() >= deadline:
-                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s")
+                drain_timeout_alert(self.cfg, self.me, busy, self.sys.now() - started,
+                                    self.sys.now())
+                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s: "
+                             + ("; ".join(busy) or "(not named)"))
             self.sys.sleep(self.cfg.poll_seconds)
+        drain_timeout_alert(self.cfg, self.me, None, self.sys.now() - started, self.sys.now())
         self.receipt.step("wait-idle", "no owned lane mid-job")
 
     def _writer_fence(self) -> list[str]:

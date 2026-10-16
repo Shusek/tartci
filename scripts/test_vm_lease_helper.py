@@ -37,6 +37,68 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 
 class VmLeaseHelperTests(unittest.TestCase):
+    def test_windows_runner_exports_granted_parallelism_to_guest_job(self) -> None:
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "4"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL="4"\n'
+            'Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f '
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL)\n',
+        )
+
+        positive = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "8"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(positive.returncode, 0, positive.stderr)
+        self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL="8"', positive.stdout)
+        # A zero grant is invalid and must not produce an unusable script.
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "0"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+
+    def test_the_listener_script_the_job_runs_carries_the_granted_parallelism(self) -> None:
+        # The script the guest runs, not only the fragment printer: the splice
+        # must replace the placeholder, or PowerShell gets it as a command.
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-listener-script", "6"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('$env:CMAKE_BUILD_PARALLEL_LEVEL="6"\n', result.stdout)
+        self.assertNotIn("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__", result.stdout)
+        # The parallelism is set before the listener starts the job.
+        self.assertLess(result.stdout.index("CMAKE_BUILD_PARALLEL_LEVEL"),
+                        result.stdout.index("Runner.Listener.exe"))
+        self.assertTrue(result.stdout.rstrip().endswith("exit $LASTEXITCODE"))
+        # An invalid grant sets no default and leaves no placeholder behind.
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-listener-script", "0"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(invalid.returncode, 0, invalid.stderr)
+        self.assertNotIn("CMAKE_BUILD_PARALLEL_LEVEL", invalid.stdout)
+        self.assertNotIn("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__", invalid.stdout)
+        self.assertIn("Runner.Listener.exe", invalid.stdout)
+
+    def test_the_job_runs_the_listener_script_function(self) -> None:
+        # The job must use the function the print-exit tests, not a copy.
+        source = WINDOWS_RUNNER.read_text()
+        self.assertEqual(source.count("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__"), 2)
+        self.assertIn('ps_run="$(windows_listener_script "$effective_win_cpus")"', source)
+
     def test_apply_false_cannot_enter_cleanup_provider(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"scripts").mkdir(); marker=root/"called"

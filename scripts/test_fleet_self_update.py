@@ -50,6 +50,7 @@ class FakeSystem(su.System):
         self.calls: list[tuple[list[str], str | None]] = []
         self.pool_state = "on"
         self.offplan = [0]             # successive `pool off --plan` exit codes
+        self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
         self.dry_run_rc = 0
         self.preflight_rc = 0
@@ -311,7 +312,11 @@ class FakeSystem(su.System):
             return ok("draining")
         if args[:3] == ["pool", "off", "--plan"]:
             rc = self.offplan.pop(0) if len(self.offplan) > 1 else self.offplan[0]
-            return su.Result(rc, "plan")
+            text = (self.offplan_text.pop(0) if isinstance(self.offplan_text, list)
+                    and len(self.offplan_text) > 1 else
+                    self.offplan_text[0] if isinstance(self.offplan_text, list)
+                    else self.offplan_text)
+            return su.Result(rc, text)
         if args[:2] == ["pool", "off"]:
             if self.off_rc:
                 return su.Result(self.off_rc, "", "refusing pool off: capacity for required label "
@@ -1605,6 +1610,72 @@ class MidJobWaitTests(Base):
         joined = [" ".join(a) for a, _ in self.sys.calls]
         self.assertFalse(any(c.startswith("./tartci pool off") and "--plan" not in c for c in joined))
         self.assertFalse(any("--apply" in c for c in joined))
+
+
+FORGE = ("com.danielraffel.tartci.tart-runner-macos-fleet.m1.forge-gate: busy, would be KILLED "
+         "(supervisor pid 87749 owns tart run pid 11310)")
+
+
+def plan_text(*rows: str) -> str:
+    """`pool off --plan` output as the real command prints it (m1, 2026-10-16)."""
+    return "\n".join([
+        "pool off --plan on m1: nothing will be changed",
+        "  state: draining -> off; participation: 0 -> 0",
+        "  capacity floor: ok (pool off keeps every required label served)",
+        "  mid-job lanes:", *[f"    {row}" for row in rows],
+        "verdict: pool off would REFUSE (an owned lane is mid-job or unknown; use pool drain, "
+        "or --now)"])
+
+
+class DrainWaitVisibilityTests(Base):
+    def steps(self) -> list[dict]:
+        return json.loads(Path(self.last()["receipt"]).read_text())["steps"]
+
+    def test_the_wait_names_the_lane_once_per_change(self) -> None:
+        other = "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate: busy, x"
+        self.sys.offplan = [12, 12, 12, 0]
+        self.sys.offplan_text = [plan_text(FORGE), plan_text(FORGE), plan_text(FORGE, other),
+                                 "plan"]
+        self.assertUpdated(self.apply())
+        waits = [s["detail"] for s in self.steps() if s["step"] == "wait-idle"]
+        self.assertEqual(waits, [f"waiting on {FORGE}", f"waiting on {FORGE}; {other}",
+                                 "no owned lane mid-job"])
+
+    def test_a_drain_timeout_opens_one_issue_naming_the_lane_and_a_clean_drain_closes_it(
+            self) -> None:
+        self.sys.offplan = [12]
+        self.sys.offplan_text = plan_text(FORGE)
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("m1.forge-gate", self.last()["error"])
+        opened = [t for kind, t in self.issues if kind == "open"]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("self-update drain timed out after 10 min waiting on a lane", opened[0])
+        self.assertIn("supervisor pid 87749 owns tart run pid 11310", self.bodies[0])
+        self.assertIn("a manual VM never blocks the drain", self.bodies[0])
+        import tartci_incident  # noqa: PLC0415
+        self.assertEqual(tartci_incident.parse(self.bodies[0])["class"],
+                         "self_update_drain_timeout")
+        self.assertNotIn(("close", "77"), self.issues)
+        # The next attempt drains cleanly: the issue closes.
+        self.sys.offplan = [0]
+        self.sys.offplan_text = "plan"
+        self.sys.clock += 3600
+        self.apply()
+        self.assertIn(("close", "77"), self.issues)
+
+    def test_the_issue_closes_when_a_later_drain_completes(self) -> None:
+        self.sys.offplan = [12]
+        self.sys.offplan_text = plan_text(FORGE)
+        su.drain_timeout_alert(self.cfg, "m1", [FORGE], 600, NOW)
+        self.assertEqual([k for k, _ in self.issues], ["open"])
+        su.drain_timeout_alert(self.cfg, "m1", [FORGE], 600, NOW + 3600)
+        self.assertEqual([k for k, _ in self.issues], ["open"])   # same episode
+        su.drain_timeout_alert(self.cfg, "m1", None, 30, NOW + 7200)
+        self.assertEqual(self.issues[-1], ("close", "77"))
+
+    def test_mid_job_rows_are_read_from_the_plan(self) -> None:
+        self.assertEqual(su.mid_job_lanes(plan_text(FORGE)), [FORGE])
+        self.assertEqual(su.mid_job_lanes("pool off --plan: nothing\nverdict: ok"), [])
 
 
 class ShipyardWriterLeaseTests(Base):

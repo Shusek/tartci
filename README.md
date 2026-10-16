@@ -105,6 +105,14 @@ baking goldens, onboarding a host and installing the agents.
   [Pulp](https://github.com/Generous-Corp/pulp) today. The serving lanes take
   any repository, golden image and labels from the environment.
 
+## Tart and TartCI
+
+[Tart](https://github.com/openai/tart) provides the Apple Virtualization
+VM engine. TartCI is an independent project that adds the CI layer: disposable
+per-job GitHub runners, host resource budgets, warm caches, Windows through
+QEMU, and coordination with [Shipyard](https://github.com/danielraffel/Shipyard).
+TartCI is not affiliated with Tart or its maintainers.
+
 ## Learn more
 
 - [Runbook](docs/runbook.md): set up a host, build images, and serve jobs.
