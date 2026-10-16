@@ -63,6 +63,10 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_host_hygiene.py", "ForeignVms"):
+        ("3.11-only: host_hygiene judges VM ownership with tart_image_prune.plan(), which "
+         "reads the fleet profile with tomllib; without it nothing is judged foreign "
+         "(NoTomllib.test_without_tomllib_nothing_is_judged_foreign)"),
     ("test_vm_boot_alert.py",
      "Alert.test_the_host_and_ssh_target_come_from_the_profile"):
         ("3.11-only: vm_boot_alert._alert_host() reads the host id and ssh target from the "

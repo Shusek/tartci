@@ -224,6 +224,22 @@ class ForeignVms(Base):
         self.assertNotIn("could not list", "".join(self.run_pass(NOW + 3600)))
 
 
+class NoTomllib(Base):
+    def test_without_tomllib_nothing_is_judged_foreign(self) -> None:
+        # The 3.9 fallback: ownership needs the fleet profile (tomllib). Without
+        # it no VM is reported, and the log says why.
+        import tart_image_prune  # noqa: PLC0415
+        self.vm(self.store, "pulp-build-runner:m1-rollback-20260701", age_days=100)
+        self.vm(self.store, "lv2repro-pulpimpl", age_days=60)
+        with mock.patch.object(tart_image_prune, "profile_strings",
+                               side_effect=RuntimeError("no tomllib (needs Python 3.11+)")):
+            lines = self.run_pass()
+        self.assertNotIn("WARN foreign-vms: pulp", "".join(lines))
+        self.assertNotIn("lv2repro", "".join(lines))
+        self.assertIn("fleet profile unreadable", "".join(lines))
+        self.assertEqual([t for t, _ in self.opened if "nothing tartci uses" in t], [])
+
+
 class OptIn(Base):
     def test_off_without_the_enable_file(self) -> None:
         self.enable.unlink()
