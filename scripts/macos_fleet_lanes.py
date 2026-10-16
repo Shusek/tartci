@@ -36,6 +36,7 @@ import support_agents
 import debug_hold
 import reuse_canary
 import power_status
+import fleet_source
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -1447,6 +1448,7 @@ def write_receipt(
         )
     persistent_records = persistent_plist_records(data, agents_dir)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    fleet_source_state = fleet_source.resolve(TARTCI_ROOT)
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
@@ -1480,6 +1482,13 @@ def write_receipt(
                 "repository": support["repository"],
                 "commit": source_authority_commit,
             },
+        },
+        "fleet_source": {
+            "root": str(fleet_source_state.root),
+            "configured": fleet_source_state.configured,
+            "commit": fleet_source_state.source_commit,
+            "profiles_dir": str(fleet_source_state.profiles_dir),
+            "published_supply": str(fleet_source_state.published_supply),
         },
     }
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -2902,7 +2911,7 @@ def _display_path(path: Path, root: Path | None = None) -> str:
 
 
 TARTCI_ROOT = Path(__file__).resolve().parents[1]
-PUBLISHED_SUPPLY = TARTCI_ROOT / "fleet" / "advertised-labels.json"
+PUBLISHED_SUPPLY = fleet_source.resolve(TARTCI_ROOT).published_supply
 PUBLISHED_SUPPLY_URL = (
     "https://raw.githubusercontent.com/danielraffel/tartci/main/fleet/advertised-labels.json"
 )
@@ -2911,9 +2920,10 @@ _PERSISTENT_RUNNER_NAME = re.compile(
     r"^actions\.runner\.[A-Za-z0-9_.-]+\.(?P<name>[A-Za-z0-9_.-]+)$")
 
 
-def fleet_profiles(root: Path = TARTCI_ROOT) -> list[Path]:
+def fleet_profiles(root: Path | None = None) -> list[Path]:
     """Every checked-in macOS fleet profile. Discovery is the glob: no host list."""
-    return sorted((root / "profiles").glob(FLEET_PROFILE_GLOB))
+    source = fleet_source.resolve(root or TARTCI_ROOT, allow_environment=root is None)
+    return sorted(source.profiles_dir.glob(FLEET_PROFILE_GLOB))
 
 
 def persistent_runners(data: dict) -> list[dict]:
@@ -2966,12 +2976,13 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
     }
 
 
-def published_snapshot(root: Path = TARTCI_ROOT) -> dict:
+def published_snapshot(root: Path | None = None) -> dict:
     """The committed form: every fleet profile, commit null.
 
     A file cannot name the commit that contains it, so the published copy
     carries no commit; its provenance is the git ref it was read from.
     """
+    root = root or TARTCI_ROOT
     return advertised_labels_snapshot(fleet_profiles(root), None, root)
 
 
@@ -3030,6 +3041,10 @@ def published_commit(source: str | Path) -> str | None:
     no commit, so this is always read from where the file came from.
     """
     text = str(source)
+    configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
+    configured_commit = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
+    if configured_root and configured_commit and _SHA.fullmatch(configured_commit):
+        return configured_commit
     if text.startswith(("https://", "http://")):
         if text != PUBLISHED_SUPPLY_URL:
             return None
@@ -3126,6 +3141,7 @@ def config_verdicts(config: Path, support_root: Path,
     Reported, never enforced: a status or admission path that refused on
     these would turn configuration drift into a capacity outage.
     """
+    source = fleet_source.resolve(support_root)
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
@@ -3136,7 +3152,7 @@ def config_verdicts(config: Path, support_root: Path,
                 "host_vitals": host_vitals_summary()}
     value: dict = {}
     try:
-        drift = profile_drift(config, support_root / "profiles")
+        drift = profile_drift(config, source.profiles_dir)
         value["profile_drift"] = {
             "state": drift["state"], "reason": drift["reason"],
             "checked_in": drift["checked_in"],
@@ -3145,14 +3161,14 @@ def config_verdicts(config: Path, support_root: Path,
         }
     except Exception as exc:  # noqa: BLE001 - a broken check reads as unknown
         value["profile_drift"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
-    source = support_root / "fleet" / "advertised-labels.json"
+    source_path = source.published_supply
     try:
         try:
-            published, error = read_published(source), ""
+            published, error = read_published(source_path), ""
         except Exception as exc:  # noqa: BLE001
-            published, error = None, f"{source}: {exc}"
+            published, error = None, f"{source_path}: {exc}"
         supply = verify_supply(config, published, error,
-                               published_from=published_commit(source),
+                               published_from=published_commit(source_path),
                                host_commit=host_tartci_commit(receipt))
         value["supply"] = {
             "state": supply["state"], "reason": supply["reason"],
@@ -3396,7 +3412,7 @@ def reachable(registration: dict, repo: str, workflow: str,
 # copy to itself. This compares the two semantically, by key path.
 
 DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
-DEFAULT_PROFILES_DIR = Path(__file__).resolve().parents[1] / "profiles"
+DEFAULT_PROFILES_DIR = fleet_source.resolve(TARTCI_ROOT).profiles_dir
 
 
 def _flatten(value: object, prefix: str = "") -> dict[str, object]:
@@ -3632,7 +3648,9 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("--all takes no profile arguments")
             if not paths:
                 parser.error("name profile files or pass --all")
-            snapshot = advertised_labels_snapshot(paths, git_head(TARTCI_ROOT))
+            source = fleet_source.resolve(TARTCI_ROOT)
+            snapshot = advertised_labels_snapshot(
+                paths, source.source_commit or git_head(source.root), source.root)
             print(json.dumps(snapshot, indent=2) if args.json else render_advertised(snapshot))
             return 0
         if args.command == "verify-supply":

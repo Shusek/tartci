@@ -64,10 +64,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import runner_census
 from runner_census import RunnerCensus, RunnerRecord
+import fleet_source
 
 DEFAULT_PROFILE = "~/.config/tartci/macos-fleet-profile.toml"
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PUBLISHED_SUPPLY = ROOT / "fleet" / "advertised-labels.json"
+DEFAULT_PUBLISHED_SUPPLY = fleet_source.resolve(ROOT).published_supply
 # A peer with no `ssh` in the published supply is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 PEER_STATUS_COMMAND = "cd ~ && ~/.local/bin/tartci pool status --json"

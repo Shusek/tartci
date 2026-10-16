@@ -43,6 +43,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Iterable
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fleet_source
+
 OBSERVED = "OBSERVED"
 NOT_OBSERVED = "NOT_OBSERVED"
 IDLE = "IDLE"
@@ -50,7 +54,7 @@ UNDECLARED_OBSERVED = "UNDECLARED_OBSERVED"
 PERSISTENT_OBSERVED = "PERSISTENT_OBSERVED"
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PUBLISHED = ROOT / "fleet" / "advertised-labels.json"
+DEFAULT_PUBLISHED = fleet_source.resolve(ROOT).published_supply
 _EPHEMERAL_TAIL = re.compile(r"^(?:-slot(?P<slot>\d+))?-(?P<nn>\d{2})-\d+-\d+$")
 
 Fetch = Callable[[str], dict]
