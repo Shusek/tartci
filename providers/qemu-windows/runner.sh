@@ -93,6 +93,46 @@ windows_build_parallel_fragment(){
     'Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f $env:CMAKE_BUILD_PARALLEL_LEVEL)'
 }
 
+# The PowerShell the guest runs for one job: PATH, the lease's build
+# parallelism, the MSVC environment, then Runner.Listener with the JIT file.
+# CPUS is the lease's CPU grant; an invalid grant leaves the default unset.
+windows_listener_script(){
+  local ps
+  ps='$runnerPathAdd = @(
+  "C:\Program Files\Git\cmd",
+  "C:\Program Files\Git\bin",
+  "C:\Program Files\Git\usr\bin",
+  "C:\ProgramData\chocolatey\bin"
+)
+$env:Path = (($runnerPathAdd + @($env:Path -split ";")) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ";"
+__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__
+$vcvarsArch="'"$VCVARS_ARCH"'"
+$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
+if ($vcvars) {
+  Write-Output ("TARTCI_DIAG runner_vcvars={0} arch={1}" -f $vcvars, $vcvarsArch)
+  $tmp = Join-Path $env:TEMP ("tartci-vcvars-" + [guid]::NewGuid().ToString("N") + ".cmd")
+  try {
+    "@echo off",("call ""{0}"" {1} >nul" -f $vcvars, $vcvarsArch),"set" | Set-Content -Path $tmp -Encoding ASCII
+    $lines = & cmd.exe /d /c $tmp
+    foreach ($line in $lines) {
+      if ($line -match "^(.*?)=(.*)$") {
+        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+      }
+    }
+  } finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  }
+  $cl = Get-Command cl -ErrorAction SilentlyContinue
+  if ($cl) { Write-Output ("TARTCI_DIAG runner_command cl={0}" -f $cl.Source) } else { Write-Output "TARTCI_DIAG runner_command cl=missing-after-vcvars" }
+} else {
+  Write-Output "TARTCI_DIAG runner_vcvars=missing"
+}
+Set-Location C:\actions-runner
+& "C:\actions-runner\bin\Runner.Listener.exe" run --jitconfig (Get-Content "C:\actions-runner\jit.cfg")
+exit $LASTEXITCODE'
+  printf '%s\n' "${ps/__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__/$(windows_build_parallel_fragment "$1") }"
+}
+
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
@@ -133,6 +173,7 @@ runtime_emit_complete(){
 # or GitHub credentials.
 : "${PRINT_HOST_HEALTH:=0}"
 PRINT_BUILD_ENV_SCRIPT=""
+PRINT_LISTENER_SCRIPT=""
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
@@ -141,6 +182,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --repo) REPO="$2"; shift 2;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-build-env-script) PRINT_BUILD_ENV_SCRIPT="$2"; shift 2;;
+  --print-listener-script) PRINT_LISTENER_SCRIPT="$2"; shift 2;;
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
@@ -153,6 +195,7 @@ esac; done
     || die "invalid build parallelism '$PRINT_BUILD_ENV_SCRIPT'"
   exit 0
 }
+[ -n "$PRINT_LISTENER_SCRIPT" ] && { windows_listener_script "$PRINT_LISTENER_SCRIPT"; exit 0; }
 
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
 # GitHub CLI for all API calls. Default `gh`; hosts authenticating as a GitHub
@@ -689,39 +732,7 @@ $jitPath="C:\actions-runner\jit.cfg"
   # (3) run the agent reading the jit FILE — small PS, no blob on the wire.
   # Use Runner.Listener.exe directly (not run.cmd) so the huge JIT config is not
   # expanded through cmd.exe's 8191-character command-line limit.
-  ps_run='$runnerPathAdd = @(
-  "C:\Program Files\Git\cmd",
-  "C:\Program Files\Git\bin",
-  "C:\Program Files\Git\usr\bin",
-  "C:\ProgramData\chocolatey\bin"
-)
-$env:Path = (($runnerPathAdd + @($env:Path -split ";")) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ";"
-__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__
-$vcvarsArch="'"$VCVARS_ARCH"'"
-$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
-if ($vcvars) {
-  Write-Output ("TARTCI_DIAG runner_vcvars={0} arch={1}" -f $vcvars, $vcvarsArch)
-  $tmp = Join-Path $env:TEMP ("tartci-vcvars-" + [guid]::NewGuid().ToString("N") + ".cmd")
-  try {
-    "@echo off",("call ""{0}"" {1} >nul" -f $vcvars, $vcvarsArch),"set" | Set-Content -Path $tmp -Encoding ASCII
-    $lines = & cmd.exe /d /c $tmp
-    foreach ($line in $lines) {
-      if ($line -match "^(.*?)=(.*)$") {
-        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
-      }
-    }
-  } finally {
-    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
-  }
-  $cl = Get-Command cl -ErrorAction SilentlyContinue
-  if ($cl) { Write-Output ("TARTCI_DIAG runner_command cl={0}" -f $cl.Source) } else { Write-Output "TARTCI_DIAG runner_command cl=missing-after-vcvars" }
-} else {
-  Write-Output "TARTCI_DIAG runner_vcvars=missing"
-}
-Set-Location C:\actions-runner
-& "C:\actions-runner\bin\Runner.Listener.exe" run --jitconfig (Get-Content "C:\actions-runner\jit.cfg")
-exit $LASTEXITCODE'
-  ps_run="${ps_run/__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__/$(windows_build_parallel_fragment "$effective_win_cpus") }"
+  ps_run="$(windows_listener_script "$effective_win_cpus")"
   local run_status=0
   local runner_output="$logdir/runner-output.log"
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed
