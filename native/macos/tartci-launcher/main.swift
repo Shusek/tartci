@@ -236,6 +236,9 @@ private func requireNothingUnhashed(_ generation: String, allowed: Set<String>) 
     }
 }
 /// The last sequence this host ran, and the one before it (a rollback).
+/// A missing floor fails open: the first run on a host has nothing to compare
+/// with, and records the floor it runs. A floor that exists but cannot be read
+/// or decoded fails closed.
 private func requireNotDowngraded(_ policy: Policy, _ sequence: Int) {
     guard sequence >= 1 else { fail("launch set has no sequence", code: 77) }
     guard access(policy.floor, F_OK) == 0 else { return }
@@ -303,12 +306,18 @@ private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String
     guard lane.environment.keys.allSatisfy({ !$0.hasPrefix("DYLD_") }) else {
         fail("signed lane contains a forbidden dynamic-loader variable", code: 77)
     }
+    // Python start-up is the launcher's alone: a signed lane may not set
+    // PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, PYTHONPYCACHEPREFIX or any other
+    // PYTHON* variable (each can run or load code nothing hashed).
+    if let python = lane.environment.keys.sorted().first(where: { $0.hasPrefix("PYTHON") }) {
+        fail("signed lane sets \(python); Python start-up variables are the launcher's", code: 77)
+    }
     recordFloor(policy, set.sequence)
-    // Python never writes bytecode beside the source, and never reads a cache
-    // kept elsewhere (a PYTHONPYCACHEPREFIX tree would be unhashed code too).
+    // No bytecode is written beside the source, and the user site-packages
+    // (~/Library/Python/...), whose .pth files run at start-up, is not used.
     var environment = lane.environment
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
+    environment["PYTHONNOUSERSITE"] = "1"
     return (launch, set.entrypoint.sha256, environment)
 }
 private func probeStore(_ store: String) -> Never {

@@ -149,7 +149,8 @@ V2_ENTRY = (
     "case \"$TARTCI_TEST_MODE\" in\n"
     "  exit-zero) exit 0 ;;\n"
     "  exit-one) exit 1 ;;\n"
-    "  env) echo \"${PYTHONDONTWRITEBYTECODE-unset}:${PYTHONPYCACHEPREFIX-unset}\" > \"$HOME/env.out\"; exit 0 ;;\n"
+    "  env) echo \"${PYTHONDONTWRITEBYTECODE-unset}:${PYTHONNOUSERSITE-unset}\" > \"$HOME/env.out\"; exit 0 ;;\n"
+    "  python) for py in $TARTCI_TEST_PYTHONS; do \"$py\" -c pass || exit 98; done; exit 0 ;;\n"
     "  *) exit 99 ;;\n"
     "esac\n"
 )
@@ -199,8 +200,10 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         (self.generation / self.ls.ENTRYPOINT).write_text(V2_ENTRY)
         self.lanes = {mode: {"environment": {"HOME": str(work), "PATH": "/usr/bin:/bin",
                                              "TART_HOME": V2_STORE, "TARTCI_TEST_MODE": mode}}
-                      for mode in ("exit-zero", "exit-one", "env")}
-        self.lanes["env"]["environment"]["PYTHONPYCACHEPREFIX"] = str(work / "cache")
+                      for mode in ("exit-zero", "exit-one", "env", "python")}
+        self.pythons = [p for p in ("/usr/bin/python3", "/opt/homebrew/bin/python3.11")
+                        if os.access(p, os.X_OK)]
+        self.lanes["python"]["environment"]["TARTCI_TEST_PYTHONS"] = " ".join(self.pythons)
         self.seal()
 
     def write_policy(self, root) -> None:
@@ -321,7 +324,7 @@ class LauncherV2RuntimeTests(unittest.TestCase):
 
     def test_a_signed_lane_on_another_store_is_refused(self) -> None:
         value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, sequence=1)
-        value["lanes"]["exit-zero"]["environment"]["TART_HOME"] = "/Volumes/Other/VMs"
+        value["lanes"]["exit-zero"]["environment"]["TART_HOME"] = "/Volumes/Example2/VMs"
         self.seal(value=value)
         self.assertRefused("wrong Tart store")
 
@@ -351,9 +354,56 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         self.plant("planted.py")
         self.assertRefused("planted.py is not in the signed manifest")
 
-    def test_python_neither_writes_nor_reads_a_bytecode_cache(self) -> None:
+    def test_python_writes_no_bytecode_and_skips_the_user_site(self) -> None:
         self.assertEqual(0, self.run_lane("env").returncode, self.run_lane("env").stderr)
-        self.assertEqual("1:unset\n", (self.work / "env.out").read_text())
+        self.assertEqual("1:1\n", (self.work / "env.out").read_text())
+
+    def test_a_planted_user_site_pth_does_not_run(self) -> None:
+        # The lane's HOME is the scratch work dir: plant a .pth in each
+        # interpreter's user site-packages there.
+        marker = self.work / "planted.ran"
+        for py in self.pythons:
+            site = subprocess.run([py, "-c", "import site; print(site.getusersitepackages())"],
+                                  env={"HOME": str(self.work), "PATH": "/usr/bin:/bin"},
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            self.assertTrue(site.startswith(str(self.work)), site)
+            Path(site).mkdir(parents=True, exist_ok=True)
+            (Path(site) / "tartci-plant.pth").write_text(
+                f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n")
+        # Control: the plant runs when Python starts without the guard.
+        for py in self.pythons:
+            subprocess.run([py, "-c", "pass"], env={"HOME": str(self.work), "PATH": "/usr/bin:/bin"},
+                           check=True)
+            self.assertTrue(marker.exists(), py)
+            marker.unlink()
+        result = self.run_lane("python")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(marker.exists(), "a user-site .pth ran under the launcher")
+
+    def test_a_python_start_up_variable_in_the_set_is_refused(self) -> None:
+        for name in ("PYTHONPATH", "PYTHONPYCACHEPREFIX", "PYTHONSTARTUP", "PYTHONHOME"):
+            with self.subTest(name=name):
+                value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, sequence=1)
+                value["lanes"]["exit-zero"]["environment"][name] = str(self.work)
+                self.seal(value=value)
+                self.assertRefused(f"signed lane sets {name}")
+
+    def test_a_corrupt_floor_is_refused(self) -> None:
+        self.assertEqual(0, self.run_lane().returncode)
+        for body in ("{not json", '{"schema": 2, "sequence": 1}', ""):
+            with self.subTest(body=body):
+                self.floor.write_text(body)
+                os.chmod(self.floor, 0o600)
+                self.assertRefused("launcher floor")
+        self.floor.unlink()                 # a missing floor fails open
+        self.assertEqual(0, self.run_lane().returncode)
+
+    def test_a_fifo_in_the_generation_is_refused(self) -> None:
+        for dirpath, _dirs, _files in os.walk(self.generation):
+            os.chmod(dirpath, 0o755)
+        os.mkfifo(self.generation / "scripts/pipe")
+        self.ls.freeze(self.generation)
+        self.assertRefused("scripts/pipe is not a regular file")
 
     def test_a_symlink_above_the_generations_root_is_refused(self) -> None:
         alias = self.work / "alias"
@@ -445,7 +495,11 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
     test_a_planted_bytecode_cache_is_refused = None
     test_a_planted_file_outside_the_manifest_is_refused = None
     test_an_empty_bytecode_cache_directory_is_refused = None
-    test_python_neither_writes_nor_reads_a_bytecode_cache = None
+    test_python_writes_no_bytecode_and_skips_the_user_site = None
+    test_a_planted_user_site_pth_does_not_run = None
+    test_a_python_start_up_variable_in_the_set_is_refused = None
+    test_a_corrupt_floor_is_refused = None
+    test_a_fifo_in_the_generation_is_refused = None
     test_a_symlink_above_the_generations_root_is_refused = None
     test_a_nested_pointer_name_is_refused = None
     test_a_symlinked_pointer_is_refused = None

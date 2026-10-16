@@ -20,6 +20,13 @@ policy.json, then the manifest digest, every member's digest and the
 entrypoint's, and refuses any path that is not owned by the user or is
 group- or world-writable. A pointer (`~/.config/tartci/launcher-generation.json`)
 names the generation lanes run and the one a rollback returns to.
+
+The launcher also keeps a floor (`~/.config/tartci/launcher-floor.json`): the
+newest sequence it has run and the one before it. It refuses an older set
+except that previous one. A missing floor fails open (the first run on a host
+records it); an unreadable or malformed floor fails closed. A lane may not set
+any PYTHON* variable: the launcher sets PYTHONDONTWRITEBYTECODE and
+PYTHONNOUSERSITE itself.
 """
 
 from __future__ import annotations
@@ -86,6 +93,10 @@ def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int) -> di
             raise LaunchSetError(f"lane {lane} does not run on the Tart store {tart_home}")
         if any(key.startswith("DYLD_") for key in env):
             raise LaunchSetError(f"lane {lane} sets a dynamic-loader variable")
+        python = sorted(key for key in env if key.startswith("PYTHON"))
+        if python:
+            raise LaunchSetError(f"lane {lane} sets {python[0]}; Python start-up variables "
+                                 "are the launcher's")
     return {
         "schema": SCHEMA,
         "sequence": sequence,
@@ -203,6 +214,8 @@ def verify_contents(generation: Path, root: Path) -> Optional[str]:
                 return f"{relative}: a bytecode cache in the generation is never hashed"
             if full.is_symlink():
                 return f"{relative} is a symlink"
+            if not (full.is_dir() or full.is_file()):
+                return f"{relative} is not a regular file"
             if full.is_file() and relative not in allowed:
                 return f"{relative} is not in the signed manifest"
     for relative, expected in [(m.get("path"), m.get("sha256")) for m in members] + [
@@ -256,16 +269,25 @@ def publish(generation: Path, *, pointer: Path, root: Path, team_id: str,
         raise LaunchSetError(f"launch set does not verify, pointer unchanged: {problem}")
     current = read_pointer(pointer)
     previous = current.get("generation") if current else None
+    note = None
     if previous and previous != str(generation):
         # The launcher refuses a set older than the last one it ran; refuse to
-        # point it at one in the first place.
+        # point it at one in the first place. A previous generation whose set
+        # cannot be read is treated as absent (and named in `note`): it can no
+        # longer serve as a rollback, and the launcher's own floor still
+        # refuses a downgrade, so it must not block every later publish.
+        after = json.loads((generation / SET_NAME).read_text())["sequence"]
         try:
-            before = json.loads((Path(previous) / SET_NAME).read_text()).get("sequence", 0)
-            after = json.loads((generation / SET_NAME).read_text())["sequence"]
-        except (OSError, ValueError, KeyError) as exc:
-            raise LaunchSetError(f"cannot compare launch set sequences, pointer unchanged: {exc}") from exc
-        if not isinstance(before, int) or after <= before:
+            before = json.loads((Path(previous) / SET_NAME).read_text())["sequence"]
+            if type(before) is not int:
+                raise ValueError(f"sequence {before!r}")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            note = f"previous generation {previous} has no readable launch set ({exc}); treated as absent"
+            before = None
+        if before is not None and after <= before:
             raise LaunchSetError(f"launch set sequence {after} is not after {before}, pointer unchanged")
+    if note:
+        previous = None
     value = {"schema": POINTER_SCHEMA, "generation": str(generation),
              "previous": previous if previous != str(generation) else (current or {}).get("previous")}
     pointer.parent.mkdir(parents=True, exist_ok=True)
@@ -280,4 +302,4 @@ def publish(generation: Path, *, pointer: Path, root: Path, team_id: str,
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
-    return value
+    return {**value, "note": note} if note else value

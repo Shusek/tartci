@@ -107,6 +107,21 @@ class LaunchSetTests(unittest.TestCase):
             with self.subTest(sequence=sequence), self.assertRaisesRegex(ls.LaunchSetError, "sequence"):
                 ls.build(self.generation, LANES, tart_home=STORE, sequence=sequence)
 
+    def test_the_swift_requirement_is_the_python_requirement(self) -> None:
+        # One source of truth in two languages: rebuild the launcher's
+        # requirement from main.swift's string literals and compare.
+        import re as _re
+        swift = (Path(__file__).resolve().parents[1]
+                 / "native/macos/tartci-launcher/main.swift").read_text()
+        body = swift[swift.index("private func launchSetRequirement"):]
+        body = body[body.index('return "anchor apple generic"'):]
+        body = body[:body.index("\n}\n")]
+        literals = _re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+        rebuilt = ("".join(literals).replace('\\"', '"')
+                   .replace("\\(policy.team_id)", TEAM)
+                   .replace("\\(launchSetIdentifier)", ls.LAUNCH_SET_IDENTIFIER))
+        self.assertEqual(ls.requirement(TEAM), rebuilt)
+
     def test_the_requirement_pins_the_policy_team(self) -> None:
         self.assertEqual('anchor apple generic'
                          ' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
@@ -200,6 +215,30 @@ class LaunchSetTests(unittest.TestCase):
                     (self.generation / "scripts/__pycache__").rmdir()
                 ls.freeze(self.generation)
         self.assertIsNone(ls.verify_contents(self.generation, self.root))
+
+    def test_a_python_start_up_variable_in_a_lane_is_refused(self) -> None:
+        for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+            lanes = {"x": {"environment": {"TART_HOME": STORE, name: "/tmp"}}}
+            with self.subTest(name=name), self.assertRaisesRegex(ls.LaunchSetError, name):
+                ls.build(self.generation, lanes, tart_home=STORE, sequence=1)
+
+    def test_a_fifo_in_the_generation_is_refused(self) -> None:
+        self.written()
+        os.mkfifo(self.generation / "scripts/pipe")
+        ls.freeze(self.generation)
+        self.assertEqual("scripts/pipe is not a regular file",
+                         ls.verify_contents(self.generation, self.root))
+
+    def test_an_unreadable_previous_generation_does_not_block_the_pointer(self) -> None:
+        older = self.written(make_generation(self.root, "b" * 40 + "-1"), sequence=1)
+        self.publish(older)
+        os.chmod(older, 0o755)
+        (older / ls.SET_NAME).unlink()      # damaged: its set is gone
+        value = self.publish(self.written(sequence=2))
+        self.assertEqual(str(self.generation), value["generation"])
+        self.assertIsNone(value["previous"], "a damaged generation is not a rollback target")
+        self.assertIn("treated as absent", value["note"])
+        self.assertEqual(str(self.generation), ls.read_pointer(self.pointer)["generation"])
 
     def test_publish_refuses_a_sequence_that_does_not_advance(self) -> None:
         newer = self.written(make_generation(self.root, "c" * 40 + "-1"), sequence=5)
