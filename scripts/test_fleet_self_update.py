@@ -4096,6 +4096,38 @@ class RecoveryBranchTests(Base):
                             and "FAILED verification" in s["detail"] for s in receipt["steps"]))
 
 
+def make_v2_host(test, team: str = "95CX6P84C4") -> None:
+    """A sealed host already on launcher v2: its stable app (inputs digest "f"*64,
+    which the fake measures for any target), its pointer at a generation of
+    INSTALLED, a v2 receipt, its opt-in file and the dedicated keychain."""
+    config = test.home / ".config/tartci"
+    app = test.home / "libexec/TartCILauncher.app"
+    (app / "Contents/Resources/bundle.json").unlink()
+    (app / "Contents/Resources/inputs.json").write_text(
+        json.dumps({"schema": 1, "sha256": "f" * 64}))
+    generation = test.home / ".local/share/tartci-generations" / f"{INSTALLED}-1"
+    generation.mkdir(parents=True)
+    (config / "launcher-generation.json").write_text(
+        json.dumps({"schema": 1, "generation": str(generation)}))
+    (config / "macos-fleet-install.json").write_text(json.dumps(
+        {"launch_helper": {"schema": 2, "layout": "v2"},
+         "support": {"source_commit": INSTALLED}}))
+    test.sys.v2_generation = generation
+    test.sys._set_installed(INSTALLED)
+    opt_in = config / "launcher-v2.enabled"
+    opt_in.write_text("")
+    opt_in.chmod(0o600)
+    secrets = test.home / ".config/pulp/secrets/keychain.env"
+    secrets.parent.mkdir(parents=True)
+    secrets.write_text('PULP_SIGN_KEYCHAIN="$HOME/Library/Keychains/pulp-signing.keychain-db"\n')
+    helper = {"path": str(app), "identifier": "com.danielraffel.tartci.launcher",
+              "team_id": team,
+              "approval_sha256_path": str(config / "m3-launcher-approved.sha256")}
+    patch = mock.patch.object(su, "launch_helper", return_value=helper)
+    patch.start()
+    test.addCleanup(patch.stop)
+
+
 class LauncherV2SelfUpdateTests(Base):
     """Launcher v2: an update that leaves the stable app's inputs, signing
     identity and team equal builds nothing and needs no consent; any
@@ -4106,32 +4138,7 @@ class LauncherV2SelfUpdateTests(Base):
 
     def setUp(self) -> None:
         super().setUp()
-        config = self.home / ".config/tartci"
-        app = self.home / "libexec/TartCILauncher.app"
-        (app / "Contents/Resources/bundle.json").unlink()
-        (app / "Contents/Resources/inputs.json").write_text(
-            json.dumps({"schema": 1, "sha256": "f" * 64}))
-        generation = self.home / ".local/share/tartci-generations" / f"{INSTALLED}-1"
-        generation.mkdir(parents=True)
-        self.sys.v2_generation = generation
-        self.sys._set_installed(INSTALLED)
-        (config / "launcher-generation.json").write_text(
-            json.dumps({"schema": 1, "generation": str(generation)}))
-        (config / "macos-fleet-install.json").write_text(json.dumps(
-            {"launch_helper": {"schema": 2, "layout": "v2"},
-             "support": {"source_commit": INSTALLED}}))
-        opt_in = config / "launcher-v2.enabled"
-        opt_in.write_text("")
-        opt_in.chmod(0o600)
-        secrets = self.home / ".config/pulp/secrets/keychain.env"
-        secrets.parent.mkdir(parents=True)
-        secrets.write_text('PULP_SIGN_KEYCHAIN="$HOME/Library/Keychains/pulp-signing.keychain-db"\n')
-        helper = {"path": str(app), "identifier": "com.danielraffel.tartci.launcher",
-                  "team_id": self.TEAM,
-                  "approval_sha256_path": str(config / "m3-launcher-approved.sha256")}
-        patch = mock.patch.object(su, "launch_helper", return_value=helper)
-        patch.start()
-        self.addCleanup(patch.stop)
+        make_v2_host(self)
 
     def ack_path(self) -> Path:
         return self.home / ".config/tartci/launcher-change-ack"
@@ -4338,6 +4345,73 @@ class LauncherV2SelfUpdateTests(Base):
         rollback = self.installs()[-1]
         self.assertEqual("v1", rollback[rollback.index("--launcher-layout") + 1])
         self.assertNotIn("--launch-set-identity", rollback)
+
+
+class LauncherV2FleetSourceTests(FleetSourceFixture):
+    """On a launcher v2 host a [fleet_source] move is measured like any update:
+    a refresh when the stable app's inputs are unchanged, an acknowledged
+    launcher change when they are not. v1 sealed hosts keep refusing it."""
+    sealed = True
+
+    def setUp(self) -> None:
+        super().setUp()
+        make_v2_host(self)
+        self.cfg.fleet_source_canary = su.self_host_id(self.cfg)   # this sealed host
+        self.sys.log_lines = ""          # main has not moved: only the source has
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def builds(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]]
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def ack(self) -> str:
+        return f"v2 inputs={'f' * 64} identity={IDENTITY} team=95CX6P84C4"
+
+    def test_a_source_move_with_unchanged_inputs_is_a_refresh_that_keeps_the_app(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertIn("fleet source moved", self.latest()["refresh"])
+        self.assertEqual([], self.builds())
+        install = self.installs()[0]
+        self.assertNotIn("--launch-helper-source", install)
+        self.assertIn("--launch-set-identity", install)
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+        launcher = next(s["detail"] for s in self.latest()["steps"] if s["step"] == "launcher")
+        self.assertIn("no launcher change", launcher)
+
+    def test_a_source_move_that_changes_the_inputs_waits_for_the_ack(self) -> None:
+        inputs = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        inputs.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn(f"echo '{self.ack()}'", self.latest()["error"])
+        (self.home / ".config/tartci/launcher-change-ack").write_text(self.ack() + "\n")
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        build = self.builds()[0]
+        self.assertEqual("v2", build[build.index("--layout") + 1])
+        self.assertIn("--launch-helper-source", self.installs()[0])
+
+    def test_a_v1_sealed_host_still_refuses_the_source_even_with_the_opt_in(self) -> None:
+        # Control: #570's refusal stands until the host has installed v2.
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 1}, "support": {"source_commit": INSTALLED}}))
+        with self.assertRaisesRegex(su.Refused, "fleet source refused on a sealed-launcher host"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_a_v2_host_whose_opt_in_is_gone_refuses_the_source_before_reading_it(self) -> None:
+        (self.home / ".config/tartci/launcher-v2.enabled").unlink()
+        with self.assertRaisesRegex(su.Refused, "--launcher-layout v1"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertFalse(any(len(a) > 2 and self.fixture.PRIVATE in a[2]
+                             for a, _ in self.sys.calls if a[:1] == [FAKE_GH]))
+
+    # Base's pause test does not configure a v2 host's source; Base covers it.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
 
 
 if __name__ == "__main__":
