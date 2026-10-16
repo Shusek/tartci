@@ -74,26 +74,16 @@ export TARTCI_RENDER_PYTHON="$render_python" TARTCI_PYTHON="$render_python"
 parent="$(dirname "$output")"; mkdir -p "$parent"; stage="$(mktemp -d "$parent/.tartci-launcher-app.XXXXXX")"; trap 'rm -rf "$stage"' EXIT
 if [[ "$layout" = v2 ]]; then
   app="$stage/TartCILauncher.app"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-  "$render_python" - "$profile" "$app/Contents/Resources/policy.json" <<'PY'
-import json, re, sys, tomllib
+  "$render_python" - "$root" "$profile" "$app/Contents/Resources/policy.json" <<'PY'
+import sys, tomllib
 from pathlib import Path
-profile = tomllib.loads(Path(sys.argv[1]).read_text())
-host, helper = profile["host"], profile["launch_helper"]
-tart_home = host["tart_home"]
-parts = tart_home.split("/")[1:]
-if not tart_home.startswith("/Volumes/") or len(parts) < 3 or any(p in ("", ".", "..") for p in parts):
-    raise SystemExit(f"launch helper requires an external-volume Tart store, got {tart_home!r}")
-if not re.fullmatch(r"[A-Z0-9]{10}", helper["team_id"]):
-    raise SystemExit("launch_helper.team_id must be a ten-character Apple Team ID")
-home = host["home"].rstrip("/")
-Path(sys.argv[2]).write_text(json.dumps({
-    "schema": 2, "identifier": helper["identifier"], "team_id": helper["team_id"],
-    "tart_home": tart_home,
-    "generations_root": f"{home}/.local/share/tartci-generations",
-    "home": home,
-    "pointer": f"{home}/.config/tartci/launcher-generation.json",
-    "floor": f"{home}/.config/tartci/launcher-floor.json",
-}, sort_keys=True, separators=(",", ":")) + "\n")
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+import macos_launcher_identity
+profile = tomllib.loads(Path(sys.argv[2]).read_text())
+try:
+    Path(sys.argv[3]).write_bytes(macos_launcher_identity.v2_policy_bytes(profile))
+except macos_launcher_identity.IdentityError as error:
+    raise SystemExit(str(error))
 PY
 fi
 if [[ "$layout" = v1 ]]; then
@@ -159,9 +149,19 @@ launch.chmod(0o555)
 PY
 chmod -R a-w "$app/Contents/Resources/support"
 fi
-cat >"$app/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>tartci-launcher</string><key>CFBundleIdentifier</key><string>com.danielraffel.tartci.launcher</string><key>CFBundleName</key><string>TartCI Launcher</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSBackgroundOnly</key><true/><key>NSRemovableVolumesUsageDescription</key><string>TartCI uses an external volume for isolated local CI virtual machines.</string></dict></plist>
-PLIST
+cat "$support_root/native/macos/tartci-launcher/Info.plist" >"$app/Contents/Info.plist"
+if [[ "$layout" = v2 ]]; then
+  # What this app is made of, so an update can tell whether it would change.
+  "$render_python" - "$root" "$support_root" "$profile" "$app/Contents/Resources/inputs.json" <<'PY'
+import json, sys, tomllib
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+import macos_launcher_identity
+profile = tomllib.loads(Path(sys.argv[3]).read_text())
+digest = macos_launcher_identity.source_inputs_digest(sys.argv[2], profile)
+Path(sys.argv[4]).write_text(json.dumps({"schema": 1, "sha256": digest}, sort_keys=True) + "\n")
+PY
+fi
 xcrun swiftc -O -whole-module-optimization -target arm64-apple-macos13 -framework Security "$support_root/native/macos/tartci-launcher/main.swift" -o "$app/Contents/MacOS/tartci-launcher"
 /usr/bin/codesign --force --timestamp --options runtime ${keychain_args[@]+"${keychain_args[@]}"} --sign "$identity" --identifier com.danielraffel.tartci.launcher "$app"
 /usr/bin/codesign --verify --strict --deep --verbose=2 "$app"; mv "$app" "$output"

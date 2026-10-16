@@ -99,4 +99,63 @@ class SameBundleTests(unittest.TestCase):
         self.assertNotIn("mv ",unchanged); self.assertNotIn("ditto",unchanged)
         self.assertIn("verify \"$launcher_target\"",unchanged)
 
+
+PROFILE={"host":{"home":"/Users/example","tart_home":"/Volumes/Example/VMs"},
+         "launch_helper":{"identifier":"com.danielraffel.tartci.launcher","team_id":"95CX6P84C4"}}
+class V2Tests(unittest.TestCase):
+    """Launcher v2: the stable app and its inputs digest."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); root=Path(self.temp.name)
+        self.support=root/"support"; native=self.support/"native/macos/tartci-launcher"; native.mkdir(parents=True)
+        (native/"main.swift").write_text("print(1)\n"); (native/"Info.plist").write_text("<plist/>\n")
+        self.app=root/"Launcher.app"; exe=self.app/"Contents/MacOS/tartci-launcher"; exe.parent.mkdir(parents=True); exe.write_bytes(b"mach-o"); exe.chmod(0o755)
+        res=self.app/"Contents/Resources"; res.mkdir(parents=True)
+        (self.app/"Contents/Info.plist").write_text("<plist/>\n")
+        (res/"policy.json").write_bytes(identity.v2_policy_bytes(PROFILE))
+        (res/"inputs.json").write_text(json.dumps({"schema":1,"sha256":identity.source_inputs_digest(self.support,PROFILE)}))
+        sig=self.app/"Contents/_CodeSignature"; sig.mkdir(); (sig/"CodeResources").write_text("x")
+    def tearDown(self): self.temp.cleanup()
+    def verify(self,**kw):
+        with Tests.inspect(self): return identity.verify_v2(self.app,identifier="com.danielraffel.tartci.launcher",team_id="95CX6P84C4",profile=PROFILE,**kw)
+    def test_record(self):
+        record=self.verify(support_root=self.support)
+        self.assertEqual("v2",record["layout"]); self.assertEqual(2,record["schema"])
+        self.assertEqual(identity.source_inputs_digest(self.support,PROFILE),record["inputs_sha256"])
+        self.assertNotIn("source_commit",record)
+    def test_the_policy_is_the_profiles_host_facts_only(self):
+        self.assertEqual({"schema":2,"identifier":"com.danielraffel.tartci.launcher","team_id":"95CX6P84C4",
+                          "tart_home":"/Volumes/Example/VMs","generations_root":"/Users/example/.local/share/tartci-generations",
+                          "home":"/Users/example","pointer":"/Users/example/.config/tartci/launcher-generation.json",
+                          "floor":"/Users/example/.config/tartci/launcher-floor.json"},identity.v2_policy(PROFILE))
+        # A lane, a source commit or any other profile change leaves it alone.
+        changed=json.loads(json.dumps(PROFILE)); changed["lane"]=[{"id":"x"}]; changed["host"]["python"]="/opt/py"
+        self.assertEqual(identity.v2_policy_bytes(PROFILE),identity.v2_policy_bytes(changed))
+        for bad in ({"tart_home":"/Users/example/VMs"},{"team_id":"abc"},{"home":"relative"}):
+            with self.subTest(bad=bad):
+                profile=json.loads(json.dumps(PROFILE))
+                for key,value in bad.items():
+                    (profile["launch_helper"] if key=="team_id" else profile["host"])[key]=value
+                with self.assertRaises(identity.IdentityError): identity.v2_policy(profile)
+    def test_the_inputs_digest_moves_with_each_input_and_nothing_else(self):
+        base=identity.inputs_digest(b"a",b"b",b"c")
+        self.assertEqual(base,identity.inputs_digest(b"a",b"b",b"c"))
+        for parts in ((b"a2",b"b",b"c"),(b"a",b"b2",b"c"),(b"a",b"b",b"c2"),(b"ab",b"",b"c")):
+            with self.subTest(parts=parts): self.assertNotEqual(base,identity.inputs_digest(*parts))
+    def test_an_extra_or_missing_file_is_refused(self):
+        (self.app/"Contents/Resources/lanes.json").write_text("{}")
+        with self.assertRaisesRegex(identity.IdentityError,"extra=\\['Contents/Resources/lanes.json'\\]"): self.verify()
+        (self.app/"Contents/Resources/lanes.json").unlink(); (self.app/"Contents/Resources/inputs.json").unlink()
+        with self.assertRaisesRegex(identity.IdentityError,"missing"): self.verify()
+    def test_a_policy_for_another_profile_is_refused(self):
+        other=json.loads(json.dumps(PROFILE)); other["host"]["tart_home"]="/Volumes/Store/VMs"
+        (self.app/"Contents/Resources/policy.json").write_bytes(identity.v2_policy_bytes(other))
+        with self.assertRaisesRegex(identity.IdentityError,"policy does not match"): self.verify()
+    def test_inputs_from_another_source_are_refused(self):
+        (self.support/"native/macos/tartci-launcher/main.swift").write_text("print(2)\n")
+        with self.assertRaisesRegex(identity.IdentityError,"not built from this support tree"): self.verify(support_root=self.support)
+        self.verify()   # without a support tree the record is only read
+    def test_v1_signature_rules_still_apply(self):
+        with self.assertRaisesRegex(identity.IdentityError,"identifier does not match"):
+            with Tests.inspect(self): identity.verify_v2(self.app,identifier="com.example.other",team_id="95CX6P84C4",profile=PROFILE)
+
 if __name__=="__main__": unittest.main()
