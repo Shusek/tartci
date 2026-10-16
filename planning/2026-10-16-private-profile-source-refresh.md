@@ -96,6 +96,13 @@ marker; Python 3.9 verifies the marker and resolves the already-validated
 bytes. The source, sync, self-update, and system-Python coverage tests pass
 locally after this fix.
 
+The focused suites were rerun from a clean current-main worktree on
+2026-10-16: `test_fleet_source.py` passed 23 tests,
+`test_fleet_source_sync.py` passed 15 tests, and
+`test_fleet_self_update.py` passed 314 tests. The private projection branch is
+pushed but has no review PR yet; external-source selection remains disabled
+while Ultra reviews the projection and the complete export is still missing.
+
 ## Stop conditions
 
 Stop and retain the public default if the private authority remains redacted,
