@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation complete locally; review pending; external-source rollout intentionally gated
+Status: implementation merged; private projection reconciled; external-source rollout intentionally gated
 
 ## Goal
 
@@ -78,6 +78,16 @@ installed on a fleet host.
 The private authority still lacks a complete export with the required profile
 set and published supply document. A partial export would omit routing and
 capacity authority, so it is not being created or rolled out.
+
+The private projection was reconciled against clean current TartCI and Pulp
+main checkouts on 2026-10-16. The reconciliation records host-specific event
+tiers: M1 remains PR-head and release capable without merge-group admission,
+while M3 and M5 admit merge-group, PR-head, and release classes. It also
+records M3's current seven-core Pulp gate VM size. The checker passed the
+updated projection and rejected a planted stale-tier change. The update is
+published in the private authority repository at commit
+`5650f6955c22a1d760a5f857a95ff3a3329f03d2`; it is not part of the public
+TartCI source tree.
 
 The first Python 3.9 run exposed a compatibility gap: stock Python 3.9 has no
 `tomllib`, so valid configured sources were rejected. Export now performs full
