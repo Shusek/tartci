@@ -3765,6 +3765,33 @@ then exits 127, so a host with a broken pin reports it instead of going
 dark. `tartci doctor fleet` reports a loaded watchdog or self-update agent
 whose last exit is nonzero (`host_agents_failing`; 127 is a refusal).
 
+The sealed launcher (`TartCILauncher.app`, on hosts whose Tart store is on an
+external volume) carries the same kind of grant: Removable Volumes belongs to
+the app, and replacing the app can reset it. Without it the helper blocks in
+`open()` on the store and no lane starts. So:
+
+- The installer leaves an identical live launcher in place. A same-generation
+  reinstall, a retried install or a rollback whose bundle matches the live one
+  byte for byte does not replace it (`launcher: unchanged, left in place`).
+- Self-update refuses, before any drain, to install a commit that would
+  replace the launcher until an operator acknowledges that commit, and opens
+  `[tartci] <host>: grant Removable Volumes to TartCI Launcher before
+  self-update installs <commit>` (`launcher_consent_needed`). Every TartCI
+  commit seals a new bundle, so each update on these hosts needs this step:
+
+  ```sh
+  echo <commit> > ~/.config/tartci/launcher-change-ack   # allow this one update
+  # right after it installs: System Settings > Privacy & Security >
+  # Files and Folders > TartCI Launcher > Removable Volumes (on)
+  ```
+
+  The key is the commit, not the bundle digest, because each build is re-signed
+  with a new timestamp. The issue closes once the change is acknowledged.
+- When the launch-helper volume probe times out, it times the same small write
+  from its own (parent) process as a control. A fast control is reported as
+  `helper blocked in open(); same-dir write from parent took N ms` with the
+  grant to restore; a slow one as `volume I/O slow`.
+
 The preflight proves a new interpreter once. A grant that is later revoked or
 reset (a macOS update, `tccutil reset`, a box unticked) is caught by the
 watchdog's hourly grant check (`scripts/interpreter_grant_check.py`). It starts

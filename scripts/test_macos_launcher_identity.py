@@ -51,4 +51,52 @@ class Tests(unittest.TestCase):
         for detail in variants:
             with self.subTest(detail=detail),self.inspect(detail),self.assertRaises(identity.IdentityError): self.verify()
         with mock.patch.object(identity,"_run",side_effect=lambda cmd: REQUIREMENT if "-r-" in cmd else ("x86_64\n" if "/usr/bin/lipo" in cmd else DETAIL)),self.assertRaises(identity.IdentityError): self.verify()
+class SameBundleTests(unittest.TestCase):
+    """An identical live launcher is left in place; anything else is replaced."""
+    setUp=Tests.setUp; tearDown=Tests.tearDown
+    def copy(self):
+        import shutil
+        other=Path(self.temp.name)/"Source.app"; shutil.copytree(self.app,other); return other
+    def test_an_identical_copy_is_the_same(self):
+        self.assertTrue(identity.same_bundle(self.app,self.copy()))
+        self.assertTrue(identity.same_bundle(self.app,self.app))
+    def test_any_content_mode_or_file_difference_is_not_the_same(self):
+        for change in ("content","mode","extra","missing"):
+            with self.subTest(change=change):
+                other=self.copy(); exe=other/"Contents/MacOS/tartci-launcher"
+                if change=="content": exe.write_bytes(b"mach-o2")
+                elif change=="mode": exe.chmod(0o700)
+                elif change=="extra": (other/"Contents/Resources/extra").write_text("x")
+                else: (other/"Contents/Resources/lanes.json").unlink()
+                self.assertFalse(identity.same_bundle(self.app,other))
+                import shutil; shutil.rmtree(other)
+    def test_a_missing_symlinked_or_unreadable_live_bundle_is_not_the_same(self):
+        source=self.copy()
+        self.assertFalse(identity.same_bundle(Path(self.temp.name)/"absent.app",source))
+        link=Path(self.temp.name)/"link.app"; link.symlink_to(self.app)
+        self.assertFalse(identity.same_bundle(link,source))
+        (self.app/"Contents/Resources/inner").symlink_to(self.exe)
+        self.assertFalse(identity.same_bundle(self.app,source))
+    def test_the_cli_exit_code_carries_the_answer(self):
+        import subprocess
+        script=str(Path(identity.__file__))
+        same=subprocess.run([sys.executable,script,"same",str(self.app),str(self.copy())],capture_output=True,timeout=60)
+        self.assertEqual(0,same.returncode,same.stderr)
+        differ=subprocess.run([sys.executable,script,"same",str(self.app),str(Path(self.temp.name)/"absent.app")],capture_output=True,timeout=60)
+        self.assertEqual(1,differ.returncode,differ.stderr)
+    def test_the_installer_leaves_an_identical_live_launcher_in_place(self):
+        body=(Path(identity.__file__).parent/"install_macos_fleet.sh").read_text()
+        decide=body.index('macos_launcher_identity.py" same')
+        copy=body.index('/usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/"')
+        self.assertLess(decide,copy)
+        self.assertIn("launcher_unchanged=1\n  else\n    launcher_candidate=",body)
+        swap=body.index('mv "$launcher_candidate" "$launcher_target"')
+        guard=body.index('if [ -n "$launcher_target" ] && [ "$launcher_unchanged" = 1 ]; then')
+        replace=body.index('elif [ -n "$launcher_target" ]; then', guard)
+        self.assertLess(guard,replace); self.assertLess(replace,swap)
+        # The unchanged branch neither moves the live bundle aside nor replaces it.
+        unchanged=body[guard:replace]
+        self.assertNotIn("mv ",unchanged); self.assertNotIn("ditto",unchanged)
+        self.assertIn("verify \"$launcher_target\"",unchanged)
+
 if __name__=="__main__": unittest.main()
