@@ -79,6 +79,19 @@ class StaleBootTests(unittest.TestCase):
         missing = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
         self.assertFalse(missing.stale, missing.reason)
 
+    def test_gather_health_surfaces_stale_boot_as_healable_wedge(self) -> None:
+        self.write_state(ts="1970-01-01T00:16:40Z")
+        original = wd._run
+        wd._run = lambda cmd: (0, "state = running\npid = 42\nlast exit code = 0\n", "")
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m1.lane",
+            str(self.plist), stale_log_s=4_500, vm_running=False,
+            pool_participating=True,
+        )
+        self.assertEqual(health.verdict, "wedged", health.reason)
+        self.assertIn("no Tart VM is running", health.reason)
+
 
 if __name__ == "__main__":
     unittest.main()
