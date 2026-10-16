@@ -934,18 +934,39 @@ class OrphanedLaneVmTests(unittest.TestCase):
         self.assertFalse(verdict[0])
         self.assertTrue(verdict[1].startswith("retired_clone_reap_off: would delete"), verdict)
 
-    def m1_digest(self, *argv: str, enabled: bool) -> tuple[dict, list, str]:
+    def m1_digest(self, *argv: str, enabled: bool,
+                  real_ownership: bool = False) -> tuple[dict, list, str]:
         import contextlib
         import io
         import fleet_lane_discovery as fld
+        # m1's layout: ~/.tartci/state/<lane>/, ~/.config/tartci, LaunchAgents.
+        home = self.tmp / "home"
+        state = home / ".tartci" / "state"
         lane = fld.Lane("com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate",
-                        "pulp-gate", self.tmp / "state" / "pulp-gate", "m1-pulp-gate-01")
-        (self.tmp / "state" / "pulp-gate").mkdir(parents=True, exist_ok=True)
-        retired_dir = self.tmp / "state" / "macos-preamble-target-06"
+                        "pulp-gate", state / "macos-fleet" / "pulp-gate", "m1-pulp-gate-01")
+        (state / "macos-fleet" / "pulp-gate").mkdir(parents=True, exist_ok=True)
+        retired_dir = state / "macos-preamble-target-06"
         retired_dir.mkdir(parents=True, exist_ok=True)
+        # m1's real record, as found on 2026-10-16.
         (retired_dir / "pulp-preamble-m1-target-06.state.json").write_text(json.dumps({
-            "provider": "tart-macos", "runner": "pulp-preamble-m1-target-06",
-            "vm": "pulp-preamble-m1-target-06-99292-1", "supervisor_pid": "99292"}))
+            "ts": "2026-07-26T07:16:35Z", "provider": "tart-macos", "host": "Daniels-MacBook-Pro",
+            "runner": "pulp-preamble-m1-target-06", "vm": "pulp-preamble-m1-target-06-99292-1",
+            "vm_ip": "192.168.64.6", "phase": "job-running", "lifecycle": "ephemeral",
+            "labels": "self-hosted,macOS,ARM64,pulp-preamble", "repo": "Generous-Corp/pulp",
+            "run_id": "{", "job_id": "{", "supervisor_pid": "99292",
+            "supervisor_pid_started_at": "Sun Jul 26 00:15:54 2026"}))
+        (retired_dir / "events.jsonl").write_text(
+            '{"event":"boot_ok","vm":"pulp-preamble-m1-target-06-99292-1"}\n')
+        config = home / ".config" / "tartci"
+        config.mkdir(parents=True, exist_ok=True)
+        profile = config / "macos-fleet-profile.toml"
+        profile.write_text('[host]\nid = "m1"\n[[lane]]\nid = "pulp-gate"\n'
+                           'golden = "pulp-build-runner:latest"\n')
+        agents = home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / f"{lane.label}.plist").write_text(
+            "<plist><dict><key>TARTCI_GOLDEN</key><string>pulp-build-runner:latest</string>"
+            "</dict></plist>")
         (self.tmp / "leases").mkdir(exist_ok=True)
         (self.tmp / "leases" / "leases.json").write_text("[]")
         flag = self.tmp / "reap-retired-clones.enabled"
@@ -955,6 +976,8 @@ class OrphanedLaneVmTests(unittest.TestCase):
             flag.unlink(missing_ok=True)
         vms = [{"Name": "pulp-preamble-m1-target-06-99292-1", "State": "stopped", "Size": 44},
                {"Name": "pulp-m1-repro-20261016-1", "State": "stopped", "Size": 20},
+               {"Name": "tartci-m1-bisect-1-2", "State": "stopped", "Size": 20},
+               {"Name": "m1-scratch-repro-12-3", "State": "stopped", "Size": 20},
                {"Name": "pulp-linux-build-proof-2.336.0-20260811", "State": "stopped", "Size": 18},
                {"Name": "vellum-pr19-linux-20260811", "State": "stopped", "Size": 6}]
         for vm in vms:
@@ -971,18 +994,21 @@ class OrphanedLaneVmTests(unittest.TestCase):
              mock.patch.object(vm_reap, "macos_running_count", return_value=0), \
              mock.patch.object(vm_reap, "github_runners", return_value=[]), \
              mock.patch.object(vm_reap, "pid_alive", return_value=False), \
-             mock.patch.object(vm_reap, "TartciNames", return_value=lambda name: False), \
+             mock.patch.object(vm_reap.pathlib.Path, "home", return_value=home), \
+             mock.patch.dict(os.environ, {"TARTCI_FLEET_PROFILE": str(profile), "HOME": str(home)}), \
+             (contextlib.nullcontext() if real_ownership else
+              mock.patch.object(vm_reap, "TartciNames", return_value=lambda name: False)), \
              mock.patch.object(vm_reap, "delete_vm",
                                side_effect=lambda name, running: deleted.append(name) or
                                [f"vm_deleted:{name}"]), \
              contextlib.redirect_stdout(out):
             if "--json" in argv:
                 digest, _ = vm_reap.build_digest(vm_reap.parse_args(
-                    ["--repo", "danielraffel/pulp", "--state-root", str(self.tmp / "state"),
+                    ["--repo", "danielraffel/pulp", "--state-root", str(state),
                      *[a for a in argv if a != "--json"]]))
             else:
                 vm_reap.main(["--repo", "danielraffel/pulp", "--state-root",
-                              str(self.tmp / "state"), *argv])
+                              str(state), *argv])
                 digest = {}
         return digest, deleted, out.getvalue()
 
@@ -992,6 +1018,19 @@ class OrphanedLaneVmTests(unittest.TestCase):
         self.assertEqual(digest["orphans"]["delete"], ["pulp-preamble-m1-target-06-99292-1"])
         self.assertEqual(digest["orphans"]["kept"]["pulp-m1-repro-20261016-1"],
                          "no_retired_lane_record")
+
+    @unittest.skipIf(sys.version_info < (3, 11), "reads the fleet profile (tomllib)")
+    def test_with_the_real_ownership_check_on_m1s_layout(self) -> None:
+        # No mocked ownership: the real retired clone, recorded by its own
+        # lane's state file, is deleted; agent-shaped names are kept.
+        digest, deleted, _ = self.m1_digest("--fix", "--json", enabled=True,
+                                            real_ownership=True)
+        self.assertEqual(deleted, ["pulp-preamble-m1-target-06-99292-1"])
+        kept = digest["orphans"]["kept"]
+        for name in ("pulp-m1-repro-20261016-1", "tartci-m1-bisect-1-2", "m1-scratch-repro-12-3"):
+            self.assertEqual(kept[name], "no_retired_lane_record", name)
+        self.assertNotIn("pulp-linux-build-proof-2.336.0-20260811", deleted)
+        self.assertNotIn("vellum-pr19-linux-20260811", deleted)
 
     def test_off_the_digest_deletes_nothing_and_names_what_it_would(self) -> None:
         digest, deleted, _ = self.m1_digest("--fix", "--json", enabled=False)
