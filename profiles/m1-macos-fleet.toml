@@ -40,6 +40,13 @@ version = "2026.10.8"
 path = "/Users/danielraffel/.local/opt/mise-2026.10.8/bin/mise"
 sha256 = "87c18142dd67f5848b0236738eb9338976329266937ecd79b11121de64dd2d47"
 
+# The host's rustup never checks for or installs its own updates (runbook:
+# Pinned mise). Rollback: delete this table and run
+# `rustup set auto-self-update enable`.
+[rustup]
+path = "/Users/danielraffel/.cargo/bin/rustup"
+auto_self_update = "disable"
+
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
