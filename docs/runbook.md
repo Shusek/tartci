@@ -3520,3 +3520,32 @@ value, so a stray export cannot skip the preflight. When the watchdog itself is 
 then exits 127, so a host with a broken pin reports it instead of going
 dark. `tartci doctor fleet` reports a loaded watchdog or self-update agent
 whose last exit is nonzero (`host_agents_failing`; 127 is a refusal).
+
+The preflight proves a new interpreter once. A grant that is later revoked or
+reset (a macOS update, `tccutil reset`, a box unticked) is caught by the
+watchdog's hourly grant check (`scripts/interpreter_grant_check.py`). It starts
+every interpreter the host runs now (each installed lane's `TARTCI_PYTHON`, and
+`python.pin`, which the watchdog, self-update and pool-on run) as a one-shot
+launchd job that writes, reads back and removes one file in `TART_HOME` within
+30 s. It probes the exact path the lanes carry, so a mise-installed Python is
+covered as soon as lanes use one. A failure records
+`~/.tartci/state/interpreter-grant-lost`, logs `WARN interpreter-grant`, and
+opens `[tartci] <host> lane interpreter can no longer use the VM store:
+<binary>` (`interpreter_grant_lost`), naming the binary macOS attributes the
+access to and the grant. It never takes the host off. The issue closes on the
+next passing check; to re-check at once, remove
+`~/.tartci/state/interpreter-grant-check.json` and kickstart the watchdog.
+
+The check is off unless `~/.config/tartci/interpreter-grant-check.enabled`
+exists on that host. It probes at most three interpreters per run and records
+the probe time (`probe_seconds`) in the check's state file. Turning it off
+closes any open issue. Enable it one host at a time: m1 first, then m5, m3 and
+m5s. After each host's first run, confirm two things before enabling the next:
+the watchdog log has no `WARN interpreter-grant` line, and the state file lists
+the lanes' interpreters with an empty `failed`.
+
+```sh
+touch ~/.config/tartci/interpreter-grant-check.enabled
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
+cat ~/.tartci/state/interpreter-grant-check.json
+```
