@@ -483,6 +483,22 @@ def _runner_state_from_plist(plist_path: str) -> tuple[str, str] | None:
     return identity.state_dir, identity.runner_name
 
 
+def _launchd_owns_pid(launchd_pid: int | None, supervisor_pid: int) -> bool:
+    """Accept the direct child used by the sealed launch-helper wrapper."""
+    if launchd_pid is None:
+        return False
+    if launchd_pid == supervisor_pid:
+        return True
+    rc, out, _ = _run(["ps", "-o", "ppid=", "-p", str(supervisor_pid)])
+    if rc != 0:
+        return False
+    try:
+        parents = [int(line.strip()) for line in out.splitlines() if line.strip()]
+    except ValueError:
+        return False
+    return launchd_pid in parents
+
+
 def probe_stale_boot(
     plist_path: str,
     launchd_pid: int | None,
@@ -518,7 +534,7 @@ def probe_stale_boot(
             return StaleBootProbe(False, "boot phase has an active run/job identity")
         if not isinstance(supervisor_pid, str) or not supervisor_pid.isdigit():
             raise ValueError("missing supervisor pid")
-        if launchd_pid is None or int(supervisor_pid) != launchd_pid:
+        if not _launchd_owns_pid(launchd_pid, int(supervisor_pid)):
             return StaleBootProbe(False, "state supervisor pid does not match launchd")
         if isinstance(ts, str):
             parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()

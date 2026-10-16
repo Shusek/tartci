@@ -41,6 +41,18 @@ class StaleBootTests(unittest.TestCase):
         mismatch = wd.probe_stale_boot(str(self.plist), 43, now=2_000.0)
         self.assertFalse(mismatch.stale, mismatch.reason)
 
+    def test_sealed_launch_helper_child_pid_is_owned_by_launchd_parent(self) -> None:
+        self.write_state()
+        original = wd._run
+        def fake_run(cmd: list[str]) -> tuple[int, str, str]:
+            if cmd[:2] == ["ps", "-o"]:
+                return 0, "41\n", ""
+            return original(cmd)
+        wd._run = fake_run
+        self.addCleanup(setattr, wd, "_run", original)
+        probe = wd.probe_stale_boot(str(self.plist), 41, now=2_000.0)
+        self.assertTrue(probe.stale, probe.reason)
+
     def test_runner_iso_heartbeat_timestamp_is_supported(self) -> None:
         self.write_state(ts="1970-01-01T00:16:40Z")
         probe = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
@@ -91,6 +103,22 @@ class StaleBootTests(unittest.TestCase):
         )
         self.assertEqual(health.verdict, "wedged", health.reason)
         self.assertIn("no Tart VM is running", health.reason)
+
+    def test_gather_health_accepts_sealed_launch_helper_parent(self) -> None:
+        self.write_state()
+        original = wd._run
+        def fake_run(cmd: list[str]) -> tuple[int, str, str]:
+            if cmd[:2] == ["ps", "-o"]:
+                return 0, "41\n", ""
+            return 0, "state = running\npid = 41\nlast exit code = 0\n", ""
+        wd._run = fake_run
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m1.lane",
+            str(self.plist), stale_log_s=4_500, vm_running=False,
+            pool_participating=True,
+        )
+        self.assertEqual(health.verdict, "wedged", health.reason)
 
 
 if __name__ == "__main__":
