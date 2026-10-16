@@ -1352,6 +1352,11 @@ PY
       launchd_timers_json="$("$status_python" "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
         || launchd_timers_json='{"state":"unreadable"}'
       [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
+      # Which launcher layout this host runs (v1 or v2) and its v2 opt-in file.
+      local launcher_json
+      launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status --receipt "$fleet_receipt" 2>/dev/null)" \
+        || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
+      [ -n "$launcher_json" ] || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
       # Whether the VM store and repository volumes answer at all: a bounded
       # probe (scripts/store_stall.py), run here and by doctor, never by a lane.
       local store_json
@@ -1363,8 +1368,8 @@ PY
         lease_fit_json="$("$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
           || lease_fit_json='{"managed":null}'
         [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
-        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"store":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json" "$launchd_timers_json" "$store_json"
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"launcher":%s,"store":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json" "$launchd_timers_json" "$launcher_json" "$store_json"
         local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -1385,6 +1390,8 @@ EOF
         "$status_python" "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
         "$status_python" "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
           || echo "launchd timers: UNREADABLE"
+        "$status_python" "$HERE/scripts/launcher_layout.py" --status-text --receipt "$fleet_receipt" 2>/dev/null \
+          || echo "launcher: UNREADABLE"
         "$status_python" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import store_stall; print(store_stall.describe(json.loads(sys.argv[1])))' "$store_json" "$HERE/scripts" 2>/dev/null \
           || echo "store: UNREADABLE"
         "$status_python" "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \

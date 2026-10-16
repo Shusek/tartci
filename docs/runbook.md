@@ -2365,6 +2365,19 @@ fleet`), and check GitHub's job history against it with
   is an operator drain or an update that died after draining. A drain of
   unknown age (the peer's pool-state file could not be read) still holds the
   turn, and a peer that is `on` but not participating always does.
+- **An operator drain or a paused peer stops holding the turn sooner.** A
+  `draining` peer with **no update marker at all** whose pool state has been
+  unchanged for `PEER_DRAIN_GRACE_SECONDS` (15 min) is an operator drain (a
+  containment drain, say): a self-update writes its marker before it drains,
+  and the grace only covers a marker written between the two reads. A
+  `draining` peer whose own self-update is paused
+  (`~/.tartci/state/self-update/scheduled-pause.json`) or halted (the
+  consecutive-failure halt, computed on the peer by its own `/usr/bin/python3`)
+  holds no turn at once, unless it has a live marker. The deferred host's log
+  names the rule that released the peer: `its self-update is paused` (or
+  `halted`), or `an operator drain: no update marker for more than 15 min`. Both are left to the capacity floor like an off
+  peer, which still refuses this host's drain when it would leave a required
+  label unserved. An expired marker keeps the 3 h bound above.
 - **The recorded reason is as old as the last attempt.** `waiting.json`'s
   `reason` is the survey of the last attempt, up to one 30 min interval old.
   A reason that names a peer which now reads `on` is not a stale view: the
