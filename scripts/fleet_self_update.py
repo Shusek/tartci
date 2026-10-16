@@ -63,6 +63,7 @@ import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate j
 import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 import fleet_source  # noqa: E402 - resolves the optional private fleet source
+import fleet_source_sync  # noqa: E402 - exports the private fleet source per commit
 
 try:
     import tomllib
@@ -188,6 +189,10 @@ EXIT_DEFERRED = 0
 POOL_OFF_REFUSALS = (11, 12, 13)
 EXIT_FAILED = 4        # a mutation ran and failed; see the receipt for what was restored
 EXIT_UNKNOWN = 5       # skew or installed state could not be determined
+
+
+class ConfigError(ValueError):
+    """self-update.toml cannot be used as written."""
 
 
 class LauncherConsent(Exception):
@@ -369,10 +374,16 @@ class Config:
     poll_seconds: int = DEFAULT_POLL_SECONDS
     idle_by_design: tuple[str, ...] = DEFAULT_IDLE_BY_DESIGN
     peers: dict[str, str] = dataclasses.field(default_factory=dict)
+    fleet_source_repository: str | None = None
+    fleet_source_canary: str | None = None
 
     @property
     def checkout(self) -> Path:
         return self.home / ".local" / "share" / "tartci" / "update-checkout"
+
+    @property
+    def fleet_source_store(self) -> Path:
+        return self.home / ".local" / "share" / "tartci" / "fleet-sources"
 
     @property
     def state_dir(self) -> Path:
@@ -511,6 +522,16 @@ def load_config(home: Path, settings: Path | None = None) -> Config:
                 setattr(cfg, key, float(data[key]))
         if isinstance(data.get("idle_by_design_labels"), list):
             cfg.idle_by_design = tuple(str(v) for v in data["idle_by_design_labels"])
+        section = data.get("fleet_source")
+        if section is not None:
+            if not isinstance(section, dict):
+                raise ConfigError(f"{path}: [fleet_source] must be a table, not {section!r}")
+            for key, value in section.items():
+                if key not in ("repository", "canary") or not isinstance(value, str) or not value.strip():
+                    raise ConfigError(f"{path}: [fleet_source] {key} must be a non-empty string "
+                                      "(keys: repository, canary)")
+            cfg.fleet_source_repository = section.get("repository", "").strip() or None
+            cfg.fleet_source_canary = section.get("canary", "").strip() or None
     return cfg
 
 
@@ -610,12 +631,164 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
+FLEET_SOURCE_ENV = ("TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+                    "TARTCI_FLEET_SOURCE_REPOSITORY")
+
+
+def installed_fleet_source_commit(cfg: Config) -> str | None:
+    """The private source commit the installed generation was built from."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    if isinstance(recorded, dict) and recorded.get("configured"):
+        commit = recorded.get("commit")
+        return commit if isinstance(commit, str) else None
+    return None
+
+
+def _source_name(commit: str | None) -> str:
+    return commit[:12] if commit else "the public profiles"
+
+
+# A private-source commit the canary has installed and verified is adopted by
+# the other hosts only after it has served this long on the canary.
+FLEET_SOURCE_SOAK_SECONDS = 30 * 60
+FLEET_SOURCE_VERIFIED = "fleet-source-verified.json"
+
+
+def read_canary_verified(cfg: Config, sys_: System, canary: str) -> dict | None:
+    """The canary's last verified source commit, aged on the canary's clock.
+
+    {"repository", "commit", "age"} or None when it is unreadable or absent.
+    """
+    if canary == self_host_id(cfg):
+        value = _read_json(cfg.state_dir / FLEET_SOURCE_VERIFIED)
+        clock = sys_.now()
+    else:
+        target = published_peers(cfg, sys_).get(canary)
+        if not target:
+            return None
+        result = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+                           'date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/'
+                           + FLEET_SOURCE_VERIFIED + '" 2>/dev/null || true'], timeout=60)
+        first, _, rest = result.out.partition("\n")
+        if result.rc != 0 or not first.strip().isdigit():
+            return None
+        clock = float(first.strip())
+        try:
+            value = json.loads(rest) if rest.strip() else None
+        except json.JSONDecodeError:
+            value = None
+    if (not isinstance(value, dict) or not isinstance(value.get("verified_at"), (int, float))
+            or not isinstance(value.get("commit"), str)
+            or not fleet_source.COMMIT.fullmatch(value["commit"])):
+        return None
+    return {"repository": value.get("repository"), "commit": value["commit"],
+            "age": clock - float(value["verified_at"])}
+
+
+def publish_fleet_source_verified(cfg: Config, sys_: System, selected: dict | None) -> None:
+    """On the canary, after an install from `selected` verified: tell the fleet."""
+    if not selected or cfg.fleet_source_canary is None:
+        return
+    if self_host_id(cfg) != cfg.fleet_source_canary:
+        return
+    if installed_fleet_source_commit(cfg) != selected["commit"]:
+        return
+    _write_json(cfg.state_dir / FLEET_SOURCE_VERIFIED,
+                {"repository": selected["repository"], "commit": selected["commit"],
+                 "verified_at": sys_.now()})
+
+
+def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict | None:
+    """Select the configured private source's commit for this run.
+
+    Without `[fleet_source] repository` in self-update.toml this does nothing
+    and the public checkout stays the source. A move is one host first: the
+    canary (`[fleet_source] canary`) adopts main's head; every other host
+    adopts only the commit the canary has installed and verified, once it has
+    served FLEET_SOURCE_SOAK_SECONDS there, and otherwise stays on the commit
+    it was installed from (or on the public profiles). An unreadable or
+    damaged source refuses; it never falls back to the public profiles. The
+    selection goes into this process's environment, so every helper and the
+    installer read the same commit. With `write` false (a plan) nothing is
+    exported or pruned.
+    """
+    repository = cfg.fleet_source_repository
+    if repository is None:
+        return None
+    if launch_helper(cfg) is not None:
+        # A source move is a same-generation refresh, which keeps the live
+        # sealed launcher; the installer then verifies that launcher against
+        # the moved profile's policy digest, fails after the drain, and rolls
+        # back, every turn. Refuse before anything is read or drained.
+        raise Refused(
+            "fleet source refused on a sealed-launcher host: a [fleet_source] move changes the "
+            "profile the sealed TartCI Launcher's policy digest covers, and a source move does "
+            "not rebuild the launcher, so the install would fail after the drain and roll back "
+            "every turn. Fix: remove [fleet_source] from self-update.toml on this host; a "
+            "sealed host takes a private source once a source move rebuilds the launcher "
+            "(launcher v2). Verify: `tartci fleet-macos self-update --plan` no longer reports "
+            "this refusal")
+    if cfg.fleet_source_canary is None:
+        raise Refused("fleet source has no canary: set [fleet_source] canary to the host that "
+                      "installs a new source commit first")
+
+    def api(path: str) -> tuple[int, str, str]:
+        result = sys_.run([gh_cli(), "api", path], cwd=str(cfg.home),
+                          env={"GH_REPO": repository}, timeout=60)
+        return result.rc, result.out, result.err
+
+    installed = installed_fleet_source_commit(cfg)
+    try:
+        if self_host_id(cfg) == cfg.fleet_source_canary:
+            commit, tree = fleet_source_sync.head(api, repository)
+            why = "canary: main's head"
+        else:
+            verified = read_canary_verified(cfg, sys_, cfg.fleet_source_canary)
+            if (verified and verified["repository"] == repository
+                    and verified["age"] >= FLEET_SOURCE_SOAK_SECONDS):
+                commit, tree = fleet_source_sync.head(api, repository, verified["commit"])
+                why = (f"verified on canary {cfg.fleet_source_canary} "
+                       f"{int(verified['age'] // 60)} min ago")
+            elif installed:
+                commit, tree = fleet_source_sync.head(api, repository, installed)
+                why = (f"staying on the installed commit: canary {cfg.fleet_source_canary} "
+                       + ("has verified nothing newer" if not verified else
+                          f"verified {verified['commit'][:12]} only "
+                          f"{int(verified['age'] // 60)} min ago"))
+            else:
+                print(f"self-update: fleet source {repository}: staying on the public "
+                      f"profiles until canary {cfg.fleet_source_canary} verifies a commit")
+                return None
+        if write:
+            root = fleet_source_sync.export(api, repository, commit, tree, cfg.fleet_source_store)
+        else:
+            root = cfg.fleet_source_store / commit
+            if fleet_source.marker_problem(root, repository, commit) is not None:
+                raise Refused(f"fleet source {repository}@{commit[:12]} is not exported yet; "
+                              "a plan writes nothing, an apply exports it")
+    except (fleet_source_sync.SyncError, OSError) as exc:
+        raise Refused(f"fleet source {repository}: {exc}") from exc
+    os.environ.update(dict(zip(FLEET_SOURCE_ENV, (str(root), commit, repository))))
+    try:
+        fleet_source.resolve(cfg.checkout)
+    except ValueError as exc:
+        raise Refused(f"fleet source {repository}@{commit[:12]}: {exc}") from exc
+    if write:
+        keep = {commit, installed or ""}
+        fleet_source_sync.prune(cfg.fleet_source_store, keep, now=sys_.now())
+    return {"repository": repository, "commit": commit, "root": str(root), "why": why}
+
+
 # A read that failed in transit (a timeout, a connection error, a 5xx) is
 # retried once after this pause; a definite answer (404, 403) is not. m1 on
 # 2026-10-16 refused a self-update because both reads hung for 60 s while
 # every other ghapp call on the host was also timing out.
 REPOSITORY_READ_RETRY_SECONDS = 20
+# gh's own transport errors read "error connecting to api.github.com" and
+# "dial tcp: lookup api.github.com: no such host". Only a failed read (rc != 0)
+# is matched: a successful read's JSON can contain any of these words.
 _TRANSIENT_READ = re.compile(r"(?i)TimeoutExpired|timed out|connection (?:reset|refused)|"
+                             r"error connecting to|no such host|dial tcp|i/o timeout|"
                              r"could not resolve|network|HTTP 5\d\d|\b50[0-4]\b|EOF")
 
 
@@ -2469,6 +2642,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)
+        selected_source = sync_fleet_source(cfg, sys_, write=apply)
     except NotManaged as exc:
         print(f"self-update: not applicable: {exc}")
         _write_json(cfg.state_dir / "skew.json", {"state": "not_applicable", "reason": str(exc),
@@ -2498,6 +2672,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
+    if selected_source:
+        print(f"self-update: fleet source {selected_source['repository']}"
+              f"@{selected_source['commit'][:12]} (installed from "
+              f"{_source_name(installed_fleet_source_commit(cfg))}; {selected_source['why']})")
     print(f"self-update: {render_skew(skew)}")
     if skew.get("explicit"):
         print(f"self-update: selected {skew.get('selected_target') or 'none'} "
@@ -2529,6 +2707,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
+    receipt.value["fleet_source"] = selected_source
     try:
         if apply and launch_helper(cfg) is not None:
             _checkout(cfg, sys_, target)
@@ -2670,7 +2849,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
                   helper=helper, approval=approval, excluded=survey.excluded)
-        return run.execute()
+        rc = run.execute()
+        if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
+            publish_fleet_source_verified(cfg, sys_, selected_source)
+        return rc
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.value["deferred"] = True
@@ -2704,8 +2886,16 @@ def refresh_reason(cfg: Config, sys_: System) -> str | None:
     """Why a current host must reinstall its own generation, or None.
 
     Today: its receipt no longer matches the OS-managed interpreter because
-    macOS was updated (interpreter_changed_by_os_update). Read-only.
+    macOS was updated (interpreter_changed_by_os_update), or the configured
+    private fleet source moved to a commit it was not installed from.
+    Read-only.
     """
+    if cfg.fleet_source_repository is not None:
+        selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
+        installed = installed_fleet_source_commit(cfg)
+        if selected and selected != installed:
+            return (f"fleet source moved to {selected[:12]} "
+                    f"(installed from {_source_name(installed)})")
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         problems = (json.loads(status.out).get("fleet") or {}).get("problems") or []
@@ -3570,7 +3760,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--settings", type=Path, default=None,
                         help="settings TOML (default ~/.config/tartci/self-update.toml)")
     args = parser.parse_args(argv)
-    cfg = load_config(Path(args.home), args.settings)
+    try:
+        cfg = load_config(Path(args.home), args.settings)
+    except ConfigError as exc:
+        print(f"self-update: REFUSED: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
     sys_ = System()
     if args.status:
         print("\n".join(status_lines(cfg.state_dir)))
