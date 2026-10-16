@@ -3572,3 +3572,28 @@ touch ~/.config/tartci/interpreter-grant-check.enabled
 launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
 cat ~/.tartci/state/interpreter-grant-check.json
 ```
+
+### Pinned mise (`[mise]`)
+
+A profile's `[mise]` table names one exact mise build: `version`, the absolute
+`path` it is installed at (the path contains the version, so two pins never
+share one), and its `sha256`. It is the binary Pulp's toolchain manifest pins
+(`tools/toolchain/manifest.toml` `[mise.binary]`): built from source once,
+copied between hosts by digest, never installed by Homebrew and never
+self-updated (its `lib/mise-self-update-instructions.toml` points at
+`pulp deps update mise`).
+
+The installer verifies it (`scripts/mise_pin.py check`) right after validating
+the profile, before any LaunchAgent, receipt or pin changes. A missing binary,
+a different sha256, or a `--version` that is not the pin refuses the install
+with exit 3 and one line naming the path, the expected and found values, and
+the fix (copy the binary from a host that has it, then confirm its sha256).
+After the interpreter pin it records `~/.config/tartci/mise.pin` (JSON:
+version, path, sha256, verified_at). A profile without `[mise]` removes that
+file, so deleting the table is the rollback.
+
+The pin changes nothing a lane runs: no PATH, no shims, no tools. Moving a lane
+to mise-provided tools is a separate, flagged step, and a new tool binary goes
+through the same launchd preflight as a new interpreter first (macOS grants
+belong to the binary). Rollout is one host at a time: m1's profile carries the
+table first; m5, m5s and m3 follow only after m1's step.
