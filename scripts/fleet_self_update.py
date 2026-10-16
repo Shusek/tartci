@@ -606,13 +606,18 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
-def configured_repository(cfg: Config, sys_: System) -> str:
-    """Resolve an explicit binding or the first readable accepted slug."""
-    bound = os.environ.get("GH_REPO", "").strip()
-    candidates = (bound,) if bound else (LEGACY_REPOSITORY, DEFAULT_REPOSITORY)
-    for repository in candidates:
-        if repository not in ACCEPTED_REPOSITORIES:
-            raise Refused(f"unsupported TartCI repository identity: {repository}")
+# A read that failed in transit (a timeout, a connection error, a 5xx) is
+# retried once after this pause; a definite answer (404, 403) is not. m1 on
+# 2026-10-16 refused a self-update because both reads hung for 60 s while
+# every other ghapp call on the host was also timing out.
+REPOSITORY_READ_RETRY_SECONDS = 20
+_TRANSIENT_READ = re.compile(r"(?i)TimeoutExpired|timed out|connection (?:reset|refused)|"
+                             r"could not resolve|network|HTTP 5\d\d|\b50[0-4]\b|EOF")
+
+
+def _read_repository(cfg: Config, sys_: System, repository: str) -> tuple[str | None, str]:
+    """(canonical full_name or None, why it was not read)."""
+    for attempt in (1, 2):
         result = sys_.run([gh_cli(), "api", f"repos/{repository}"],
                           cwd=str(cfg.checkout), env={"GH_REPO": repository}, timeout=60)
         try:
@@ -620,10 +625,31 @@ def configured_repository(cfg: Config, sys_: System) -> str:
         except (json.JSONDecodeError, AttributeError):
             canonical = None
         if result.rc == 0 and canonical in ACCEPTED_REPOSITORIES:
+            return canonical, ""
+        why = (f"exit {result.rc}: {result.text.strip()[:160]}" if result.rc != 0
+               else f"answered {canonical or 'no full_name'}")
+        if attempt == 1 and result.rc != 0 and _TRANSIENT_READ.search(result.text or ""):
+            sys_.sleep(REPOSITORY_READ_RETRY_SECONDS)
+            continue
+        return None, why + (" (after one retry)" if attempt == 2 else "")
+    return None, "unreachable"
+
+
+def configured_repository(cfg: Config, sys_: System) -> str:
+    """Resolve an explicit binding or the first readable accepted slug."""
+    bound = os.environ.get("GH_REPO", "").strip()
+    candidates = (bound,) if bound else (LEGACY_REPOSITORY, DEFAULT_REPOSITORY)
+    reasons = []
+    for repository in candidates:
+        if repository not in ACCEPTED_REPOSITORIES:
+            raise Refused(f"unsupported TartCI repository identity: {repository}")
+        canonical, why = _read_repository(cfg, sys_, repository)
+        if canonical:
             return canonical
+        reasons.append(f"{repository}: {why}")
         if bound:
             break
-    raise Refused("no accepted TartCI repository is readable")
+    raise Refused("no accepted TartCI repository is readable: " + "; ".join(reasons))
 
 
 def repository_url(repository: str) -> str:
