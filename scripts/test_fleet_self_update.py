@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_self_update as su
+import fleet_source
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED = "1" * 40
@@ -3496,8 +3497,11 @@ class FleetSourceSyncTests(FleetSourceFixture):
     def test_the_configured_source_is_exported_and_selected(self) -> None:
         selected = su.sync_fleet_source(self.cfg, self.sys)
         root = self.cfg.fleet_source_store / self.fixture.COMMIT
+        source = fleet_source.FleetSource(
+            root, root / "profiles", root / fleet_source.PUBLISHED_SUPPLY, True)
         self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
-                          "root": str(root), "why": "canary: main's head"}, selected)
+                          "root": str(root), "why": "canary: main's head",
+                          **source.provenance}, selected)
         self.assertEqual(str(root), os.environ["TARTCI_FLEET_SOURCE_ROOT"])
         self.assertEqual(self.fixture.COMMIT, os.environ["TARTCI_FLEET_SOURCE_COMMIT"])
         self.assertEqual(self.fixture.PRIVATE, os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"])

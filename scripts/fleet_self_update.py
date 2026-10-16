@@ -780,13 +780,14 @@ def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict 
         raise Refused(f"fleet source {repository}: {exc}") from exc
     os.environ.update(dict(zip(FLEET_SOURCE_ENV, (str(root), commit, repository))))
     try:
-        fleet_source.resolve(cfg.checkout)
+        resolved_source = fleet_source.resolve(cfg.checkout)
     except ValueError as exc:
         raise Refused(f"fleet source {repository}@{commit[:12]}: {exc}") from exc
     if write:
         keep = {commit, installed or ""}
         fleet_source_sync.prune(cfg.fleet_source_store, keep, now=sys_.now())
-    return {"repository": repository, "commit": commit, "root": str(root), "why": why}
+    return {"repository": repository, "commit": commit, "root": str(root), "why": why,
+            **resolved_source.provenance}
 
 
 # A read that failed in transit (a timeout, a connection error, a 5xx) is

@@ -84,6 +84,8 @@ PROFILES = {"canary-macos-fleet.toml": "schema = 1\nname = \"canary\"\n",
             "other-macos-fleet.toml": "schema = 1\nname = \"other\"\n"}
 
 
+@unittest.skipUnless(fleet_source.tomllib is not None,
+                     "source export requires the pinned Python 3.11+ TOML parser")
 class ExportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.td = tempfile.TemporaryDirectory()
@@ -151,6 +153,12 @@ class ExportTests(unittest.TestCase):
             self.export()
         self.assertFalse((self.store / COMMIT).exists())
         self.assertEqual([], [p for p in self.store.iterdir()])  # no staging left behind
+
+    def test_invalid_profile_is_refused_before_export_is_published(self) -> None:
+        self.repo.files["profiles/canary-macos-fleet.toml"] = b"schema = [\n"
+        with self.assertRaisesRegex(sync.SyncError, "exported profile is invalid"):
+            self.export()
+        self.assertFalse((self.store / COMMIT).exists())
 
     def test_only_profiles_and_the_supply_are_written_never_outside_the_export(self) -> None:
         planted = b"planted\n"
