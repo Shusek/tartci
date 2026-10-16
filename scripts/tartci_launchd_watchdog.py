@@ -553,7 +553,10 @@ def probe_stale_boot(
         if not _pid_start_matches(supervisor_pid_int, started_at):
             return StaleBootProbe(False, "supervisor pid start time does not match state")
         if isinstance(ts, str):
-            parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            parsed_dt = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed_dt.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+            parsed_ts = parsed_dt.timestamp()
         else:
             parsed_ts = float(ts)
         if not math.isfinite(parsed_ts):

@@ -382,7 +382,7 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         return {"skipped": True, "peers": last.get("peers") or {}}
     if peers is None:
         checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
-        if not (checkout / ".git").exists():
+        if not (checkout / ".git").exists() and not os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip():
             # Not a managed fleet host (a CI runner, a fresh clone): there is
             # no published supply to read peers from, and nothing to say.
             return {"skipped": True, "peers": {}, "reason": "no self-update checkout"}

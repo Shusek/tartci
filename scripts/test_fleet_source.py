@@ -58,6 +58,7 @@ class FleetSourceTests(unittest.TestCase):
                 "schema": "tartci.advertised-labels/v1",
                 "generated_from": {
                     "repo": "ORG/private-fleet-authority",
+                    "commit": "0123456789abcdef0123456789abcdef01234567",
                     "profiles": ["profiles/canary-macos-fleet.toml"],
                     "profiles_sha256": profile_digest,
                 },

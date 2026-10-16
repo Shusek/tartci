@@ -729,7 +729,7 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
     threshold = setting("TARTCI_TAILNET_OFFLINE_ALERT_SECS", OFFLINE_ALERT_SECS)
     if hosts is None:
         checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
-        if not (checkout / ".git").exists():
+        if not (checkout / ".git").exists() and not os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip():
             return {"skipped": True, "reason": "no self-update checkout", "hosts": {}}
         hosts, me = published_hosts()
     directory.mkdir(parents=True, exist_ok=True)

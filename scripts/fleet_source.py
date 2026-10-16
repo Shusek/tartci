@@ -127,4 +127,9 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
             raise ValueError(
                 "configured fleet source requires TARTCI_FLEET_SOURCE_REPOSITORY"
             )
+        configured_repo = os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"].strip()
+        if generated.get("repo") != configured_repo or generated.get("commit") != configured_commit:
+            raise ValueError(
+                "configured fleet source published supply provenance does not match environment"
+            )
     return FleetSource(root, profiles_dir, published_supply, bool(configured_root))
