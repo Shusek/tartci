@@ -29,6 +29,17 @@ job_claim_max_age_seconds = 1800
 # below its computed floor. `refuse` denies the new clone instead; flip it only
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
+# The pinned mise binary (runbook: Pinned mise). Built from source at mise
+# v2026.10.8 and copied between hosts by digest; the same sha256 is on m1, m3,
+# m5 and m5s. The install refuses a missing or different binary and records
+# ~/.config/tartci/mise.pin. It changes no PATH and no lane: lanes keep their
+# tools until one is moved to the pinned toolchain on purpose. m1 first; the
+# other hosts get this table after m1's rollout step. Rollback: delete it.
+[mise]
+version = "2026.10.8"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.8/bin/mise"
+sha256 = "87c18142dd67f5848b0236738eb9338976329266937ecd79b11121de64dd2d47"
+
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"

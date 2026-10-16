@@ -422,6 +422,35 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertFalse((self.home / ".tartci/state/interpreter-refused").exists())
         self.assertIn(f"pinned interpreter {expected}", result.stdout)
 
+    def pin_mise(self, binary: Path, sha256: str) -> None:
+        self.config.write_text(self.config.read_text()
+                               + f'\n[mise]\nversion = "2026.10.8"\npath = "{binary}"\nsha256 = "{sha256}"\n')
+
+    def mise_binary(self) -> tuple[Path, str]:
+        binary = self.root / "opt/mise-2026.10.8/bin/mise"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\necho '2026.10.8 macos-arm64 (2026-10-13)'\n")
+        binary.chmod(0o755)
+        import hashlib
+        return binary, hashlib.sha256(binary.read_bytes()).hexdigest()
+
+    def test_a_pinned_mise_is_verified_and_recorded(self) -> None:
+        binary, digest = self.mise_binary()
+        self.pin_mise(binary, digest)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads((self.home / ".config/tartci/mise.pin").read_text())
+        self.assertEqual((record["path"], record["sha256"]), (str(binary), digest))
+
+    def test_a_different_mise_binary_refuses_the_install_before_any_agent(self) -> None:
+        binary, digest = self.mise_binary()
+        self.pin_mise(binary, "0" * 64)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn(f"has sha256 {digest}, but the profile pins {'0' * 64}", result.stderr)
+        self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
+        self.assertFalse((self.home / ".config/tartci/mise.pin").exists())
+
     def preflight(self, rc: int) -> Path:
         script = self.root / f"preflight-{rc}"
         script.write_text("#!/bin/sh\n"
