@@ -53,6 +53,20 @@ class StaleBootTests(unittest.TestCase):
         probe = wd.probe_stale_boot(str(self.plist), 41, now=2_000.0)
         self.assertTrue(probe.stale, probe.reason)
 
+    def test_recorded_supervisor_start_time_blocks_pid_reuse(self) -> None:
+        self.write_state(supervisor_pid_started_at="Mon Jan  1 00:00:00 2024")
+        original = wd._run
+        def fake_run(cmd: list[str]) -> tuple[int, str, str]:
+            if cmd[:2] == ["ps", "-o"] and "ppid=" in cmd:
+                return 0, "41\n", ""
+            if cmd[:2] == ["ps", "-o"] and "lstart=" in cmd:
+                return 0, "Tue Jan  2 00:00:00 2024\n", ""
+            return original(cmd)
+        wd._run = fake_run
+        self.addCleanup(setattr, wd, "_run", original)
+        probe = wd.probe_stale_boot(str(self.plist), 41, now=2_000.0)
+        self.assertFalse(probe.stale, probe.reason)
+
     def test_runner_iso_heartbeat_timestamp_is_supported(self) -> None:
         self.write_state(ts="1970-01-01T00:16:40Z")
         probe = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)

@@ -499,6 +499,15 @@ def _launchd_owns_pid(launchd_pid: int | None, supervisor_pid: int) -> bool:
     return launchd_pid in parents
 
 
+def _pid_start_matches(supervisor_pid: int, recorded: str) -> bool:
+    """Compare the runner's recorded ``ps lstart`` value with the live pid."""
+    rc, out, _ = _run(["ps", "-o", "lstart=", "-p", str(supervisor_pid)])
+    if rc != 0:
+        return False
+    live = " ".join(out.split())
+    return bool(live) and live == " ".join(recorded.split())
+
+
 def probe_stale_boot(
     plist_path: str,
     launchd_pid: int | None,
@@ -534,8 +543,15 @@ def probe_stale_boot(
             return StaleBootProbe(False, "boot phase has an active run/job identity")
         if not isinstance(supervisor_pid, str) or not supervisor_pid.isdigit():
             raise ValueError("missing supervisor pid")
-        if not _launchd_owns_pid(launchd_pid, int(supervisor_pid)):
+        supervisor_pid_int = int(supervisor_pid)
+        if not _launchd_owns_pid(launchd_pid, supervisor_pid_int):
             return StaleBootProbe(False, "state supervisor pid does not match launchd")
+        started_at = state.get("supervisor_pid_started_at")
+        if started_at:
+            if not isinstance(started_at, str) or not _pid_start_matches(
+                supervisor_pid_int, started_at
+            ):
+                return StaleBootProbe(False, "supervisor pid start time does not match state")
         if isinstance(ts, str):
             parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
         else:
