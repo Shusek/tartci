@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation merged; private projection reconciled; external-source rollout intentionally gated
+Status: resolver implementation merged; private projection review open; external-source rollout intentionally gated
 
 ## Goal
 
@@ -79,15 +79,11 @@ The private authority still lacks a complete export with the required profile
 set and published supply document. A partial export would omit routing and
 capacity authority, so it is not being created or rolled out.
 
-The private projection was reconciled against clean current TartCI and Pulp
-main checkouts on 2026-10-16. The reconciliation records host-specific event
-tiers: M1 remains PR-head and release capable without merge-group admission,
-while M3 and M5 admit merge-group, PR-head, and release classes. It also
-records M3's current seven-core Pulp gate VM size. The checker passed the
-updated projection and rejected a planted stale-tier change. The update is
-published in the private authority repository at commit
-`5650f6955c22a1d760a5f857a95ff3a3329f03d2`; it is not part of the public
-TartCI source tree.
+The private desired-state projection was reconciled against exact current
+TartCI and Pulp `origin/main` checkouts on 2026-10-16. Its checker passed the
+reconciled projection and rejects missing, empty, malformed, unknown, and
+stale host tier data. The projection is kept in the private authority
+repository and is not part of the public TartCI source tree.
 
 The first Python 3.9 run exposed a compatibility gap: stock Python 3.9 has no
 `tomllib`, so valid configured sources were rejected. Export now performs full
@@ -99,9 +95,9 @@ locally after this fix.
 The focused suites were rerun from a clean current-main worktree on
 2026-10-16: `test_fleet_source.py` passed 23 tests,
 `test_fleet_source_sync.py` passed 15 tests, and
-`test_fleet_self_update.py` passed 314 tests. The private projection branch is
-pushed but has no review PR yet; external-source selection remains disabled
-while Ultra reviews the projection and the complete export is still missing.
+`test_fleet_self_update.py` passed 314 tests. The private projection checker
+tests pass 5 tests. The private review is open; external-source selection
+remains disabled while the complete export is still missing.
 
 ## Stop conditions
 
