@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -1028,6 +1029,36 @@ GENERATION_MANIFEST = ".tartci-support-manifest.json"
 SEALED_BUNDLE_MARKER = "Contents/Resources/bundle.json"
 
 
+LAUNCHER_V2_POLICY = "Contents/Resources/policy.json"
+LAUNCH_SET_NAME = ".tartci-launch-set.json"
+
+
+def launcher_v2_identity(policy: dict) -> dict:
+    """A v2 lane runs the generation its pointer names; read the version there."""
+    pointer = _read_json(Path(str(policy.get("pointer", ""))))
+    generation = (pointer or {}).get("generation")
+    if not isinstance(generation, str) or not generation:
+        return {"source_commit": None, "layout": "v2",
+                "detail": f"no readable launcher pointer at {policy.get('pointer')}"}
+    root = Path(generation)
+    try:
+        manifest_bytes = (root / GENERATION_MANIFEST).read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, ValueError):
+        return {"source_commit": None, "layout": "v2", "generation": root.name,
+                "detail": f"unreadable generation manifest at {root / GENERATION_MANIFEST}"}
+    launch = _read_json(root / LAUNCH_SET_NAME) or {}
+    return {
+        "source_commit": manifest.get("source_commit") if isinstance(manifest, dict) else None,
+        "support_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "layout": "v2",
+        "generation": root.name,
+        "launch_set_sequence": launch.get("sequence"),
+        "sealed_lane_ids": sorted((launch.get("lanes") or {}).keys()) or None,
+        "detail": None,
+    }
+
+
 def agents_dir() -> Path:
     return Path(os.environ.get("TARTCI_AGENTS_DIR") or Path.home() / "Library/LaunchAgents")
 
@@ -1071,6 +1102,9 @@ def in_force_identity(classified: dict) -> dict:
         return {"source_commit": None, "detail": "no recognised launch entrypoint"}
     root_path = Path(root)
     if classified["delivery"] == "sealed-bundle":
+        policy = _read_json(root_path / LAUNCHER_V2_POLICY)
+        if policy is not None and policy.get("schema") == 2:
+            return launcher_v2_identity(policy)
         bundle = _read_json(root_path / SEALED_BUNDLE_MARKER)
         if bundle is None:
             return {
@@ -1155,7 +1189,10 @@ def build_delivery_report(
         arguments = [str(item) for item in (plist.get("ProgramArguments") or [])]
         classified = classify_delivery(arguments)
         identity = in_force_identity(classified)
-        sealed = classified["delivery"] == "sealed-bundle"
+        # A v2 lane is a stable app running the pointer's generation, which an
+        # install repoints, so it updates like a generation lane.
+        sealed = (classified["delivery"] == "sealed-bundle"
+                  and identity.get("layout") != "v2")
         lanes.append({
             "label": label,
             "delivery": classified["delivery"],
@@ -1174,6 +1211,9 @@ def build_delivery_report(
                 "tartci fleet-macos install --apply <profile> stages a new "
                 "generation and repoints this lane at it"
                 if classified["delivery"] == "generation" else
+                "tartci fleet-macos install --apply <profile> stages a new "
+                "generation and moves the launcher v2 pointer to its signed launch set"
+                if identity.get("layout") == "v2" else
                 "unrecognised launch entrypoint; inspect ProgramArguments"
             ),
         })

@@ -154,8 +154,14 @@ def same_bundle(live: str|Path, source: str|Path)->bool:
     except (IdentityError,OSError):
         return False
 def main()->int:
-    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="command",required=True); same=sub.add_parser("same"); same.add_argument("live"); same.add_argument("source"); command=sub.add_parser("verify"); command.add_argument("path"); command.add_argument("--identifier",required=True); command.add_argument("--team-id",required=True); command.add_argument("--sha256"); command.add_argument("--profile-policy-sha256"); command.add_argument("--source-commit"); command.add_argument("--tart-home"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="command",required=True); same=sub.add_parser("same"); same.add_argument("live"); same.add_argument("source"); command=sub.add_parser("verify"); command.add_argument("path"); command.add_argument("--identifier",required=True); command.add_argument("--team-id",required=True); command.add_argument("--sha256"); command.add_argument("--profile-policy-sha256"); command.add_argument("--source-commit"); command.add_argument("--tart-home")
+    v2=sub.add_parser("verify-v2"); v2.add_argument("path"); v2.add_argument("--identifier",required=True); v2.add_argument("--team-id",required=True); v2.add_argument("--profile",required=True); v2.add_argument("--sha256"); v2.add_argument("--support-root")
+    args=parser.parse_args()
     if args.command=="same": return 0 if same_bundle(args.live,args.source) else 1
+    if args.command=="verify-v2":
+        try: record=verify_v2(args.path,identifier=args.identifier,team_id=args.team_id,profile=tomllib.loads(Path(args.profile).read_text()),sha256=args.sha256,support_root=args.support_root)
+        except (IdentityError,OSError,ValueError,subprocess.TimeoutExpired) as error: parser.exit(1,f"macos launcher identity rejected: {error}\n")
+        print(json.dumps(record,sort_keys=True,separators=(",",":"))); return 0
     try: record=verify(args.path,identifier=args.identifier,team_id=args.team_id,sha256=args.sha256,profile_policy_sha256=args.profile_policy_sha256,source_commit=args.source_commit,tart_home=args.tart_home)
     except (IdentityError,OSError,subprocess.TimeoutExpired) as error: parser.exit(1,f"macos launcher identity rejected: {error}\n")
     print(json.dumps(record,sort_keys=True,separators=(",",":"))); return 0

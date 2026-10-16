@@ -307,6 +307,7 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         for relative, why in (("tartci", "does not match its digest"),
                               ("scripts/x.py", "does not match its digest"),
                               (self.ls.ENTRYPOINT, "does not match its digest"),
+                              (".tartci-launch", "does not match its digest"),
                               (self.ls.MANIFEST_NAME, "support manifest does not match")):
             with self.subTest(relative=relative):
                 original = (self.generation / relative).read_bytes()
@@ -371,6 +372,14 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         (self.generation / "scripts/__pycache__").mkdir()
         self.ls.freeze(self.generation)
         self.assertRefused("a bytecode cache in the generation is never hashed")
+
+    def test_a_set_that_does_not_pin_the_v1_launch_file_is_refused(self) -> None:
+        # Every staged generation carries v1's .tartci-launch; the set pins it.
+        value = json.loads((self.generation / self.ls.SET_NAME).read_text())
+        self.assertEqual([".tartci-launch"], [f["path"] for f in value["files"]])
+        value["files"] = []
+        self.seal(value=value)
+        self.assertRefused(".tartci-launch is not in the signed manifest")
 
     def test_a_planted_file_outside_the_manifest_is_refused(self) -> None:
         self.plant("planted.py")
@@ -612,6 +621,7 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
     test_a_signed_lane_on_another_store_is_refused = None
     test_a_planted_bytecode_cache_is_refused = None
     test_a_planted_file_outside_the_manifest_is_refused = None
+    test_a_set_that_does_not_pin_the_v1_launch_file_is_refused = None
     test_an_empty_bytecode_cache_directory_is_refused = None
     test_lanes_get_the_shim_and_no_bytecode_or_user_site = None
     test_a_planted_global_site_pth_or_sitecustomize_does_not_run = None

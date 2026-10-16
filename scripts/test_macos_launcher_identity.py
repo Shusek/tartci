@@ -97,7 +97,7 @@ class SameBundleTests(unittest.TestCase):
         # The unchanged branch neither moves the live bundle aside nor replaces it.
         unchanged=body[guard:replace]
         self.assertNotIn("mv ",unchanged); self.assertNotIn("ditto",unchanged)
-        self.assertIn("verify \"$launcher_target\"",unchanged)
+        self.assertIn("verify_launcher \"$launcher_target\"",unchanged)
 
 
 PROFILE={"host":{"home":"/Users/example","tart_home":"/Volumes/Example/VMs"},
@@ -157,5 +157,17 @@ class V2Tests(unittest.TestCase):
     def test_v1_signature_rules_still_apply(self):
         with self.assertRaisesRegex(identity.IdentityError,"identifier does not match"):
             with Tests.inspect(self): identity.verify_v2(self.app,identifier="com.example.other",team_id="95CX6P84C4",profile=PROFILE)
+    def test_the_verify_v2_command_reads_the_profile_and_refuses(self):
+        import subprocess
+        profile=self.app.parent/"profile.toml"
+        profile.write_text('[host]\nhome = "/Users/example"\ntart_home = "/Volumes/Example/VMs"\n'
+                           '[launch_helper]\nidentifier = "com.danielraffel.tartci.launcher"\nteam_id = "95CX6P84C4"\n')
+        (self.app/"Contents/Resources/lanes.json").write_text("{}")
+        result=subprocess.run([sys.executable,str(Path(identity.__file__)),"verify-v2",str(self.app),
+                               "--identifier","com.danielraffel.tartci.launcher","--team-id","95CX6P84C4",
+                               "--profile",str(profile),"--support-root",str(self.support)],
+                              capture_output=True,text=True,check=False)
+        self.assertEqual(1,result.returncode)
+        self.assertIn("macos launcher identity rejected: launcher v2 bundle files differ",result.stderr)
 
 if __name__=="__main__": unittest.main()
