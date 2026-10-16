@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mise_pin  # noqa: E402
+import testing_support  # noqa: E402
 
 VERSION = "2026.10.8"
 
@@ -73,6 +74,7 @@ class MisePinTests(unittest.TestCase):
                 self.assertIn(needle, "; ".join(mise_pin.table_errors(self.table(**override))))
         self.assertTrue(mise_pin.table_errors(dict(self.table(), extra="x")))
 
+    @testing_support.requires_tomllib
     def test_check_and_write(self) -> None:
         pin = self.root / "config/mise.pin"
         self.write_profile(self.table())
@@ -84,6 +86,7 @@ class MisePinTests(unittest.TestCase):
                          (record["version"], record["path"], record["sha256"]))
         self.assertIn("verified_at", record)
 
+    @testing_support.requires_tomllib
     def test_a_refused_binary_writes_no_pin(self) -> None:
         pin = self.root / "config/mise.pin"
         self.write_profile(self.table(sha256="0" * 64))
@@ -91,6 +94,7 @@ class MisePinTests(unittest.TestCase):
         self.assertEqual(1, mise_pin.main(["write", str(self.profile), str(pin)]))
         self.assertFalse(pin.exists())
 
+    @testing_support.requires_tomllib
     def test_removing_the_table_removes_the_pin(self) -> None:
         pin = self.root / "config/mise.pin"
         self.write_profile(self.table())
@@ -100,11 +104,13 @@ class MisePinTests(unittest.TestCase):
         self.assertEqual(0, mise_pin.main(["write", str(self.profile), str(pin)]))
         self.assertFalse(pin.exists())
 
+    @testing_support.requires_tomllib
     def test_a_malformed_table_is_a_usage_error(self) -> None:
         self.write_profile(self.table(version="2026"))
         self.assertEqual(2, mise_pin.main(["check", str(self.profile)]))
         self.assertEqual(2, mise_pin.main(["write", str(self.profile)]))
 
+    @testing_support.requires_tomllib
     def test_the_fleet_loader_validates_the_table(self) -> None:
         import macos_fleet_lanes as lanes
 
@@ -112,6 +118,7 @@ class MisePinTests(unittest.TestCase):
         source = (Path(lanes.__file__)).read_text(encoding="utf-8")
         self.assertIn("mise_pin.table_errors", source)
 
+    @testing_support.requires_tomllib
     def test_every_fleet_profile_pin_is_well_formed(self) -> None:
         import tomllib
 
