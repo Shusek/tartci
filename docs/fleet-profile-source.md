@@ -66,17 +66,10 @@ Each self-update run then:
 4. reinstalls the current generation when the installed receipt was built from
    a different source commit.
 
-## Not on a sealed-launcher host
-
-A host with a sealed TartCI Launcher (`[launch_helper]` in its profile: the
-external-volume hosts) refuses `[fleet_source]` before reading the source or
-draining anything. The sealed launcher's policy digest covers the profile, and
-a source move reinstalls the same generation without rebuilding the launcher,
-so the installer would refuse the live launcher after the drain and roll back
-on every turn. The refusal names the cause and the fix (remove
-`[fleet_source]` on that host). A sealed host takes a private source once a
-source move rebuilds the launcher, which launcher v2 makes unnecessary by
-taking the policy out of the app.
+A canary that is not a published host id refuses the run on every other
+host, naming the published ids, rather than leaving them on their installed
+commit with nothing saying why. A host asked for a verified commit exports
+exactly that commit: an answer naming any other commit refuses.
 
 A plan (`--plan`) writes and prunes nothing: it uses an export that already
 exists and otherwise reports that an apply would export it.
@@ -99,3 +92,25 @@ identify exactly what was selected.
 This setting does not move or publish fleet profiles. Keep host identities,
 paths, labels, receipts, and snapshots in a private operator repository. Keep
 generic schemas and examples in TartCI.
+
+## Settings that must arrive through the canary
+
+A profile change that turns on a host-side action reaches the fleet only
+through this path, one host first. In particular, no profile sets
+`worktree_cleanup.apply = true` unless that change came through a canary
+verified commit of the private source: enabling cleanup by any other route
+(an edited installed profile, a public-profile change) skips the one-host
+proof. The structural limits in `macos_fleet_lanes.worktree_cleanup_problem`
+bound what the setting can do; the canary bounds who gets it first.
+
+## Not on a sealed-launcher host
+
+A host with a sealed TartCI Launcher (`[launch_helper]` in its profile: the
+external-volume hosts) refuses `[fleet_source]` before reading the source or
+draining anything. The sealed launcher's policy digest covers the profile, and
+a source move reinstalls the same generation without rebuilding the launcher,
+so the installer would refuse the live launcher after the drain and roll back
+on every turn. The refusal names the cause and the fix (remove
+`[fleet_source]` on that host). A sealed host takes a private source once a
+source move rebuilds the launcher, which launcher v2 makes unnecessary by
+taking the policy out of the app.
