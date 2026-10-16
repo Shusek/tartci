@@ -484,7 +484,7 @@ class ProfileRenderTests(unittest.TestCase):
         self.assertNotEqual(self._run(zero_age).returncode, 0)
 
     @testing_support.requires_tomllib
-    def test_only_m1_pulp_gate_falls_back_and_only_to_m3(self) -> None:
+    def test_no_shipped_profile_enables_the_young_work_fallback(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         enabled = []
         for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
@@ -493,9 +493,10 @@ class ProfileRenderTests(unittest.TestCase):
                 env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
                 if "TARTCI_FALLBACK_PEERS" in env:
                     enabled.append((path.name, lane["id"], env["TARTCI_FALLBACK_PEERS"]))
-        # m5 is excluded on purpose: deferring to a starved host keeps young
-        # work there, and an unreachable peer turns every decision into a hold.
-        self.assertEqual(enabled, [("m1-macos-fleet.toml", "pulp-gate", "studio=m3")])
+        # m1 was the only fallback lane; since 2026-10-16 it is overflow-only
+        # and takes nothing younger than its 600 s floor. The mechanism stays,
+        # tested above through profiles that add the key back.
+        self.assertEqual(enabled, [])
         self.assertEqual(self._run((ROOT / "profiles" / "m1-macos-fleet.toml").read_text()).returncode, 0)
 
 
