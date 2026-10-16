@@ -3621,12 +3621,18 @@ Enable it one host at a time, after a dry run, starting with m1:
 ```sh
 scripts/agent_cargo_reap.py --dry-run      # from the installed generation
 touch ~/.config/tartci/reap-agent-cargo.enabled
+```
+
+Rollout: m1 opted in at 09:09Z on 2026-10-16. Its dry run named nothing: the
+only CACHEDIR.TAG dirs there were two pytest caches, which the reap skips. m5,
+m3 and m5s stay report-only until their own dry runs are reviewed.
+
 ## Git maintenance on shared object stores
 
 Every agent worktree of a repository shares one object store, and any git
 command can start `git maintenance run --auto` or `git repack` in the
 background. On m3 around 07:15Z on 2026-10-16, 53+ of them ran at once on
-`/Volumes/Workshop/Code/pulp` and the load reached 207. Three parts handle
+`<checkout>` and the load reached 207. Three parts handle
 this (`scripts/git_maintenance_guard.py`):
 
 - **Check (every watchdog pass, report only).** More than 3 `git
@@ -3650,7 +3656,7 @@ this (`scripts/git_maintenance_guard.py`):
 Enable it on m3 first:
 
 ```sh
-echo /Volumes/Workshop/Code/pulp > ~/.config/tartci/git-maintenance.repos
+echo "<checkout>" > ~/.config/tartci/git-maintenance.repos   # the shared checkout, absolute
 scripts/git_maintenance_guard.py enforce
 scripts/git_maintenance_guard.py nightly --dry-run
 touch ~/.config/tartci/git-maintenance.enabled
@@ -3764,6 +3770,33 @@ value, so a stray export cannot skip the preflight. When the watchdog itself is 
 then exits 127, so a host with a broken pin reports it instead of going
 dark. `tartci doctor fleet` reports a loaded watchdog or self-update agent
 whose last exit is nonzero (`host_agents_failing`; 127 is a refusal).
+
+The sealed launcher (`TartCILauncher.app`, on hosts whose Tart store is on an
+external volume) carries the same kind of grant: Removable Volumes belongs to
+the app, and replacing the app can reset it. Without it the helper blocks in
+`open()` on the store and no lane starts. So:
+
+- The installer leaves an identical live launcher in place. A same-generation
+  reinstall, a retried install or a rollback whose bundle matches the live one
+  byte for byte does not replace it (`launcher: unchanged, left in place`).
+- Self-update refuses, before any drain, to install a commit that would
+  replace the launcher until an operator acknowledges that commit, and opens
+  `[tartci] <host>: grant Removable Volumes to TartCI Launcher before
+  self-update installs <commit>` (`launcher_consent_needed`). Every TartCI
+  commit seals a new bundle, so each update on these hosts needs this step:
+
+  ```sh
+  echo <commit> > ~/.config/tartci/launcher-change-ack   # allow this one update
+  # right after it installs: System Settings > Privacy & Security >
+  # Files and Folders > TartCI Launcher > Removable Volumes (on)
+  ```
+
+  The key is the commit, not the bundle digest, because each build is re-signed
+  with a new timestamp. The issue closes once the change is acknowledged.
+- When the launch-helper volume probe times out, it times the same small write
+  from its own (parent) process as a control. A fast control is reported as
+  `helper blocked in open(); same-dir write from parent took N ms` with the
+  grant to restore; a slow one as `volume I/O slow`.
 
 The preflight proves a new interpreter once. A grant that is later revoked or
 reset (a macOS update, `tccutil reset`, a box unticked) is caught by the

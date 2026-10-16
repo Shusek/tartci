@@ -73,6 +73,8 @@ class Redaction(unittest.TestCase):
         "curl -u admin:Cu2WqE5rTy8UiO3pAs6DfG9h https://api.example.com":
             "Cu2WqE5rTy8UiO3pAs6DfG9h",
         "AWS_SECRET_ACCESS_KEY=Aw6ZxC9vBn2MqW5eRt8YuI1o aws s3 ls": "Aw6ZxC9vBn2MqW5eRt8YuI1o",
+        "env SHIPYARD_GITHUB_APP_PRIVATE_KEY=Gk3RtY7uIo1PaS5dFg9HjK2l shipyard pr":
+            "Gk3RtY7uIo1PaS5dFg9HjK2l",
     }
 
     def test_planted_secrets_never_reach_the_log(self) -> None:
