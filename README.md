@@ -44,7 +44,7 @@ registers a one-job runner in the VM; GitHub assigns the job
 job finishes -> VM deleted, lease released
 ```
 
-- **macOS and Linux** guests run on [Tart](https://github.com/cirruslabs/tart)
+- **macOS and Linux** guests run on [Tart](https://github.com/openai/tart)
   (Apple Virtualization).
 - **Windows** guests run on QEMU, since Apple Virtualization cannot install
   Windows.
@@ -100,7 +100,7 @@ baking goldens, onboarding a host and installing the agents.
 
 ## Tart and TartCI
 
-[Tart](https://github.com/cirruslabs/tart) provides the Apple Virtualization
+[Tart](https://github.com/openai/tart) provides the Apple Virtualization
 VM engine. TartCI is an independent project that adds the CI layer: disposable
 per-job GitHub runners, host resource budgets, warm caches, Windows through
 QEMU, and coordination with [Shipyard](https://github.com/danielraffel/Shipyard).
