@@ -1459,6 +1459,13 @@ def launcher_consent_alert(cfg: Config, me: str, target: str, installed: str,
 # pool on's readiness failure from macos_launcher_probe (any outcome: a denial
 # exits at once, a blocked open() times out).
 LAUNCH_PROBE_FAILED = re.compile(r"launch helper volume probe")
+# The probe's own control write was slow too (macos_launcher_probe): the volume,
+# not the launcher's consent, is the cause.
+LAUNCH_PROBE_SLOW_VOLUME = re.compile(r"volume I/O slow")
+
+
+def probe_slow_volume(probe: str) -> bool:
+    return bool(LAUNCH_PROBE_SLOW_VOLUME.search(probe or ""))
 
 
 def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float) -> None:
@@ -1472,6 +1479,8 @@ def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: flo
         since = _iso(now)
 
         def render() -> tuple[str, str]:
+            if probe_slow_volume(probe):
+                return render_slow()
             body = "\n".join([
                 "## What happened",
                 f"`{me}`'s self-update installed `{target[:12]}`, which replaced TartCI "
@@ -1500,6 +1509,37 @@ def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: flo
             ])
             title = f"[tartci] {me} is OFF: grant Removable Volumes to TartCI Launcher, then pool on"
             marker = tartci_incident.marker(me, "launcher_probe_failed", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        def render_slow() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update installed `{target[:12]}`, which replaced TartCI "
+                "Launcher, and then `pool on` failed the launch-helper volume probe because "
+                "the Tart store's volume was slow. Self-update STOPPED with the host OFF and "
+                "did not roll back.", "",
+                "## Evidence",
+                f"- pool on: `{probe.strip()[:600]}`",
+                "- the probe's own control write into the same directory was slow too, so "
+                "this is the volume, not the launcher's Removable Volumes consent", "",
+                "## Likely cause",
+                "Heavy I/O on the external volume that holds the Tart store (a large VM "
+                "copy, a reclaim scan, Spotlight or backup), or a failing disk.", "",
+                "## Fix", "```sh",
+                "# 1. find what is loading the volume",
+                "sudo fs_usage -w -f filesys | grep -i Volumes   # or Activity Monitor > Disk",
+                "# 2. once a write to the store is fast again, on the host:",
+                "tartci pool on",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Whether the volume is healthy is a person's call; a rollback would "
+                "replace the launcher again.", "",
+                "## How to verify",
+                "`tartci pool on` passes the launch-helper volume probe and the lanes start. "
+                "This issue closes after the next self-update that completes.",
+            ])
+            title = f"[tartci] {me} is OFF: its Tart store volume was too slow for the launcher probe"
+            marker = tartci_incident.marker(me, "launcher_probe_slow_volume", since, since)
             return title, tartci_incident.with_marker(body, marker)
 
         host_off.episode_alert(
@@ -3184,13 +3224,17 @@ class Run:
                           ok=False)
         self._repin_to_live()
         launcher_probe_alert(self.cfg, self.me, self.target, probe, self.sys.now())
+        if probe_slow_volume(probe):
+            next_step = ("The Tart store volume was slow (the probe's control write was slow "
+                         "too); once writes to it are fast again, run `tartci pool on`.")
+        else:
+            next_step = ("Grant Removable Volumes to TartCI Launcher (System Settings > "
+                         "Privacy & Security > Files and Folders), then run `tartci pool on`.")
         return self._terminal(
             "failed",
             f"launch helper volume probe failed after installing a new launcher for "
             f"{self.target[:12]}; STOPPED and NOT rolled back (a rollback replaces the launcher "
-            "again and can reset its consent). Grant Removable Volumes to TartCI Launcher "
-            "(System Settings > Privacy & Security > Files and Folders), then run "
-            f"`tartci pool on`. Probe: {probe[:300]}",
+            f"again and can reset its consent). {next_step} Probe: {probe[:300]}",
             pool_state=self._pool_state_quiet())
 
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:

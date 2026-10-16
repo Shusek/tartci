@@ -2414,12 +2414,35 @@ class LauncherProbeStopTests(Base):
                              for step in json.loads(Path(last["receipt"]).read_text())["steps"]))
         self.assertEqual(T_OLD, self.sys.running(), "the new generation stays installed")
         self.assertEqual("c" * 64 + "\n", self.pin().read_text(), "pin matches the live bundle")
+        self.assertIs(True, json.loads(Path(last["receipt"]).read_text())["host_off"])
+        self.assertIs(True, last["host_off"])
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertIn("[tartci] studio is OFF: grant Removable Volumes to TartCI Launcher, "
                       "then pool on", opened)
         body = next(b for b in self.bodies if "Files and Folders" in b)
         self.assertIn("tartci pool on", body)
         self.assertIn("## Safe to auto-apply\nNo.", body)
+
+    def test_a_slow_volume_stops_without_asking_for_the_grant(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = ("fleet readiness: launch helper volume probe timed out after 60s "
+                            "(probe wait elapsed 60.1s; its write to the store did not finish): "
+                            "volume I/O slow; same-dir write from parent took 4200 ms. "
+                            "Not an access denial")
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertIn("STOPPED and NOT rolled back", last["error"])
+        self.assertIn("The Tart store volume was slow", last["error"])
+        self.assertNotIn("Grant Removable Volumes", last["error"])
+        self.assertIs(True, last["host_off"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn("[tartci] studio is OFF: its Tart store volume was too slow for the "
+                      "launcher probe", opened)
+        body = next(b for b in self.bodies if "launcher_probe_slow_volume" in b)
+        self.assertNotIn("Removable Volumes to TartCI Launcher", body)
+        self.assertNotIn("Files and Folders", body)
+        self.assertIn("tartci pool on", body)
 
     def test_any_other_pool_on_failure_still_rolls_back(self) -> None:
         # pool on fails every attempt after the install, then serves the rollback.
