@@ -360,6 +360,12 @@ def publish(generation: Path, *, pointer: Path, root: Path, team_id: str,
         previous = None
     value = {"schema": POINTER_SCHEMA, "generation": str(generation),
              "previous": previous if previous != str(generation) else (current or {}).get("previous")}
+    _point(pointer, value)
+    return {**value, "note": note} if note else value
+
+
+def _point(pointer: Path, value: dict) -> dict:
+    """Replace the pointer atomically with `value`, mode 0600."""
     pointer.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".launcher-generation.", dir=pointer.parent)
     try:
@@ -372,7 +378,7 @@ def publish(generation: Path, *, pointer: Path, root: Path, team_id: str,
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
-    return {**value, "note": note} if note else value
+    return value
 
 
 def next_sequence(pointer: Path, floor: Path) -> int:
@@ -410,18 +416,41 @@ def lanes_from_plists(render_dir: Path) -> dict:
 def install(generation: Path, *, render_dir: Path, tart_home: str, pin: str, pointer: Path,
             floor: Path, root: Path, team_id: str, identity: str, keychain: Optional[str],
             signing_ready: Callable[[], Optional[str]], run: Runner = subprocess.run) -> dict:
-    """Give a staged generation its v2 runtime and signed set, and point at it."""
-    problem = signing_ready()
-    if problem:
-        raise LaunchSetError(f"signing keychain not ready, pointer unchanged: {problem}")
+    """Give a staged generation its v2 runtime and signed set, and point at it.
+
+    Three ways, in order:
+    - the pointer already names this generation and its signed set says what
+      a rebuild would: nothing changes ("unchanged");
+    - this generation is the pointer's `previous` (a rollback) and its signed
+      set still verifies with the same lanes: the pointer switches back
+      without a signature, which the launcher's floor allows for exactly one
+      step ("rolled_back");
+    - otherwise the set is written and signed forward with the next sequence,
+      which needs the dedicated signing keychain. When it is not ready nothing
+      is written and the refusal names why neither of the first two applied.
+    """
     lanes = lanes_from_plists(render_dir)
-    current = read_pointer(pointer)
-    if (current and current.get("generation") == str(generation)
-            and _unchanged(generation, lanes, tart_home=tart_home, pin=pin, root=root,
-                           team_id=team_id, run=run)):
+    current = read_pointer(pointer) or {}
+    reusable = _why_not_reusable(generation, lanes, tart_home=tart_home, pin=pin, root=root,
+                                 team_id=team_id, run=run)
+    if current.get("generation") == str(generation) and reusable is None:
         # Reinstalling the generation the pointer already names, with the same
         # lanes: its signed set stands, and a re-sign would only spend a sequence.
         return {**current, "unchanged": True}
+    if (current.get("previous") == str(generation) and current.get("generation")
+            and reusable is None):
+        return {**_point(pointer, {"schema": POINTER_SCHEMA, "generation": str(generation),
+                                   "previous": current["generation"]}), "rolled_back": True}
+    problem = signing_ready()
+    if problem:
+        if current.get("previous") == str(generation):
+            why = f"its signed set cannot be reused ({reusable})"
+        else:
+            why = "it is not the pointer's previous generation, so no signed set can be reused"
+        raise LaunchSetError(
+            f"cannot point launcher v2 at {generation}: {why}, and the signing keychain is not "
+            f"ready to sign it forward ({problem}). Pointer unchanged. Operator step: make the "
+            "dedicated signing keychain ready (`pulp ship doctor`), then run the install again")
     # A reinstall of a generation that already has a runtime finds it frozen.
     for directory in (generation, generation / "bin"):
         if directory.is_dir() and not directory.is_symlink():
@@ -433,21 +462,23 @@ def install(generation: Path, *, render_dir: Path, tart_home: str, pin: str, poi
     except BaseException:
         freeze(generation)
         raise
+    # Readiness was just proven; publish need not probe again.
     return publish(generation, pointer=pointer, root=root, team_id=team_id, identity=identity,
-                   keychain=keychain, signing_ready=signing_ready, run=run)
+                   keychain=keychain, signing_ready=lambda: None, run=run)
 
 
-def _unchanged(generation: Path, lanes: dict, *, tart_home: str, pin: str, root: Path,
-               team_id: str, run: Runner) -> bool:
-    """Whether the generation's signed set already says what a rebuild would."""
+def _why_not_reusable(generation: Path, lanes: dict, *, tart_home: str, pin: str, root: Path,
+                      team_id: str, run: Runner) -> Optional[str]:
+    """Why the generation's signed set cannot stand as it is, or None."""
     try:
         existing = json.loads((generation / SET_NAME).read_text())
         wanted = build(generation, lanes, tart_home=tart_home, python=pin,
                        sequence=existing["sequence"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-    return (existing == wanted and verify_contents(generation, root) is None
-            and verify_signature(generation, team_id, run=run) is None)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"no readable signed set: {exc}"
+    if existing != wanted:
+        return "its lanes or interpreter differ from this install's"
+    return verify_contents(generation, root) or verify_signature(generation, team_id, run=run)
 
 
 def keychain_problem(keychain: Optional[str]) -> Optional[str]:
@@ -455,6 +486,28 @@ def keychain_problem(keychain: Optional[str]) -> Optional[str]:
         return "no dedicated signing keychain was given"
     if not keychain.endswith(".keychain-db") or not Path(keychain).is_file():
         return f"{keychain} is not a keychain file"
+    return None
+
+
+def signing_problem(identity: str, keychain: Optional[str],
+                    run: Runner = subprocess.run) -> Optional[str]:
+    """Why the dedicated keychain cannot sign unattended now, or None: it must
+    be a keychain file, and a timestamped probe signature through it must
+    succeed in bounded time (a locked keychain fails here, never prompts)."""
+    problem = keychain_problem(keychain)
+    if problem:
+        return problem
+    with tempfile.TemporaryDirectory() as scratch:
+        probe = Path(scratch) / "signing-probe"
+        probe.write_bytes(b"tartci launch set signing probe\n")
+        try:
+            result = run(["/usr/bin/codesign", "--force", "--timestamp", "--keychain", keychain,
+                          "--sign", identity, str(probe)],
+                         capture_output=True, text=True, timeout=60, check=False)
+        except subprocess.TimeoutExpired:
+            return "the signing probe timed out (a locked keychain waiting on a prompt?)"
+    if result.returncode != 0:
+        return f"the signing probe failed: {(result.stderr or result.stdout).strip()[:200]}"
     return None
 
 
@@ -473,7 +526,7 @@ def main(argv: Optional[list] = None) -> int:
                         tart_home=args.tart_home, pin=args.pin, pointer=Path(args.pointer),
                         floor=Path(args.floor), root=Path(args.root), team_id=args.team_id,
                         identity=args.identity, keychain=args.keychain,
-                        signing_ready=lambda: keychain_problem(args.keychain))
+                        signing_ready=lambda: signing_problem(args.identity, args.keychain))
     except LaunchSetError as exc:
         print(f"launch set: {exc}", file=sys.stderr)
         return 2

@@ -120,6 +120,9 @@ class FakeSystem(su.System):
         self.launchd_print = None
         self.target_orchestrator_rc = 0
         self.target_orchestrator_calls: list[list[str]] = []
+        self.v2_generation: Path | None = None   # launcher v2: the pointer's generation
+        self.live_team = "95CX6P84C4"            # the live app's TeamIdentifier
+        self.keychain_identities = [IDENTITY]    # Developer ID identities in the keychain
 
     def now(self) -> float:
         return self.clock
@@ -252,12 +255,15 @@ class FakeSystem(su.System):
                              self.agents_check_rc == 0 else "reclaim: missing template")
         if a[0] == "codesign" and "--extract-certificates" in joined:
             return ok()
+        if a[0] == "codesign" and "-d" in a and "--verbose=2" in a:
+            return su.Result(0, "", f"Identifier=x\nTeamIdentifier={self.live_team}\n")
         if a[0] == "codesign" and "--verify" in a:
             return su.Result(self.codesign_verify_rc, "", "" if self.codesign_verify_rc == 0 else "invalid signature")
         if a[0] == "openssl":
             return ok(f"SHA1 Fingerprint={FINGERPRINT}\n")
         if a[0] == "security":
-            return ok(f'  1) {IDENTITY} "Developer ID Application: X (95CX6P84C4)"\n')
+            return ok("".join(f'  {n}) {identity} "Developer ID Application: X (95CX6P84C4)"\n'
+                              for n, identity in enumerate(self.keychain_identities, 1)))
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
             return self._build(a, env)
         if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
@@ -292,6 +298,17 @@ class FakeSystem(su.System):
         if args[:2] == ["fleet-macos", "validate"]:
             return ok("valid")
         if args[:2] == ["fleet-macos", "install"]:
+            if "--apply" in args and self.v2_generation is not None:
+                # The installer records the layout it wrote in the receipt.
+                layout = ("v1" if "--launcher-layout" in args
+                          and args[args.index("--launcher-layout") + 1] == "v1"
+                          else "v2" if "--launch-set-identity" in args else None)
+                receipt = self.home / ".config/tartci/macos-fleet-install.json"
+                if layout:
+                    value = json.loads(receipt.read_text())
+                    value["launch_helper"] = {"schema": 2, "layout": "v2"} if layout == "v2" \
+                        else {"schema": 1}
+                    receipt.write_text(json.dumps(value))
             if "--apply" not in args:
                 if "--preflight" in args:
                     return su.Result(self.preflight_rc, "preflight ok" if self.preflight_rc == 0 else "preflight rejected",
@@ -332,6 +349,9 @@ class FakeSystem(su.System):
         raise AssertionError(f"unexpected ./tartci {args}")
 
     def running(self):
+        if self.v2_generation is not None:
+            return json.loads((self.v2_generation / ".tartci-support-manifest.json")
+                              .read_text())["source_commit"]
         if self.sealed:
             meta = self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json"
             return json.loads(meta.read_text())["source_commit"]
@@ -387,6 +407,10 @@ class FakeSystem(su.System):
         raise AssertionError(f"unexpected shim {args}")
 
     def _set_installed(self, commit):
+        if self.v2_generation is not None:
+            (self.v2_generation / ".tartci-support-manifest.json").write_text(
+                json.dumps({"source_commit": commit}))
+            return
         if self.sealed:
             meta = self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json"
             meta.write_text(json.dumps({"source_commit": commit}))
@@ -418,6 +442,10 @@ class FakeSystem(su.System):
             lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
         res = out / "Contents" / "Resources"
         res.mkdir(parents=True)
+        if "--layout" in a and a[a.index("--layout") + 1] == "v2":
+            (res / "inputs.json").write_text(json.dumps({"schema": 1, "sha256": "f" * 64}))
+            approval.write_text("d" * 64 + "\n")
+            return su.Result(0, "", "")
         (res / "lanes.json").write_text(json.dumps({"schema": 1, "lanes": lanes}))
         (res / "bundle.json").write_text(json.dumps({"source_commit": self.bundle_commit or self.checked_out}))
         approval.write_text("c" * 64 + "\n")
@@ -3810,6 +3838,197 @@ class RecoveryBranchTests(Base):
         receipt = json.loads(Path(self.last()["receipt"]).read_text())
         self.assertTrue(any(s["step"] == "reinstall-for-pool-on"
                             and "FAILED verification" in s["detail"] for s in receipt["steps"]))
+
+
+class LauncherV2SelfUpdateTests(Base):
+    """Launcher v2: an update that leaves the stable app's inputs, signing
+    identity and team equal builds nothing and needs no consent; any
+    difference, or the move from v1, is a launcher change keyed on all three.
+    Rollback points back at the previous generation."""
+    sealed = True
+    TEAM = "95CX6P84C4"
+
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.home / ".config/tartci"
+        app = self.home / "libexec/TartCILauncher.app"
+        (app / "Contents/Resources/bundle.json").unlink()
+        (app / "Contents/Resources/inputs.json").write_text(
+            json.dumps({"schema": 1, "sha256": "f" * 64}))
+        generation = self.home / ".local/share/tartci-generations" / f"{INSTALLED}-1"
+        generation.mkdir(parents=True)
+        self.sys.v2_generation = generation
+        self.sys._set_installed(INSTALLED)
+        (config / "launcher-generation.json").write_text(
+            json.dumps({"schema": 1, "generation": str(generation)}))
+        (config / "macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 2, "layout": "v2"},
+             "support": {"source_commit": INSTALLED}}))
+        opt_in = config / "launcher-v2.enabled"
+        opt_in.write_text("")
+        opt_in.chmod(0o600)
+        secrets = self.home / ".config/pulp/secrets/keychain.env"
+        secrets.parent.mkdir(parents=True)
+        secrets.write_text('PULP_SIGN_KEYCHAIN="$HOME/Library/Keychains/pulp-signing.keychain-db"\n')
+        helper = {"path": str(app), "identifier": "com.danielraffel.tartci.launcher",
+                  "team_id": self.TEAM,
+                  "approval_sha256_path": str(config / "m3-launcher-approved.sha256")}
+        patch = mock.patch.object(su, "launch_helper", return_value=helper)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def ack_path(self) -> Path:
+        return self.home / ".config/tartci/launcher-change-ack"
+
+    def installed_v1(self) -> None:
+        """The live app is v1: its receipt says so and its bundle.json names the commit."""
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 1}, "support": {"source_commit": INSTALLED}}))
+        (self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json").write_text(
+            json.dumps({"source_commit": INSTALLED}))
+
+    def fail_probe_until_rollback(self) -> None:
+        """pool on fails the volume probe until a rollback install has run."""
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+
+        def recover(argv):
+            if "--apply" in argv and "rollback" in " ".join(argv):
+                self.sys.on_rc = 0
+        self.sys.hook = recover
+
+    def pin(self) -> Path:
+        return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+    def builds(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]]
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def step(self, name: str) -> str:
+        return next(s["detail"] for s in self.latest()["steps"] if s["step"] == name)
+
+    def expected_ack(self, inputs: str = "f" * 64, identity: str = IDENTITY,
+                     team: str = TEAM) -> str:
+        return f"v2 inputs={inputs} identity={identity} team={team}"
+
+    def test_the_installed_commit_is_read_through_the_pointer(self) -> None:
+        self.assertEqual(INSTALLED, su.installed_commit(self.cfg)[0])
+
+    def test_no_launcher_change_builds_nothing_and_needs_no_consent(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.builds())
+        install = self.installs()[0]
+        self.assertNotIn("--launch-helper-source", install)
+        self.assertEqual(IDENTITY, install[install.index("--launch-set-identity") + 1])
+        self.assertTrue(install[install.index("--launch-set-keychain") + 1]
+                        .endswith("pulp-signing.keychain-db"))
+        self.assertEqual("0" * 64 + "\n", self.pin().read_text(), "the approval pin stays")
+        self.assertIn("no launcher change", self.step("launcher"))
+
+    def test_changed_inputs_need_the_exact_ack_before_any_drain(self) -> None:
+        app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        app.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.builds())
+        error = self.latest()["error"]
+        self.assertIn(f"inputs {'e' * 12} -> {'f' * 12}", error)
+        self.assertIn(f"echo '{self.expected_ack()}' > {self.ack_path()}", error)
+        # The printed line, written as printed, lets the change through.
+        self.ack_path().write_text(self.expected_ack() + "\n")
+        self.assertUpdated(self.apply())
+        build = self.builds()[0]
+        self.assertEqual("v2", build[build.index("--layout") + 1])
+        install = self.installs()[0]
+        self.assertIn("--launch-helper-source", install)
+        self.assertEqual("d" * 64 + "\n", self.pin().read_text(), "the new app's approval")
+
+    def test_an_ack_for_any_other_inputs_identity_or_team_is_refused(self) -> None:
+        app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        app.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        for stale in (self.expected_ack(inputs="e" * 64),
+                      self.expected_ack(identity="A" * 40),
+                      self.expected_ack(team="ZZZZZZZZZZ"),
+                      T_OLD):     # a v1 commit ack never covers a v2 change
+            with self.subTest(stale=stale[:40]):
+                self.ack_path().write_text(stale + "\n")
+                self.assertEqual(su.EXIT_REFUSED, self.apply())
+                self.assertEqual([], self.sys.mutations())
+                self.assertIn("launcher change needs consent", self.latest()["error"])
+
+    def test_a_rotated_signing_certificate_is_a_launcher_change(self) -> None:
+        self.sys.keychain_identities = ["B" * 40]   # the live app's cert is gone
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        error = self.latest()["error"]
+        self.assertIn(f"identity {IDENTITY[:12]} -> {'B' * 12}", error)
+        self.assertIn(self.expected_ack(identity="B" * 40), error)
+
+    def test_a_different_team_is_a_launcher_change(self) -> None:
+        self.sys.live_team = "ZZZZZZZZZZ"
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn(f"team ZZZZZZZZZZ -> {self.TEAM}", self.latest()["error"])
+
+    def test_a_move_from_v1_is_a_launcher_change(self) -> None:
+        self.installed_v1()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("layout v1 -> v2", self.latest()["error"])
+
+    def test_the_plan_says_which_of_the_three_differed(self) -> None:
+        self.sys.live_team = "ZZZZZZZZZZ"
+        self.plan()
+        launcher = self.step("launcher")
+        self.assertIn("launcher change (team ZZZZZZZZZZ -> 95CX6P84C4)", launcher)
+        self.assertNotIn("inputs", launcher)
+        self.assertNotIn("identity", launcher)
+
+    def test_a_v2_host_whose_opt_in_is_gone_refuses_before_any_drain(self) -> None:
+        (self.home / ".config/tartci/launcher-v2.enabled").unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("--launcher-layout v1", self.latest()["error"])
+
+    def test_without_the_dedicated_keychain_v2_refuses_before_any_drain(self) -> None:
+        (self.home / ".config/pulp/secrets/keychain.env").unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("dedicated signing keychain", self.latest()["error"])
+
+    def test_a_failed_probe_without_a_launcher_change_rolls_back(self) -> None:
+        # No new app, so the probe failure cannot be a lost grant: roll back
+        # (the installer points the launcher back at the previous generation).
+        self.fail_probe_until_rollback()
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"], self.last())
+        self.assertEqual(INSTALLED, self.sys.running())
+        rollback = self.installs()[-1]
+        self.assertIn("rollback", " ".join(rollback))
+        self.assertEqual("v2", rollback[rollback.index("--launcher-layout") + 1])
+        self.assertEqual(IDENTITY, rollback[rollback.index("--launch-set-identity") + 1])
+
+    def test_a_failed_probe_after_a_launcher_change_stops_without_rollback(self) -> None:
+        # Control: with a new app the #579 stop still applies.
+        app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        app.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        self.ack_path().write_text(self.expected_ack() + "\n")
+        self.fail_probe_until_rollback()
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("STOPPED and NOT rolled back", self.last()["error"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+
+    def test_a_rollback_after_a_move_from_v1_reinstalls_v1_explicitly(self) -> None:
+        self.installed_v1()
+        self.ack_path().write_text(self.expected_ack() + "\n")
+        self.sys.broken_target = True
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        rollback = self.installs()[-1]
+        self.assertEqual("v1", rollback[rollback.index("--launcher-layout") + 1])
+        self.assertNotIn("--launch-set-identity", rollback)
 
 
 if __name__ == "__main__":
