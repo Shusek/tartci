@@ -1063,13 +1063,36 @@ gh auth status -h github.com
 mkdir -p "$HOME/.tartci/goldens" "$HOME/VMs/tmp" "$HOME/VMs/logs"
 ```
 
-Install the Windows golden on each host:
+Install a Windows golden with its separately supplied, trusted SHA-256 sidecar
+on each host. If the source has no sidecar, establish its provenance and issue
+one before this step; do not compute a new checksum from an untrusted copy.
 
 ```bash
-cp /path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2 \
-  "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
-shasum -a 256 "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+source_golden=/path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2
+test -f "$source_golden.sha256" || { echo "trusted source sidecar required" >&2; exit 1; }
+golden="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+cp "$source_golden" "$golden"
+cp "$source_golden.sha256" "$golden.sha256"
+python3 scripts/verify_windows_golden.py --no-cache "$golden"
 ```
+
+The manual clone and Windows runner require an adjacent `.qcow2.sha256`
+sidecar. The first shared-source check streams the image; subsequent checks can
+use a private cache keyed by image identity and sidecar digest. After taking a
+VM lease, each job makes a private APFS CoW snapshot, fully hashes its exact
+bytes against the sidecar, seals it, and creates the overlay against that
+snapshot. If APFS cloning or hashing fails, the job refuses to boot. Use
+`python3 scripts/verify_windows_golden.py --no-cache /path/to/base.qcow2`
+for a forensic recheck. A checksum proves that the disk matches its recorded
+bytes; the boot/toolchain probe and provenance receipt are separate admission
+requirements. Do not regenerate a mismatched sidecar to silence a refusal.
+The runner, the manual clone and the snapshot script hash with the host's
+pinned interpreter (`tartci_toml_python_path`, see "Pinned interpreter"), never
+PATH's `python3`: the hash reads the whole golden from the VM store, and macOS
+grants for that store belong to the binary. Each job logs `Windows snapshot
+hash: <N>s for <bytes> bytes (<interpreter>)`, which is the per-job cost of the
+full hash. When the Windows lane is next enabled, enable it on one host (m1 or
+m5) and see one green job before the other.
 
 Keep the runner code on a home-backed path so launchd and non-interactive SSH do
 not depend on a mounted workspace:
@@ -2068,6 +2091,20 @@ Each body ends with the tartci-incident marker. On recovery `fixed_at` is
 PATCHed in and the issue closes; a failed PATCH or close is retried every
 pass.
 
+A host that reaches no Ethernet or Wi-Fi route of two or more hosts the
+tailnet does reach is LAN-blind: the fault is its own, not theirs. Its routes
+read `unchecked`, it attributes nothing to them, and after 10 min it opens
+`[tartci] <host> cannot reach the LAN from tartci` (`lan_blind`). One other
+host with dead routes is never enough; that is the other host's fault. If
+several hosts report this at once, suspect the LAN itself (router or switch).
+Otherwise something on the host keeps its tartci process off the LAN while
+the tailnet works; check, from the watchdog's own context, the route the
+kernel picks for a LAN address (`route -n get`), any firewall holding the
+probe binary, and the host's privacy settings for the binary that runs the
+probe (for example Homebrew Python, which needs a re-grant after each
+upgrade; on m5s, 2026-10-15, Local Network was denied to Homebrew Python
+3.15, the interpreter its watchdog picked). See "Pinned interpreter" below.
+
 `python3 scripts/tailnet_peer_alert.py --status` prints which routes reached
 each host in the last pass. `TARTCI_TAILNET_ISSUE=0` keeps the events and
 WARN lines without opening issues; `TARTCI_TAILNET_OFFLINE_ALERT_SECS` changes
@@ -2120,6 +2157,94 @@ the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) 
 `1` a mutation ran and failed its postcondition, `3` refused before changing
 anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
 host-wide "no VM running" gate.
+
+### Runners the janitor must never delete (`keep_not_minted_here`)
+
+Every host's janitor (`scripts/vm_reap.py`, run by the `reap` LaunchAgent) reads
+every self-hosted registration in the repository, but it holds a state file
+only for the runners its own lanes minted. "Offline, not busy, no local state"
+therefore proves a registration is a dead ghost only when this host could have
+minted it. GitHub also reports a healthy, connected runner as `offline` for the
+seconds its broker long-poll stalls, so a single offline reading proves nothing
+about a persistent runner.
+
+That combination deleted a persistent bare-metal runner that lived on a
+different host. The runner noticed its registration was gone, deleted its own
+`.runner` and `.credentials` files, and exited cleanly. That left its launchd
+job loaded but not running, and the lane stayed dead until someone re-registered
+it by hand.
+
+A pass now keeps an offline row, recording `action: keep_not_minted_here` and a
+`refusal`, whenever any of these holds:
+
+| `refusal` | Meaning |
+|---|---|
+| `persistent_runner` | The name is listed in `TARTCI_REAP_PERSISTENT_RUNNERS` (comma-separated) or passed with `--persistent-runners`. |
+| `not_a_per_boot_name` | The name lacks the `<runner>-<pid>-<n>` shape that tartci gives every registration it mints, so this host did not mint it. |
+| `not_this_hosts_prefix` | The per-boot name does not start with a prefix this host mints. Those prefixes come from this host's fleet lanes (`<runner_name>-`, never the shared lane identity) and its installed Linux/Windows lane plists (`linux-ephr-`, `win-ephr-<host>-`), plus `TARTCI_REAP_OWN_NAME_PREFIXES`. When no prefix is known, everything is kept. |
+| `bound_to_other_host:<label>` | The runner carries a host-bound label (a prefix in `TARTCI_REAP_HOST_LABEL_PREFIXES`, default `pulp-host-`) that is not one of this host's own. This host's label is read from the `--labels` of its installed Linux/Windows lane plists, plus `TARTCI_HOST_LABEL`. A host owns exactly one host-bound label. If those sources give more than one, or one that disagrees with `TARTCI_HOST_LABEL`, the host owns none and the pass reports `host_label_conflict:<labels>`. Linux per-boot names (`linux-ephr-<pid>-<n>`) carry no host, so for Linux runners the label is the only ownership axis. The digest's `config.host_labels` shows the effective set. |
+| `offline_too_recent` (action `wait_offline_age`) | Every other check passed, but GitHub has reported the runner offline on fewer than `TARTCI_REAP_MIN_OFFLINE_PASSES` (3) consecutive passes, or for less than `TARTCI_REAP_MIN_OFFLINE_SECS` (900). Any online or busy reading resets the clock, which is kept in `<state root>/reap/runner-offline.json`. |
+
+The janitor no longer reaps ghosts of retired lanes, such as legacy
+`pulp-vm-*` names, because no installed lane on this host claims those names.
+Remove them by hand, or list them in `TARTCI_REAP_OWN_NAME_PREFIXES` for a pass.
+
+A kept row is not a problem and does not change the exit status. Its owner is
+responsible for it: the persistent runner's own host, or the reaper of the pool
+that minted it. The janitor still deletes its own residue, meaning per-boot names
+that carry no host label or carry one of this host's own labels.
+
+**Runner inventory.** Before you register a runner by hand, decide which kind it is.
+
+- *Per-job (JIT / ephemeral).* tartci's VM lanes and other pools that mint a
+  fresh name per job. A stale registration can't outlive the job, and a ghost
+  is harmless residue.
+- *Persistent, host-bound.* One long-lived registration on bare metal. Give it
+  a `<project>-host-<host>` label, add its name to
+  `TARTCI_REAP_PERSISTENT_RUNNERS` on every host that runs the janitor, and give
+  it its own health check, because nothing else revives it.
+
+**Keeping a persistent runner alive.** Two jobs work together. Neither needs a
+long-lived credential on the runner's host.
+
+- `scripts/runner_host_health.sh` runs on the runner's own host every 5
+  minutes, at background priority
+  (`launchd/com.danielraffel.tartci.runner-host-health.plist.template`). If the
+  runner is configured but its listener is not running, the script kickstarts
+  the runner's launchd job. That job, written by svc.sh, has no KeepAlive. If
+  `.runner` is gone, the script writes a `deconfigured` marker, because only a
+  registration token can fix that.
+- `tartci runner-heal --fix` runs on one fleet host that has `ghapp` and ssh
+  access to the runner hosts
+  (`launchd/com.danielraffel.tartci.persistent-runner-heal.plist.template`). It
+  reads the runners declared in `~/.config/tartci/persistent-runners.json` and
+  compares GitHub's view with each host's view over ssh. A registered runner
+  whose listener is down gets restarted. A runner that is missing on GitHub, or
+  whose host lost `.runner`, gets re-registered: the job mints a one-hour
+  registration token and sends it over ssh stdin. The old local identity is
+  moved aside, not deleted, and each runner is re-registered at most once an
+  hour. Without `--fix`, the job only reports. An unreachable host or an
+  unreadable census is reported and never acted on.
+
+Roll out one host at a time, and run report-only for a few passes first.
+
+**If a persistent runner has vanished.** Its log in `_diag/Runner_*.log` ends
+with `Runner registration no longer exists ... Cleaning up local
+configuration.`, `.runner` is missing, and the lane's jobs wait for a runner
+until they are cancelled.
+
+1. Find who deleted it. Search the org audit log for
+   `action:repo.remove_self_hosted_runner` or
+   `action:org.remove_self_hosted_runner` in the minute before that log line.
+   Then search each host's `~/Library/Logs/tartci/tartci-reap.log` for
+   `github_runner_deleted:<name>`.
+2. `tartci runner-heal --fix` re-registers it automatically if it is declared.
+   To do it by hand, re-register it with a short-lived registration token
+   (`POST repos/OWNER/REPO/actions/runners/registration-token`), then run
+   `./config.sh --unattended --replace --url https://github.com/OWNER/REPO
+   --token <token> --name <name> --labels <labels>` and restart its launchd job.
+3. Confirm it reads `online` in `GET repos/OWNER/REPO/actions/runners`, and that
+   a dispatched job lists it as `runner_name`.
 
 ### Published fleet supply and how to fact-check it
 
@@ -2804,8 +2929,8 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 
       [reclaim]
       pulp_worktree_builds = true
-      repo = "/Volumes/Workshop/Code/pulp"
-      worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+      repo = "/Volumes/<data-volume>/Code/pulp"
+      worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
       pressure_free_gb = 200          # optional
       worktree_build_idle_hours = 2   # optional, 2..24
 
@@ -2890,7 +3015,7 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 
   **The home volume has its own floor.** The disk axis above judges the
   volume holding the Tart store. When the store is on another volume
-  (m5studio's `/Volumes/Atelier`), a VM lease also judges the home volume,
+  (m5studio's `/Volumes/<data-volume>`), a VM lease also judges the home volume,
   which holds every supervisor's temp files and the build trees
   (`scripts/home_volume_floor.py`). m5studio, 2026-10-04: the boot Data volume
   reached 99% with coverage build dirs, ENOSPC killed a merge-group runner and
@@ -3342,3 +3467,133 @@ detection floor, enablement and remedy: [build-disagreement.md](build-disagreeme
 #### Install-time interpreter pin
 
 On macOS fleet installs, the installer resolves one regular interpreter, probes api.github.com through that exact path, and records it as TARTCI_PYTHON. LaunchAgents, sealed TartCILauncher lane bundles, and the ghapp token minter carry the same path; TARTCI_RENDER_PYTHON is the render-time handoff used while building a launcher. A probe failure names the interpreter and must be repaired before admission.
+
+### Pinned interpreter (`host.python`)
+
+A profile's `host.python` names the one interpreter the host runs: an absolute
+path, never a PATH search. The installer uses it over `TARTCI_PYTHON`, the old
+pin and any search, refuses the install if it is missing, renders it into
+every lane as `TARTCI_PYTHON`, and writes it to `~/.config/tartci/python.pin`.
+LaunchAgents rendered without their own `TARTCI_PYTHON` (the watchdog,
+reclaim, self-update) resolve through that pin. Any LaunchAgent tartci ships
+(every template and rendered lane sets `TARTCI_LAUNCHD=1`; an older agent is
+recognised by its `com.danielraffel.*` label, though a wrapper such as
+Homebrew's GNU `timeout` resets `XPC_SERVICE_NAME` to `0`) with neither
+refuses to run, unless its installed fleet lanes carry an absolute
+`TARTCI_PYTHON`: that bootstraps a host whose pin was never written (m3 and
+m5s, 2026-10-15, where the self-update agent was refused before the install
+that writes the pin could run). The bootstrap applies to every tartci
+LaunchAgent on such a host (watchdog, relay, reclaim, reap and self-update),
+each running the binary its lanes already run; when lanes disagree, the newest
+lane plist wins. Each use logs `no ~/.config/tartci/python.pin: <job> uses the
+fleet lanes' interpreter <path>`, and `tartci doctor fleet` reports a managed
+host without a pin (`python_pin_missing`) or with one that names no executable
+(`python_pin_unusable`), so a host cannot stay on the bootstrap unnoticed.
+Otherwise it refuses to run
+and logs `refusing an unpinned interpreter`; it never takes whatever
+`/opt/homebrew/bin/python3` is today. The helpers that otherwise fall back to
+`/usr/bin/python3` when no TOML-capable interpreter exists (status, reclaim,
+governor, the network relay, job claims and the rest of
+`tartci_toml_exec_or_python3`) do so only in an operator's shell; under a
+LaunchAgent the refusal stands. Interactive commands keep the search.
+
+Why: macOS privacy grants follow the binary. On m5s (2026-10-15) the watchdog
+picked Homebrew Python 3.15, Local Network was denied to it, and every LAN
+probe failed with `EHOSTUNREACH` while the tailnet worked. A Homebrew upgrade
+replaces the binary and needs a fresh grant, so pin a path an upgrade does not
+replace, and grant Local Network once for that binary.
+
+The fleet pins Homebrew `python@3.12` 3.12.13_2, and every host runs `brew pin
+python@3.12` so `brew upgrade` neither replaces that binary nor removes its
+Cellar directory. To change the interpreter deliberately: `brew unpin`, install
+the new one, set `host.python` to its absolute Cellar path, self-update, then
+grant Local Network for the new binary (System Settings > Privacy & Security >
+Local Network, entry "Python"). If the pinned binary vanishes anyway, the pin
+fails closed: every tartci LaunchAgent refuses to run rather than fall back.
+
+A refusal is loud: the job's log gets `refusing an unpinned interpreter` (or
+`the pinned interpreter … is unusable`), the first refusal is recorded in
+`~/.tartci/state/interpreter-refused`, and the watchdog opens
+`[tartci] <host> refused to run an unpinned interpreter` (class
+`interpreter_unpinned`), which closes itself once the installer writes a
+working pin and removes that record.
+
+Changing the lane interpreter is gated. Before an install moves the lanes to
+a different binary, it starts that binary as a launchd job, the way the lanes
+will run it, and has it write, read back and remove one file in the profile's
+`tart_home` within 60 s (`scripts/interpreter_preflight.py`). macOS grants
+(Full Disk Access, Files & Folders > Removable Volumes, Local Network) belong
+to the binary, so a new one that was never granted waits on a consent nobody
+answers. If the preflight fails, the install keeps the interpreter the lanes
+run now, records `~/.tartci/state/interpreter-switch-refused`, and the
+watchdog opens `[tartci] <host> kept its lane interpreter: <new> failed the
+launchd preflight` (`interpreter_switch_refused`), naming the grant; it closes
+once a later install switches or no switch is attempted. A self-update
+rollback reinstalls with the interpreter the previous generation's lanes ran
+and restores its `python.pin`, never the new generation's: it passes
+`TARTCI_ROLLBACK_PYTHON`, which outranks the snapshot profile's `host.python`
+(that profile may name the switch the preflight refused, and it is not
+rewritten because a sealed launcher's policy digest covers it). A rollback is
+not preflighted; it restores a binary the lanes already ran. The installer
+honours `TARTCI_ROLLBACK_PYTHON` only when it equals `python.pin` (self-update
+pins it first) or an installed lane's `TARTCI_PYTHON`, and refuses any other
+value, so a stray export cannot skip the preflight. When the watchdog itself is refused,
+`tartci launchd heal` still runs that alert alone under `/usr/bin/python3`
+(`scripts/interpreter_alert.py`, stdlib only; Homebrew never replaces it) and
+then exits 127, so a host with a broken pin reports it instead of going
+dark. `tartci doctor fleet` reports a loaded watchdog or self-update agent
+whose last exit is nonzero (`host_agents_failing`; 127 is a refusal).
+
+The preflight proves a new interpreter once. A grant that is later revoked or
+reset (a macOS update, `tccutil reset`, a box unticked) is caught by the
+watchdog's hourly grant check (`scripts/interpreter_grant_check.py`). It starts
+every interpreter the host runs now (each installed lane's `TARTCI_PYTHON`, and
+`python.pin`, which the watchdog, self-update and pool-on run) as a one-shot
+launchd job that writes, reads back and removes one file in `TART_HOME` within
+30 s. It probes the exact path the lanes carry, so a mise-installed Python is
+covered as soon as lanes use one. A failure records
+`~/.tartci/state/interpreter-grant-lost`, logs `WARN interpreter-grant`, and
+opens `[tartci] <host> lane interpreter can no longer use the VM store:
+<binary>` (`interpreter_grant_lost`), naming the binary macOS attributes the
+access to and the grant. It never takes the host off. The issue closes on the
+next passing check; to re-check at once, remove
+`~/.tartci/state/interpreter-grant-check.json` and kickstart the watchdog.
+
+The check is off unless `~/.config/tartci/interpreter-grant-check.enabled`
+exists on that host. It probes at most three interpreters per run and records
+the probe time (`probe_seconds`) in the check's state file. Turning it off
+closes any open issue. Enable it one host at a time: m1 first, then m5, m3 and
+m5s. After each host's first run, confirm two things before enabling the next:
+the watchdog log has no `WARN interpreter-grant` line, and the state file lists
+the lanes' interpreters with an empty `failed`.
+
+```sh
+touch ~/.config/tartci/interpreter-grant-check.enabled
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
+cat ~/.tartci/state/interpreter-grant-check.json
+```
+
+### Pinned mise (`[mise]`)
+
+A profile's `[mise]` table names one exact mise build: `version`, the absolute
+`path` it is installed at (the path contains the version, so two pins never
+share one), and its `sha256`. It is the binary Pulp's toolchain manifest pins
+(`tools/toolchain/manifest.toml` `[mise.binary]`): built from source once,
+copied between hosts by digest, never installed by Homebrew and never
+self-updated (its `lib/mise-self-update-instructions.toml` points at
+`pulp deps update mise`).
+
+The installer verifies it (`scripts/mise_pin.py check`) right after validating
+the profile, before any LaunchAgent, receipt or pin changes. A missing binary,
+a different sha256, or a `--version` that is not the pin refuses the install
+with exit 3 and one line naming the path, the expected and found values, and
+the fix (copy the binary from a host that has it, then confirm its sha256).
+After the interpreter pin it records `~/.config/tartci/mise.pin` (JSON:
+version, path, sha256, verified_at). A profile without `[mise]` removes that
+file, so deleting the table is the rollback.
+
+The pin changes nothing a lane runs: no PATH, no shims, no tools. Moving a lane
+to mise-provided tools is a separate, flagged step, and a new tool binary goes
+through the same launchd preflight as a new interpreter first (macOS grants
+belong to the binary). Rollout is one host at a time: m1's profile carries the
+table first; m5, m5s and m3 follow only after m1's step.

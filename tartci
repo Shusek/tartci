@@ -30,6 +30,7 @@
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
 #   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
 #   tartci vm-dhcp <status|probe-now>    # VM DHCP breaker; probe at once after a fix
+#   tartci runner-heal [--fix]           # keep declared persistent runners registered + listening
 #   tartci fleet-macos support-agents <plan|apply|auto|status> [--json] # declared support LaunchAgents
 #   tartci support-manifest <write|verify|stage-install> # bind/install runtime cohort
 #   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
@@ -96,10 +97,19 @@ tartci_toml_exec() {
 # Like tartci_toml_exec, for a helper that still does useful work without
 # tomllib: the reclaim janitor and status read the fleet profile to find the
 # Tart store's volume, but without a TOML-capable interpreter they fall back to
-# judging every scanned volume rather than refusing to run at all.
+# judging every scanned volume rather than refusing to run at all. That
+# fallback is for an operator's shell only: under a tartci LaunchAgent a
+# refused pin stays refused, so the network relay and the other agents never
+# drift onto /usr/bin/python3, a binary with its own privacy grants.
 tartci_toml_exec_or_python3() {
   local python
-  python="$(tartci_verified_python 2>/dev/null)" || python=/usr/bin/python3
+  if ! python="$(tartci_verified_python 2>/dev/null)"; then
+    if tartci_launchd_context; then
+      tartci_toml_python_path >/dev/null || true   # prints the refusal to the job's log
+      return 127
+    fi
+    python=/usr/bin/python3
+  fi
   "$python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || return 127
   exec "$python" "$@"
 }
@@ -564,6 +574,15 @@ cmd_launchd() {
     guard) tartci_verified_python_run "$HERE/scripts/launchctl_guard.py" "$@" ;;
     status) tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
     heal)
+      # A refused interpreter must not silence the alert about it: run only the
+      # interpreter alert under Apple's Python (stdlib, never replaced by
+      # Homebrew), then fail like the refusal did.
+      local heal_python_error
+      if ! heal_python_error="$(tartci_toml_python_path 2>&1 >/dev/null)"; then
+        printf '%s\n' "$heal_python_error" >&2
+        /usr/bin/python3 "$HERE/scripts/interpreter_alert.py" || true
+        return 127
+      fi
       # Reboot/offline rejoin convergence includes the optional per-host relay
       # profile. Keep the watchdog's JSON output singular and pass dry-run
       # through without forwarding unrelated watchdog flags.
@@ -1497,6 +1516,7 @@ case "${1:-help}" in
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
   retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;
   vm-dhcp) shift; tartci_verified_python_run "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
+  runner-heal) shift; tartci_verified_python_run "$HERE/scripts/persistent_runner_heal.py" "$@" ;;
   held) shift; tartci_toml_python_exec "$HERE/scripts/debug_hold.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;

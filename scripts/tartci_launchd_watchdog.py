@@ -1330,6 +1330,34 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
+    """Raise one issue while a tartci LaunchAgent on this host refuses to run
+    an unpinned interpreter (scripts/interpreter_alert.py). Never raises."""
+    try:
+        import interpreter_alert  # noqa: PLC0415 - sibling module
+        return interpreter_alert.alert_pass(utcnow() if now is None else now,
+                                            issue=issue, close=close)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter check FAILED "
+                f"({type(exc).__name__}: {exc})")
+
+
+def interpreter_grant_pass(now: float | None = None, probe=None, issue=None,
+                           close=None) -> str | None:
+    """About hourly, prove this host's current lane interpreters can still use
+    the VM store from launchd, and raise one issue when one cannot
+    (scripts/interpreter_grant_check.py). Never takes the host off; never raises."""
+    try:
+        import interpreter_grant_check as grant  # noqa: PLC0415 - sibling module
+        kwargs = {"issue": issue, "close": close}
+        if probe is not None:
+            kwargs["probe"] = probe
+        return grant.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter-grant check FAILED "
+                f"({type(exc).__name__}: {exc}); a revoked grant would not be reported")
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1361,6 +1389,10 @@ def tailnet_pass(now: float | None = None) -> str | None:
                          f"{v.get('since')} ({v.get('minutes')} min)")
         elif v.get("state") == "unmapped":
             parts.append(f"{host} has no tailnet node ({v.get('detail')})")
+        if (v.get("lan_blind") or {}).get("active"):
+            parts.append(f"this host ({host}) cannot reach the LAN since "
+                         f"{v['lan_blind'].get('since')}; fallback routes unchecked "
+                         "(several hosts at once: suspect the router or switch)")
         for kind, route in sorted((v.get("routes") or {}).items()):
             if route.get("active"):
                 parts.append(f"{route.get('alias') or host + '-' + kind} ({route.get('addr')}) "
@@ -1687,6 +1719,12 @@ def main(argv: list[str] | None = None) -> int:
         tailnet_line = tailnet_pass()
         if tailnet_line:
             print(tailnet_line)
+        interpreter_line = interpreter_refusal_pass()
+        if interpreter_line:
+            print(interpreter_line)
+        grant_line = interpreter_grant_pass()
+        if grant_line:
+            print(grant_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

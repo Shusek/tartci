@@ -1435,6 +1435,25 @@ def python_shim_dir() -> str:
     return _PYTHON_SHIM_DIR
 
 
+def installed_lane_python(home: Path) -> str | None:
+    """The absolute TARTCI_PYTHON the installed fleet lanes run, or None."""
+    import plistlib  # noqa: PLC0415
+    for plist in sorted((home / "Library" / "LaunchAgents").glob(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+        try:
+            value = plistlib.loads(plist.read_bytes()).get("EnvironmentVariables", {}).get(
+                "TARTCI_PYTHON")
+        except (OSError, plistlib.InvalidFileException, ValueError, AttributeError):
+            continue
+        if isinstance(value, str) and value.startswith("/"):
+            return value
+    return None
+
+
+def python_pin_path(home: Path) -> Path:
+    return Path(os.environ.get("TARTCI_PYTHON_PIN") or home / ".config" / "tartci" / "python.pin")
+
+
 def census_env(repository: str | None = None) -> dict[str, str]:
     # The census binds its identity per call (#227); this also pins the CLI and
     # the interpreter every tartci helper runs under, including on rollback.
@@ -1735,6 +1754,18 @@ def restore_writable(root: Path) -> None:
                 os.chmod(path, (path.stat().st_mode & 0o7777) | 0o200)
 
 
+def launch_python(profile: Path) -> str:
+    """The interpreter a launcher is built and verified with: the profile's
+    host.python when it declares one (the installer will pin exactly that),
+    else the render handoff, TARTCI_PYTHON, or this process's own."""
+    host = _toml(profile).get("host") or {}
+    declared = host.get("python") if isinstance(host, dict) else None
+    if isinstance(declared, str) and declared.startswith("/"):
+        return os.path.realpath(declared)
+    return os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON")
+                            or os.environ.get("TARTCI_PYTHON") or sys.executable)
+
+
 def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, target: str,
                    out_dir: Path) -> tuple[Path, Path]:
     live = Path(helper["path"])
@@ -1746,8 +1777,7 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
-        launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-            "TARTCI_PYTHON") or sys.executable)
+        launcher_python = launch_python(profile)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
                            "--support-root", ".", "--profile", str(profile),
@@ -1776,8 +1806,7 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
-    launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-        "TARTCI_PYTHON") or sys.executable)
+    launcher_python = launch_python(profile)
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
                        "--output", str(rendered)], cwd=str(cfg.checkout),
                       env={"TARTCI_RENDER_PYTHON": launcher_python,
@@ -2472,7 +2501,16 @@ class Run:
             if result.rc != 0:
                 raise Refused(f"cannot snapshot the live launcher: {result.text}")
             self._verify_snapshot_bundle(snap)
-        _write_json(snap / "snapshot.json", {"previous": self.previous, "at": _iso(self.sys.now())})
+        # The interpreter the running generation's lanes use, and its pin:
+        # a rollback reinstalls with these, never with the new generation's.
+        # m5s, 2026-10-15: the rollback rendered the old launcher against the
+        # new pin and refused ("launch helper lanes are missing pinned
+        # interpreter"), leaving the host off.
+        pin = python_pin_path(self.cfg.home)
+        previous_pin = pin.read_text().strip() if pin.is_file() else None
+        _write_json(snap / "snapshot.json", {
+            "previous": self.previous, "at": _iso(self.sys.now()),
+            "python": installed_lane_python(self.cfg.home), "python_pin": previous_pin})
         self.snapshot = snap
         self.receipt.value["snapshot"] = str(snap)
         self.receipt.step("snapshot", f"{snap} (previous generation {self.previous[:12]})")
@@ -2611,11 +2649,19 @@ class Run:
             return []
         return [str(shipyard), "writer-domain-exec", "--path", str(self.cfg.shim), "--"]
 
-    def _install(self, args: list[str]) -> None:
+    def _install(self, args: list[str], python: str | None = None) -> None:
         fence = self._writer_fence()
+        env = census_env(self.repository)
+        if python:
+            # Only a rollback names one. TARTCI_ROLLBACK_PYTHON outranks the
+            # snapshot profile's host.python, which may name the switch the
+            # preflight refused; an older installer reads TARTCI_PYTHON only.
+            env["TARTCI_PYTHON"] = python
+            if python.startswith("/"):
+                env["TARTCI_ROLLBACK_PYTHON"] = python
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
-                                           cwd=str(self.cfg.checkout), env=census_env(self.repository),
+                                           cwd=str(self.cfg.checkout), env=env,
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
@@ -2688,7 +2734,27 @@ class Run:
             self._write_pin((self.snapshot / "approved.sha256").read_text())
             self.receipt.step("pin-restore", "previous approval restored from the snapshot")
             args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
-        self._install(args)
+        self._install(args, python=self._restore_previous_python())
+
+    def _restore_previous_python(self) -> str | None:
+        """Pin the interpreter the previous generation's lanes ran (else its
+        old pin) and return it, for the rollback install."""
+        snap = (_read_json(self.snapshot / "snapshot.json") if self.snapshot else None) or {}
+        previous = snap.get("python") if isinstance(snap.get("python"), str) else None
+        pin_value = snap.get("python_pin") if isinstance(snap.get("python_pin"), str) else None
+        pin = python_pin_path(self.cfg.home)
+        # The pin names what the rollback installs: the installer honours
+        # TARTCI_ROLLBACK_PYTHON only when it equals the pin or a lane's.
+        restore = previous if previous and previous.startswith("/") else pin_value
+        if restore:
+            pin.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pin.with_name(f".{pin.name}.rollback")
+            tmp.write_text(restore + "\n")
+            os.replace(tmp, pin)
+        if restore or previous:
+            self.receipt.step("python-restore",
+                              f"rollback runs the previous interpreter {restore or previous}")
+        return restore or previous
 
     def _pool_state(self) -> str:
         status = installed_tartci(self.cfg, self.sys, "pool", "status", "--json")

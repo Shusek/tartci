@@ -72,6 +72,59 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # launcher builder and the installed launchd helpers.
 # shellcheck disable=SC1091
 . "$ROOT/providers/common/toml-python.lib.sh"
+# A self-update rollback reinstalls the interpreter the previous generation's
+# lanes ran (fleet_self_update sets TARTCI_ROLLBACK_PYTHON). It wins over the
+# snapshot profile's host.python, which may name a switch the preflight
+# refused; the profile itself is not rewritten, because a sealed launcher's
+# policy digest covers it. It is honoured only when it is the interpreter this
+# host is pinned to (fleet_self_update restores the pin first) or one an
+# installed lane runs, so a stray export cannot skip the preflight.
+tartci_is_rollback_python() {
+  local plist candidate
+  [ "$(tartci_pinned_python 2>/dev/null || true)" = "$1" ] && return 0
+  for plist in "${TARTCI_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"/com.danielraffel.tartci.tart-runner-macos-fleet.*.plist; do
+    [ -f "$plist" ] || continue
+    candidate="$(awk '
+      /<key>TARTCI_PYTHON<\/key>/ { want = 1; next }
+      want && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit }
+    ' "$plist")"
+    [ "$candidate" = "$1" ] && return 0
+  done
+  return 1
+}
+if [ -n "${TARTCI_ROLLBACK_PYTHON:-}" ]; then
+  case "$TARTCI_ROLLBACK_PYTHON" in
+    /*) ;;
+    *) echo "fleet install: TARTCI_ROLLBACK_PYTHON must be an absolute path: $TARTCI_ROLLBACK_PYTHON" >&2
+       exit 2 ;;
+  esac
+  tartci_is_rollback_python "$TARTCI_ROLLBACK_PYTHON" || {
+    echo "fleet install: TARTCI_ROLLBACK_PYTHON=$TARTCI_ROLLBACK_PYTHON is not a rollback interpreter:" \
+         "it is neither $(tartci_python_pin_file) nor any installed lane's TARTCI_PYTHON" >&2
+    exit 2
+  }
+  [ -x "$TARTCI_ROLLBACK_PYTHON" ] && [ ! -d "$TARTCI_ROLLBACK_PYTHON" ] || {
+    echo "fleet install: the rollback interpreter is not an executable file: $TARTCI_ROLLBACK_PYTHON" >&2
+    exit 127
+  }
+  if PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")" \
+      && [ "$PROFILE_PYTHON" != "$TARTCI_ROLLBACK_PYTHON" ]; then
+    echo "fleet install (rollback) uses the previous lanes' interpreter $TARTCI_ROLLBACK_PYTHON, not the profile's host.python $PROFILE_PYTHON" >&2
+  fi
+  export TARTCI_PYTHON="$TARTCI_ROLLBACK_PYTHON"
+# A profile's host.python is the interpreter this host runs, full stop: it
+# wins over the environment, the previous pin and any PATH search, and a
+# missing or unusable one refuses the install rather than falling back.
+elif PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")"; then
+  if [ -n "${TARTCI_PYTHON:-}" ] && [ "$TARTCI_PYTHON" != "$PROFILE_PYTHON" ]; then
+    echo "fleet install uses the profile's host.python $PROFILE_PYTHON, not TARTCI_PYTHON=$TARTCI_PYTHON" >&2
+  fi
+  [ -x "$PROFILE_PYTHON" ] && [ ! -d "$PROFILE_PYTHON" ] || {
+    echo "fleet install: the profile's host.python is not an executable file: $PROFILE_PYTHON" >&2
+    exit 127
+  }
+  export TARTCI_PYTHON="$PROFILE_PYTHON"
+fi
 if [ -n "${TARTCI_PYTHON:-}" ] && [[ "$TARTCI_PYTHON" == */* ]]; then
   python_probe="$TARTCI_PYTHON"
   python_probe_hops=0
@@ -117,6 +170,39 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# Switching the lane interpreter: macOS grants (Full Disk Access, Removable
+# Volumes, Local Network) belong to the binary, so prove the NEW one can use the
+# VM store from launchd before any lane runs it. If it cannot, keep the
+# interpreter the lanes run now and record why; the watchdog raises an issue
+# naming the grant (scripts/interpreter_alert.py). m5s, 2026-10-15.
+SWITCH_RECORD="${TARTCI_HOME:-$HOME/.tartci}/state/interpreter-switch-refused"
+PREVIOUS_PYTHON="$(tartci_lane_pinned_python 2>/dev/null || true)"
+# A rollback restores an interpreter the previous generation already ran, so
+# it is not a switch to prove. There is no skip for tests: they stub launchctl
+# or name a preflight with TARTCI_INTERPRETER_PREFLIGHT.
+if [ -z "${TARTCI_ROLLBACK_PYTHON:-}" ] && [ -n "$PREVIOUS_PYTHON" ] \
+    && [ "$PREVIOUS_PYTHON" != "$PYTHON_BIN" ] \
+    && [ -x "$PREVIOUS_PYTHON" ] && "$PREVIOUS_PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
+  preflight_rc=0
+  if [ -n "${TARTCI_INTERPRETER_PREFLIGHT:-}" ]; then
+    preflight_text="$("$TARTCI_INTERPRETER_PREFLIGHT" "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
+  else
+    preflight_text="$("$PREVIOUS_PYTHON" "$ROOT/scripts/interpreter_preflight.py" \
+      "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
+  fi
+  if [ "$preflight_rc" -ne 0 ]; then
+    echo "fleet install keeps the lane interpreter $PREVIOUS_PYTHON: $preflight_text" >&2
+    mkdir -p "$(dirname "$SWITCH_RECORD")"
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PYTHON_BIN" "$PREVIOUS_PYTHON" \
+      "$(printf '%s' "$preflight_text" | tr '\t\n' '  ')" >"$SWITCH_RECORD"
+    PYTHON_BIN="$PREVIOUS_PYTHON"
+  else
+    rm -f "$SWITCH_RECORD"
+  fi
+else
+  # No switch is attempted, so no switch stands refused.
+  rm -f "$SWITCH_RECORD"
+fi
 # The interpreter is part of the installed launch contract.  Probe GitHub
 # through that exact executable before writing any LaunchAgent; a PATH python3
 # may be a newly linked Homebrew build that is blocked by the host firewall.
@@ -151,6 +237,13 @@ cleanup_plan() {
 }
 trap cleanup_plan EXIT
 "$PYTHON_BIN" "$PY" validate "$CONFIG"
+# A profile that pins mise ([mise]) names one exact binary by digest. Refuse a
+# missing or different binary here, before any LaunchAgent or receipt changes;
+# the message names the expected and found digest and the fix.
+"$PYTHON_BIN" "$ROOT/scripts/mise_pin.py" check "$CONFIG" >/dev/null || {
+  echo "fleet install refused: the profile's [mise] binary is not the pinned one (see above)" >&2
+  exit 3
+}
 "$PYTHON_BIN" "$PY" render "$CONFIG" --output "$plan_dir" >/dev/null
 "$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" verify "$SUPPORT_MANIFEST" \
   --root "$SUPPORT_SOURCE" >/dev/null
@@ -954,6 +1047,23 @@ fi
 loaded_receipt_touched=1
 maybe_test_crash receipt
 
+# Every tartci LaunchAgent without its own TARTCI_PYTHON (the watchdog,
+# reclaim, self-update) resolves the interpreter through this pin, so they run
+# the same binary as the lanes. Written before the entrypoint swap, so no
+# LaunchAgent of the new generation ever starts without it; the old
+# generation's picker never reads it, so a rollback is unaffected.
+pin_file="$(tartci_python_pin_file)"
+pin_tmp="$(mktemp "$(dirname "$pin_file")/.python.pin.XXXXXX")"
+printf '%s\n' "$PYTHON_BIN" >"$pin_tmp"
+chmod 644 "$pin_tmp"
+durable_file "$pin_tmp"
+mv -f "$pin_tmp" "$pin_file"
+durable_file "$pin_file"
+# A working pin is in place: the watchdog's unpinned-interpreter issue closes.
+rm -f "$(tartci_interpreter_refusal_file)"
+# The verified mise pin (or its removal, when the profile no longer pins one).
+"$PYTHON_BIN" "$ROOT/scripts/mise_pin.py" write "$CONFIG" "$HOME/.config/tartci/mise.pin"
+
 if [ -d "$ENTRYPOINT" ] && [ ! -L "$ENTRYPOINT" ]; then
   echo "fleet install refuses a directory at the canonical TartCI entrypoint: $ENTRYPOINT" >&2
   exit 3
@@ -982,5 +1092,6 @@ lock_owned=0
 trap - EXIT
 rm -rf "$stage_dir" "$plan_dir"
 echo "installed ${#changed_targets[@]} profile-rendered LaunchAgents; retired ${#retired_paths[@]} declared legacy LaunchAgents"
+echo "pinned interpreter $PYTHON_BIN in $pin_file"
 echo "verified receipt $RECEIPT; pool admission remains closed"
 echo "run 'tartci pool on' at an approved idle boundary"

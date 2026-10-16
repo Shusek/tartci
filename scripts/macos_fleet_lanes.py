@@ -58,7 +58,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary", "debug_hold", "launchd_watchdog",
+    "reuse_canary", "debug_hold", "launchd_watchdog", "mise",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -78,7 +78,7 @@ HOST_KEYS = {
     "github_api_timeout_seconds", "persistent_runner_labels",
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
-    "ssh",
+    "ssh", "python",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
     "job_claim_max_age_seconds",
     "home_volume_floor_mode",
@@ -430,6 +430,10 @@ def load(path: Path) -> dict:
     if ssh is not None and (not isinstance(ssh, str)
                             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}", ssh)):
         fail("host.ssh must be an SSH host alias or user@host other fleet hosts use to reach this one")
+    python = host.get("python")
+    if python is not None and (not isinstance(python, str) or not python.startswith("/")
+                               or '"' in python or "\n" in python):
+        fail("host.python must be the absolute path of this host's pinned interpreter")
     if "published" in host and type(host["published"]) is not bool:
         fail("host.published must be a boolean")
     github_api_timeout = host.get("github_api_timeout_seconds")
@@ -556,6 +560,14 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    if "mise" in data:
+        # The pinned mise binary (scripts/mise_pin.py); the installer verifies
+        # the binary itself before writing any LaunchAgent.
+        import mise_pin  # noqa: PLC0415 - sibling script, loaded only when declared
+
+        errors = mise_pin.table_errors(data["mise"])
+        if errors:
+            fail("; ".join(errors))
     watchdog = data.get("launchd_watchdog")
     if watchdog is not None:
         # The watchdog's frozen-lane threshold, rendered into its plist by the
@@ -2570,6 +2582,9 @@ def lane_plist(
         "TARTCI_RUNNER_NAME_PREFIX": f"{host['id']}-{identity}",
         "TARTCI_RUNNER_SLOT": str(slot),
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
+        # Marks a LaunchAgent run: the interpreter picker refuses to search
+        # PATH under it (providers/common/toml-python.lib.sh).
+        "TARTCI_LAUNCHD": "1",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
     # The installer resolves and probes one interpreter before rendering. Keep

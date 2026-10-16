@@ -2302,6 +2302,64 @@ class SealedRollbackTests(Base):
         source = rollback[rollback.index("--launch-helper-source") + 1]
         self.assertIn("rollback", source)
 
+    def test_rollback_reinstalls_with_the_previous_interpreter_and_pin(self) -> None:
+        # m5s, 2026-10-15: the update switched the lanes to a new interpreter
+        # and its pin; the rollback rendered the old launcher against the new
+        # pin, refused, and left the host off.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/python3.15\n")
+
+        seen = {"installs": 0}
+
+        def switch_on_install(argv):
+            if "--apply" in argv and "install" in argv:
+                seen["installs"] += 1
+                if seen["installs"] == 1:  # the new generation's install writes its pin
+                    pin.write_text("/new/python3.12\n")
+        self.sys.hook = switch_on_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "rolled_back")
+        installs = [(a, e) for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertGreaterEqual(len(installs), 2)
+        rollback_argv, rollback_env = installs[-1]
+        self.assertIn("rollback", " ".join(rollback_argv))
+        self.assertEqual(rollback_env.get("TARTCI_PYTHON"), "/old/python3.15")
+        # It must outrank the snapshot profile's host.python in the installer.
+        self.assertEqual(rollback_env.get("TARTCI_ROLLBACK_PYTHON"), "/old/python3.15")
+        self.assertNotIn("TARTCI_ROLLBACK_PYTHON", installs[0][1] or {})
+        self.assertEqual(pin.read_text().strip(), "/old/python3.15")
+
+    def test_rollback_pins_what_the_lanes_ran_when_the_old_pin_disagrees(self) -> None:
+        # The installer honours TARTCI_ROLLBACK_PYTHON only when it equals the
+        # pin or a lane's, so the pin must name the interpreter reinstalled.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/lane-python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/pin-python3.15\n")
+
+        def new_pin_on_first_install(argv):
+            if "--apply" in argv and "install" in argv and pin.read_text().startswith("/old/pin"):
+                pin.write_text("/new/python3.12\n")
+        self.sys.hook = new_pin_on_first_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        installs = [e for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertEqual(installs[-1].get("TARTCI_ROLLBACK_PYTHON"), "/old/lane-python3.15")
+        self.assertEqual(pin.read_text().strip(), "/old/lane-python3.15")
+
     def test_signing_probe_failure_refuses_before_drain(self) -> None:
         self.sys.signing_rc = 1
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
