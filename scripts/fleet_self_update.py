@@ -1062,6 +1062,27 @@ WAITING_SEPARATOR = "--- waiting ---"
 UNREADABLE_SEPARATOR = "--- unreadable ---"
 POOL_SINCE_SEPARATOR = "--- pool-state-since ---"
 PAUSED_SEPARATOR = "--- self-update-paused ---"
+# halt_reason, run by the PEER's own /usr/bin/python3 (any 3.x, no imports
+# from tartci) so a peer of any version reports whether its self-update is
+# halted. test_fleet_self_update checks it agrees with halt_reason.
+_PEER_HALTED = (
+    "import json, os, glob, datetime as d\n"
+    "s = (os.environ.get(\"TARTCI_HOME\") or os.path.expanduser(\"~/.tartci\")) + \"/state/self-update\"\n"
+    "def t(x):\n"
+    "    try: return d.datetime.strptime(str(x), \"%Y-%m-%dT%H:%M:%SZ\").replace(tzinfo=d.timezone.utc).timestamp()\n"
+    "    except ValueError: return 0.0\n"
+    "def r(p):\n"
+    "    try: v = json.load(open(p))\n"
+    "    except Exception: return None\n"
+    "    return v if isinstance(v, dict) else None\n"
+    "c = t((r(s + \"/halt-cleared.json\") or {}).get(\"at\")); n = 0\n"
+    "for p in sorted(glob.glob(s + \"/attempts/*.json\")):\n"
+    "    v = r(p)\n"
+    f"    if not v or v.get(\"mode\") != \"apply\" or v.get(\"status\") not in {json.dumps(list(TERMINAL_STATUSES))}:\n"
+    "        continue\n"
+    "    if t(v.get(\"started_at\")) < c: continue\n"
+    "    n = 0 if v.get(\"status\") == \"succeeded\" else n + 1\n"
+    f"print(\"halted\" if n >= {MAX_CONSECUTIVE_FAILURES} else \"\")\n")
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
@@ -1071,7 +1092,7 @@ _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/
                 'stat -f %m "${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}" '
                 '2>/dev/null || true; echo; echo "' + PAUSED_SEPARATOR + '"; '
                 'test -s "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/scheduled-pause.json" '
-                '&& echo paused || true')
+                '&& echo paused || true; /usr/bin/python3 -c \'' + _PEER_HALTED + '\' 2>/dev/null || true')
 
 
 def _ssh_failure_kind(result: Result) -> str:
@@ -1106,7 +1127,7 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     every other host's update for 11 h). It is marked `off`, and whether this
     host may still go out is the capacity floor's call, which counts an off
     host as serving nothing. So is a DRAINING peer with no live update marker
-    whose self-update an operator paused, or whose markerless drain is older
+    whose self-update is paused or halted, or whose markerless drain is older
     than PEER_DRAIN_GRACE_SECONDS (an operator drain: a containment drain on
     2026-10-16, held every other host's turn for 3 h). Updating, unreadable
     and freshly draining peers still refuse.
@@ -1134,7 +1155,7 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     out["clock"] = clock
     rest, _, pool_since_text = rest.partition(POOL_SINCE_SEPARATOR)
     pool_since_text, _, paused_text = pool_since_text.partition(PAUSED_SEPARATOR)
-    paused = paused_text.strip() == "paused"
+    held = set(paused_text.split())   # "paused" and/or "halted"
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
     waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
     pool_since = (int(pool_since_text.strip())
@@ -1196,9 +1217,12 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     # floor, like an off peer.
     operator_drain = (active is None and pool_since is not None
                       and clock - pool_since >= PEER_DRAIN_GRACE_SECONDS)
-    if value.get("state") == "draining" and (paused or operator_drain):
-        why = ("its self-update is paused by an operator" if paused
-               else "an operator drain: no update marker")
+    stopped = sorted(held & {"paused", "halted"})
+    if value.get("state") == "draining" and (stopped or operator_drain):
+        why = (f"its self-update is {' and '.join(stopped)}, so no update is in this drain"
+               if stopped else
+               f"an operator drain: no update marker for more than "
+               f"{PEER_DRAIN_GRACE_SECONDS // 60} min")
         age = (f" for {int((clock - pool_since) // 60)} min" if pool_since is not None else "")
         out.update(busy=False, off=True,
                    evidence=f"peer {host_id} is draining{age}, {why} (left to the capacity floor)")
