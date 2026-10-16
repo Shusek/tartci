@@ -188,7 +188,7 @@ class ClassifierTests(unittest.TestCase):
             "pkill -f 'sr codex'",
             "pkill -f 'claude proxy'",
             "pkill -f 'login -flp'",
-            "pkill -f '^/Users/danielraffel/.subrouter/codex/claude-proxy'",
+            "pkill -f '^/Users/example/.subrouter/codex/claude-proxy'",
             "pgrep -f 'sr codex' | xargs kill",
         )
         for command in patterns:
@@ -261,7 +261,7 @@ class ClassifierTests(unittest.TestCase):
     def test_descendant_of_protected_lane_is_refused(self) -> None:
         rows = "\n".join([
             "1 0 /sbin/launchd",
-            "10 1 /Users/danielraffel/bin/tartci-launcher --lane pulp-gate",
+            "10 1 /Users/example/bin/tartci-launcher --lane pulp-gate",
             "11 10 /usr/bin/helper --safe-child",
         ] + [f"{100 + i} 1 /usr/bin/idle-{i}" for i in range(41)])
         with mock.patch.object(guard, "_process_table", return_value=[

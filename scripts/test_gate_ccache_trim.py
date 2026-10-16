@@ -148,9 +148,9 @@ class Evict(StubFixture):
 
 class CacheDir(unittest.TestCase):
     def test_the_runners_variable_wins_then_the_legacy_one_then_the_profile(self):
-        both = {"TARTCI_CI_CACHE": "/Volumes/Workshop/ci-cache", "PULP_CI_CACHE": "/legacy"}
+        both = {"TARTCI_CI_CACHE": "/Volumes/Example/ci-cache", "PULP_CI_CACHE": "/legacy"}
         self.assertEqual(trim.cache_dir("/profile/root", env=both),
-                         Path("/Volumes/Workshop/ci-cache/ccache"))
+                         Path("/Volumes/Example/ci-cache/ccache"))
         self.assertEqual(trim.cache_dir("/profile/root", env={"PULP_CI_CACHE": "/legacy"}),
                          Path("/legacy/ccache"))
         self.assertEqual(trim.cache_dir("/profile/root", env={}), Path("/profile/root/ccache"))

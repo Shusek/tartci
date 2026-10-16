@@ -39,7 +39,7 @@ Proof status, 2026-06-13:
 - The fresh runtime export imported into Shipyard with
   `shipyard metrics import tartci --file ... --json` (`imported: 1`).
   `shipyard metrics summary --project pulp --json` then reported one
-  `tart-macos` VM row for `Daniels-Mac-Studio.local`; `shipyard metrics watch
+  `tart-macos` VM row for `studio-host.local`; `shipyard metrics watch
   --project pulp --since 1d --json` reported the expected
   `insufficient_samples` finding.
 - The proof workflow's macOS operator job and required `macos` wrapper job both

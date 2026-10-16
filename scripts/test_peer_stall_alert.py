@@ -341,7 +341,7 @@ class PeerStall(unittest.TestCase):
         self.assertEqual((peers, me), (expected, "m5"))
         # A node name that names no published host (no profile read): read every host.
         with mock.patch.object(vm_boot_alert, "_alert_host",
-                               return_value=("Daniels-Mac-Studio", "x")):
+                               return_value=("studio-host", "x")):
             self.assertIsNone(psa.published_peers(home=self.tmp, run=git)[1])
         cfg = fsu.Config(home=self.tmp)
         with mock.patch.object(fsu, "published_supply", return_value=supply):

@@ -1,0 +1,13 @@
+# Tracked files that still carry a real fleet path, each with its reason.
+# A file leaves this list when the path moves to the private fleet source
+# (fleet_source.py) or becomes a placeholder. New entries need a reason.
+profiles/m1-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+profiles/m3-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+profiles/m5-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+profiles/m5studio-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+scripts/macos_fleet_lanes.py	the reviewed M3 worktree_cleanup contract pins M3's checkout and store paths; moves to private fleet source in PR 2
+scripts/worktree_cleanup.py	the reviewed M3 worktree_cleanup contract pins M3's checkout path; moves to private fleet source in PR 2
+providers/common/vm-lease.lib.sh	runs the M3 worktree cleanup only for M3's VM store; moves to private fleet source in PR 2
+providers/tart-linux/provision.sh	the Linux lane's TART_HOME default is M3's store; moves to private fleet source in PR 2
+providers/tart-linux/run.sh	the Linux lane's TART_HOME default is M3's store; moves to private fleet source in PR 2
+providers/tart-linux/runner.sh	the Linux lane's TART_HOME default is M3's store; moves to private fleet source in PR 2

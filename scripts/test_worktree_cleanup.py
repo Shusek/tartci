@@ -6,7 +6,7 @@ import worktree_cleanup as cleanup
 
 class Tests(unittest.TestCase):
     def authority_argv(self, root):
-        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Workshop/Code/pulp","--prefix","/Volumes/Workshop/Code","--main-ref","origin/main","--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
+        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Example/Code/pulp","--prefix","/Volumes/Example/Code","--main-ref","origin/main","--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
 
     def test_nonblocking_lock_and_cooldown_stop_before_inspection(self):
         with tempfile.TemporaryDirectory() as td:

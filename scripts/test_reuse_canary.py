@@ -280,7 +280,7 @@ class Worktree(Case):
 
     def test_an_unmounted_volume_never_falls_back(self):
         self.sys.mounted = False
-        self.assertEqual(self.canary("/Volumes/Workshop/Code/agent-worktrees").run(),
+        self.assertEqual(self.canary("/Volumes/Example/Code/agent-worktrees").run(),
                          rc.EXIT_SETUP)
         self.assertIn("not mounted", self.receipt()["detail"])
         self.assertFalse(any("worktree" in c for c in self.sys.calls))

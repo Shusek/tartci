@@ -268,7 +268,7 @@ class WiringTests(unittest.TestCase):
 class VolumeProbeTests(unittest.TestCase):
     helper = {"path": "/x/TartCILauncher.app", "sha256": "s", "designated_requirement_sha256": "d"}
     profile = {"host": {"log_root": tempfile.gettempdir(), "home": "/Users/x",
-                        "tart_home": "/Volumes/Workshop/VMs"}}
+                        "tart_home": "/Volumes/Example/VMs"}}
 
     def fake_run(self, plists: list[dict]):
         missing = subprocess.CompletedProcess([], 113, "", "Could not find service")

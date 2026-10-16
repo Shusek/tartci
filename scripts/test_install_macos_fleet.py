@@ -1629,7 +1629,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             "source_commit": commit,
             "support_manifest_sha256": manifest_sha256,
             "profile_policy_sha256": "d" * 64,
-            "tart_home": "/Volumes/Workshop/VMs",
+            "tart_home": "/Volumes/Example/VMs",
         }, sort_keys=True))
         approval = self.home / ".config/tartci/m3-launcher-approved.sha256"
         approval.write_text("e" * 64 + "\n")
@@ -1637,7 +1637,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         helper_config = self.root / "fleet-launch-helper.toml"
         helper_config.write_text(
             self.config.read_text()
-            .replace(f'tart_home = "{self.home}/VMs"', 'tart_home = "/Volumes/Workshop/VMs"')
+            .replace(f'tart_home = "{self.home}/VMs"', 'tart_home = "/Volumes/Example/VMs"')
             .replace("[github_app]", textwrap.dedent(f"""\
                 [launch_helper]
                 path = "{bundle}"
@@ -1759,7 +1759,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             "source_commit": "a" * 40,
             "support_manifest_sha256": "f" * 64,
             "profile_policy_sha256": "d" * 64,
-            "tart_home": "/Volumes/Workshop/VMs",
+            "tart_home": "/Volumes/Example/VMs",
         }, sort_keys=True))
         record = json.loads(fixture["output"].read_text())["launch_helper"]
         with mock.patch.object(

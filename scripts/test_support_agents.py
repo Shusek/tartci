@@ -126,7 +126,7 @@ class HostMaintenanceAgents(Case):
 
     def test_m5studio_without_a_watchdog_reads_missing(self):
         self.write_profile(table(["launchd-watchdog", "reap"]).replace(
-            '[host]\nid = "t"\n', '[host]\nid = "m5studio"\ntart_home = "/Volumes/Atelier/VMs"\n'))
+            '[host]\nid = "t"\n', '[host]\nid = "m5studio"\ntart_home = "/Volumes/Store/VMs"\n'))
         self.install_rendered("reap")
         self.assertEqual(self.run_pass("plan"), sa.EXIT_OK)
         agents = self.receipt()["agents"]
@@ -135,7 +135,7 @@ class HostMaintenanceAgents(Case):
         self.assertEqual(self.sys.mutations(), [])
 
     def test_each_render_carries_its_own_hosts_tart_home(self):
-        for host, store in (("m3", "/Volumes/Workshop/VMs"), ("m5studio", "/Volumes/Atelier/VMs")):
+        for host, store in (("m3", "/Volumes/Example/VMs"), ("m5studio", "/Volumes/Store/VMs")):
             profile = {"host": {"id": host, "tart_home": store}}
             for name in ("launchd-watchdog", "reap"):
                 rendered, err = sa.System.render(self.sys, sa.REGISTRY[name], profile)

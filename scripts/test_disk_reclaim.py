@@ -1211,7 +1211,7 @@ class RootDiscoveryTests(unittest.TestCase):
     def test_profile_reclaim_paths_add_the_external_volume_root(self):
         """A host whose external volume is not named Workshop is still scanned.
 
-        m5studio keeps code on /Volumes/Atelier; the root comes from the
+        m5studio keeps code on /Volumes/Store; the root comes from the
         installed profile's [reclaim] repo/worktrees_root, not a volume name.
         """
         code = self.base / "atelier" / "Code"
@@ -1578,7 +1578,7 @@ class HomeRootGuardTests(unittest.TestCase):
                 self.assertNotIn("REFUSED", err)
 
     def test_a_whole_volume_root_is_refused(self) -> None:
-        self.assertIn("whole volume", dr.refused_root(pathlib.Path("/Volumes/Workshop")))
+        self.assertIn("whole volume", dr.refused_root(pathlib.Path("/Volumes/Example")))
 
     def test_a_refused_listing_is_named_never_silent(self) -> None:
         code = self.home / "Code"

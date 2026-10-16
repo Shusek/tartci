@@ -957,7 +957,7 @@ class OrphanedLaneVmTests(unittest.TestCase):
         retired_dir.mkdir(parents=True, exist_ok=True)
         # m1's real record, as found on 2026-10-16.
         (retired_dir / "pulp-preamble-m1-target-06.state.json").write_text(json.dumps({
-            "ts": "2026-07-26T07:16:35Z", "provider": "tart-macos", "host": "Daniels-MacBook-Pro",
+            "ts": "2026-07-26T07:16:35Z", "provider": "tart-macos", "host": "laptop-host",
             "runner": "pulp-preamble-m1-target-06", "vm": "pulp-preamble-m1-target-06-99292-1",
             "vm_ip": "192.168.64.6", "phase": "job-running", "lifecycle": "ephemeral",
             "labels": "self-hosted,macOS,ARM64,pulp-preamble", "repo": "Generous-Corp/pulp",
