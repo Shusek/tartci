@@ -345,7 +345,7 @@ class FakeSystem(su.System):
                 self.on_at = self.clock
             elif not self.refuse_keeps_state:
                 self.pool_state = "off"  # pool on's own rollback closes admission
-            return su.Result(rc, "on", "" if rc == 0 else
+            return su.Result(rc, "on", "" if rc == 0 else getattr(self, "on_text", None) or
                              "fleet-macos: loaded persistent LaunchAgent x is not running")
         if args[:2] == ["pool", "status"]:
             if self.pool_state != "on":
@@ -2390,6 +2390,86 @@ class RelayRollbackTests(Base):
         self.assertIn("relay", self.last()["error"])
 
 
+class LauncherProbeStopTests(Base):
+    """After installing a NEW sealed launcher, a failed volume probe stops the
+    update with the host OFF instead of rolling back: a rollback replaces the
+    launcher again, which can reset its Removable Volumes consent again."""
+    sealed = True
+    PROBE = ("fleet readiness: launch helper volume probe timed out after 60s (probe wait "
+             "elapsed 60.1s; its write to the store did not finish): helper blocked in open()")
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def test_a_failed_probe_after_a_new_launcher_stops_without_rollback(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = self.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("failed", last["status"])
+        self.assertIn("STOPPED and NOT rolled back", last["error"])
+        self.assertIn("Grant Removable Volumes to TartCI Launcher", last["error"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+        self.assertFalse(any(step["step"].startswith("rollback")
+                             for step in json.loads(Path(last["receipt"]).read_text())["steps"]))
+        self.assertEqual(T_OLD, self.sys.running(), "the new generation stays installed")
+        self.assertEqual("c" * 64 + "\n", self.pin().read_text(), "pin matches the live bundle")
+        self.assertIs(True, json.loads(Path(last["receipt"]).read_text())["host_off"])
+        self.assertIs(True, last["host_off"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn("[tartci] studio is OFF: grant Removable Volumes to TartCI Launcher, "
+                      "then pool on", opened)
+        body = next(b for b in self.bodies if "Files and Folders" in b)
+        self.assertIn("tartci pool on", body)
+        self.assertIn("## Safe to auto-apply\nNo.", body)
+
+    def test_a_slow_volume_stops_without_asking_for_the_grant(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = ("fleet readiness: launch helper volume probe timed out after 60s "
+                            "(probe wait elapsed 60.1s; its write to the store did not finish): "
+                            "volume I/O slow; same-dir write from parent took 4200 ms. "
+                            "Not an access denial")
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertIn("STOPPED and NOT rolled back", last["error"])
+        self.assertIn("The Tart store volume was slow", last["error"])
+        self.assertNotIn("Grant Removable Volumes", last["error"])
+        self.assertIs(True, last["host_off"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn("[tartci] studio is OFF: its Tart store volume was too slow for the "
+                      "launcher probe", opened)
+        body = next(b for b in self.bodies if "launcher_probe_slow_volume" in b)
+        self.assertNotIn("Removable Volumes to TartCI Launcher", body)
+        self.assertNotIn("Files and Folders", body)
+        self.assertIn("tartci pool on", body)
+
+    def test_any_other_pool_on_failure_still_rolls_back(self) -> None:
+        # pool on fails every attempt after the install, then serves the rollback.
+        self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"])
+        self.assertEqual(INSTALLED, self.sys.running())
+
+    def test_a_completed_update_closes_the_issue(self) -> None:
+        su._write_json(self.cfg.state_dir / "launcher-probe-alert.json",
+                       {"since": "2026-10-16T13:00:00Z", "evented": True, "issue": "91"})
+        self.assertUpdated(self.apply())
+        self.assertIn(("close", "91"), self.issues)
+        self.assertFalse((self.cfg.state_dir / "launcher-probe-alert.json").exists())
+
+    def pin(self) -> Path:
+        return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+
+class UnsealedProbeTests(Base):
+    def test_without_a_new_launcher_the_probe_text_does_not_stop_a_rollback(self) -> None:
+        self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"])
+
+
 class LauncherConsentTests(Base):
     """A sealed launcher is not replaced on an external-volume host until an
     operator has acknowledged the change: replacing TartCILauncher.app can
@@ -2445,6 +2525,17 @@ class LauncherConsentTests(Base):
         self.assertIsNone(su.launcher_change_refusal(self.cfg, INSTALLED, INSTALLED, False))
         self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, True))
         self.assertIsNotNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
+
+    def test_an_acknowledged_change_whose_probe_fails_stops_without_rollback(self) -> None:
+        # Both guards in one run: the gate lets the acknowledged change in,
+        # and the failed volume probe then stops it instead of rolling back.
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("STOPPED and NOT rolled back", self.last()["error"])
+        installs = [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+        self.assertEqual(1, len(installs))
+        self.assertEqual(T_OLD, self.sys.running())
 
     def test_a_host_without_a_sealed_launcher_is_not_gated(self) -> None:
         self.ack().unlink()
