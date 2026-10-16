@@ -1568,25 +1568,26 @@ def verify_receipt(
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
     recorded_source = receipt.get("fleet_source")
-    if isinstance(recorded_source, dict) and recorded_source.get("configured") is True:
+    source_keys = {
+        "root", "configured", "commit", "repository", "tree_sha256",
+        "published_supply_sha256", "profiles_dir", "published_supply",
+    }
+    if recorded_source is None:
+        # Older public receipts predate source provenance. They always verify
+        # against the immutable support cohort, never ambient environment.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
+    elif not isinstance(recorded_source, dict) or set(recorded_source) != source_keys:
+        fail("install receipt fleet source is missing or malformed")
+    elif recorded_source.get("configured") is True:
         # Standalone self-update verification does not inherit the environment
         # used by the installer. Reconstruct the selected source from the
         # receipt so it does not falsely compare against public profiles.
         active_source = fleet_source.resolve_recorded(recorded_source, TARTCI_ROOT)
     else:
-        active_source = fleet_source.resolve(TARTCI_ROOT)
-        if not active_source.configured:
-            # Public installs execute from the immutable support generation. Use
-            # that same root while verifying the receipt, including during the
-            # install transaction before the staged wrapper becomes active.
-            active_source = fleet_source.resolve(support_root, allow_environment=False)
-    source_keys = {
-        "root", "configured", "commit", "repository", "tree_sha256",
-        "published_supply_sha256", "profiles_dir", "published_supply",
-    }
-    if active_source.configured:
-        if not isinstance(recorded_source, dict) or set(recorded_source) != source_keys:
-            fail("install receipt fleet source is missing or malformed")
+        # Public installs execute from the immutable support generation. Use
+        # that same root while verifying the receipt, including during the
+        # install transaction before the staged wrapper becomes active.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
     if isinstance(recorded_source, dict):
         expected_source = {
             "root": str(active_source.root),
