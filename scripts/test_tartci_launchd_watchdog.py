@@ -344,6 +344,15 @@ with tempfile.TemporaryDirectory() as td:
     check("timed out" in probe.reason.lower(),
           f"timed out Tart inventory must preserve its cause: {probe.reason}")
 
+with tempfile.TemporaryDirectory() as td:
+    with mock.patch.object(
+        wd.subprocess, "run",
+        return_value=subprocess.CompletedProcess(["tart", "list"], 0, "[]", ""),
+    ) as run:
+        wd._run_tart_inventory("/bin/tart", td)
+    check(run.call_args.kwargs.get("timeout") == 30,
+          f"Tart inventory must enforce a 30s subprocess timeout: {run.call_args}")
+
 with (
     mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
     mock.patch.object(wd.shutil, "which", return_value=None),
