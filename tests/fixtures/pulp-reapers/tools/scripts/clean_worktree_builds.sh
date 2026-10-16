@@ -95,7 +95,7 @@ fi
 # therefore delete a build on a DIFFERENT device, re-measure the volume it cares
 # about, see no improvement, and keep going — destroying the most while
 # accomplishing the least, and still missing the floor. This fleet already has
-# such a host: M3 keeps worktrees on /Volumes/Workshop while the repo and its
+# such a host: M3 keeps worktrees on /Volumes/Example while the repo and its
 # in-repo `.claude/worktrees` stay on the internal disk. A caller that names the
 # volume it is trying to relieve gets only candidates that can actually relieve
 # it.

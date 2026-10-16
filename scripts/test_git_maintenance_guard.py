@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import git_maintenance_guard as gmg  # noqa: E402
 
 NOW = 1792120000.0
-REPO = "/Volumes/Workshop/Code/pulp"
+REPO = "/Volumes/Example/Code/pulp"
 # m3, 2026-10-16 ~07:15Z: one store, many concurrent background maintenances.
 STAMPEDE = "\n".join(
     [f"{1000 + i} 02:41:{i:02d} /opt/homebrew/bin/git maintenance run --auto" for i in range(3)]
@@ -111,7 +111,7 @@ class Nightly(Base):
         self.assertEqual(self.git.calls, [])
 
     def test_one_niced_background_gc_per_repo_and_settings_enforced(self) -> None:
-        self.repos.write_text(f"{REPO}\n/Volumes/Workshop/Code/tartci\n")
+        self.repos.write_text(f"{REPO}\n/Volumes/Example/Code/tartci\n")
         self.enable.write_text("")
         lines = self.run_nightly()
         runs = self.git.maintenance_runs()
