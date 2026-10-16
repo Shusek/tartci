@@ -93,7 +93,11 @@ installed on M1, and the standalone verification passes.
 
 The fix is published for review at
 https://github.com/danielraffel/tartci/pull/602, head
-https://github.com/danielraffel/tartci/commit/7dfbebf114f2774edce01a0833304470f6b1dd84.
+https://github.com/danielraffel/tartci/commit/8d194ff2d9b9aa3e06c0862729d4d04bfceba416.
+
+The fix was exercised against the live M1 installed receipt from a temporary
+clean process environment. It returned `verified installed macOS fleet
+receipt`, proving the selected private source and rendered LaunchAgents agree.
 
 The private desired-state projection was reconciled against exact current
 TartCI and Pulp `origin/main` checkouts on 2026-10-16. Its checker passed the
