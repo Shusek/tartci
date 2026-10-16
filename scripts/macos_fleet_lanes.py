@@ -1449,6 +1449,12 @@ def write_receipt(
     persistent_records = persistent_plist_records(data, agents_dir)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     fleet_source_state = fleet_source.resolve(TARTCI_ROOT)
+    # The public source is copied into the immutable support generation before
+    # this receipt is written. Record that installed root so a later `pool on`
+    # validates the same files it will execute. A configured private source is
+    # intentionally kept as the external authority and retains its provenance.
+    if not fleet_source_state.configured:
+        fleet_source_state = fleet_source.resolve(support_root, allow_environment=False)
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
@@ -1522,6 +1528,11 @@ def verify_receipt(
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
     active_source = fleet_source.resolve(TARTCI_ROOT)
+    if not active_source.configured:
+        # Public installs execute from the immutable support generation. Use
+        # that same root while verifying the receipt, including during the
+        # install transaction before the staged wrapper becomes active.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
     recorded_source = receipt.get("fleet_source")
     source_keys = {
         "root", "configured", "commit", "repository", "tree_sha256",
