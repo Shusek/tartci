@@ -2169,6 +2169,22 @@ class AgentTemplateTests(unittest.TestCase):
         self.assertEqual(value["ProgramArguments"][-4:],
                          ["fleet-macos", "self-update", "--apply", "--scheduled"])
 
+    def test_private_source_environment_can_be_rendered_into_agent(self) -> None:
+        rendered = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/render_launchd_template.py"),
+             str(ROOT / "launchd/com.danielraffel.tartci.self-update.plist.template"),
+             "--set", "HOME=/Users/x",
+             "--environment", "TARTCI_FLEET_SOURCE_ROOT=/private/fleet",
+             "--environment", "TARTCI_FLEET_SOURCE_COMMIT=" + "a" * 40,
+             "--environment", "TARTCI_FLEET_SOURCE_REPOSITORY=ORG/private-fleet-authority",
+             "--environment", "TARTCI_ADVERTISED_LABELS=/private/fleet/fleet/advertised-labels.json",
+             "--environment", "TARTCI_JOB_CLAIM_SUPPLY=/private/fleet/fleet/advertised-labels.json"],
+            capture_output=True, check=True)
+        environment = plistlib.loads(rendered.stdout)["EnvironmentVariables"]
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_ROOT"], "/private/fleet")
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"], "ORG/private-fleet-authority")
+
     def test_watchdog_never_interrupts_the_agent(self) -> None:
         import tartci_launchd_watchdog as wd
         self.assertIn("com.danielraffel.tartci.self-update", wd.UNINTERRUPTIBLE_AGENTS)
@@ -2240,6 +2256,19 @@ class SystemRunTests(unittest.TestCase):
 
 
 class CensusEnvTests(unittest.TestCase):
+    def test_census_env_preserves_private_source_binding(self) -> None:
+        values = {
+            "TARTCI_FLEET_SOURCE_ROOT": "/private/fleet",
+            "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+            "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
+            "TARTCI_ADVERTISED_LABELS": "/private/fleet/fleet/advertised-labels.json",
+            "TARTCI_JOB_CLAIM_SUPPLY": "/private/fleet/fleet/advertised-labels.json",
+        }
+        with mock.patch.dict(os.environ, values, clear=False):
+            env = su.census_env()
+        for name, value in values.items():
+            self.assertEqual(env[name], value)
+
     def test_tartci_calls_resolve_this_interpreter_even_from_a_minimal_path(self) -> None:
         with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False):
             os.environ.pop("TARTCI_PYTHON", None)

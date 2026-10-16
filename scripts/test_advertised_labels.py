@@ -49,7 +49,10 @@ class SnapshotShapeTests(unittest.TestCase):
         self.assertEqual(snapshot["schema"], "tartci.advertised-labels/v1")
         self.assertEqual(snapshot["generated_from"], {
             "repo": "danielraffel/tartci", "commit": "a" * 40,
-            "profiles": ["profiles/m3-macos-fleet.toml"]})
+            "profiles": ["profiles/m3-macos-fleet.toml"],
+            "profiles_sha256": fleet.fleet_source.FleetSource(
+                ROOT, ROOT / "profiles", ROOT / "fleet" / "advertised-labels.json", True
+            ).profiles_sha256})
         for row in snapshot["registrations"]:
             self.assertEqual(set(row), {
                 "profile", "host_id", "lane", "repo", "assignment_mode",

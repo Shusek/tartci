@@ -78,6 +78,7 @@ except ImportError:  # Python < 3.11 (/usr/bin/python3 on macOS is 3.9)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import reuse_canary  # noqa: E402
 import schedule_backstop_mode  # noqa: E402
+import fleet_source  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TABLE = "support_agents"
@@ -110,8 +111,19 @@ def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
     """
     table = profile.get("launchd_watchdog") if isinstance(profile.get("launchd_watchdog"), dict) else {}
     stale = table.get("stale_log_seconds")
-    return ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
-            if type(stale) is int else {})
+    environment = ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
+                   if type(stale) is int else {})
+    configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
+    if configured_root:
+        source = fleet_source.resolve(ROOT)
+        environment.update({
+            "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
+            "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
+            "TARTCI_FLEET_SOURCE_REPOSITORY": source.repository or "",
+            "TARTCI_ADVERTISED_LABELS": str(source.published_supply),
+            "TARTCI_JOB_CLAIM_SUPPLY": str(source.published_supply),
+        })
+    return environment
 
 
 def _disk_watch_paths(profile: Dict[str, Any]) -> Dict[str, str]:

@@ -37,6 +37,11 @@
       --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
       > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
 
+  For a private fleet source, add `--environment` values for
+  `TARTCI_FLEET_SOURCE_ROOT`, `TARTCI_FLEET_SOURCE_COMMIT`,
+  `TARTCI_FLEET_SOURCE_REPOSITORY`, `TARTCI_ADVERTISED_LABELS`, and
+  `TARTCI_JOB_CLAIM_SUPPLY` to the same command.
+
     launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
     launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"
 
@@ -90,6 +95,17 @@
         <string>$HOME/.tartci</string>
         <key>TART_HOME</key>
         <string>$TART_HOME</string>
+        <!-- Optional private fleet source. Use render --environment to fill these. -->
+        <key>TARTCI_FLEET_SOURCE_ROOT</key>
+        <string></string>
+        <key>TARTCI_FLEET_SOURCE_COMMIT</key>
+        <string></string>
+        <key>TARTCI_FLEET_SOURCE_REPOSITORY</key>
+        <string></string>
+        <key>TARTCI_ADVERTISED_LABELS</key>
+        <string></string>
+        <key>TARTCI_JOB_CLAIM_SUPPLY</key>
+        <string></string>
     </dict>
 </dict>
 </plist>
