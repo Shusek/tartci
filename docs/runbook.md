@@ -3570,6 +3570,35 @@ touch ~/.config/tartci/reap-retired-clones.enabled
 
 `--dry-run` changes nothing, even combined with `--fix`.
 
+## Agents' stale Cargo target dirs
+
+Agents' Cargo build caches under `~/agent-scratch` grow without bound. On m1
+on 2026-10-16 they reached 246 GB and took the host down to 150 GB free. About
+hourly, the watchdog (`scripts/agent_cargo_reap.py`) names every target dir
+that meets all of these:
+
+- Cargo made it: its `CACHEDIR.TAG` has the cache-dir signature and says it was
+  created by cargo (pytest and ccache write the same signature).
+- It is at most three levels under `~/agent-scratch`, reached without
+  following a symlink.
+- It is not under `~/agent-scratch/rcg`.
+- Its newest build activity is at least 2 days old: the newest mtime across
+  `debug/`, `release/`, their `deps/`, and every `.fingerprint` entry.
+  `.fingerprint` itself keeps its first-build mtime.
+- No process has its cwd or an open file inside it, per lsof. If lsof cannot
+  be read, nothing is deleted.
+
+The line it logs is `WARN agent-cargo: <N> stale Cargo target dir(s), <GB>:
+<path> <GB> idle <d> d; ...`. It deletes those dirs only on a host where
+`~/.config/tartci/reap-agent-cargo.enabled` exists.
+
+Enable it one host at a time, after a dry run, starting with m1:
+
+```sh
+scripts/agent_cargo_reap.py --dry-run      # from the installed generation
+touch ~/.config/tartci/reap-agent-cargo.enabled
+```
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
