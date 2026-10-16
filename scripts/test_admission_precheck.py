@@ -133,7 +133,8 @@ class RunOneHarness:
             f"exit {exit_code}\n",
         )
 
-    def run(self, *, source_override: str | None = None) -> subprocess.CompletedProcess:
+    def run(self, *, source_override: str | None = None,
+            inventory: str = "0") -> subprocess.CompletedProcess:
         source = (
             MACOS_RUNNER.read_text(encoding="utf-8")
             if source_override is None
@@ -165,6 +166,12 @@ class RunOneHarness:
             "runner_api_root_for_group(){ printf 'repos/%s' \"$REPO\"; }\n"
             "jit_admission_denied(){ return 1; }\n"
             "tartci_pool_lock_absent(){ return 0; }\n"
+            # boot_vm_to_ssh re-checks admission and reads the Tart inventory
+            # before the lease; an open pool and a readable count here, so an
+            # admitted verdict reaches the clone.
+            "tartci_pool_admission_open(){ return 0; }\n"
+            "tartci_pool_read_state(){ echo on; }\n"
+            f"running_macos_vms(){{ echo {inventory!r}; }}\n"
             "tartci_check_macos_disk_floor_with_cleanup_once(){ return 0; }\n"
             "tartci_prepare_and_check_disk_root_observed(){ return 0; }\n"
             "tartci_prepare_disk_root(){ return 0; }\n"
@@ -302,6 +309,18 @@ class PrecheckSkipsTheCloneTests(unittest.TestCase):
                 f"an admitted verdict must still clone: {result.stderr}",
             )
             self.assertIn("clone_start", harness.event_names())
+
+    def test_an_unreadable_tart_inventory_defers_before_the_clone(self) -> None:
+        """The same real boot body, with `tart list` unreadable: deferred (75),
+        no clone. The admitted control above is the same run with a count."""
+        with tempfile.TemporaryDirectory() as raw:
+            harness = RunOneHarness(Path(raw))
+            harness.stub_shipyard(make_envelope("admit", "clean"), 0)
+            result = harness.run(inventory="unknown")
+            self.assertEqual(result.returncode, 75, result.stderr)
+            names = harness.event_names()
+            self.assertIn("inventory_unknown", names)
+            self.assertNotIn("clone_start", names)
 
     def test_probe_runs_before_the_clone_and_the_gate_still_runs_after_boot(
         self,

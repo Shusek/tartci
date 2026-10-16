@@ -23,8 +23,8 @@ tartci pool supply --json) and says, for one repository and one event class:
              wait, which is the existing behaviour.
   verdict    `ok`, or `unknown` with a reason. Anything that cannot be read
              (launchd, a heartbeat, the lease store, an unrecognised phase) is
-             unknown, never zero. An unreadable Tart inventory follows the
-             host's own slot claim instead: reservations are the occupancy.
+             unknown, never zero. An unreadable Tart inventory makes new VM
+             slots unavailable until the host can read it again.
 
 `decide` runs on the fallback host. It fetches every preferred host's report,
 reads this host's own report for sibling lanes, and prints one line:
@@ -87,6 +87,7 @@ BLOCKED_PHASES = frozenset({
     "lease-wait", "lease-never-fits",
     # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.
     "vm-dhcp-breaker-open",
+    "inventory-unavailable",
 })
 # A heartbeat older than this many polls (floor below) is not current.
 HEARTBEAT_STALE_POLLS = 6
@@ -323,12 +324,14 @@ def build_report(
     running = (running_reader or (lambda: 0))()
     cap = (cap_reader or (lambda: DEFAULT_VM_CAP))()
     reserved = (reservations_reader or (lambda: 0))()
-    # The same rule the host's own slot claim applies (macos-vm-cap.lib.sh): an
-    # unreadable Tart inventory is not a full host; the reservation files,
-    # which every lane holds from before boot until its VM is proved gone, are
-    # the occupancy source then.
-    report["inventory"] = "tart" if running is not None else "reservations"
-    running = running if running is not None else 0
+    # A host that cannot read Tart inventory refuses new clones. Reservations
+    # account for its own claims but cannot establish storage health.
+    if running is None:
+        report.update({"inventory": "unavailable", "vm_cap": cap,
+                       "running_vms": None, "reservations": reserved,
+                       "vm_slots_free": None, "free": 0})
+        return report
+    report["inventory"] = "tart"
     vm_slots = max(0, cap - max(running, reserved))
     try:
         capacity = (capacity_reader or (lambda: {}))()

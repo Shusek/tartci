@@ -10,7 +10,9 @@ lane runs moves out of the app into the support generation, described by
     {"schema": 1, "sequence": <monotonic per host>, "source_commit": ...,
      "tart_home": ...,
      "manifest_sha256": <sha256 of .tartci-support-manifest.json>,
-     "entrypoint": {"path": ".tartci-launch", "sha256": ...},
+     "entrypoint": {"path": ".tartci-launch-v2", "sha256": ...},
+     "python": {"pin": ..., "shim": {"path": "bin/python3", "sha256": ...}},
+     "files": [{"path": ".tartci-launch", "sha256": ...}],
      "lanes": {"<lane id>": {"environment": {...}}}}
 
 The set carries a detached Developer ID signature (`.tartci-launch-set.sig`,
@@ -58,6 +60,10 @@ SHIM_FLAGS = "-B -E -s -S"
 # rebuild the exact bytes: absolute, no space, quote or shell metacharacter.
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9._+@/-]+$")
 INTERPRETER_KEYS = ("TARTCI_PYTHON", "SHIPYARD_GHAPP_PYTHON_BINARY")
+# Files stage-install writes into every generation beside the manifest
+# members: v1's `.tartci-launch`. The set pins each one present by digest, so
+# the tree check can name every file.
+PINNED_EXTRAS = (".tartci-launch",)
 LAUNCH_SET_IDENTIFIER = "com.danielraffel.tartci.launch-set"
 POINTER_SCHEMA = 1
 TEAM_ID = re.compile(r"^[A-Z0-9]{10}$")
@@ -157,6 +163,8 @@ def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int, pytho
         "manifest_sha256": _sha256(manifest),
         "entrypoint": {"path": ENTRYPOINT, "sha256": _sha256(entry)},
         "python": {"pin": python, "shim": {"path": SHIM, "sha256": _sha256(generation / SHIM)}},
+        "files": [{"path": name, "sha256": _sha256(generation / name)}
+                  for name in PINNED_EXTRAS if (generation / name).is_file()],
         # Every interpreter a lane names is the shim.
         "lanes": {lane: {"environment": dict(sorted(
                       {**row["environment"],
@@ -262,8 +270,11 @@ def verify_contents(generation: Path, root: Path) -> Optional[str]:
         return "the support manifest does not match the launch set"
     entry = value.get("entrypoint") or {}
     shim = (value.get("python") or {}).get("shim") or {}
-    allowed = {m.get("path") for m in members} | {entry.get("path"), shim.get("path"),
-                                                  SET_NAME, SIG_NAME, MANIFEST_NAME}
+    pinned = value.get("files") or []
+    if not isinstance(pinned, list) or not all(isinstance(f, dict) for f in pinned):
+        return "the launch set's pinned files are malformed"
+    allowed = {m.get("path") for m in members} | {f.get("path") for f in pinned} | {
+        entry.get("path"), shim.get("path"), SET_NAME, SIG_NAME, MANIFEST_NAME}
     for dirpath, dirs, files in os.walk(generation):
         for name in dirs + files:
             full = Path(dirpath) / name
@@ -277,7 +288,8 @@ def verify_contents(generation: Path, root: Path) -> Optional[str]:
             if full.is_file() and relative not in allowed:
                 return f"{relative} is not in the signed manifest"
     for relative, expected in [(m.get("path"), m.get("sha256")) for m in members] + [
-            (entry.get("path"), entry.get("sha256")), (shim.get("path"), shim.get("sha256"))]:
+            (entry.get("path"), entry.get("sha256")), (shim.get("path"), shim.get("sha256"))] + [
+            (f.get("path"), f.get("sha256")) for f in pinned]:
         if (not isinstance(relative, str) or relative.startswith("/")
                 or any(part in ("", ".", "..") for part in relative.split("/"))):
             return f"unsafe member path {relative!r}"
@@ -361,3 +373,113 @@ def publish(generation: Path, *, pointer: Path, root: Path, team_id: str,
         Path(temporary).unlink(missing_ok=True)
         raise
     return {**value, "note": note} if note else value
+
+
+def next_sequence(pointer: Path, floor: Path) -> int:
+    """One past the newest sequence this host has pointed at or run."""
+    seen = [0]
+    current = read_pointer(pointer)
+    if current and current.get("generation"):
+        try:
+            seen.append(int(json.loads((Path(current["generation"]) / SET_NAME).read_text())["sequence"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    try:
+        seen.append(int(json.loads(Path(floor).read_text())["sequence"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return max(seen) + 1
+
+
+def lanes_from_plists(render_dir: Path) -> dict:
+    """{lane id: {"environment": ...}} from rendered lane LaunchAgents."""
+    import plistlib  # noqa: PLC0415
+    lanes = {}
+    for path in sorted(Path(render_dir).glob("*.plist")):
+        env = plistlib.loads(path.read_bytes()).get("EnvironmentVariables") or {}
+        lane = env.get("TARTCI_QUEUE_LANE_ID")
+        if isinstance(lane, str):
+            if lane in lanes:
+                raise LaunchSetError(f"lane {lane} is rendered twice")
+            lanes[lane] = {"environment": dict(env)}
+    if not lanes:
+        raise LaunchSetError(f"no lane LaunchAgents in {render_dir}")
+    return lanes
+
+
+def install(generation: Path, *, render_dir: Path, tart_home: str, pin: str, pointer: Path,
+            floor: Path, root: Path, team_id: str, identity: str, keychain: Optional[str],
+            signing_ready: Callable[[], Optional[str]], run: Runner = subprocess.run) -> dict:
+    """Give a staged generation its v2 runtime and signed set, and point at it."""
+    problem = signing_ready()
+    if problem:
+        raise LaunchSetError(f"signing keychain not ready, pointer unchanged: {problem}")
+    lanes = lanes_from_plists(render_dir)
+    current = read_pointer(pointer)
+    if (current and current.get("generation") == str(generation)
+            and _unchanged(generation, lanes, tart_home=tart_home, pin=pin, root=root,
+                           team_id=team_id, run=run)):
+        # Reinstalling the generation the pointer already names, with the same
+        # lanes: its signed set stands, and a re-sign would only spend a sequence.
+        return {**current, "unchanged": True}
+    # A reinstall of a generation that already has a runtime finds it frozen.
+    for directory in (generation, generation / "bin"):
+        if directory.is_dir() and not directory.is_symlink():
+            os.chmod(directory, 0o755)
+    try:
+        write_runtime(generation, pin)
+        write(generation, build(generation, lanes, tart_home=tart_home,
+                                python=pin, sequence=next_sequence(pointer, floor)))
+    except BaseException:
+        freeze(generation)
+        raise
+    return publish(generation, pointer=pointer, root=root, team_id=team_id, identity=identity,
+                   keychain=keychain, signing_ready=signing_ready, run=run)
+
+
+def _unchanged(generation: Path, lanes: dict, *, tart_home: str, pin: str, root: Path,
+               team_id: str, run: Runner) -> bool:
+    """Whether the generation's signed set already says what a rebuild would."""
+    try:
+        existing = json.loads((generation / SET_NAME).read_text())
+        wanted = build(generation, lanes, tart_home=tart_home, python=pin,
+                       sequence=existing["sequence"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (existing == wanted and verify_contents(generation, root) is None
+            and verify_signature(generation, team_id, run=run) is None)
+
+
+def keychain_problem(keychain: Optional[str]) -> Optional[str]:
+    if not keychain:
+        return "no dedicated signing keychain was given"
+    if not keychain.endswith(".keychain-db") or not Path(keychain).is_file():
+        return f"{keychain} is not a keychain file"
+    return None
+
+
+def main(argv: Optional[list] = None) -> int:
+    import argparse  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    command = sub.add_parser("install", help="v2 runtime, signed set and pointer for a generation")
+    for name in ("generation", "render-dir", "tart-home", "pin", "pointer", "floor", "root",
+                 "team-id", "identity", "keychain"):
+        command.add_argument(f"--{name}", required=True)
+    args = parser.parse_args(argv)
+    try:
+        value = install(Path(args.generation), render_dir=Path(args.render_dir),
+                        tart_home=args.tart_home, pin=args.pin, pointer=Path(args.pointer),
+                        floor=Path(args.floor), root=Path(args.root), team_id=args.team_id,
+                        identity=args.identity, keychain=args.keychain,
+                        signing_ready=lambda: keychain_problem(args.keychain))
+    except LaunchSetError as exc:
+        print(f"launch set: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(value, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

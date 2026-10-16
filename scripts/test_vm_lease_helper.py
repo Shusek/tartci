@@ -1627,7 +1627,7 @@ fi
 
 
 class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
-    """With inventory unknown, the reservation files decide occupancy."""
+    """An unreadable inventory cannot authorize another clone."""
 
     CAP_LIB = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
 
@@ -1658,11 +1658,11 @@ class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             return proc.stdout.strip()
 
-    def test_unknown_inventory_with_free_reservations_boots(self) -> None:
+    def test_unknown_inventory_refuses_even_with_free_reservations(self) -> None:
         for via_arg in (True, False):
             with self.subTest(via_arg=via_arg):
-                self.assertIn("resv.", self._claim(0, inventory="unknown", via_arg=via_arg))
-                self.assertIn("resv.", self._claim(1, inventory="unknown", via_arg=via_arg))
+                self.assertEqual(self._claim(0, inventory="unknown", via_arg=via_arg), "")
+                self.assertEqual(self._claim(1, inventory="unknown", via_arg=via_arg), "")
 
     def test_unknown_inventory_with_full_reservations_waits(self) -> None:
         for via_arg in (True, False):
@@ -1672,6 +1672,35 @@ class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
     def test_a_readable_full_inventory_still_blocks(self) -> None:
         self.assertEqual(self._claim(0, inventory="2", via_arg=True), "")
         self.assertEqual(self._claim(0, inventory="2", via_arg=False), "")
+
+    def test_readable_inventory_with_capacity_still_claims(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertIn("resv.", self._claim(0, inventory="0", via_arg=via_arg))
+
+    def test_inventory_recovery_admits_without_stale_refusal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={tmp}/resv
+                export TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/no-cap-file
+                source {self.CAP_LIB}
+                running_macos_vms(){{ cat {tmp}/inventory; }}
+                echo unknown > {tmp}/inventory
+                first="$(tartci_claim_macos_slot 2)"
+                [ -z "$first" ]
+                echo 0 > {tmp}/inventory
+                second="$(tartci_claim_macos_slot 2)"
+                [ -f "$second" ]
+                printf 'recovered\\n'
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "recovered")
 
 
 if __name__ == "__main__":
