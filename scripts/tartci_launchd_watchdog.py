@@ -829,8 +829,11 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
                 label, plist_path, log_path, state, last_exit, log_age, "unknown",
                 f"{boot_probe.reason}; refusing stale boot recovery",
             )
+    # The inventory probe is Tart-specific. Never let an idle Tart store
+    # authorize recovery of a QEMU lane, whose guest state is independent.
+    classify_vm_running = None if ".qemu-runner" in label else vm_running
     verdict, reason = classify(
-        state, last_exit, log_age, effective_stale_s, vm_running, expected_loaded,
+        state, last_exit, log_age, effective_stale_s, classify_vm_running, expected_loaded,
         restart_grace_s, vm_probe_reason
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
