@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: resolver implementation merged; private projection review open; external-source rollout intentionally gated
+Status: resolver implementation merged; private projection approved; external-source rollout intentionally gated
 
 ## Goal
 
@@ -96,8 +96,9 @@ The focused suites were rerun from a clean current-main worktree on
 2026-10-16: `test_fleet_source.py` passed 23 tests,
 `test_fleet_source_sync.py` passed 15 tests, and
 `test_fleet_self_update.py` passed 314 tests. The private projection checker
-tests pass 6 tests. The private review is open; external-source selection
-remains disabled while the complete export is still missing.
+tests pass 6 tests. Ultra approved the private projection at its current
+review head. External-source selection remains disabled while the complete
+export is still missing.
 
 ## Stop conditions
 
