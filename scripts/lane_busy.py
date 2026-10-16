@@ -86,7 +86,7 @@ WORK_PATTERNS = (
 # providers/tart-macos/runner.sh `heartbeat` phases. Past waiting: the
 # supervisor has admitted work and owns (or is about to own) a VM or a runner.
 BUSY_PHASES = frozenset({
-    "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
+    "cloning", "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
     "admission-check", "admission-deferred", "admission-error",
     "minting-jit", "idle-wait", "idle-retarget-check",
     "job-running", "cancel-pending-terminal",

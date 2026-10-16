@@ -62,6 +62,7 @@ import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness jud
 import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate jobs
 import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
+import fleet_source  # noqa: E402 - resolves the optional private fleet source
 
 try:
     import tomllib
@@ -790,7 +791,16 @@ def render_skew(skew: dict | None) -> str:
 # ── one host at a time ─────────────────────────────────────────────────────
 
 def published_supply(cfg: Config, sys_: System) -> dict[str, Any]:
-    """main's fleet/advertised-labels.json (the target can predate a host)."""
+    """The target's published supply, from the selected fleet source."""
+    source = fleet_source.resolve(cfg.checkout)
+    if source.configured:
+        try:
+            value = json.loads(source.published_supply.read_text())
+        except (OSError, json.JSONDecodeError):
+            value = None
+        if not isinstance(value, dict):
+            raise Refused(f"published supply {source.published_supply} is unreadable")
+        return value
     shown = sys_.run(["git", "-C", str(cfg.checkout), "show",
                       "origin/main:fleet/advertised-labels.json"])
     try:
@@ -1405,7 +1415,8 @@ def _gate_queue_path(cfg: Config) -> Path:
 def refresh_gate_demand(cfg: Config, me: str, now: float) -> dict:
     """Read the queued self-hosted gate jobs this host serves and keep them in
     gate-queue.json. A host with no published registration reads nothing."""
-    advertised = _read_json(cfg.checkout / "fleet/advertised-labels.json")
+    source = fleet_source.resolve(cfg.checkout)
+    advertised = _read_json(source.published_supply)
     regs = gate_job_demand.registrations(advertised, me)
     if not regs:
         return {}
@@ -1538,6 +1549,14 @@ def census_env(repository: str | None = None) -> dict[str, str]:
     }
     if repository is not None:
         env["GH_REPO"] = repository
+    for name in (
+        "TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+        "TARTCI_FLEET_SOURCE_REPOSITORY", "TARTCI_ADVERTISED_LABELS",
+        "TARTCI_JOB_CLAIM_SUPPLY",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            env[name] = value
     return env
 
 
@@ -2039,7 +2058,8 @@ def prune_refusals(state_dir: Path, now: float) -> None:
 
 def checked_in_profile(cfg: Config) -> Path:
     name = _toml(cfg.installed_profile).get("name")
-    for path in sorted((cfg.checkout / "profiles").glob("*-macos-fleet.toml")):
+    source = fleet_source.resolve(cfg.checkout)
+    for path in sorted(source.profiles_dir.glob("*-macos-fleet.toml")):
         if _toml(path).get("name") == name:
             return path
     raise Refused(f"no checked-in profile named {name!r} at the target commit")

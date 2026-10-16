@@ -318,6 +318,41 @@ with tempfile.TemporaryDirectory() as td:
     check("Tart store unavailable" in probe.reason,
           f"malformed profile must preserve a typed store cause: {probe.reason}")
 
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nexit 0\n")
+    fake_tart.chmod(0o755)
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "TARTCI_TART_CLI": str(fake_tart),
+                "TART_HOME": str(tart_home),
+            },
+        ),
+        mock.patch.object(
+            wd,
+            "_run_tart_inventory",
+            side_effect=subprocess.TimeoutExpired([str(fake_tart), "list"], 30),
+        ),
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None,
+          f"timed out Tart inventory must be unavailable, not idle: {probe}")
+    check("timed out" in probe.reason.lower(),
+          f"timed out Tart inventory must preserve its cause: {probe.reason}")
+
+with tempfile.TemporaryDirectory() as td:
+    with mock.patch.object(
+        wd.subprocess, "run",
+        return_value=subprocess.CompletedProcess(["tart", "list"], 0, "[]", ""),
+    ) as run:
+        wd._run_tart_inventory("/bin/tart", td)
+    check(run.call_args.kwargs.get("timeout") == 30,
+          f"Tart inventory must enforce a 30s subprocess timeout: {run.call_args}")
+
 with (
     mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
     mock.patch.object(wd.shutil, "which", return_value=None),

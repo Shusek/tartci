@@ -326,6 +326,13 @@ def published_peers(home: Optional[pathlib.Path] = None,
     (test_system_python_tests_run follows it). A `[peers]` override in
     self-update.toml applies when tomllib can read it."""
     home = home or pathlib.Path.home()
+    configured = os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip()
+    if configured:
+        try:
+            value = json.loads(pathlib.Path(configured).read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"published supply unreadable from {configured}: {exc}") from exc
+        return _published_peer_rows(value, home)
     checkout = home / ".local" / "share" / "tartci" / "update-checkout"
     rc, out, err = (run or _run)(["git", "-C", str(checkout), "show",
                                   "origin/main:fleet/advertised-labels.json"])
@@ -335,6 +342,10 @@ def published_peers(home: Optional[pathlib.Path] = None,
         value = None
     if not isinstance(value, dict):
         raise RuntimeError(f"published supply unreadable from {checkout}: {(err or out)[:200]}")
+    return _published_peer_rows(value, home)
+
+
+def _published_peer_rows(value: dict, home: pathlib.Path) -> Tuple[Dict[str, str], Optional[str]]:
     rows = [r for r in value.get("hosts") or [] if isinstance(r, dict)]
     ssh = {r["host_id"]: r.get("ssh") for r in rows if isinstance(r.get("host_id"), str)}
     ids = {r["host_id"] for r in value.get("registrations") or []
@@ -371,7 +382,7 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         return {"skipped": True, "peers": last.get("peers") or {}}
     if peers is None:
         checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
-        if not (checkout / ".git").exists():
+        if not (checkout / ".git").exists() and not os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip():
             # Not a managed fleet host (a CI runner, a fresh clone): there is
             # no published supply to read peers from, and nothing to say.
             return {"skipped": True, "peers": {}, "reason": "no self-update checkout"}

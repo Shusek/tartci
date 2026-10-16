@@ -1851,6 +1851,7 @@ boot_vm_to_ssh(){
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
+  heartbeat cloning
   CLONE_STARTED_AT="$(date +%s)"
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.

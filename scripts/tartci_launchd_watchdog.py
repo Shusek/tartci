@@ -63,14 +63,18 @@ import argparse
 import datetime as dt
 import glob
 import json
+import math
 import os
 import plistlib
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from typing import Any, NamedTuple
+
+import macos_runner_identity
 
 try:
     import tomllib
@@ -108,6 +112,11 @@ def default_stale_log_seconds() -> int:
 # If launchd does not respawn it, that explicit restart contract has failed; do
 # not make a known-idle lane wait for the generic 30-minute crash-loop bound.
 DEFAULT_RESTART_GRACE_S = 60
+DEFAULT_STALE_BOOT_S = 900  # 15 minutes: a boot/admission phase should make progress
+STALE_BOOT_PHASES = frozenset({
+    "booting", "admission-precheck", "cloning", "registering",
+    "ensuring-runner", "aqua-preflight", "chrome-preflight", "minting-jit",
+})
 # Exit codes with which a tartci agent reports APPLICATION state: the program
 # ran to completion and is reporting a condition a reload cannot fix. Treating
 # those as the crash-loop signature boots out a working agent every hour and
@@ -180,6 +189,11 @@ class TartVMProbe(NamedTuple):
     tart_home: str | None
 
 
+class StaleBootProbe(NamedTuple):
+    stale: bool | None       # None means the lane evidence was unreadable
+    reason: str
+
+
 def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
     """Extract (state, last_exit_code) from `launchctl print` output.
 
@@ -206,6 +220,17 @@ def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
             match = re.match(r"-?\d+", val)
             last_exit = int(match.group()) if match else None
     return state, last_exit
+
+
+def parse_launchctl_pid(text: str) -> int | None:
+    """Extract the loaded job's top-level pid from ``launchctl print``."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("pid = "):
+            value = line[len("pid = "):].strip()
+            match = re.match(r"\d+", value)
+            return int(match.group()) if match else None
+    return None
 
 
 def parse_launchctl_exit_timeout(text: str) -> float | None:
@@ -443,6 +468,109 @@ def _program_path_from_plist(plist_path: str) -> str | None:
     return None
 
 
+def _runner_state_from_plist(plist_path: str) -> tuple[str, str] | None:
+    """Return (state directory, runner name) declared by a runner plist."""
+    try:
+        with open(plist_path, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return None
+    try:
+        identity = macos_runner_identity.resolve_plist_identity(
+            data, hostname=socket.gethostname()
+        )
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return identity.state_dir, identity.runner_name
+
+
+def _launchd_owns_pid(launchd_pid: int | None, supervisor_pid: int) -> bool:
+    """Accept the direct child used by the sealed launch-helper wrapper."""
+    if launchd_pid is None:
+        return False
+    if launchd_pid == supervisor_pid:
+        return True
+    rc, out, _ = _run(["ps", "-o", "ppid=", "-p", str(supervisor_pid)])
+    if rc != 0:
+        return False
+    try:
+        parents = [int(line.strip()) for line in out.splitlines() if line.strip()]
+    except ValueError:
+        return False
+    return launchd_pid in parents
+
+
+def _pid_start_matches(supervisor_pid: int, recorded: str) -> bool:
+    """Compare the runner's recorded ``ps lstart`` value with the live pid."""
+    rc, out, _ = _run(["ps", "-o", "lstart=", "-p", str(supervisor_pid)])
+    if rc != 0:
+        return False
+    live = " ".join(out.split())
+    return bool(live) and live == " ".join(recorded.split())
+
+
+def probe_stale_boot(
+    plist_path: str,
+    launchd_pid: int | None,
+    now: float | None = None,
+    stale_after_s: int = DEFAULT_STALE_BOOT_S,
+) -> StaleBootProbe:
+    """Detect a supervisor stuck before a VM or job exists.
+
+    This is deliberately narrower than the log watchdog. It needs a state file
+    written by this exact lane, the state heartbeat must be old, its supervisor
+    pid must match launchd's current pid, and the phase must name a boot or
+    admission operation with no run/job identity. Missing or malformed evidence
+    is unknown and callers must not heal on it.
+    """
+    declared = _runner_state_from_plist(plist_path)
+    if declared is None:
+        return StaleBootProbe(False, "lane does not declare a TartCI state file")
+    state_dir, runner = declared
+    path = os.path.join(state_dir, f"{runner}.state.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            raise ValueError("state is not an object")
+        phase = state.get("phase")
+        ts = state.get("ts")
+        supervisor_pid = state.get("supervisor_pid")
+        if not isinstance(phase, str) or isinstance(ts, bool) or not isinstance(ts, (int, float, str)):
+            raise ValueError("missing phase or timestamp")
+        if phase not in STALE_BOOT_PHASES:
+            return StaleBootProbe(False, f"phase={phase}")
+        if state.get("run_id") or state.get("job_id"):
+            return StaleBootProbe(False, "boot phase has an active run/job identity")
+        if not isinstance(supervisor_pid, str) or not supervisor_pid.isdigit():
+            raise ValueError("missing supervisor pid")
+        supervisor_pid_int = int(supervisor_pid)
+        if not _launchd_owns_pid(launchd_pid, supervisor_pid_int):
+            return StaleBootProbe(False, "state supervisor pid does not match launchd")
+        started_at = state.get("supervisor_pid_started_at")
+        if not isinstance(started_at, str) or not started_at.strip():
+            return StaleBootProbe(None, "lane state has no supervisor start identity")
+        if not _pid_start_matches(supervisor_pid_int, started_at):
+            return StaleBootProbe(False, "supervisor pid start time does not match state")
+        if isinstance(ts, str):
+            parsed_dt = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed_dt.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+            parsed_ts = parsed_dt.timestamp()
+        else:
+            parsed_ts = float(ts)
+        if not math.isfinite(parsed_ts):
+            raise ValueError("timestamp is not finite")
+        age = max(0.0, (time.time() if now is None else now) - parsed_ts)
+        if age <= stale_after_s:
+            return StaleBootProbe(False, f"phase={phase}, heartbeat age {int(age)}s")
+        return StaleBootProbe(True, f"phase={phase}, heartbeat stale {int(age)}s")
+    except FileNotFoundError:
+        return StaleBootProbe(False, f"lane state file not present at {path}")
+    except (OSError, OverflowError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return StaleBootProbe(None, f"lane state unavailable at {path}: {exc}")
+
+
 def resolve_tart_cli() -> tuple[str | None, str]:
     """Resolve Tart without assuming an interactive shell has Homebrew on PATH."""
     configured = os.environ.get("TARTCI_TART_CLI", "").strip()
@@ -520,6 +648,7 @@ def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
         capture_output=True,
         text=True,
         env=env,
+        timeout=30,
     )
     return process.returncode, process.stdout, process.stderr
 
@@ -568,7 +697,7 @@ def probe_tart_vm_running() -> TartVMProbe:
             tart_cli,
             tart_home,
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         return TartVMProbe(
             None,
             f"Tart VM inventory unavailable via {tart_cli} in {tart_home}: {exc}",
@@ -590,6 +719,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
                   vm_probe_reason: str = "Tart VM inventory unavailable") -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
+    launchd_pid = parse_launchctl_pid(out) if rc == 0 else None
     log_path = _log_path_from_plist(plist_path)
     log_age: float | None = None
     if log_path and os.path.exists(log_path):
@@ -687,8 +817,29 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
             "only repeat it — read its log",
         )
     expected_loaded = pool_participating and pool_runner
+    # A Tart child can wedge before it ever appears in `tart list`, leaving a
+    # fresh supervisor and a misleadingly healthy launchd job. The lane-local
+    # heartbeat catches that case, but only an idle, readable Tart inventory may
+    # authorize recovery.
+    if expected_loaded and ".tart-runner-macos" in label and vm_running is False:
+        boot_probe = probe_stale_boot(plist_path, launchd_pid)
+        if boot_probe.stale:
+            return AgentHealth(
+                label, plist_path, log_path, state, last_exit, log_age, "wedged",
+                f"{boot_probe.reason}; no Tart VM is running",
+            )
+        if boot_probe.stale is None:
+            return AgentHealth(
+                label, plist_path, log_path, state, last_exit, log_age, "unknown",
+                f"{boot_probe.reason}; refusing stale boot recovery",
+            )
+    # The inventory probe is Tart-specific. Never let an idle Tart store
+    # authorize recovery of a QEMU lane, whose guest state is independent.
+    classify_vm_running = (
+        None if ".qemu-runner" in label or ".tart-runner-linux" in label else vm_running
+    )
     verdict, reason = classify(
-        state, last_exit, log_age, effective_stale_s, vm_running, expected_loaded,
+        state, last_exit, log_age, effective_stale_s, classify_vm_running, expected_loaded,
         restart_grace_s, vm_probe_reason
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,

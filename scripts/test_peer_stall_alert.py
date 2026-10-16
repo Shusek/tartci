@@ -93,6 +93,37 @@ class PeerStall(unittest.TestCase):
         return psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS, me=host,
                               run=self.fleet.run, close=self.close, **kw)
 
+    def test_configured_advertised_supply_is_used_without_checkout(self):
+        supply = self.tmp / "advertised-labels.json"
+        supply.write_text(json.dumps({
+            "schema": "tartci.advertised-labels/v1",
+            "registrations": [],
+            "hosts": [
+                {"host_id": "m1", "ssh": "m1"},
+                {"host_id": "studio", "ssh": "m3"},
+            ],
+        }) + "\n")
+        profile = self.tmp / "macos-fleet-profile.toml"
+        profile.write_text('[host]\nid = "m1"\nssh = "m1"\n')
+        with (
+            mock.patch.dict(os.environ, {
+                "TARTCI_ADVERTISED_LABELS": str(supply),
+                "TARTCI_FLEET_PROFILE": str(profile),
+            }, clear=False),
+            mock.patch.object(psa.pathlib.Path, "home", return_value=self.tmp),
+        ):
+            out = psa.alert_pass(
+                now=RECEIPT_TS + 60,
+                directory=self.tmp / "configured",
+                peers=None,
+                me=None,
+                run=self.fleet.run,
+                issue=self.issue,
+                close=self.close,
+            )
+        self.assertFalse(out["skipped"])
+        self.assertTrue(out["peers"]["studio"]["active"])
+
     def test_m3_stalled_97_h_is_one_issue_named_by_a_peer(self):
         out = self.run_pass(RECEIPT_TS + 60)
         self.assertTrue(out["peers"]["studio"]["active"])

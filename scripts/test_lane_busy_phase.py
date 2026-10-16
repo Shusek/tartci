@@ -78,6 +78,10 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual(both, set())
         self.assertEqual(phases - (lane_busy.BUSY_PHASES | lane_busy.IDLE_PHASES), set())
 
+    def test_cloning_heartbeat_precedes_tart_clone(self) -> None:
+        source = (ROOT / "providers/tart-macos/runner.sh").read_text()
+        self.assertLess(source.index("heartbeat cloning"), source.index("tart clone"))
+
     def test_every_busy_phase_is_busy(self) -> None:
         for phase in sorted(lane_busy.BUSY_PHASES):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as td:

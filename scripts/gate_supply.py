@@ -71,7 +71,7 @@ FREE_PHASES = frozenset({"waiting", "loop", "backoff", "warm-parking", "warm-par
                          "job-claim-covered"})
 # Past admission, not yet assigned: this lane is already reaching for a job.
 IN_FLIGHT_PHASES = frozenset({
-    "admission-precheck", "booting", "ensuring-runner", "aqua-preflight",
+    "cloning", "admission-precheck", "booting", "ensuring-runner", "aqua-preflight",
     "chrome-preflight", "admission-check", "minting-jit", "idle-wait",
     "idle-retarget-check", "warm-handoff",
 })

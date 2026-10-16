@@ -29,6 +29,15 @@ def _cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PublishedSupplyTests(unittest.TestCase):
+    def test_publish_refuses_an_empty_source(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "profiles").mkdir()
+            (root / "fleet").mkdir()
+            (root / "fleet" / "advertised-labels.json").write_text("{}\n")
+            with self.assertRaisesRegex(ValueError, "no macOS fleet profiles"):
+                fleet.published_snapshot(root)
+
     def test_committed_file_is_current(self) -> None:
         """The CI gate: fleet/advertised-labels.json cannot go stale in-repo."""
         self.assertEqual(PUBLISHED.read_text(), fleet.render_published(fleet.published_snapshot()),

@@ -43,6 +43,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Iterable
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fleet_source
+
 OBSERVED = "OBSERVED"
 NOT_OBSERVED = "NOT_OBSERVED"
 IDLE = "IDLE"
@@ -50,7 +54,7 @@ UNDECLARED_OBSERVED = "UNDECLARED_OBSERVED"
 PERSISTENT_OBSERVED = "PERSISTENT_OBSERVED"
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PUBLISHED = ROOT / "fleet" / "advertised-labels.json"
+DEFAULT_PUBLISHED = fleet_source.resolve(ROOT, allow_environment=False).published_supply
 _EPHEMERAL_TAIL = re.compile(r"^(?:-slot(?P<slot>\d+))?-(?P<nn>\d{2})-\d+-\d+$")
 
 Fetch = Callable[[str], dict]
@@ -271,7 +275,7 @@ def exit_code(result: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--published", default=str(DEFAULT_PUBLISHED),
+    parser.add_argument("--published", default=None,
                         help="file or URL of the tartci.advertised-labels/v1 supply")
     parser.add_argument("--repo", required=True)
     parser.add_argument("--lookback-hours", type=int, default=24)
@@ -286,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         import macos_fleet_lanes as fleet
+        if args.published is None:
+            args.published = str(fleet.fleet_source.resolve(fleet.TARTCI_ROOT).published_supply)
         published = fleet.read_published(args.published)
         workflows = {w for row in published["registrations"]
                      if row["repo"].lower() == args.repo.lower() for w in row["workflows"]}
