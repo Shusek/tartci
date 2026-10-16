@@ -48,7 +48,8 @@
 #   tartci pool status --usage [--range 24h] [--json] # slot occupancy, idle-with-demand, discards
 #   tartci held <list|inspect NAME|stop NAME|delete NAME|expire>  # failed gate VMs kept for debugging ([debug_hold])
 #                              # --plan: print the transition, write nothing;
-#                              # off refuses a mid-job lane (exit 12) unless --now
+#                              # off refuses a mid-job lane (exit 12) unless --force
+#                              # (or --now); every change is logged with its caller
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
@@ -58,7 +59,7 @@
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
 #   tartci launchd <reload <label>|status|heal>  # heal a wedged serve LaunchAgent (full bootout+bootstrap)
-#                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
+#                              # reload refuses a mid-job lane (exit 3) unless --force;
 #                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
 #   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
 #   tartci disk <watch|status> [--json]  # write-latency watchdog for the cache/VM volumes
@@ -631,7 +632,7 @@ cmd_launchd() {
       fi
       tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" "$@"
       ;;
-    *) echo "usage: tartci launchd <reload <label> [--dry-run] [--allow-mid-job] | status | heal [--dry-run] [--json] | guard <--hook|--command CMD>>"; return 2 ;;
+    *) echo "usage: tartci launchd <reload <label> [--dry-run] [--force|--allow-mid-job] | status | heal [--dry-run] [--json] | guard <--hook|--command CMD>>"; return 2 ;;
   esac
 }
 
@@ -835,10 +836,12 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|log|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
+  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|log|repair-lock> [--plan] [--force|--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
-  --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  --force  off: stop immediately even though an owned lane is mid-job (kills it);
+           --now is the same. Every on/off/drain/undrain is recorded in
+           ~/Library/Logs/tartci/manual-changes.log with its caller
   --restore-receipt  on: restore the previously receipted serving set during
            self-update recovery without requiring a fresh relay probe
   status --usage [--range DUR] [--until TS] [--json] [--peer HOST=SSH_TARGET]: slot
@@ -865,10 +868,17 @@ cmd_pool() {
       -h|--help) echo "$pool_usage"; return 0 ;;
       --allow-last-serving-host) allow_last_serving_host=1 ;;
       --plan) plan=1 ;;
-      --now) now=1 ;;
+      --now|--force) now=1 ;;
       --restore-receipt) restore_receipt=1 ;;
     esac
   done
+  # Who changed the pool, recorded before the change (or its refusal). The
+  # 2026-10-16 05:19Z m5 off/on that killed two jobs left no trace of its caller.
+  pool_change_log() {
+    local outcome="$1"; shift
+    "$(tartci_pool_python)" "$HERE/scripts/manual_change_log.py" "pool $sub" "$outcome" "$@" \
+      >/dev/null 2>&1 || true
+  }
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
   local agents_dir="$HOME/Library/LaunchAgents"
   if [ "$plan" = 1 ]; then
@@ -900,16 +910,24 @@ cmd_pool() {
               fi
               printf '%s\n' "$mid_job_rows" | awk -F '\t' '$2 == "busy" || $2 == "unknown" { printf "  %s: %s (%s)\n", $1, $2, $3; next } NF < 2 && NF > 0 { print "  " $0 }'
               echo "Use \`tartci pool drain\` to let running jobs finish, \`tartci pool off --plan\`"
-              echo "to see what off would stop, or \`tartci pool off --now\` to stop immediately anyway."
+              echo "to see what off would stop, or \`tartci pool off --force\` (or --now) to stop"
+              echo "immediately anyway."
             } >&2
+            pool_change_log "refused: a lane is mid-job or unknown" "$@"
             return 12
           fi
         fi
         tartci_pool_capacity_floor_preflight off "$allow_last_serving_host" || return $?
+        if [ "$now" = 1 ]; then
+          pool_change_log "forced: mid-job check skipped" "$@"
+        else
+          pool_change_log "proceeding: every owned lane idle" "$@"
+        fi
         # Emergency stop deliberately bypasses the cooperative JIT-start lock.
         tartci_pool_write_participation 0
         tartci_pool_write_state off
       else
+        pool_change_log "requested" "$@"
         tartci_pool_config_verdicts on
         tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
         local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
@@ -1153,6 +1171,7 @@ EOF
       # had before the drain. Refused unless the pool is draining.
       [ "$(tartci_pool_read_state)" = draining ] \
         || { echo "pool undrain refused: pool is $(tartci_pool_read_state), not draining" >&2; return 5; }
+      pool_change_log "requested" "$@"
       tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
       local label launchd_target
       while IFS= read -r label; do
@@ -1169,6 +1188,7 @@ EOF
       ;;
     drain)
       tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
+      pool_change_log "requested" "$@"
       # Close both native and provider admission before waiting for a provider
       # already inside the serialized JIT-start boundary.
       local prior_participation drain_wait_until
