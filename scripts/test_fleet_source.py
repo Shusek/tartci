@@ -75,6 +75,31 @@ class FleetSourceTests(unittest.TestCase):
             source = fleet_source.resolve(Path("/public"))
             self.assertEqual(root.resolve(), source.root)
 
+    def test_recorded_source_resolves_without_inheriting_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env = configured_source(root)
+            recorded = {
+                "root": str(root.resolve()),
+                "configured": True,
+                "commit": env["TARTCI_FLEET_SOURCE_COMMIT"],
+                "repository": env["TARTCI_FLEET_SOURCE_REPOSITORY"],
+                "tree_sha256": fleet_source.FleetSource(
+                    root, root / "profiles", root / fleet_source.PUBLISHED_SUPPLY, True
+                ).tree_sha256,
+                "published_supply_sha256": fleet_source.FleetSource(
+                    root, root / "profiles", root / fleet_source.PUBLISHED_SUPPLY, True
+                ).published_supply_sha256,
+                "profiles_dir": str(root / "profiles"),
+                "published_supply": str(root / fleet_source.PUBLISHED_SUPPLY),
+            }
+            os.environ["TARTCI_FLEET_SOURCE_ROOT"] = "/wrong/source"
+            source = fleet_source.resolve_recorded(recorded, Path("/public"))
+            self.assertEqual(root.resolve(), source.root)
+            self.assertEqual(recorded["commit"], source.source_commit)
+            self.assertEqual(recorded["repository"], source.repository)
+            self.assertEqual("/wrong/source", os.environ["TARTCI_FLEET_SOURCE_ROOT"])
+
     def test_explicit_source_requires_profiles_and_published_supply(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

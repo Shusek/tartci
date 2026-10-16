@@ -1565,13 +1565,19 @@ def verify_receipt(
         fail("install receipt paths do not match the canonical installed paths")
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
-    active_source = fleet_source.resolve(TARTCI_ROOT)
-    if not active_source.configured:
-        # Public installs execute from the immutable support generation. Use
-        # that same root while verifying the receipt, including during the
-        # install transaction before the staged wrapper becomes active.
-        active_source = fleet_source.resolve(support_root, allow_environment=False)
     recorded_source = receipt.get("fleet_source")
+    if isinstance(recorded_source, dict) and recorded_source.get("configured") is True:
+        # Standalone self-update verification does not inherit the environment
+        # used by the installer. Reconstruct the selected source from the
+        # receipt so it does not falsely compare against public profiles.
+        active_source = fleet_source.resolve_recorded(recorded_source, TARTCI_ROOT)
+    else:
+        active_source = fleet_source.resolve(TARTCI_ROOT)
+        if not active_source.configured:
+            # Public installs execute from the immutable support generation. Use
+            # that same root while verifying the receipt, including during the
+            # install transaction before the staged wrapper becomes active.
+            active_source = fleet_source.resolve(support_root, allow_environment=False)
     source_keys = {
         "root", "configured", "commit", "repository", "tree_sha256",
         "published_supply_sha256", "profiles_dir", "published_supply",
@@ -2219,6 +2225,12 @@ def fleet_readiness(
             "config": config_verdicts(config, support_root),
         }
 
+    recorded_source = receipt.get("fleet_source")
+    if isinstance(recorded_source, dict):
+        active_source = fleet_source.resolve_recorded(recorded_source, support_root)
+    else:
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
+
     labels = sorted(name.removesuffix(".plist") for name in receipt["plists"])
     persistent_labels = sorted(
         name.removesuffix(".plist")
@@ -2592,7 +2604,7 @@ def fleet_readiness(
         "disk": disks,
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.
-        "config": config_verdicts(config, support_root),
+        "config": config_verdicts(config, support_root, source=active_source),
     }
 
 
@@ -3227,13 +3239,14 @@ def verify_supply(installed: Path, published: dict | None,
 
 
 def config_verdicts(config: Path, support_root: Path,
-                    receipt: Path = DEFAULT_INSTALL_RECEIPT) -> dict:
+                    receipt: Path = DEFAULT_INSTALL_RECEIPT,
+                    source: fleet_source.FleetSource | None = None) -> dict:
     """Profile drift and supply verdicts for status surfaces. Never raises.
 
     Reported, never enforced: a status or admission path that refused on
     these would turn configuration drift into a capacity outage.
     """
-    source = fleet_source.resolve(support_root)
+    source = source or fleet_source.resolve(support_root)
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
