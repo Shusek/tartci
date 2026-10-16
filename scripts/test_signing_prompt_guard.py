@@ -185,15 +185,26 @@ class LauncherV2BuildTests(LauncherBuildTests):
         self.assertEqual(["Contents/Info.plist", "Contents/MacOS/tartci-launcher",
                           "Contents/Resources/inputs.json", "Contents/Resources/policy.json",
                           "Contents/_CodeSignature/CodeResources"], files)
-        import macos_launcher_identity
-        import tomllib
+        # The expectations come from the interpreter the builder itself
+        # resolves: this test may run on the hosts' Python 3.9, without tomllib.
+        builder_python = subprocess.run(
+            [str(HERE / "build_macos_launcher.sh"), "--support-root", str(self.support_root),
+             "--print-render-python"], env={**os.environ, "TARTCI_PYTHON": "",
+                                            "TARTCI_RENDER_PYTHON": ""},
+            capture_output=True, text=True, check=True).stdout.strip()
+        expected = json.loads(subprocess.run(
+            [builder_python, "-c",
+             "import json, sys, tomllib; sys.path.insert(0, sys.argv[1]); "
+             "import macos_launcher_identity as m; p = tomllib.loads(open(sys.argv[2]).read()); "
+             "print(json.dumps({'digest': m.source_inputs_digest(sys.argv[3], p), 'profile': p}))",
+             str(HERE), str(self.profile), str(self.support_root)],
+            capture_output=True, text=True, check=True).stdout)
         inputs = json.loads((output / "Contents/Resources/inputs.json").read_text())
-        self.assertEqual(macos_launcher_identity.source_inputs_digest(
-            self.support_root, tomllib.loads(self.profile.read_text())), inputs["sha256"])
+        self.assertEqual(expected["digest"], inputs["sha256"])
         self.assertEqual((self.support_root / "native/macos/tartci-launcher/Info.plist").read_bytes(),
                          (output / "Contents/Info.plist").read_bytes())
         policy = json.loads((output / "Contents/Resources/policy.json").read_text())
-        profile = tomllib.loads(self.profile.read_text())
+        profile = expected["profile"]
         home = profile["host"]["home"].rstrip("/")
         self.assertEqual({
             "schema": 2, "identifier": profile["launch_helper"]["identifier"],
@@ -293,7 +304,7 @@ class PinnedKeychainTests(Host):
         body = source[source.index("def build_launcher("):]
         self.assertIn(
             '"--profile", str(profile),\n'
-            '                           "--python", launcher_python, *pinned]',
+            '                           "--python", launcher_python, *pinned,',
             body[:body.index("\ndef ")],
         )
 
