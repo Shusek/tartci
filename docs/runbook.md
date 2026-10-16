@@ -2429,6 +2429,16 @@ fleet`), and check GitHub's job history against it with
   reconcile, `pool on` through the installed shim, verify (pool on and fleet
   ready, serving not blocked, executed commit == target, `launchd guard`
   present).
+  The wait counts only tartci's own lanes. A lane is mid-job when its
+  supervisor has a `tart run`, `tart clone`, `qemu-system` or `Runner.Worker`
+  descendant, holds a VM lease from its own process tree, or has a fresh busy
+  heartbeat. A manual VM, or a lease taken outside every lane's process tree,
+  never blocks the drain. Each change in what it waits on is logged as
+  `wait-idle: waiting on <lane: state, detail>`. If the 90 min bound passes,
+  the attempt fails, the host goes back ON, and one issue opens:
+  `[tartci] <host> self-update drain timed out after <N> min waiting on a lane`
+  (`self_update_drain_timeout`). It names the lane and closes on the next
+  drain that completes.
 - **A failure never leaves the host off if `pool on` can work.** Every
   failure path ends with `pool on` (three attempts, 15/45/90 s apart). If it
   still refuses (for example a receipt it rejects after a macOS update), the
