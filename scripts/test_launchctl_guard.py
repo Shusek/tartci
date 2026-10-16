@@ -180,6 +180,25 @@ class ClassifierTests(unittest.TestCase):
         finally:
             os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
 
+    def test_home_anchored_kills_are_refused_without_a_process_table(self) -> None:
+        # The fail-closed list carries this account's real home, so a pattern
+        # anchored on it still matches when ps is unavailable.
+        home = str(Path.home())
+        old = os.environ["TARTCI_GUARD_PS_SNAPSHOT"]
+        os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = str(ROOT / "missing-ps-snapshot")
+        try:
+            for command in (f"pkill -f '^{home}/.local/bin'",
+                            f"pkill -f '{home}/.subrouter'",
+                            f"pkill -f '^{home}/.local/share/tartci-generations'",
+                            f"pkill -f '{home}/.claude/shell-snapshots'"):
+                with self.subTest(command=command):
+                    self.assertEqual(2, guard.decide(command)[0], command)
+            self.assertTrue(guard._matches_static_fallback(f"^{home}/.local/bin"))
+            # Control: a home-anchored pattern naming nothing protected passes.
+            self.assertFalse(guard._matches_static_fallback(f"^{home}/harmless-worker$"))
+        finally:
+            os.environ["TARTCI_GUARD_PS_SNAPSHOT"] = old
+
     def test_live_process_table_refuses_real_agent_and_lane_shapes(self) -> None:
         patterns = (
             "pkill -f tartci-launcher",
@@ -188,7 +207,7 @@ class ClassifierTests(unittest.TestCase):
             "pkill -f 'sr codex'",
             "pkill -f 'claude proxy'",
             "pkill -f 'login -flp'",
-            "pkill -f '^/Users/example/.subrouter/codex/claude-proxy'",
+            f"pkill -f '^{Path.home()}/.subrouter/codex/claude-proxy'",
             "pgrep -f 'sr codex' | xargs kill",
         )
         for command in patterns:

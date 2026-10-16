@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -88,31 +89,38 @@ SHELL_SNAPSHOT = re.compile(
 # pkill -f matches the complete command line.  Keep representative lines
 # for the process families that the guard must protect; matching only the
 # executable basename lets path and snapshot patterns evade the guard.
-BROAD_KILL_COMMAND_LINES = (
-    # Shapes captured from ps -axo command on the fleet hosts.
-    "/Users/example/.local/share/tartci-generations/aad356ca6bef941b2b675d695a0231acf89e4833-dbf3e8dbd7183aef/providers/tart-macos/runner.sh --loop",
-    "/Users/example/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-pulp-gate",
-    "/bin/zsh -c source /Users/example/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
-    "/Users/example/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
+_HOME = str(Path.home())
+try:
+    _USER = pwd.getpwuid(os.getuid()).pw_name
+except KeyError:
+    _USER = os.environ.get("USER", "")
+BROAD_KILL_COMMAND_LINES = tuple(line.format(home=_HOME, user=_USER) for line in (
+    # Shapes captured from ps -axo command on the fleet hosts, with this
+    # account's home and name filled in at import: these are runtime data,
+    # so a home-anchored `pkill -f '^<home>/...'` must match them here.
+    "{home}/.local/share/tartci-generations/aad356ca6bef941b2b675d695a0231acf89e4833-dbf3e8dbd7183aef/providers/tart-macos/runner.sh --loop",
+    "{home}/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-pulp-gate",
+    "/bin/zsh -c source {home}/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
+    "{home}/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
     "/bin/zsh -lc tartci pool status",
     "/bin/bash -lc runner.sh --loop",
-    "/bin/sh -c source /Users/example/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-20261011.sh",
-    "/Users/example/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-20261011.sh",
+    "/bin/sh -c source {home}/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-20261011.sh",
+    "{home}/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-20261011.sh",
     "/usr/bin/python3 -m tartci",
     "/usr/local/bin/python3.12 -m agent_cli",
-    "/opt/homebrew/bin/node /Users/example/.local/bin/claude",
-    "/Users/example/.local/bin/claude --dangerously-skip-permissions",
-    "/Users/example/.local/bin/codex --full-auto",
+    "/opt/homebrew/bin/node {home}/.local/bin/claude",
+    "{home}/.local/bin/claude --dangerously-skip-permissions",
+    "{home}/.local/bin/codex --full-auto",
     "/usr/local/bin/tartci-launcher --lane pulp-gate",
     "/usr/local/bin/shipyard-daemon-launcher --lane pulp-gate",
-    "/Users/example/.local/bin/Runner.Listener --start",
-    "/usr/bin/login -flp daniel",
+    "{home}/.local/bin/Runner.Listener --start",
+    "/usr/bin/login -flp {user}",
     "sr codex resume 01a126fe-4702-7b62-9852-63e986e1379c",
     "sr claude proxy --resume 08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb",
-    "/usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh",
-    "/Users/example/.local/bin/studio-pulp-gate",
-    "/Users/example/.local/bin/claude proxy --resume",
-)
+    "/usr/bin/login -flp {user} /bin/bash --noprofile --norc -c exec -l /bin/zsh",
+    "{home}/.local/bin/studio-pulp-gate",
+    "{home}/.local/bin/claude proxy --resume",
+))
 PROCESS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(.*)$")
 PROTECTED_PROCESS = re.compile(
     r"(?:tartci[-_]launcher|TartCILauncher|runner\.sh\s+--loop|"
