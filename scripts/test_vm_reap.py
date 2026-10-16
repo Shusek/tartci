@@ -1046,6 +1046,17 @@ class OrphanedLaneVmTests(unittest.TestCase):
         self.assertEqual(digest["orphans"]["retired_would_delete"],
                          ["pulp-preamble-m1-target-06-99292-1"])
 
+    def test_dry_run_leaves_the_runner_offline_tracker_unchanged(self) -> None:
+        tracker = self.tmp / "home" / ".tartci" / "state" / "reap" / "runner-offline.json"
+        tracker.parent.mkdir(parents=True, exist_ok=True)
+        before = '{"m1-old-runner": {"first_offline": 1, "passes": 2}}'
+        tracker.write_text(before)
+        self.m1_digest("--dry-run", enabled=False)
+        self.assertEqual(tracker.read_text(), before)
+        # Control, same instrument: a plain report pass rewrites the clocks.
+        self.m1_digest(enabled=False)
+        self.assertNotEqual(tracker.read_text(), before)
+
     def test_dry_run_prints_and_never_deletes_even_with_fix(self) -> None:
         _, deleted, out = self.m1_digest("--fix", "--dry-run", enabled=True)
         self.assertEqual(deleted, [])
