@@ -192,6 +192,23 @@ class ForeignVms(Base):
         self.assertIn("tart stop lv2repro-pulpimpl", body)
         self.assertTrue((self.user / ".tart" / "vms" / "vellum-pr19-linux-20260811").exists())
 
+    def test_a_recorded_scratch_vm_is_tartci_s_until_its_ttl(self) -> None:
+        # Its record under ~/.tartci/state/scratch-vms names it, and the
+        # ownership text reads that state, so it is never reported foreign;
+        # the scratch-vm pass deletes it at its TTL.
+        import scratch_vm_ttl  # noqa: PLC0415
+        self.vm(self.store, "scratch-pulp-impl-repro", state="running")
+        self.vm(self.store, "scratch-unrecorded", state="running")
+        scratch_vm_ttl.write({"name": "scratch-pulp-impl-repro", "owner": "pulp-impl",
+                              "store": str(self.store), "expires_at": NOW + 3600,
+                              "warned_at": None})
+        ps = ("05:00:00 /opt/homebrew/bin/tart run scratch-pulp-impl-repro\n"
+              "05:00:00 /opt/homebrew/bin/tart run scratch-unrecorded\n")
+        line = self.foreign_line(self.run_pass(ps=ps))
+        self.assertNotIn("scratch-pulp-impl-repro", line)
+        # Control: the same shape without a record is reported.
+        self.assertIn("scratch-unrecorded running 5.0 h", line)
+
     def test_a_short_foreign_run_is_not_reported(self) -> None:
         self.vm(self.store, "lv2repro-pulpimpl", state="running")
         ps = "03:59:00 /opt/homebrew/bin/tart run lv2repro-pulpimpl\n"
@@ -246,6 +263,26 @@ class OptIn(Base):
         self.vm(self.store, "old-thing", age_days=60)
         self.assertEqual(self.run_pass(free_gb=10), [])
         self.assertEqual((self.opened, self.measured), ([], []))
+
+
+class WatchdogPass(Base):
+    def test_the_watchdog_pass_returns_the_lines_host_hygiene_produced(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        line = watchdog.host_hygiene_pass(
+            NOW, user_home=self.user,
+            vols=lambda paths: [vol(str(paths[0]), 150, 2000)],
+            measure=lambda path, timeout=0: GB, listing=lambda store: [],
+            ps=lambda: "", lsof=lambda: [],
+            issue=lambda t, b: (0, "71"), close=lambda n: (0, "closed"))
+        self.assertIn("WARN host-disk", line)
+        # Control: with the floor holding, the pass reports no disk line.
+        os.unlink(self.user / ".tartci" / "state" / "host-hygiene" / "foreign-vms.json")
+        self.assertNotIn("host-disk", watchdog.host_hygiene_pass(
+            NOW + 3600, user_home=self.user,
+            vols=lambda paths: [vol(str(paths[0]), 900, 2000)],
+            measure=lambda path, timeout=0: GB, listing=lambda store: [],
+            ps=lambda: "", lsof=lambda: [],
+            issue=lambda t, b: (0, "71"), close=lambda n: (0, "closed")) or "")
 
 
 class Wiring(unittest.TestCase):

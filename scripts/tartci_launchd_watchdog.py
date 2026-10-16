@@ -988,15 +988,30 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
         print(f"launchd-watchdog: REFUSE: no plist for {label} at {plist}",
               file=sys.stderr)
         return RELOAD_REFUSED if dry_run else RELOAD_FAILED
-    if not allow_mid_job:
+    def log(outcome: str) -> None:
+        # Who reloaded which lane (scripts/manual_change_log.py); never fails.
+        if dry_run:
+            return
+        try:
+            import manual_change_log  # noqa: PLC0415 - sibling module
+            manual_change_log.record("launchd reload", outcome,
+                                     [label] + (["--force"] if allow_mid_job else []))
+        except Exception:  # noqa: BLE001 - the record never blocks the reload
+            pass
+
+    if allow_mid_job:
+        log("forced: mid-job check skipped")
+    else:
         refusal = mid_job_refusal(label, launch_agents_dir)
         if refusal is not None:
+            log(f"refused: {refusal}")
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "
                   "tartci pool drain so it finishes its job and stops.\n"
                   "  Override (kills the job): tartci launchd reload "
-                  f"{label} --allow-mid-job", file=sys.stderr)
+                  f"{label} --force (or --allow-mid-job)", file=sys.stderr)
             return RELOAD_REFUSED
+        log("proceeding: lane idle")
     plan = plan_reload(label, plist)
     if not plan.proceed:
         print(f"launchd-watchdog: REFUSE: {plan.reason}", file=sys.stderr)
@@ -1522,6 +1537,18 @@ def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
     return "\n".join(lines) or None
 
 
+def agent_cargo_pass(now: float | None = None, **kwargs) -> str | None:
+    """About hourly, name agents' stale Cargo target dirs, and delete them on a
+    host that opted in (scripts/agent_cargo_reap.py). Never raises."""
+    try:
+        import agent_cargo_reap  # noqa: PLC0415 - sibling module
+        lines = agent_cargo_reap.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN agent-cargo check FAILED "
+                f"({type(exc).__name__}: {exc}); stale build caches would not be reported")
+    return "\n".join(lines) or None
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1752,7 +1779,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="report what heal/reload would do; take no action. "
                     "With --reload: exit 0 if it would proceed, 3 if refused")
-    ap.add_argument("--allow-mid-job", action="store_true",
+    ap.add_argument("--allow-mid-job", "--force", dest="allow_mid_job", action="store_true",
                     help="--reload only: proceed even though the lane is "
                     "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1899,6 +1926,9 @@ def main(argv: list[str] | None = None) -> int:
         hygiene_line = host_hygiene_pass()
         if hygiene_line:
             print(hygiene_line)
+        cargo_line = agent_cargo_pass()
+        if cargo_line:
+            print(cargo_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
