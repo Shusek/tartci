@@ -95,7 +95,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             supply.write_text(json.dumps({
                 "schema": "tartci.advertised-labels/v1",
                 "generated_from": {
-                    "repo": "danielraffel/pulp-planning",
+                    "repo": "ORG/private-fleet-authority",
                     "profiles": ["profiles/canary-macos-fleet.toml"],
                     "profiles_sha256": source.profiles_sha256,
                 },
@@ -104,13 +104,13 @@ class MacosFleetLaneTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                 "TARTCI_FLEET_SOURCE_ROOT": str(root),
                 "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
-                "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+                "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
             }, clear=False):
                 data = fleet.load(CONFIG)
                 env = fleet.lane_plist(data, data["lane"][0])["EnvironmentVariables"]
             self.assertEqual(env["TARTCI_FLEET_SOURCE_ROOT"], str(root.resolve()))
             self.assertEqual(env["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
-            self.assertEqual(env["TARTCI_FLEET_SOURCE_REPOSITORY"], "danielraffel/pulp-planning")
+            self.assertEqual(env["TARTCI_FLEET_SOURCE_REPOSITORY"], "ORG/private-fleet-authority")
             self.assertEqual(env["TARTCI_ADVERTISED_LABELS"], str(supply.resolve()))
             self.assertEqual(env["TARTCI_JOB_CLAIM_SUPPLY"], str(supply.resolve()))
 

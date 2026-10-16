@@ -2176,14 +2176,14 @@ class AgentTemplateTests(unittest.TestCase):
              "--set", "HOME=/Users/x",
              "--environment", "TARTCI_FLEET_SOURCE_ROOT=/private/fleet",
              "--environment", "TARTCI_FLEET_SOURCE_COMMIT=" + "a" * 40,
-             "--environment", "TARTCI_FLEET_SOURCE_REPOSITORY=danielraffel/pulp-planning",
+             "--environment", "TARTCI_FLEET_SOURCE_REPOSITORY=ORG/private-fleet-authority",
              "--environment", "TARTCI_ADVERTISED_LABELS=/private/fleet/fleet/advertised-labels.json",
              "--environment", "TARTCI_JOB_CLAIM_SUPPLY=/private/fleet/fleet/advertised-labels.json"],
             capture_output=True, check=True)
         environment = plistlib.loads(rendered.stdout)["EnvironmentVariables"]
         self.assertEqual(environment["TARTCI_FLEET_SOURCE_ROOT"], "/private/fleet")
         self.assertEqual(environment["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
-        self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"], "danielraffel/pulp-planning")
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"], "ORG/private-fleet-authority")
 
     def test_watchdog_never_interrupts_the_agent(self) -> None:
         import tartci_launchd_watchdog as wd
@@ -2260,7 +2260,7 @@ class CensusEnvTests(unittest.TestCase):
         values = {
             "TARTCI_FLEET_SOURCE_ROOT": "/private/fleet",
             "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
-            "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+            "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
             "TARTCI_ADVERTISED_LABELS": "/private/fleet/fleet/advertised-labels.json",
             "TARTCI_JOB_CLAIM_SUPPLY": "/private/fleet/fleet/advertised-labels.json",
         }

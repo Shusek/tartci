@@ -8,7 +8,7 @@ An operator can select an installed private source for offline fleet tooling:
 ```sh
 export TARTCI_FLEET_SOURCE_ROOT=/path/to/fleet-source
 export TARTCI_FLEET_SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
-export TARTCI_FLEET_SOURCE_REPOSITORY=danielraffel/pulp-planning
+export TARTCI_FLEET_SOURCE_REPOSITORY=ORG/private-fleet-authority
 ```
 
 The source directory must contain:

@@ -57,7 +57,7 @@ class FleetSourceTests(unittest.TestCase):
             (root / "fleet" / "advertised-labels.json").write_text(json.dumps({
                 "schema": "tartci.advertised-labels/v1",
                 "generated_from": {
-                    "repo": "danielraffel/pulp-planning",
+                    "repo": "ORG/private-fleet-authority",
                     "profiles": ["profiles/canary-macos-fleet.toml"],
                     "profiles_sha256": profile_digest,
                 },
@@ -65,14 +65,14 @@ class FleetSourceTests(unittest.TestCase):
             }) + "\n")
             os.environ["TARTCI_FLEET_SOURCE_ROOT"] = str(root)
             os.environ["TARTCI_FLEET_SOURCE_COMMIT"] = "0123456789abcdef0123456789abcdef01234567"
-            os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "danielraffel/pulp-planning"
+            os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "ORG/private-fleet-authority"
             source = fleet_source.resolve(Path("/public"))
             self.assertTrue(source.configured)
             self.assertEqual(root.resolve(), source.root)
             self.assertEqual(root.resolve() / "profiles", source.profiles_dir)
             self.assertEqual(
                 "0123456789abcdef0123456789abcdef01234567", source.source_commit)
-            self.assertEqual("danielraffel/pulp-planning", source.repository)
+            self.assertEqual("ORG/private-fleet-authority", source.repository)
             self.assertRegex(source.tree_sha256, r"^[0-9a-f]{64}$")
             self.assertRegex(source.published_supply_sha256, r"^[0-9a-f]{64}$")
 

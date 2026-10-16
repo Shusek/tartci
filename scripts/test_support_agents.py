@@ -232,20 +232,20 @@ class Plan(Case):
             ).profiles_sha256
             (source / "fleet" / "advertised-labels.json").write_text(
                 '{"schema":"tartci.advertised-labels/v1",'
-                f'"generated_from":{{"repo":"danielraffel/pulp-planning",'
+                f'"generated_from":{{"repo":"ORG/private-fleet-authority",'
                 f'"profiles":["profiles/canary-macos-fleet.toml"],'
                 f'"profiles_sha256":"{digest}"}},"registrations":[]}}\n')
             values = {
                 "TARTCI_FLEET_SOURCE_ROOT": str(source),
                 "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
-                "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+                "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
             }
             with mock.patch.dict(os.environ, values, clear=False):
                 environment = sa._watchdog_env({})
             self.assertEqual(environment["TARTCI_FLEET_SOURCE_ROOT"], str(source.resolve()))
             self.assertEqual(environment["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
             self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"],
-                             "danielraffel/pulp-planning")
+                             "ORG/private-fleet-authority")
 
     def test_missing_matching_and_differing_are_named_and_nothing_is_written(self):
         self.write_profile(table(THREE))
