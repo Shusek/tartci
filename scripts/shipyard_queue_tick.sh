@@ -189,9 +189,26 @@ health "starting" "local_prerequisites_validated" || exit 2
 # reaper decides (it trusts only a ref listing that carries HEAD, and skips
 # runs that hold no runner); this tick only runs it. It never fails the tick,
 # and the support helper bounds it to REAP_TIMEOUT seconds per repository.
+# Shipyard resolves its GitHub credential from the checkout it runs in, so the
+# reaper runs from SHIPYARD_QUEUE_REPO_ROOT; from $HOME it fails with
+# "token_command placeholder requires remote.origin.url to be a GitHub remote".
 REAP_APPLY=0; [ -e "$REAP_OPT_IN" ] && REAP_APPLY=1
+# One checkout resolves one repository's credential, so a root cannot serve
+# several reaped repositories.
+reap_count=0
+for reap_repo in $REAP_REPOS; do reap_count=$((reap_count+1)); done
+if [ "$reap_count" -gt 1 ]; then
+  log "$HOST: reap-superseded: skipped: one repo root cannot serve $reap_count repositories" \
+      "($REAP_REPOS); set SHIPYARD_QUEUE_REAP_REPOS to the root's repository"
+  REAP_REPOS=""
+fi
 for reap_repo in $REAP_REPOS; do
-  reap_line="$(cd "$HOME" && python3 "$SUPPORT" reap-superseded "$SY" "$reap_repo" "$REAP_APPLY" \
+  if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
+    log "$HOST: reap-superseded $reap_repo: skipped: no repo root configured" \
+        "(install the tick with --repo-root <checkout>)"
+    continue
+  fi
+  reap_line="$(cd "$REPO_ROOT" && python3 "$SUPPORT" reap-superseded "$SY" "$reap_repo" "$REAP_APPLY" \
     "$REAP_LOG" "$HOST" "$(ts)" --timeout "$REAP_TIMEOUT" 2>&1 | head -n 1)"
   log "$HOST: ${reap_line:-reap-superseded $reap_repo: no output}"
 done

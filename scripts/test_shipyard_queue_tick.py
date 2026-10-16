@@ -61,6 +61,7 @@ elif [ "$1 $2" = "auth export" ]; then
 elif [ "$1 $2" = "merge-queue status" ]; then
   printf '{"held":%s,"authority_matches":false}\\n' "$HELD"
 elif [ "$1" = "rescue" ]; then
+  pwd -P > "$CALLS.rescue-cwd"
   [ -z "$RESCUE_SLEEP" ] || sleep "$RESCUE_SLEEP"
   [ -z "$RESCUE_ERROR" ] || printf '%s\\n' "$RESCUE_ERROR" >&2
   printf '%s\\n' "$RESCUE_JSON"
@@ -170,6 +171,10 @@ exit 98
                 if ledger_path.exists()
                 else None
             )
+            rescue_cwd = Path(f"{calls}.rescue-cwd")
+            self.last_rescue_cwd = (
+                rescue_cwd.read_text(encoding="utf-8").strip() if rescue_cwd.exists() else None
+            )
             reap_log = root / "Library/Logs/tartci/superseded-merge-groups.log"
             self.last_reap_log = (
                 reap_log.read_text(encoding="utf-8") if reap_log.exists() else ""
@@ -252,6 +257,47 @@ exit 98
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("mode=apply timed out after 1.0s; skipped", result.stdout)
         self.assertIn("ghapp pr view 42", calls)
+
+    def test_without_a_repo_root_the_reaper_is_skipped_and_shipyard_never_called(self) -> None:
+        # Run from $HOME, Shipyard cannot resolve its token from a git remote.
+        result, calls, _ = self.run_tick(held=False, reap_opt_in=True, repo_root=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
+        self.assertIn("reap-superseded Generous-Corp/pulp: skipped: no repo root configured",
+                      result.stdout)
+        self.assertIn("mode=reap", result.stdout)
+
+    def test_a_configured_root_that_does_not_exist_skips_the_reaper(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True, repo_root=False,
+            extra_env={"SHIPYARD_QUEUE_REPO_ROOT": "/nonexistent/tartci-reaper-root"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
+        self.assertIn("skipped: no repo root configured", result.stdout)
+
+    def test_one_repo_root_never_serves_several_repositories(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True,
+            extra_env={"SHIPYARD_QUEUE_REAP_REPOS": "Generous-Corp/pulp danielraffel/tartci"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
+        self.assertIn("skipped: one repo root cannot serve 2 repositories", result.stdout)
+        self.assertIn("(Generous-Corp/pulp danielraffel/tartci)", result.stdout)
+        self.assertIn("mode=reap", result.stdout)
+
+    def test_the_reaper_runs_from_the_repo_root(self) -> None:
+        # A checkout apart from HOME, so running from HOME cannot pass.
+        with tempfile.TemporaryDirectory() as checkout:
+            result, calls, _ = self.run_tick(
+                held=False, reap_opt_in=True, repo_root=False,
+                extra_env={"RESCUE_JSON": json.dumps(self.SUPERSEDED),
+                           "SHIPYARD_QUEUE_REPO_ROOT": checkout},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(self.rescue_calls(calls)), 1)
+            self.assertEqual(self.last_rescue_cwd, os.path.realpath(checkout))
 
     def test_a_held_queue_skips_the_reaper(self) -> None:
         result, calls, _ = self.run_tick(held=True, reap_opt_in=True)
