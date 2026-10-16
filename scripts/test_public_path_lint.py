@@ -16,12 +16,13 @@ import public_path_lint as ppl  # noqa: E402
 REAL_HOME = "/Users/" + "danielraffel"     # split so this file does not trip the lint
 REAL_VOLUME = "/Volumes/" + "Workshop"
 REAL_HOST = "Daniels" + "-Mac-Studio"
+OTHER_HOST = "Alexs" + "-MacBook-Pro"
 
 
 class Findings(unittest.TestCase):
     def test_real_paths_and_host_names_are_found(self) -> None:
         text = (f"home = \"{REAL_HOME}/.config\"\nstore = \"{REAL_VOLUME}/VMs\"\n"
-                f"host = \"{REAL_HOST}-m3\"\nlaptop = \"Alexs-MacBook-Pro.local\"\n")
+                f"host = \"{REAL_HOST}-m3\"\nlaptop = \"{OTHER_HOST}.local\"\n")
         self.assertEqual([n for n, _ in ppl.findings_in(text)], [1, 2, 3, 4])
 
     def test_placeholders_pass(self) -> None:
