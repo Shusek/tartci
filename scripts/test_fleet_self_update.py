@@ -3203,6 +3203,36 @@ class RepositoryIdentityTests(Base):
         self.assertEqual(message.count("(after one retry)"), 2)
         self.assertEqual(len(self.reads()), 4)
 
+    def test_gh_network_errors_are_retried_once(self):
+        for text in ("error connecting to api.github.com",
+                     "Get \"https://api.github.com/repos/x\": dial tcp: lookup api.github.com: "
+                     "no such host"):
+            with self.subTest(text=text):
+                self.sys.calls.clear()
+                self.sys.api_repository = su.LEGACY_REPOSITORY
+                self.sys.repository_failures[su.LEGACY_REPOSITORY] = [su.Result(1, "", text)]
+                before = self.sys.clock
+                with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+                    self.assertEqual(su.LEGACY_REPOSITORY,
+                                     su.configured_repository(self.cfg, self.sys))
+                self.assertEqual([f"repos/{su.LEGACY_REPOSITORY}"] * 2, self.reads())
+                self.assertEqual(su.REPOSITORY_READ_RETRY_SECONDS, self.sys.clock - before)
+
+    def test_a_successful_read_is_never_retried_whatever_its_json_says(self):
+        # rc 0 with the wrong full_name is an answer; "network_count" in the
+        # JSON must not look like a transport error.
+        answer = su.Result(0, json.dumps({"full_name": "example/other", "network_count": 3,
+                                          "description": "timed out connection reset"}), "")
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.repository_failures[repository] = [answer]
+        before = self.sys.clock
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            with self.assertRaises(su.Refused) as caught:
+                su.configured_repository(self.cfg, self.sys)
+        self.assertEqual(2, len(self.reads()))
+        self.assertEqual(before, self.sys.clock)
+        self.assertIn("answered example/other", str(caught.exception))
+
     def test_a_definite_answer_is_not_retried(self):
         # Control: a 404 is an answer, not a transport failure.
         self.sys.unreadable_repositories.update({su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY})
@@ -3272,6 +3302,387 @@ class OsInterpreterRefreshTests(Base):
         self.sys.status_problems = [{"code": "receipt_mismatch", "detail": "x"}]
         self.assertEqual(self.apply(), su.EXIT_NOTHING)
         self.assertEqual(self.sys.mutations(), [])
+
+
+class PrivateSourceSystem(FakeSystem):
+    """FakeSystem plus GitHub API reads of one private fleet repository."""
+
+    def __init__(self, home: Path, repository) -> None:
+        super().__init__(home)
+        self.private = repository
+
+    def run(self, argv, *, cwd=None, env=None, timeout=900):
+        if argv[:2] == [FAKE_GH, "api"] and argv[2].startswith(f"repos/{self.private.repository}/"):
+            self.calls.append((list(argv), cwd))
+            return su.Result(*self.private(argv[2]))
+        return super().run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def _set_installed(self, commit):
+        # The installer records the selected source in its receipt.
+        super()._set_installed(commit)
+        selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT")
+        if getattr(self, "records_source", True) is False:
+            selected = None
+        self.installed_sources = getattr(self, "installed_sources", []) + [selected]
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {"configured": bool(selected), "commit": selected}
+        receipt_path.write_text(json.dumps(receipt))
+
+
+class TwoCommits:
+    """One private repository at two commits: `head` is main, `older` is not."""
+
+    def __init__(self, head, older) -> None:
+        self.head, self.older = head, older
+        self.repository = head.repository
+        self.calls: list[str] = []
+
+    @property
+    def unreadable(self) -> bool:
+        return self.head.unreadable
+
+    @unreadable.setter
+    def unreadable(self, value: bool) -> None:
+        self.head.unreadable = self.older.unreadable = value
+
+    @property
+    def corrupt(self) -> set:
+        return self.head.corrupt
+
+    def __call__(self, path: str):
+        self.calls.append(path)
+        if path.endswith("/commits/main"):
+            return self.head(path)
+        for repo in (self.head, self.older):
+            rc, out, err = repo(path)
+            if rc == 0:
+                return rc, out, err
+        return 1, "", f"HTTP 404: {path}"
+
+
+class FleetSourceFixture(Base):
+    """A private fleet source served by a fake GitHub; no tests of its own."""
+    OLDER = "a1" * 20      # a private-source commit installed before main moved
+
+    def setUp(self) -> None:
+        super().setUp()
+        import test_fleet_source_sync as fixture
+        self.fixture = fixture
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        profiles = {path.name: path.read_text()
+                    for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))}
+        files = fixture.source_files(profiles)
+        self.repo = TwoCommits(fixture.FakeRepository(files),
+                               fixture.FakeRepository(files, commit=self.OLDER, tree="b1" * 20))
+        self.sys = PrivateSourceSystem(self.home, self.repo)
+        self.cfg.fleet_source_repository = fixture.PRIVATE
+        self.cfg.fleet_source_canary = "m1"     # this host
+
+
+class FleetSourceSyncTests(FleetSourceFixture):
+
+    def test_settings_name_the_private_repository(self) -> None:
+        self.cfg.settings.write_text('[fleet_source]\nrepository = "ORG/private-fleet-authority"\n')
+        self.assertEqual("ORG/private-fleet-authority",
+                         su.load_config(self.home).fleet_source_repository)
+        self.cfg.settings.unlink()
+        self.assertIsNone(su.load_config(self.home).fleet_source_repository)
+
+    def test_a_malformed_setting_is_a_clean_refusal(self) -> None:
+        for body in ('fleet_source = "ORG/x"\n', '[fleet_source]\nrepository = 3\n',
+                     '[fleet_source]\nrepo = "ORG/x"\n', '[fleet_source]\ncanary = ""\n'):
+            with self.subTest(body=body):
+                self.cfg.settings.write_text(body)
+                with self.assertRaisesRegex(su.ConfigError, r"\[fleet_source\]"):
+                    su.load_config(self.home)
+                out = io.StringIO()
+                with contextlib.redirect_stderr(out):
+                    self.assertEqual(su.EXIT_REFUSED, su.main(["--home", str(self.home)]))
+                self.assertIn("self-update: REFUSED", out.getvalue())
+        self.cfg.settings.write_text('[fleet_source]\nrepository = "ORG/x"\ncanary = "m1"\n')
+        loaded = su.load_config(self.home)
+        self.assertEqual(("ORG/x", "m1"), (loaded.fleet_source_repository, loaded.fleet_source_canary))
+
+    def test_pruning_keeps_the_commit_the_running_generation_reads(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": True, "commit": self.OLDER}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        store = self.cfg.fleet_source_store
+        (store / self.OLDER).mkdir(parents=True)
+        os.utime(store / self.OLDER, (1, 1))                  # the oldest export
+        newer = [f"{i}" * 40 for i in range(2, 7)]
+        for i, commit in enumerate(newer):
+            (store / commit).mkdir()
+            os.utime(store / commit, (NOW - 100 + i, NOW - 100 + i))
+        su.sync_fleet_source(self.cfg, self.sys)
+        self.assertTrue((store / self.OLDER).is_dir(), "the installed generation's export was pruned")
+        self.assertTrue((store / self.fixture.COMMIT).is_dir())
+        # Control: the same store with nothing installed from it loses that export.
+        receipt["fleet_source"] = {"configured": False, "commit": None}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        su.sync_fleet_source(self.cfg, self.sys)
+        self.assertFalse((store / self.OLDER).exists())
+
+    def test_a_plan_writes_and_prunes_nothing(self) -> None:
+        store = self.cfg.fleet_source_store
+        with self.assertRaisesRegex(su.Refused, "not exported yet"):
+            su.sync_fleet_source(self.cfg, self.sys, write=False)
+        self.assertFalse(store.exists())
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        self.assertFalse(store.exists())
+        root = Path(su.sync_fleet_source(self.cfg, self.sys)["root"])
+        stale = [f"{i}" * 40 for i in range(2, 7)]
+        for commit in stale:
+            (store / commit).mkdir()
+            os.utime(store / commit, (1, 1))
+        before = {p.name: p.stat().st_mtime for p in store.iterdir()}
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        selected = su.sync_fleet_source(self.cfg, self.sys, write=False)
+        self.assertEqual(str(root), selected["root"])
+        self.assertEqual(before, {p.name: p.stat().st_mtime for p in store.iterdir()})
+
+    def test_without_the_setting_nothing_is_read_or_selected(self) -> None:
+        self.cfg.fleet_source_repository = None
+        self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+        self.assertEqual([], self.repo.calls)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_the_configured_source_is_exported_and_selected(self) -> None:
+        selected = su.sync_fleet_source(self.cfg, self.sys)
+        root = self.cfg.fleet_source_store / self.fixture.COMMIT
+        self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                          "root": str(root), "why": "canary: main's head"}, selected)
+        self.assertEqual(str(root), os.environ["TARTCI_FLEET_SOURCE_ROOT"])
+        self.assertEqual(self.fixture.COMMIT, os.environ["TARTCI_FLEET_SOURCE_COMMIT"])
+        self.assertEqual(self.fixture.PRIVATE, os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"])
+        # The profile self-update installs now comes from the private export.
+        self.assertEqual(root.resolve() / "profiles" / "m1-macos-fleet.toml",
+                         su.checked_in_profile(self.cfg))
+        # And the installer it runs inherits the selection.
+        self.assertEqual(self.fixture.COMMIT, su.census_env()["TARTCI_FLEET_SOURCE_COMMIT"])
+
+    def test_an_unreadable_source_refuses_and_never_falls_back(self) -> None:
+        self.repo.unreadable = True
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual("unknown", skew["state"])
+        self.assertIn("fleet source ORG/private-fleet-authority", skew["reason"])
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_tampered_source_refuses(self) -> None:
+        self.repo.corrupt.add(fleet_source_supply())
+        with self.assertRaisesRegex(su.Refused, "does not match blob"):
+            su.sync_fleet_source(self.cfg, self.sys)
+
+    def test_a_moved_source_is_a_refresh_reason(self) -> None:
+        su.sync_fleet_source(self.cfg, self.sys)
+        receipt = {"support": {"source_commit": INSTALLED}}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIn("fleet source moved to cccccccccccc (installed from the public profiles)",
+                      su.refresh_reason(self.cfg, self.sys))
+        receipt["fleet_source"] = {"configured": True, "commit": "9" * 40}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIn("installed from 999999999999", su.refresh_reason(self.cfg, self.sys))
+        receipt["fleet_source"]["commit"] = self.fixture.COMMIT
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_current_host_reinstalls_from_a_moved_source(self) -> None:
+        self.sys.log_lines = ""   # current with main
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(self.fixture.COMMIT, receipt["fleet_source"]["commit"])
+        # Installed from that commit, the next run has nothing to do.
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+
+
+class FleetSourceCanaryTests(FleetSourceFixture):
+    """A private-source move is one host first: the canary installs and verifies
+    it; every other host adopts only that commit, after it has served there."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.fleet_source_canary = "studio"   # another host
+
+    def installed_from(self, commit: str | None) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": commit is not None, "commit": commit}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+
+    def canary(self, record: dict | None):
+        return mock.patch.object(su, "read_canary_verified", return_value=record)
+
+    def test_without_a_canary_the_setting_refuses(self) -> None:
+        self.cfg.fleet_source_canary = None
+        with self.assertRaisesRegex(su.Refused, "no canary"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual([], self.repo.calls)
+
+    def test_a_host_stays_public_until_the_canary_has_verified_a_commit(self) -> None:
+        with self.canary(None):
+            self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+        self.assertEqual([], self.repo.calls)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_a_host_stays_on_its_installed_commit_while_the_canary_soaks(self) -> None:
+        self.installed_from(self.OLDER)
+        young = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                 "age": su.FLEET_SOURCE_SOAK_SECONDS - 60}
+        with self.canary(young):
+            selected = su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual(self.OLDER, selected["commit"])
+        self.assertIn("only 29 min ago", selected["why"])
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+        self.assertFalse(any(call.endswith("/commits/main") for call in self.repo.calls))
+
+    def test_a_host_adopts_the_canary_commit_after_the_soak(self) -> None:
+        self.installed_from(self.OLDER)
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        with self.canary(soaked):
+            selected = su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual(self.fixture.COMMIT, selected["commit"])
+        self.assertIn("fleet source moved to cccccccccccc", su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_record_for_another_repository_is_not_adopted(self) -> None:
+        self.installed_from(self.OLDER)
+        other = {"repository": "ORG/other", "commit": self.fixture.COMMIT, "age": 99999}
+        with self.canary(other):
+            self.assertEqual(self.OLDER, su.sync_fleet_source(self.cfg, self.sys)["commit"])
+
+    def test_the_canary_record_is_read_on_its_own_clock(self) -> None:
+        record = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "verified_at": 1000}
+        def ssh(argv):
+            if argv[0] == "ssh" and su.FLEET_SOURCE_VERIFIED in argv[-1]:
+                return su.Result(0, "1600\n" + json.dumps(record) + "\n")
+            return None
+        with mock.patch.object(su, "published_peers", return_value={"studio": "m3"}), \
+                mock.patch.object(self.sys, "run", side_effect=lambda argv, **kw: ssh(argv)
+                                  or su.Result(255, "", "unreachable")):
+            self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                              "age": 600.0}, su.read_canary_verified(self.cfg, self.sys, "studio"))
+            record["commit"] = "not-a-commit"
+            self.assertIsNone(su.read_canary_verified(self.cfg, self.sys, "studio"))
+        with mock.patch.object(su, "published_peers", return_value={"studio": "m3"}), \
+                mock.patch.object(self.sys, "run", return_value=su.Result(255, "", "timed out")):
+            self.assertIsNone(su.read_canary_verified(self.cfg, self.sys, "studio"))
+
+    def test_a_host_whose_canary_failed_does_not_move(self) -> None:
+        # The canary never published the new commit: this host stays put and
+        # its apply has nothing to do.
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = ""   # current with main
+        with self.canary({"repository": self.fixture.PRIVATE, "commit": self.OLDER,
+                          "age": 99999}):
+            self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+
+class FleetSourceCanaryHostTests(FleetSourceFixture):
+    """On the canary itself (this host is m1)."""
+
+    def verified(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / su.FLEET_SOURCE_VERIFIED)
+
+    def test_a_verified_install_is_published_for_the_fleet(self) -> None:
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        record = self.verified()
+        self.assertEqual((self.fixture.PRIVATE, self.fixture.COMMIT),
+                         (record["repository"], record["commit"]))
+        self.assertEqual(self.sys.now(), record["verified_at"])
+
+    def test_an_install_that_fails_verification_publishes_nothing(self) -> None:
+        # The installer recorded the new commit, but pool on refused it.
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1               # pool on keeps refusing
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+        self.assertIsNone(self.verified())
+
+    def test_a_run_that_did_not_install_the_selected_commit_publishes_nothing(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.records_source = False
+        self.assertEqual(su.EXIT_OK, self.apply())
+        self.assertIsNone(self.verified())
+
+    def test_a_failed_install_publishes_nothing_and_backs_off(self) -> None:
+        self.sys.log_lines = ""
+        # A same-generation reinstall installs the running commit, which the
+        # fake installer treats like a rollback: make that install fail.
+        self.sys.rollback_install_rc = 1
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertNotEqual("succeeded", self.last()["status"])
+        self.assertIsNone(self.verified())
+        drained = len(self.sys.mutations())
+        self.sys.clock += 1800          # the next scheduled turn
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(drained, len(self.sys.mutations()), "no second drain within rate_hours")
+
+
+class SealedHostFleetSourceTests(Base):
+    """A sealed-launcher host refuses [fleet_source] before anything happens: a
+    source move would not rebuild the launcher, whose policy digest covers the
+    moved profile, so the install would fail after the drain every turn."""
+    sealed = True
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        self.cfg.fleet_source_repository = "ORG/private-fleet-authority"
+        self.cfg.fleet_source_canary = "studio"
+        self.pin = self.home / ".config/tartci/m3-launcher-approved.sha256"
+        self.pin_before = self.pin.read_bytes()
+
+    def assertNothingMoved(self) -> None:
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(any("drain" in a for a, _ in self.sys.calls), "no drain call")
+        self.assertFalse(any(len(a) > 2 and "private-fleet-authority" in a[2]
+                             for a, _ in self.sys.calls if a[:1] == [FAKE_GH]),
+                         "the private source is never read")
+        self.assertFalse(self.cfg.fleet_source_store.exists(), "nothing exported")
+        self.assertEqual(self.pin_before, self.pin.read_bytes(), "launcher pin unchanged")
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ, "no source selected")
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual("unknown", skew["state"])
+        self.assertIn("fleet source refused on a sealed-launcher host", skew["reason"])
+        self.assertIn("remove [fleet_source]", skew["reason"])
+
+    def test_an_apply_refuses_before_any_drain(self) -> None:
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertNothingMoved()
+
+    def test_a_plan_refuses_the_same_way(self) -> None:
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        self.assertNothingMoved()
+
+    def test_without_the_setting_a_sealed_host_is_unaffected(self) -> None:
+        self.cfg.fleet_source_repository = None
+        self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+
+    # Base's pause test runs with this class's [fleet_source], which now
+    # refuses first by design; Base covers it without the setting.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
+
+
+def fleet_source_supply() -> str:
+    import fleet_source
+    return fleet_source.PUBLISHED_SUPPLY
 
 
 class RecoveryBranchTests(Base):
