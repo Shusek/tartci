@@ -130,6 +130,12 @@
       "remedy": "Nothing to do.",
       "do_not": "Do not read one refusal as a problem; a refusal is the floor working."
     },
+    "host_agents_failing": {
+      "summary": "A loaded watchdog or self-update agent last exited nonzero.",
+      "why": "Loaded is not running: an agent refused by the interpreter pin (exit 127) stays loaded and fails every start, so the host stops healing and updating while launchctl list still shows it.",
+      "remedy": "Read the agent's log under ~/Library/Logs/tartci; for exit 127 read ~/.tartci/state/interpreter-refused and ~/.config/tartci/python.pin, fix host.python and reinstall.",
+      "do_not": "Do not kickstart it in a loop; the next start fails the same way until the cause is fixed."
+    },
     "host_agents_missing": {
       "summary": "This managed fleet host is missing the launchd watchdog or the self-update agent.",
       "why": "A host brought up without them serves jobs but never heals lanes, never refreshes skew or tool freshness, and never updates tartci, Shipyard or the pulp CLI, so it drifts unnoticed (m5studio ran with no watchdog).",
@@ -330,6 +336,30 @@
       "summary": "The executed cohort could not be resolved for some agent.",
       "why": "The executed cohort is read from ProgramArguments and, for a signed launcher, from the bundle's sealed metadata. When neither can be read the agent's identity is unknown, which must not be reported as agreement.",
       "remedy": "Inspect the named LaunchAgent and its program before trusting any generation claim for this host."
+    },
+    "python_pin_missing": {
+      "summary": "This managed fleet host has no ~/.config/tartci/python.pin.",
+      "why": "Every tartci LaunchAgent then runs the interpreter the fleet lanes carry, by bootstrap. That is meant for one cycle, until an install writes the pin; a host that stays on it never completed an install with the pinned-interpreter generation.",
+      "remedy": "Set host.python in the fleet profile and reinstall (tartci fleet-macos install <profile> --apply), which writes the pin.",
+      "do_not": "Do not write the pin by hand to a path the lanes do not run; macOS grants follow the binary."
+    },
+    "python_pin_not_applicable": {
+      "summary": "No installed fleet profile, so no interpreter pin is expected.",
+      "why": "Only managed fleet hosts run tartci LaunchAgents that resolve through the pin.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not write a pin on a host that is not in the fleet."
+    },
+    "python_pin_ok": {
+      "summary": "The interpreter pin names an executable absolute path.",
+      "why": "LaunchAgents rendered without their own TARTCI_PYTHON run exactly that binary, never a PATH search.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read executable as granted; the lanes' privacy grants are proven by the install preflight, not here."
+    },
+    "python_pin_unusable": {
+      "summary": "The interpreter pin is unreadable or names something that is not an executable absolute path.",
+      "why": "Every tartci LaunchAgent that resolves through the pin refuses to run (exit 127), so the host stops healing and updating.",
+      "remedy": "Fix host.python in the fleet profile and reinstall; tartci launchd heal still runs the refusal alert.",
+      "do_not": "Do not delete the pin to make agents run; under launchd that falls back only to the lanes' interpreter or a refusal."
     },
     "readiness_not_managed": {
       "summary": "This host carries no managed fleet profile.",

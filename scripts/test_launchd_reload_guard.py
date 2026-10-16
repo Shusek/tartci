@@ -7,6 +7,7 @@ LaunchAgents directory. Nothing here reaches the real launchd domain.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -44,6 +45,8 @@ PS_TREE = textwrap.dedent("""\
       301   300 /Users/x/actions-runner/bin/Runner.Worker spawnclient 1 2
       400     1 /bin/bash /Users/x/tartci/providers/qemu-windows/runner.sh --loop
       401   400 /opt/homebrew/bin/qemu-system-aarch64 -M virt -accel hvf -drive file=w.qcow2
+      500   450 /opt/homebrew/bin/tart run --no-graphics lv2repro-pulpimpl
+      450     1 -zsh
     """)
 
 
@@ -114,7 +117,13 @@ class FakeHost:
         # Hermetic: never read this machine's lease store.
         return {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                 "TARTCI_POOL_UID": str(os.getuid()),
-                "TARTCI_LEASE_DIR": str(self.root / "leases")}
+                "TARTCI_LEASE_DIR": str(self.root / "leases"),
+                "TARTCI_MANUAL_CHANGE_LOG": str(self.root / "manual-changes.log"),
+                "SSH_CONNECTION": "192.0.2.9 52344 192.0.2.5 22"}
+
+    def changes(self) -> list[dict]:
+        path = self.root / "manual-changes.log"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
 
     def reload(self, label: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -170,6 +179,28 @@ class LaneBusyProbeTests(unittest.TestCase):
             self.assertEqual(idle.state, lane_busy.IDLE)
             table = {1: (0, "sup"), 2: (1, "qemu-img convert a b"), 3: (1, "grep qemu-system")}
             self.assertIsNone(lane_busy.find_worker(1, table))
+
+    def test_a_foreign_vm_and_its_lease_never_make_a_lane_busy(self) -> None:
+        # A manual repro VM (m1, 2026-10-16: lv2repro-pulpimpl, started from an
+        # agent's shell) is neither a descendant of any lane supervisor nor
+        # holding a lease from one, so it can never hold up a drain.
+        with tempfile.TemporaryDirectory() as td:
+            host = FakeHost(Path(td))
+            host.loaded(SIBLING, 200)
+            foreign = [{"id": "vm-manual-lv2repro", "command_kind": "tart-linux-vm",
+                        "pid": 500, "vm_name": "lv2repro-pulpimpl"}]
+            old = os.environ["PATH"]
+            os.environ["PATH"] = f"{host.bin}:{old}"
+            try:
+                (row,) = lane_busy.probe([SIBLING], agents_dir=host.agents, leases=foreign)
+                self.assertEqual(row.state, lane_busy.IDLE, row.detail)
+                # Control, same instrument: the same lease held by the lane's
+                # own descendant makes it busy.
+                own = [dict(foreign[0], pid=201)]
+                (row,) = lane_busy.probe([SIBLING], agents_dir=host.agents, leases=own)
+                self.assertEqual(row.state, lane_busy.BUSY, row.detail)
+            finally:
+                os.environ["PATH"] = old
 
     def test_absent_is_absent_and_other_print_errors_are_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -231,6 +262,25 @@ class ReloadGuardTests(unittest.TestCase):
             proc = host.reload(LANE, "--allow-mid-job")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn(f"bootout gui/{os.getuid()}/{LANE}", host.calls())
+
+    def test_force_overrides_and_every_reload_is_logged_with_its_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakeHost(Path(td))
+            host.plist(LANE)
+            host.loaded(LANE, 100)
+            self.assertEqual(host.reload(LANE).returncode, 3)
+            host.loaded(LANE, 100)
+            proc = host.reload(LANE, "--force")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"bootout gui/{os.getuid()}/{LANE}", host.calls())
+            refused, forced = host.changes()
+            self.assertEqual(refused["action"], "launchd reload")
+            self.assertTrue(refused["outcome"].startswith("refused"))
+            self.assertEqual(forced["outcome"], "forced: mid-job check skipped")
+            self.assertEqual((forced["via"], forced["ssh_client"]), ("ssh", "192.0.2.9"))
+            # A dry run changes nothing and records nothing.
+            host.reload(LANE, "--dry-run")
+            self.assertEqual(len(host.changes()), 2)
 
     def test_unknown_busy_state_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as td:

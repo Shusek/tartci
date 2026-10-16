@@ -1317,6 +1317,79 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
         ticket["issue_error"] = text[:300]
 
 
+def mid_job_lanes(plan_text: str) -> list[str]:
+    """The `lane: state, detail` rows under `mid-job lanes:` in `pool off --plan`."""
+    rows: list[str] = []
+    inside = False
+    for line in plan_text.splitlines():
+        if line.strip() == "mid-job lanes:":
+            inside = True
+            continue
+        if inside:
+            if not line.startswith("    ") or ":" not in line:
+                break
+            rows.append(line.strip()[:300])
+    return rows
+
+
+def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: float,
+                        now: float) -> None:
+    """One issue while the self-update drain timed out waiting on a lane; it
+    closes on the next drain that completes. `busy` None means the wait ended.
+
+    The bounded wait only failed the attempt, and a human heard of it only
+    when consecutive failures halted self-update. Best effort: never raises.
+    """
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "drain-timeout-alert.json"
+        # One episode across attempts: a later timeout keeps the first's time.
+        since = (host_off._read_json(path) or {}).get("since") or _iso(now)
+        lanes = "; ".join(busy or []) or "(not named)"
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update drained the pool and then waited {waited / 60:.0f} min "
+                f"(the bound) for its own lanes to finish, and they did not: {lanes}. "
+                "The attempt failed and the host was put back ON; the update did not land.", "",
+                "## Evidence",
+                f"- the self-update receipt's `wait-idle` steps name what it waited on: {lanes}",
+                "- `tartci pool off --plan` on the host lists `mid-job lanes:`", "",
+                "## Likely cause",
+                "A lane job that runs longer than the bound (a long build, or a hung job "
+                "that is not timing out), or a lane supervisor whose VM lease or heartbeat "
+                "outlived its work. Only tartci's own lanes count: a manual VM never "
+                "blocks the drain.", "",
+                "## Fix", "```sh",
+                "tartci pool off --plan        # which lane, which pid",
+                "# a real job: let it finish; self-update retries on its next tick",
+                "# a hung job: cancel it in GitHub Actions, then let the lane tear down",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Killing a lane mid-job kills someone's CI run.", "",
+                "## How to verify",
+                "The next self-update logs `wait-idle: no owned lane mid-job`; this issue "
+                "then closes itself.",
+            ])
+            title = (f"[tartci] {me} self-update drain timed out after {waited / 60:.0f} min "
+                     f"waiting on a lane")
+            marker = tartci_incident.marker(me, "self_update_drain_timeout", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=busy is not None,
+            resolved=busy is None, since=since if busy is not None else None,
+            raise_event=lambda: host_off.event(cfg.state_dir, "self_update_drain_timeout",
+                                               f"waited {waited:.0f}s on {lanes}"[:300],
+                                               {"lanes": busy or []}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: drain-timeout alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
 # A gate-demand snapshot older than this is not used: the bound falls back.
 GATE_DEMAND_FRESH_SECONDS = 10 * 60
 
@@ -1433,6 +1506,25 @@ def python_shim_dir() -> str:
         os.symlink(sys.executable, os.path.join(directory, "python3"))
         _PYTHON_SHIM_DIR = directory
     return _PYTHON_SHIM_DIR
+
+
+def installed_lane_python(home: Path) -> str | None:
+    """The absolute TARTCI_PYTHON the installed fleet lanes run, or None."""
+    import plistlib  # noqa: PLC0415
+    for plist in sorted((home / "Library" / "LaunchAgents").glob(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+        try:
+            value = plistlib.loads(plist.read_bytes()).get("EnvironmentVariables", {}).get(
+                "TARTCI_PYTHON")
+        except (OSError, plistlib.InvalidFileException, ValueError, AttributeError):
+            continue
+        if isinstance(value, str) and value.startswith("/"):
+            return value
+    return None
+
+
+def python_pin_path(home: Path) -> Path:
+    return Path(os.environ.get("TARTCI_PYTHON_PIN") or home / ".config" / "tartci" / "python.pin")
 
 
 def census_env(repository: str | None = None) -> dict[str, str]:
@@ -1735,6 +1827,18 @@ def restore_writable(root: Path) -> None:
                 os.chmod(path, (path.stat().st_mode & 0o7777) | 0o200)
 
 
+def launch_python(profile: Path) -> str:
+    """The interpreter a launcher is built and verified with: the profile's
+    host.python when it declares one (the installer will pin exactly that),
+    else the render handoff, TARTCI_PYTHON, or this process's own."""
+    host = _toml(profile).get("host") or {}
+    declared = host.get("python") if isinstance(host, dict) else None
+    if isinstance(declared, str) and declared.startswith("/"):
+        return os.path.realpath(declared)
+    return os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON")
+                            or os.environ.get("TARTCI_PYTHON") or sys.executable)
+
+
 def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, target: str,
                    out_dir: Path) -> tuple[Path, Path]:
     live = Path(helper["path"])
@@ -1746,8 +1850,7 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
-        launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-            "TARTCI_PYTHON") or sys.executable)
+        launcher_python = launch_python(profile)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
                            "--support-root", ".", "--profile", str(profile),
@@ -1776,8 +1879,7 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
-    launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-        "TARTCI_PYTHON") or sys.executable)
+    launcher_python = launch_python(profile)
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
                        "--output", str(rendered)], cwd=str(cfg.checkout),
                       env={"TARTCI_RENDER_PYTHON": launcher_python,
@@ -2472,7 +2574,16 @@ class Run:
             if result.rc != 0:
                 raise Refused(f"cannot snapshot the live launcher: {result.text}")
             self._verify_snapshot_bundle(snap)
-        _write_json(snap / "snapshot.json", {"previous": self.previous, "at": _iso(self.sys.now())})
+        # The interpreter the running generation's lanes use, and its pin:
+        # a rollback reinstalls with these, never with the new generation's.
+        # m5s, 2026-10-15: the rollback rendered the old launcher against the
+        # new pin and refused ("launch helper lanes are missing pinned
+        # interpreter"), leaving the host off.
+        pin = python_pin_path(self.cfg.home)
+        previous_pin = pin.read_text().strip() if pin.is_file() else None
+        _write_json(snap / "snapshot.json", {
+            "previous": self.previous, "at": _iso(self.sys.now()),
+            "python": installed_lane_python(self.cfg.home), "python_pin": previous_pin})
         self.snapshot = snap
         self.receipt.value["snapshot"] = str(snap)
         self.receipt.step("snapshot", f"{snap} (previous generation {self.previous[:12]})")
@@ -2573,7 +2684,9 @@ class Run:
         self.receipt.step("vm-dhcp-verify", result.text.strip()[-500:], ok=result.rc == 0)
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
-        deadline = self.sys.now() + self.cfg.wait_seconds
+        started = self.sys.now()
+        deadline = started + self.cfg.wait_seconds
+        waiting_on: list[str] | None = None
         while True:
             plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
             if plan.rc == 0:
@@ -2587,9 +2700,21 @@ class Run:
                               f"{plan.text[:300]}")
             if plan.rc != 12:
                 raise Failed(f"pool off --plan refused (exit {plan.rc}): {plan.text[:300]}")
+            # Say what the drain waits on, once per change: a receipt that
+            # reads only "drain" for half an hour looks stuck (m1, 2026-10-16,
+            # waiting on one Forge gate job).
+            busy = mid_job_lanes(f"{plan.out}\n{plan.err}")
+            if busy != waiting_on:
+                waiting_on = busy
+                self.receipt.step("wait-idle", "waiting on " + ("; ".join(busy) or
+                                                                 "an owned lane (not named)"))
             if self.sys.now() >= deadline:
-                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s")
+                drain_timeout_alert(self.cfg, self.me, busy, self.sys.now() - started,
+                                    self.sys.now())
+                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s: "
+                             + ("; ".join(busy) or "(not named)"))
             self.sys.sleep(self.cfg.poll_seconds)
+        drain_timeout_alert(self.cfg, self.me, None, self.sys.now() - started, self.sys.now())
         self.receipt.step("wait-idle", "no owned lane mid-job")
 
     def _writer_fence(self) -> list[str]:
@@ -2611,11 +2736,19 @@ class Run:
             return []
         return [str(shipyard), "writer-domain-exec", "--path", str(self.cfg.shim), "--"]
 
-    def _install(self, args: list[str]) -> None:
+    def _install(self, args: list[str], python: str | None = None) -> None:
         fence = self._writer_fence()
+        env = census_env(self.repository)
+        if python:
+            # Only a rollback names one. TARTCI_ROLLBACK_PYTHON outranks the
+            # snapshot profile's host.python, which may name the switch the
+            # preflight refused; an older installer reads TARTCI_PYTHON only.
+            env["TARTCI_PYTHON"] = python
+            if python.startswith("/"):
+                env["TARTCI_ROLLBACK_PYTHON"] = python
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
-                                           cwd=str(self.cfg.checkout), env=census_env(self.repository),
+                                           cwd=str(self.cfg.checkout), env=env,
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
@@ -2688,7 +2821,27 @@ class Run:
             self._write_pin((self.snapshot / "approved.sha256").read_text())
             self.receipt.step("pin-restore", "previous approval restored from the snapshot")
             args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
-        self._install(args)
+        self._install(args, python=self._restore_previous_python())
+
+    def _restore_previous_python(self) -> str | None:
+        """Pin the interpreter the previous generation's lanes ran (else its
+        old pin) and return it, for the rollback install."""
+        snap = (_read_json(self.snapshot / "snapshot.json") if self.snapshot else None) or {}
+        previous = snap.get("python") if isinstance(snap.get("python"), str) else None
+        pin_value = snap.get("python_pin") if isinstance(snap.get("python_pin"), str) else None
+        pin = python_pin_path(self.cfg.home)
+        # The pin names what the rollback installs: the installer honours
+        # TARTCI_ROLLBACK_PYTHON only when it equals the pin or a lane's.
+        restore = previous if previous and previous.startswith("/") else pin_value
+        if restore:
+            pin.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pin.with_name(f".{pin.name}.rollback")
+            tmp.write_text(restore + "\n")
+            os.replace(tmp, pin)
+        if restore or previous:
+            self.receipt.step("python-restore",
+                              f"rollback runs the previous interpreter {restore or previous}")
+        return restore or previous
 
     def _pool_state(self) -> str:
         status = installed_tartci(self.cfg, self.sys, "pool", "status", "--json")

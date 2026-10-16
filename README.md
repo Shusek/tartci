@@ -22,6 +22,12 @@ Use tartci if you:
 tartci is a set of shell and Python scripts plus docs. It holds no VM images:
 those are baked or pulled onto each host and never committed.
 
+The public contract is the CLI, provider behavior, and per-project manifests.
+Host profiles, runner labels, receipts, host paths, and fleet snapshots describe
+one deployment. Do not copy those values into a new installation. Keep a real
+fleet's desired state and live receipts in its private operator repository;
+examples in this repository are not requirements for using TartCI.
+
 ## How it works
 
 ```
@@ -48,9 +54,10 @@ job finishes -> VM deleted, lease released
   (Apple Virtualization).
 - **Windows** guests run on QEMU, since Apple Virtualization cannot install
   Windows.
-- **Golden images** are built once per host (`tartci prepare linux|macos`,
-  `tartci windows golden`) or copied from another host (`tartci
-  tart-image-sync` for Tart images, `tartci goldens sync` for Windows).
+- **Golden images** are built or tagged per lane. `tartci prepare linux` builds
+  the Pulp Linux golden, `tartci prepare macos` provides macOS golden helpers,
+  and `tartci windows golden` snapshots a prepared Windows VM. Copy Windows
+  images with `tartci goldens sync`; copy Tart images with `tartci tart-image-sync`.
 - **LaunchAgents** in `launchd/` keep the serving loops running across
   reboots.
 - **`tartci pool drain` and `tartci pool on`** take a Mac out of the pool and
@@ -98,14 +105,23 @@ baking goldens, onboarding a host and installing the agents.
   [Pulp](https://github.com/Generous-Corp/pulp) today. The serving lanes take
   any repository, golden image and labels from the environment.
 
+## Tart and TartCI
+
+[Tart](https://github.com/openai/tart) provides the Apple Virtualization
+VM engine. TartCI is an independent project that adds the CI layer: disposable
+per-job GitHub runners, host resource budgets, warm caches, Windows through
+QEMU, and coordination with [Shipyard](https://github.com/danielraffel/Shipyard).
+TartCI is not affiliated with Tart or its maintainers.
+
 ## Learn more
 
-- [Runbook](docs/runbook.md): host setup, goldens, serving, and recovery,
-  step by step.
-- [Reference](docs/reference.md): the resource governor, serving behavior,
-  diagnostics, and the environment variables each lane reads.
-- [Gotchas](docs/gotchas.md): failure modes found in practice and their fixes.
-- [Onboarding a new repository](docs/new-repo-agent-guide.md).
+- [Runbook](docs/runbook.md): set up a host, build images, and serve jobs.
+- [Prepare](docs/prepare.md): what each `prepare` command does and when to use it.
+- [Reference](docs/reference.md): resource limits, serving behavior, diagnostics,
+  and environment variables.
+- [Gotchas](docs/gotchas.md): known failure modes and practical fixes.
+- [Onboarding a new repository](docs/new-repo-agent-guide.md): connect a repo to
+  an existing TartCI host.
 - [LaunchAgents](launchd/README.md) and the
   [published label table](fleet/README.md).
 - [AGENTS.md](AGENTS.md): a dense reference for coding agents.

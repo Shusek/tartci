@@ -849,15 +849,30 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
         print(f"launchd-watchdog: REFUSE: no plist for {label} at {plist}",
               file=sys.stderr)
         return RELOAD_REFUSED if dry_run else RELOAD_FAILED
-    if not allow_mid_job:
+    def log(outcome: str) -> None:
+        # Who reloaded which lane (scripts/manual_change_log.py); never fails.
+        if dry_run:
+            return
+        try:
+            import manual_change_log  # noqa: PLC0415 - sibling module
+            manual_change_log.record("launchd reload", outcome,
+                                     [label] + (["--force"] if allow_mid_job else []))
+        except Exception:  # noqa: BLE001 - the record never blocks the reload
+            pass
+
+    if allow_mid_job:
+        log("forced: mid-job check skipped")
+    else:
         refusal = mid_job_refusal(label, launch_agents_dir)
         if refusal is not None:
+            log(f"refused: {refusal}")
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "
                   "tartci pool drain so it finishes its job and stops.\n"
                   "  Override (kills the job): tartci launchd reload "
-                  f"{label} --allow-mid-job", file=sys.stderr)
+                  f"{label} --force (or --allow-mid-job)", file=sys.stderr)
             return RELOAD_REFUSED
+        log("proceeding: lane idle")
     plan = plan_reload(label, plist)
     if not plan.proceed:
         print(f"launchd-watchdog: REFUSE: {plan.reason}", file=sys.stderr)
@@ -1330,6 +1345,83 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
+    """Raise one issue while a tartci LaunchAgent on this host refuses to run
+    an unpinned interpreter (scripts/interpreter_alert.py). Never raises."""
+    try:
+        import interpreter_alert  # noqa: PLC0415 - sibling module
+        return interpreter_alert.alert_pass(utcnow() if now is None else now,
+                                            issue=issue, close=close)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter check FAILED "
+                f"({type(exc).__name__}: {exc})")
+
+
+def interpreter_grant_pass(now: float | None = None, probe=None, issue=None,
+                           close=None) -> str | None:
+    """About hourly, prove this host's current lane interpreters can still use
+    the VM store from launchd, and raise one issue when one cannot
+    (scripts/interpreter_grant_check.py). Never takes the host off; never raises."""
+    try:
+        import interpreter_grant_check as grant  # noqa: PLC0415 - sibling module
+        kwargs = {"issue": issue, "close": close}
+        if probe is not None:
+            kwargs["probe"] = probe
+        return grant.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter-grant check FAILED "
+                f"({type(exc).__name__}: {exc}); a revoked grant would not be reported")
+
+
+def scratch_vm_pass(now: float | None = None, tart=None) -> str | None:
+    """Warn 30 min before a scratch VM's TTL, then stop and delete it
+    (scripts/scratch_vm_ttl.py). Acts only on VMs that command recorded. Never raises."""
+    try:
+        import scratch_vm_ttl  # noqa: PLC0415 - sibling module; standard library only
+        kwargs = {} if tart is None else {"tart": tart}
+        lines = scratch_vm_ttl.enforce(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN scratch-vm check FAILED "
+                f"({type(exc).__name__}: {exc}); no scratch VM was stopped")
+    return "\n".join(lines) or None
+
+
+def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
+    """Disk floor and foreign VMs on this host, report-only
+    (scripts/host_hygiene.py). Off unless the host opts in. Never raises."""
+    try:
+        import host_hygiene  # noqa: PLC0415 - sibling module
+        lines = host_hygiene.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-hygiene check FAILED "
+                f"({type(exc).__name__}: {exc}); a full disk or a stray VM would not be reported")
+    return "\n".join(lines) or None
+
+
+def agent_cargo_pass(now: float | None = None, **kwargs) -> str | None:
+    """About hourly, name agents' stale Cargo target dirs, and delete them on a
+    host that opted in (scripts/agent_cargo_reap.py). Never raises."""
+    try:
+        import agent_cargo_reap  # noqa: PLC0415 - sibling module
+        lines = agent_cargo_reap.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN agent-cargo check FAILED "
+                f"({type(exc).__name__}: {exc}); stale build caches would not be reported")
+    return "\n".join(lines) or None
+
+
+def git_maintenance_pass(now: float | None = None, **kwargs) -> str | None:
+    """WARN on a git maintenance stampede; run the opted-in nightly pass
+    (scripts/git_maintenance_guard.py). Never raises."""
+    try:
+        import git_maintenance_guard  # noqa: PLC0415 - sibling module
+        lines = git_maintenance_guard.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN git-maintenance check FAILED "
+                f"({type(exc).__name__}: {exc}); a maintenance stampede would not be reported")
+    return "\n".join(lines) or None
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1361,6 +1453,10 @@ def tailnet_pass(now: float | None = None) -> str | None:
                          f"{v.get('since')} ({v.get('minutes')} min)")
         elif v.get("state") == "unmapped":
             parts.append(f"{host} has no tailnet node ({v.get('detail')})")
+        if (v.get("lan_blind") or {}).get("active"):
+            parts.append(f"this host ({host}) cannot reach the LAN since "
+                         f"{v['lan_blind'].get('since')}; fallback routes unchecked "
+                         "(several hosts at once: suspect the router or switch)")
         for kind, route in sorted((v.get("routes") or {}).items()):
             if route.get("active"):
                 parts.append(f"{route.get('alias') or host + '-' + kind} ({route.get('addr')}) "
@@ -1492,9 +1588,13 @@ def serving_truth_pass(now: float | None = None) -> str | None:
         return (f"{stamp} launchd-watchdog: WARN serving-truth check FAILED "
                 f"({type(exc).__name__}: {exc}); no serving alarm was raised")
     parts = []
-    if out.get("trips"):
-        parts.append(f"{len(out['trips'])} rule trip(s) on {me} "
-                     f"({', '.join(t['rule'] for t in out['trips'])}), evidence recorded")
+    # Once per episode: a trip whose episode is already open was reported when
+    # it opened, and its evidence stays in the lookback for hours.
+    new = [t for t in out.get("trips") or []
+           if t.get("episode_key") in out.get("opened_keys", ())]
+    if new:
+        parts.append(f"{len(new)} rule trip(s) on {me} "
+                     f"({', '.join(t['rule'] for t in new)}), evidence recorded")
     if out.get("demand_errors"):
         parts.append(f"gate demand partly unread: {out['demand_errors'][0]}")
     if not parts:
@@ -1552,7 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="report what heal/reload would do; take no action. "
                     "With --reload: exit 0 if it would proceed, 3 if refused")
-    ap.add_argument("--allow-mid-job", action="store_true",
+    ap.add_argument("--allow-mid-job", "--force", dest="allow_mid_job", action="store_true",
                     help="--reload only: proceed even though the lane is "
                     "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1687,6 +1787,24 @@ def main(argv: list[str] | None = None) -> int:
         tailnet_line = tailnet_pass()
         if tailnet_line:
             print(tailnet_line)
+        interpreter_line = interpreter_refusal_pass()
+        if interpreter_line:
+            print(interpreter_line)
+        grant_line = interpreter_grant_pass()
+        if grant_line:
+            print(grant_line)
+        scratch_line = scratch_vm_pass()
+        if scratch_line:
+            print(scratch_line)
+        hygiene_line = host_hygiene_pass()
+        if hygiene_line:
+            print(hygiene_line)
+        cargo_line = agent_cargo_pass()
+        if cargo_line:
+            print(cargo_line)
+        git_line = git_maintenance_pass()
+        if git_line:
+            print(git_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

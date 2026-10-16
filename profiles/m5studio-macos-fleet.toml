@@ -13,6 +13,11 @@ name = "m5studio-macos-fleet"
 id = "m5studio"
 # The SSH alias other fleet hosts reach this one by (self-update peers).
 ssh = "m5s"
+# The one interpreter every tartci LaunchAgent here runs (runbook: Pinned
+# interpreter). Homebrew python@3.12, held by `brew pin python@3.12`; Local
+# Network is granted to this binary once. Homebrew's 3.12.13_2, which m3 and
+# m5 run, is no longer installable, so this host runs 3.12.15.
+python = "/opt/homebrew/Cellar/python@3.12/3.12.15/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Atelier/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"

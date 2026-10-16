@@ -75,6 +75,7 @@ CODES: tuple[str, ...] = (
     "hold_receipt_present",
     "home_volume_floor_not_judged",
     "home_volume_floor_ok",
+    "host_agents_failing",
     "host_agents_missing",
     "host_agents_not_applicable",
     "host_agents_ok",
@@ -116,6 +117,10 @@ CODES: tuple[str, ...] = (
     "power_unknown",
     "profile_drift",
     "profile_drift_unknown",
+    "python_pin_missing",
+    "python_pin_not_applicable",
+    "python_pin_ok",
+    "python_pin_unusable",
     "profile_in_sync",
     "program_unresolvable",
     "readiness_not_managed",
@@ -980,8 +985,49 @@ def check_host_agents(rows: list[dict] | None, *, managed: bool,
         return Finding("host_agents", PROBLEM, "host_agents_missing",
                        f"not loaded: {', '.join(missing)}; this host never refreshes skew "
                        "or tool freshness and never updates itself", facts)
+    # Loaded is not running: an agent refused by the interpreter pin (exit 127)
+    # stays loaded and fails every start.
+    failing = {row["label"]: row.get("last_exit") for row in rows
+               if row.get("label") in REQUIRED_HOST_AGENTS and row.get("last_exit") not in (None, 0)}
+    facts["failing"] = failing
+    if failing:
+        detail = ", ".join(f"{label} last exit {code}" for label, code in sorted(failing.items()))
+        hint = ("; exit 127 is an interpreter refusal: see ~/.tartci/state/interpreter-refused "
+                "and ~/.config/tartci/python.pin") if 127 in failing.values() else ""
+        return Finding("host_agents", PROBLEM, "host_agents_failing",
+                       f"loaded but failing: {detail}{hint}", facts)
     return Finding("host_agents", OK, "host_agents_ok",
-                   "watchdog and self-update agents are loaded", facts)
+                   "watchdog and self-update agents are loaded and last exited 0", facts)
+
+
+def check_python_pin(pin: Path, *, managed: bool) -> Finding:
+    """A managed fleet host must carry ~/.config/tartci/python.pin.
+
+    Without it, every tartci LaunchAgent borrows the interpreter its fleet
+    lanes carry (the bootstrap in providers/common/toml-python.lib.sh). That
+    is safe for one cycle, until an install writes the pin; a host still on
+    the bootstrap has never completed an install with this generation."""
+    if not managed:
+        return Finding("python_pin", NOT_APPLICABLE, "python_pin_not_applicable",
+                       "no installed fleet profile: not a managed fleet host")
+    facts = {"pin": str(pin)}
+    if not pin.is_file():
+        return Finding("python_pin", PROBLEM, "python_pin_missing",
+                       f"{pin} is missing: every tartci LaunchAgent here runs the fleet "
+                       "lanes' interpreter by bootstrap; reinstall the fleet profile "
+                       "(tartci fleet-macos install ... --apply) to write the pin", facts)
+    try:
+        text = pin.read_text()
+    except OSError as exc:
+        return Finding("python_pin", PROBLEM, "python_pin_unusable",
+                       f"{pin} is unreadable: {exc}", facts)
+    value = text.splitlines()[0].strip() if text.strip() else ""
+    facts["python"] = value
+    if not value.startswith("/") or not os.access(value, os.X_OK) or os.path.isdir(value):
+        return Finding("python_pin", PROBLEM, "python_pin_unusable",
+                       f"{pin} names {value or 'nothing'}, which is not an executable "
+                       "absolute path; every LaunchAgent here refuses to run", facts)
+    return Finding("python_pin", OK, "python_pin_ok", f"pinned interpreter {value}", facts)
 
 
 def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | None = None
@@ -1008,7 +1054,9 @@ def launchd_registrations(run: Callable[[list[str]], tuple[int, str, str]] | Non
         if code != 0:
             continue  # listed in another domain or gone since the list
         match = re.search(r"^\tpath = (.+)$", text, re.M)
-        rows.append({"label": label, "path": match.group(1).strip() if match else None})
+        exited = re.search(r"^\tlast exit code = (-?\d+)", text, re.M)
+        rows.append({"label": label, "path": match.group(1).strip() if match else None,
+                     "last_exit": int(exited.group(1)) if exited else None})
     return rows, ""
 
 
@@ -1655,6 +1703,9 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     rows, launchd_error = launchd_registrations(launchd_run)
     findings.append(check_launchd_registrations(rows, home=home, error=launchd_error))
     findings.append(check_host_agents(rows, managed=config.is_file(), error=launchd_error))
+    findings.append(check_python_pin(
+        Path(os.environ.get("TARTCI_PYTHON_PIN") or home / ".config" / "tartci" / "python.pin"),
+        managed=config.is_file()))
     if reclaim_value is None:
         try:
             import reclaim_status

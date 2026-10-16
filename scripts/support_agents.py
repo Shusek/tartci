@@ -185,6 +185,12 @@ OTHER_OWNERS: Dict[str, str] = {
     "com.danielraffel.tartci.self-update": "scripts/install_self_update_agent.sh",
     "com.danielraffel.tartci.http-connect-ssh-relay": "scripts/network_profile.py reconcile",
     "com.danielraffel.tartci.orchard-worker": "scripts/disable_orchard.sh (retirement)",
+    # Persistent-runner healing is installed per runner, not per fleet profile:
+    # the host job on the runner's own host and the central job on one fleet
+    # host, by the recipe in docs/runbook.md ("Runners the janitor must never
+    # delete").
+    "com.danielraffel.tartci.runner-host-health": "docs/runbook.md (persistent runner, its own host)",
+    "com.danielraffel.tartci.persistent-runner-heal": "docs/runbook.md (persistent runners, one fleet host)",
 }
 
 

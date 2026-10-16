@@ -50,6 +50,7 @@ class FakeSystem(su.System):
         self.calls: list[tuple[list[str], str | None]] = []
         self.pool_state = "on"
         self.offplan = [0]             # successive `pool off --plan` exit codes
+        self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
         self.dry_run_rc = 0
         self.preflight_rc = 0
@@ -311,7 +312,11 @@ class FakeSystem(su.System):
             return ok("draining")
         if args[:3] == ["pool", "off", "--plan"]:
             rc = self.offplan.pop(0) if len(self.offplan) > 1 else self.offplan[0]
-            return su.Result(rc, "plan")
+            text = (self.offplan_text.pop(0) if isinstance(self.offplan_text, list)
+                    and len(self.offplan_text) > 1 else
+                    self.offplan_text[0] if isinstance(self.offplan_text, list)
+                    else self.offplan_text)
+            return su.Result(rc, text)
         if args[:2] == ["pool", "off"]:
             if self.off_rc:
                 return su.Result(self.off_rc, "", "refusing pool off: capacity for required label "
@@ -1607,6 +1612,72 @@ class MidJobWaitTests(Base):
         self.assertFalse(any("--apply" in c for c in joined))
 
 
+FORGE = ("com.danielraffel.tartci.tart-runner-macos-fleet.m1.forge-gate: busy, would be KILLED "
+         "(supervisor pid 87749 owns tart run pid 11310)")
+
+
+def plan_text(*rows: str) -> str:
+    """`pool off --plan` output as the real command prints it (m1, 2026-10-16)."""
+    return "\n".join([
+        "pool off --plan on m1: nothing will be changed",
+        "  state: draining -> off; participation: 0 -> 0",
+        "  capacity floor: ok (pool off keeps every required label served)",
+        "  mid-job lanes:", *[f"    {row}" for row in rows],
+        "verdict: pool off would REFUSE (an owned lane is mid-job or unknown; use pool drain, "
+        "or --now)"])
+
+
+class DrainWaitVisibilityTests(Base):
+    def steps(self) -> list[dict]:
+        return json.loads(Path(self.last()["receipt"]).read_text())["steps"]
+
+    def test_the_wait_names_the_lane_once_per_change(self) -> None:
+        other = "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate: busy, x"
+        self.sys.offplan = [12, 12, 12, 0]
+        self.sys.offplan_text = [plan_text(FORGE), plan_text(FORGE), plan_text(FORGE, other),
+                                 "plan"]
+        self.assertUpdated(self.apply())
+        waits = [s["detail"] for s in self.steps() if s["step"] == "wait-idle"]
+        self.assertEqual(waits, [f"waiting on {FORGE}", f"waiting on {FORGE}; {other}",
+                                 "no owned lane mid-job"])
+
+    def test_a_drain_timeout_opens_one_issue_naming_the_lane_and_a_clean_drain_closes_it(
+            self) -> None:
+        self.sys.offplan = [12]
+        self.sys.offplan_text = plan_text(FORGE)
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("m1.forge-gate", self.last()["error"])
+        opened = [t for kind, t in self.issues if kind == "open"]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("self-update drain timed out after 10 min waiting on a lane", opened[0])
+        self.assertIn("supervisor pid 87749 owns tart run pid 11310", self.bodies[0])
+        self.assertIn("a manual VM never blocks the drain", self.bodies[0])
+        import tartci_incident  # noqa: PLC0415
+        self.assertEqual(tartci_incident.parse(self.bodies[0])["class"],
+                         "self_update_drain_timeout")
+        self.assertNotIn(("close", "77"), self.issues)
+        # The next attempt drains cleanly: the issue closes.
+        self.sys.offplan = [0]
+        self.sys.offplan_text = "plan"
+        self.sys.clock += 3600
+        self.apply()
+        self.assertIn(("close", "77"), self.issues)
+
+    def test_the_issue_closes_when_a_later_drain_completes(self) -> None:
+        self.sys.offplan = [12]
+        self.sys.offplan_text = plan_text(FORGE)
+        su.drain_timeout_alert(self.cfg, "m1", [FORGE], 600, NOW)
+        self.assertEqual([k for k, _ in self.issues], ["open"])
+        su.drain_timeout_alert(self.cfg, "m1", [FORGE], 600, NOW + 3600)
+        self.assertEqual([k for k, _ in self.issues], ["open"])   # same episode
+        su.drain_timeout_alert(self.cfg, "m1", None, 30, NOW + 7200)
+        self.assertEqual(self.issues[-1], ("close", "77"))
+
+    def test_mid_job_rows_are_read_from_the_plan(self) -> None:
+        self.assertEqual(su.mid_job_lanes(plan_text(FORGE)), [FORGE])
+        self.assertEqual(su.mid_job_lanes("pool off --plan: nothing\nverdict: ok"), [])
+
+
 class ShipyardWriterLeaseTests(Base):
     """The install writes ~/.local/bin only under `shipyard writer-domain-exec`."""
 
@@ -2301,6 +2372,64 @@ class SealedRollbackTests(Base):
         rollback = [a for a, _ in self.sys.calls if "--apply" in a][-1]
         source = rollback[rollback.index("--launch-helper-source") + 1]
         self.assertIn("rollback", source)
+
+    def test_rollback_reinstalls_with_the_previous_interpreter_and_pin(self) -> None:
+        # m5s, 2026-10-15: the update switched the lanes to a new interpreter
+        # and its pin; the rollback rendered the old launcher against the new
+        # pin, refused, and left the host off.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/python3.15\n")
+
+        seen = {"installs": 0}
+
+        def switch_on_install(argv):
+            if "--apply" in argv and "install" in argv:
+                seen["installs"] += 1
+                if seen["installs"] == 1:  # the new generation's install writes its pin
+                    pin.write_text("/new/python3.12\n")
+        self.sys.hook = switch_on_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "rolled_back")
+        installs = [(a, e) for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertGreaterEqual(len(installs), 2)
+        rollback_argv, rollback_env = installs[-1]
+        self.assertIn("rollback", " ".join(rollback_argv))
+        self.assertEqual(rollback_env.get("TARTCI_PYTHON"), "/old/python3.15")
+        # It must outrank the snapshot profile's host.python in the installer.
+        self.assertEqual(rollback_env.get("TARTCI_ROLLBACK_PYTHON"), "/old/python3.15")
+        self.assertNotIn("TARTCI_ROLLBACK_PYTHON", installs[0][1] or {})
+        self.assertEqual(pin.read_text().strip(), "/old/python3.15")
+
+    def test_rollback_pins_what_the_lanes_ran_when_the_old_pin_disagrees(self) -> None:
+        # The installer honours TARTCI_ROLLBACK_PYTHON only when it equals the
+        # pin or a lane's, so the pin must name the interpreter reinstalled.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/lane-python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/pin-python3.15\n")
+
+        def new_pin_on_first_install(argv):
+            if "--apply" in argv and "install" in argv and pin.read_text().startswith("/old/pin"):
+                pin.write_text("/new/python3.12\n")
+        self.sys.hook = new_pin_on_first_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        installs = [e for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertEqual(installs[-1].get("TARTCI_ROLLBACK_PYTHON"), "/old/lane-python3.15")
+        self.assertEqual(pin.read_text().strip(), "/old/lane-python3.15")
 
     def test_signing_probe_failure_refuses_before_drain(self) -> None:
         self.sys.signing_rc = 1
