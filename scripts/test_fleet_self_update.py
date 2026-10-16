@@ -452,6 +452,9 @@ def make_home(td: Path, *, sealed: bool = False, relay: bool = False) -> Path:
 class Base(unittest.TestCase):
     sealed = False
     relay = False
+    # Sealed-launcher tests about other gates treat the launcher change as
+    # acknowledged; LauncherConsentTests exercises the consent gate itself.
+    consent_gate = False
 
     def setUp(self) -> None:
         self.td = tempfile.TemporaryDirectory()
@@ -480,6 +483,10 @@ class Base(unittest.TestCase):
             original = su.launch_helper
             su.launch_helper = lambda cfg: helper
             self.addCleanup(setattr, su, "launch_helper", original)
+            if not self.consent_gate:
+                gate = mock.patch.object(su, "launcher_change_refusal", return_value=None)
+                gate.start()
+                self.addCleanup(gate.stop)
 
     def tearDown(self) -> None:
         os.environ.pop("TARTCI_HOME", None)
@@ -2381,6 +2388,68 @@ class RelayRollbackTests(Base):
         self.assertEqual(self.sys.running(), INSTALLED)
         self.assertEqual(self.last()["status"], "rolled_back")
         self.assertIn("relay", self.last()["error"])
+
+
+class LauncherConsentTests(Base):
+    """A sealed launcher is not replaced on an external-volume host until an
+    operator has acknowledged the change: replacing TartCILauncher.app can
+    reset its Removable Volumes consent, and then no lane starts."""
+    sealed = True
+    consent_gate = True
+
+    def ack(self) -> Path:
+        return self.home / ".config/tartci/launcher-change-ack"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ack().write_text(T_OLD + "\n")
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def test_an_unacknowledged_change_refuses_and_alerts_before_any_drain(self) -> None:
+        self.ack().unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(any(a[:2] == ["bash", "scripts/build_macos_launcher.sh"]
+                             for a, _ in self.sys.calls), "no signing build for a refused run")
+        self.assertFalse(any("codesign" in a[0] for a, _ in self.sys.calls))
+        self.assertEqual("refused", self.latest()["status"])
+        self.assertIn("launcher change needs consent", self.latest()["error"])
+        self.assertIn(f"echo {T_OLD} > {self.ack()}", self.latest()["error"])
+        self.assertEqual([("open", f"[tartci] studio: grant Removable Volumes to TartCI Launcher "
+                                   f"before self-update installs {T_OLD[:12]}")], self.issues)
+        body = self.bodies[0]
+        self.assertIn(f"echo {T_OLD} > {self.ack()}", body)
+        self.assertIn("Files and Folders", body)
+        self.assertIn("## Safe to auto-apply\nNo.", body)
+        # A refusal does not spend the attempt: once acknowledged it updates.
+        self.ack().write_text(T_OLD + "\n")
+        self.assertUpdated(self.apply())
+        self.assertIn(("close", "77"), self.issues)
+
+    def test_an_acknowledgement_for_another_commit_still_refuses(self) -> None:
+        self.ack().write_text(T_NEW + "\n")
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_plan_reports_the_refusal_and_opens_nothing(self) -> None:
+        self.ack().unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.plan())
+        self.assertEqual([], self.issues)
+        self.assertEqual([], self.sys.mutations())
+
+    def test_no_change_to_the_launcher_needs_no_consent(self) -> None:
+        self.ack().unlink()
+        self.assertIsNone(su.launcher_change_refusal(self.cfg, INSTALLED, INSTALLED, False))
+        self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, True))
+        self.assertIsNotNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
+
+    def test_a_host_without_a_sealed_launcher_is_not_gated(self) -> None:
+        self.ack().unlink()
+        with mock.patch.object(su, "launch_helper", return_value=None):
+            self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
 
 
 class SealedRollbackTests(Base):

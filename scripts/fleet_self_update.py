@@ -1368,6 +1368,90 @@ def mid_job_lanes(plan_text: str) -> list[str]:
     return rows
 
 
+def launcher_ack_path(cfg: Config) -> Path:
+    return cfg.home / ".config" / "tartci" / "launcher-change-ack"
+
+
+def launcher_change_refusal(cfg: Config, target: str, installed: str,
+                            refresh: bool) -> str | None:
+    """Why this update must not replace the sealed launcher yet, or None.
+
+    The launcher bundle seals the support tree and its commit, so every update
+    to a new commit replaces TartCILauncher.app, and replacing it can reset
+    its Removable Volumes consent. On a host whose Tart store is on an
+    external volume the helper's open() then blocks and every lane stops. The
+    update proceeds only once an operator has acknowledged that exact target
+    commit in launcher-change-ack (the bundle digest cannot be the key: each
+    build is re-signed with a new timestamp). Checked before any drain.
+    """
+    if launch_helper(cfg) is None or refresh or target == installed:
+        return None
+    try:
+        acknowledged = launcher_ack_path(cfg).read_text().strip()
+    except OSError:
+        acknowledged = ""
+    if acknowledged == target:
+        return None
+    return (f"launcher change needs consent: {installed[:12]} -> {target[:12]} replaces "
+            "TartCI Launcher, which can reset its Removable Volumes consent; acknowledge "
+            f"with: echo {target} > {launcher_ack_path(cfg)}")
+
+
+def launcher_consent_alert(cfg: Config, me: str, target: str, installed: str,
+                           refusal: str | None, now: float) -> None:
+    """One issue while a launcher change waits for consent; it closes once the
+    change is acknowledged or no longer needed. Best effort: never raises."""
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "launcher-consent-alert.json"
+        since = (host_off._read_json(path) or {}).get("since") or _iso(now)
+        ack = launcher_ack_path(cfg)
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update to `{target[:12]}` would replace TartCI Launcher "
+                f"(installed from `{installed[:12]}`). It refused before draining: the host "
+                "is still serving on the installed generation.", "",
+                "## Evidence",
+                f"- `{ack}` does not name `{target}`",
+                "- the self-update receipt's `refused` step quotes this refusal", "",
+                "## Likely cause",
+                "Every TartCI commit seals a new launcher bundle. Replacing the bundle can "
+                "reset its per-app Removable Volumes consent; this host's Tart store is on "
+                "an external volume, so without that consent the helper blocks in open() "
+                "and no lane starts.", "",
+                "## Fix", "```sh",
+                "# 1. allow this one update to replace the launcher",
+                f"echo {target} > {ack}",
+                "# 2. right after it installs: grant Removable Volumes to TartCI Launcher",
+                "#    System Settings > Privacy & Security > Files and Folders >",
+                "#    TartCI Launcher > Removable Volumes (on)",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. The consent is a person's decision in System Settings.", "",
+                "## How to verify",
+                "The next self-update passes this gate and installs; `tartci pool on` then "
+                "passes the launch-helper volume probe. This issue closes itself.",
+            ])
+            title = (f"[tartci] {me}: grant Removable Volumes to TartCI Launcher before "
+                     f"self-update installs {target[:12]}")
+            marker = tartci_incident.marker(me, "launcher_consent_needed", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=refusal is not None, resolved=refusal is None,
+            since=since if refusal is not None else None,
+            raise_event=lambda: host_off.event(cfg.state_dir, "launcher_consent_needed",
+                                               (refusal or "")[:300],
+                                               {"target": target, "installed": installed}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: launcher-consent alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
 def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: float,
                         now: float) -> None:
     """One issue while the self-update drain timed out waiting on a lane; it
@@ -2363,6 +2447,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             prior = recent_attempt(cfg, target, now)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
+        consent = launcher_change_refusal(cfg, target, installed, bool(refresh))
+        if apply:
+            launcher_consent_alert(cfg, me, target, installed, consent, now)
+        if consent is not None:
+            raise Refused(consent)
         if apply and scheduled:
             sys_.sleep(stagger_seconds(me))
         _checkout(cfg, sys_, target)

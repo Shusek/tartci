@@ -8,6 +8,7 @@ import plistlib
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -25,6 +26,55 @@ TIMEOUT_ENV = "TARTCI_LAUNCH_HELPER_PROBE_TIMEOUT_SECS"
 # as a throttled Background job would (macOS throttles Background disk I/O
 # whenever other I/O is in flight).
 PROCESS_TYPE = "Standard"
+
+
+# The control: the same small write, made by this (parent) process into the
+# same directory. A helper that times out while this write is fast is blocked
+# in its own open() (per-app consent), not by the volume.
+CONTROL_TIMEOUT_SECONDS = 10.0
+SLOW_CONTROL_MS = 1000.0
+
+
+def parent_write_ms(directory: str, timeout: float = CONTROL_TIMEOUT_SECONDS) -> dict:
+    """Time one create/write/remove in directory from this process, bounded."""
+    result: dict = {}
+
+    def write() -> None:
+        started = time.monotonic()
+        try:
+            fd, name = tempfile.mkstemp(prefix=".tartci-probe-control.", dir=directory)
+            try:
+                os.write(fd, b"tartci probe control\n")
+            finally:
+                os.close(fd)
+                os.unlink(name)
+            result["ms"] = (time.monotonic() - started) * 1000
+        except OSError as error:
+            result["error"] = f"{type(error).__name__}: {error}"
+
+    worker = threading.Thread(target=write, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return {"timed_out": True, "timeout": timeout}
+    return result
+
+
+def timeout_message(timeout_seconds: float, elapsed: float, tart_home: str, control: dict) -> str:
+    """Name what blocked: the helper (fast control write) or the volume."""
+    head = (f"launch helper volume probe timed out after {timeout_seconds:g}s "
+            f"(probe wait elapsed {elapsed:.3f}s; its write to {tart_home} did not finish)")
+    if "ms" in control and control["ms"] < SLOW_CONTROL_MS:
+        return (f"{head}: helper blocked in open(); same-dir write from parent took "
+                f"{control['ms']:.0f} ms, so the volume is not slow. Grant Removable Volumes "
+                "to TartCI Launcher (System Settings > Privacy & Security > Files and Folders)")
+    if "ms" in control:
+        return (f"{head}: volume I/O slow; same-dir write from parent took "
+                f"{control['ms']:.0f} ms. Not an access denial")
+    if control.get("timed_out"):
+        return (f"{head}: volume I/O slow; same-dir write from parent did not finish within "
+                f"{control['timeout']:g}s. Not an access denial")
+    return f"{head}: same-dir write from parent failed too ({control.get('error', 'unknown')})"
 
 
 def fail(message: str) -> None:
@@ -119,9 +169,8 @@ def run(helper: dict, profile: dict, timeout_seconds: float | None = None) -> di
                 time.sleep(0.1)
             if outcome is None:
                 wait_elapsed = time.monotonic() - probe_started
-                fail(f"launch helper volume probe timed out after {timeout_seconds:g}s "
-                     f"(probe wait elapsed {wait_elapsed:.3f}s; its write to {host['tart_home']} "
-                     "did not finish: volume I/O slow, not an access denial)")
+                fail(timeout_message(timeout_seconds, wait_elapsed, host["tart_home"],
+                                     parent_write_ms(host["tart_home"])))
         except Exception as error:  # Preserve the primary probe diagnosis.
             probe_error = error
         finally:

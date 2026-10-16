@@ -410,7 +410,7 @@ class HostDeliveryReportTests(unittest.TestCase):
                 "source_commit": commit,
                 "support_manifest_sha256": "a" * 64,
                 "profile_policy_sha256": "b" * 64,
-                "tart_home": "/Volumes/Workshop/VMs",
+                "tart_home": "/Volumes/Example/VMs",
             }))
             (app / "Contents/Resources/lanes.json").write_text(json.dumps({
                 "schema": 1, "lanes": {"studio-pulp-gate": {"environment": {}}},

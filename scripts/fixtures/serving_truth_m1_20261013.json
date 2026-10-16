@@ -1298,7 +1298,7 @@
    "vm": "m1-pulp-gate-01-15902-3"
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 Daniels-Mac-Studio-m3-4:free=1,in_flight=1",
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 studio-host-m3-4:free=1,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-01",
    "ts": "2026-10-12T20:38:03Z",
@@ -1410,7 +1410,7 @@
    "vm": ""
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=2 peer_cover=2 local_cover=1 excess=-1 Daniels-Mac-Studio-m3-4:free=1,in_flight=1",
+   "detail": "tier=1 label=pulp-build-pr-head demand=2 peer_cover=2 local_cover=1 excess=-1 studio-host-m3-4:free=1,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-slot2-02",
    "ts": "2026-10-12T21:08:56Z",
@@ -1445,7 +1445,7 @@
    "vm": ""
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=0 local_cover=1 excess=0 Daniels-Mac-Studio-m3-4:free=0,in_flight=0",
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=0 local_cover=1 excess=0 studio-host-m3-4:free=0,in_flight=0",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-slot2-02",
    "ts": "2026-10-12T21:25:24Z",
@@ -1494,7 +1494,7 @@
    "vm": "m1-pulp-gate-01-15902-5"
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 Daniels-Mac-Studio-m3-4:free=1,in_flight=1",
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 studio-host-m3-4:free=1,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-slot2-02",
    "ts": "2026-10-12T21:43:36Z",
@@ -1585,14 +1585,14 @@
    "vm": ""
   },
   {
-   "detail": "tier=0 label=pulp-build-merge-group demand=1 peer_cover=1 local_cover=1 excess=-1 Daniels-Mac-Studio-m3-4:free=0,in_flight=1",
+   "detail": "tier=0 label=pulp-build-merge-group demand=1 peer_cover=1 local_cover=1 excess=-1 studio-host-m3-4:free=0,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-slot2-02",
    "ts": "2026-10-12T22:21:16Z",
    "vm": ""
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=1 local_cover=0 excess=0 Daniels-Mac-Studio-m3-4:free=0,in_flight=1",
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=1 local_cover=0 excess=0 studio-host-m3-4:free=0,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-01",
    "ts": "2026-10-12T22:26:37Z",
@@ -1788,7 +1788,7 @@
    "vm": ""
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=0 local_cover=1 excess=0 Daniels-Mac-Studio-m3-4:free=0,in_flight=0",
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=0 local_cover=1 excess=0 studio-host-m3-4:free=0,in_flight=0",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-slot2-02",
    "ts": "2026-10-12T23:24:29Z",
@@ -1802,14 +1802,14 @@
    "vm": ""
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 Daniels-Mac-Studio-m3-4:free=1,in_flight=1",
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 studio-host-m3-4:free=1,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-01",
    "ts": "2026-10-12T23:33:32Z",
    "vm": ""
   },
   {
-   "detail": "tier=1 label=pulp-build-pr-head demand=3 peer_cover=2 local_cover=1 excess=0 Daniels-Mac-Studio-m3-4:free=0,in_flight=2",
+   "detail": "tier=1 label=pulp-build-pr-head demand=3 peer_cover=2 local_cover=1 excess=0 studio-host-m3-4:free=0,in_flight=2",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-slot2-02",
    "ts": "2026-10-12T23:39:50Z",
@@ -1858,7 +1858,7 @@
    "vm": ""
   },
   {
-   "detail": "tier=0 label=pulp-build-merge-group demand=1 peer_cover=1 local_cover=0 excess=0 Daniels-Mac-Studio-m3-4:free=0,in_flight=1",
+   "detail": "tier=0 label=pulp-build-merge-group demand=1 peer_cover=1 local_cover=0 excess=0 studio-host-m3-4:free=0,in_flight=1",
    "event": "fallback_hold",
    "runner": "m1-pulp-gate-01",
    "ts": "2026-10-12T23:58:05Z",
