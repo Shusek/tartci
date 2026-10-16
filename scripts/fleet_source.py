@@ -120,12 +120,83 @@ def _symlinked_source_files(root: Path) -> list[str]:
 
 def _profile_problem(path: Path) -> str | None:
     """Return a parse error for one profile, or None when it is valid TOML."""
-    if tomllib is None:
-        return "Python 3.11+ with tomllib is required to validate profiles"
     try:
-        tomllib.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return f"{path.name} is not valid UTF-8 TOML: {exc}"
+    if tomllib is None:
+        # The stock macOS/Python 3.9 interpreter has no TOML module. Keep the
+        # source usable there with a conservative syntax check; the profile
+        # consumers that interpret the full document already require the
+        # pinned 3.11+ interpreter. The marker and blob checks still bind the
+        # exact bytes, and a 3.11+ resolver performs full TOML parsing.
+        return _fallback_toml_problem(path.name, text)
+    try:
+        tomllib.loads(text)
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         return f"{path.name} is not valid TOML: {exc}"
+    return None
+
+
+def _fallback_toml_problem(name: str, text: str) -> str | None:
+    """Catch malformed profile syntax without a third-party TOML dependency.
+
+    This is deliberately a syntax guard, not a TOML interpreter. Python 3.9
+    must be able to select and read a pinned source's published supply, while
+    full profile interpretation remains on the repository's 3.11+ path.
+    """
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw
+        content: list[str] = []
+        line_depth = depth
+        i = 0
+        while i < len(line):
+            char = line[i]
+            if quote:
+                content.append(char)
+                if quote == '"' and escaped:
+                    escaped = False
+                elif quote == '"' and char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                i += 1
+                continue
+            if char in ('"', "'"):
+                quote = char
+                content.append(char)
+            elif char == "#":
+                break
+            else:
+                content.append(char)
+                if char in "[{":
+                    depth += 1
+                elif char in "]}":
+                    depth -= 1
+                    if depth < 0:
+                        return f"{name} is not valid TOML near line {number}"
+            i += 1
+        clean = "".join(content).strip()
+        if not clean:
+            continue
+        if depth == 0 and clean.startswith("["):
+            if not (clean.startswith("[[") and clean.endswith("]]")) and not (
+                    clean.startswith("[") and clean.endswith("]")):
+                return f"{name} is not valid TOML near line {number}"
+        elif depth == 0 and "=" not in clean:
+            return f"{name} is not valid TOML near line {number}"
+        if depth == 0 and "=" in clean and not clean.startswith("["):
+            key, value = clean.split("=", 1)
+            if not key.strip() or not value.strip():
+                return f"{name} is not valid TOML near line {number}"
+        # A table header's brackets are delimiters, not a value container.
+        if line_depth == 0 and clean.startswith("["):
+            depth = 0
+    if quote or depth:
+        return f"{name} is not valid TOML (unclosed string or container)"
     return None
 
 
