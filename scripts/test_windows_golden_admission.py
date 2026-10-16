@@ -100,6 +100,7 @@ class WindowsGoldenAdmissionTests(unittest.TestCase):
             self.assertIn('"$TARTCI_PYTHON" "$', script)
             self.assertNotIn("nice -n 20 python3", script)
 
+    @unittest.skipIf(sys.version_info < (3, 11), "the pinned interpreter must be 3.11+ (tomllib)")
     @unittest.skipUnless(sys.platform == "darwin", "APFS CoW snapshot needs macOS")
     def test_snapshot_uses_explicit_python_when_path_python3_is_shadowed(self):
         self.sidecar()
@@ -124,13 +125,41 @@ class WindowsGoldenAdmissionTests(unittest.TestCase):
             [str(SNAPSHOT), str(self.image), str(snapshot)],
             env=env, capture_output=True, text=True, check=False,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("verify_windows_golden.py", log.read_text(encoding="utf-8"))
-        self.assertNotIn("shadowed-python", result.stderr)
         self.addCleanup(lambda: subprocess.run(
             ["chflags", "nouchg", str(snapshot), f"{snapshot}.sha256"],
             capture_output=True, check=False,
         ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verify_windows_golden.py", log.read_text(encoding="utf-8"))
+        self.assertNotIn("shadowed-python", result.stderr)
+        # The private snapshot and its sidecar are sealed before QEMU reads them.
+        import stat  # noqa: PLC0415
+        for path in (snapshot, Path(f"{snapshot}.sha256")):
+            with self.subTest(sealed=path.name):
+                self.assertTrue(path.stat().st_flags & stat.UF_IMMUTABLE)
+
+    def test_print_host_health_answers_on_an_unpinned_launchd_host(self):
+        # The print-exits need no interpreter: a launchd host with no pin must
+        # still answer the health probe (exit 0) rather than die on the pin.
+        stubs = self.root / "stubs"
+        stubs.mkdir()
+        for name in ("qemu-system-aarch64", "gh"):
+            (stubs / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (stubs / name).chmod(0o755)
+        home = self.root / "home"
+        home.mkdir()
+        env = {"HOME": str(home), "PATH": f"{stubs}:/usr/bin:/bin", "TARTCI_LAUNCHD": "1",
+               "TARTCI_HOME": str(home / ".tartci")}
+        health = subprocess.run([str(RUNNER), "--print-host-health"], env=env,
+                                capture_output=True, text=True, check=False, timeout=120)
+        self.assertEqual(health.returncode, 0, health.stderr)
+        self.assertNotIn("no pinned Python", health.stderr)
+        # Control, same host: going past the print-exits still refuses the
+        # unpinned interpreter.
+        past = subprocess.run([str(RUNNER), "--once"], env=env,
+                              capture_output=True, text=True, check=False, timeout=120)
+        self.assertNotEqual(past.returncode, 0)
+        self.assertIn("refusing an unpinned interpreter", past.stderr)
 
     @unittest.skipUnless(sys.platform == "darwin", "APFS CoW snapshot needs macOS")
     def test_private_snapshot_survives_source_swap_and_refuses_bad_receipt(self):

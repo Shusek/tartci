@@ -86,12 +86,6 @@ now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
 
-# Golden admission streams a potentially large qcow2. Resolve the interpreter
-# once through the host pin so a launchd PATH change cannot silently select a
-# different Python (or one without the required tomllib support).
-TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
-export TARTCI_PYTHON
-
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
@@ -227,6 +221,13 @@ esac; done
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+# Golden admission streams a potentially large qcow2. Resolve the interpreter
+# once through the host pin so a launchd PATH change cannot silently select a
+# different Python (or one without the required tomllib support). This comes
+# after the print-exits, which need no interpreter and must answer on a host
+# whose pin is broken.
+TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
+export TARTCI_PYTHON
 [[ "$RUNNER_NAME_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
   || die "unsafe Windows runner name prefix"
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
