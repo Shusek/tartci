@@ -155,7 +155,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertEqual(
                 arguments,
                 [
-                    "/Users/example/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher",
+                    "/Users/danielraffel/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher",
                     "--lane",
                     value["EnvironmentVariables"]["TARTCI_QUEUE_LANE_ID"],
                 ],
@@ -172,34 +172,34 @@ class MacosFleetLaneTests(unittest.TestCase):
                 fleet.load(path)
 
     def test_launcher_accepts_a_differently_named_external_volume(self) -> None:
-        """m5studio keeps its store on /Volumes/Store, not Workshop."""
+        """m5studio keeps its store on /Volumes/Atelier, not Workshop."""
         data = fleet.load(ROOT / "profiles" / "m5studio-macos-fleet.toml")
-        self.assertEqual(data["host"]["tart_home"], "/Volumes/Store/VMs")
+        self.assertEqual(data["host"]["tart_home"], "/Volumes/Atelier/VMs")
         self.assertEqual(
             data["launch_helper"]["approval_sha256_path"],
-            "/Users/example/.config/tartci/m5studio-launcher-approved.sha256")
+            "/Users/danielraffel/.config/tartci/m5studio-launcher-approved.sha256")
         self.assertNotIn("worktree_cleanup", data)
         self.assertNotIn("build_disagreement", data)
-        self.assertEqual(data["reclaim"]["repo"], "/Volumes/Store/Code/pulp")
+        self.assertEqual(data["reclaim"]["repo"], "/Volumes/Atelier/Code/pulp")
 
     def test_launcher_rejects_a_store_at_the_volume_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m3.toml"
             path.write_text(HOST_CONFIGS["studio"].read_text().replace(
-                'tart_home = "/Volumes/Example/VMs"', 'tart_home = "/Volumes/Example"'
+                'tart_home = "/Volumes/Workshop/VMs"', 'tart_home = "/Volumes/Workshop"'
             ))
             with self.assertRaisesRegex(ValueError, "below an external volume root"):
                 fleet.load(path)
 
     def test_launcher_approval_path_stays_in_the_private_config_dir(self) -> None:
         body = HOST_CONFIGS["studio"].read_text()
-        for bad in ("/Users/example/m3-launcher-approved.sha256",
-                    "/Users/example/.config/tartci/m3-approved.sha256",
-                    "/Users/example/.config/tartci/../m3-launcher-approved.sha256"):
+        for bad in ("/Users/danielraffel/m3-launcher-approved.sha256",
+                    "/Users/danielraffel/.config/tartci/m3-approved.sha256",
+                    "/Users/danielraffel/.config/tartci/../m3-launcher-approved.sha256"):
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as td:
                 path = Path(td) / "m3.toml"
                 path.write_text(body.replace(
-                    "/Users/example/.config/tartci/m3-launcher-approved.sha256", bad))
+                    "/Users/danielraffel/.config/tartci/m3-launcher-approved.sha256", bad))
                 with self.assertRaisesRegex(ValueError, "approval_sha256_path"):
                     fleet.load(path)
 
@@ -210,7 +210,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             config = root / "m3.toml"
             config.write_text(
                 HOST_CONFIGS["studio"].read_text()
-                .replace("/Users/example", str(home))
+                .replace("/Users/danielraffel", str(home))
             )
             helper = {
                 "path": str(home / ".local/libexec/tartci-launcher"),
@@ -234,7 +234,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     Path("receipt"), config, root / "agents", root / "support"
                 )
             self.assertTrue(result["passed"])
-            self.assertEqual(result["path"], "/Volumes/Example/VMs")
+            self.assertEqual(result["path"], "/Volumes/Workshop/VMs")
             self.assertEqual(run.call_args_list[-1].args[0][1], "bootout")
             # launchd can defer the probe's RunAtLoad launch indefinitely on a
             # busy host, so it is kickstarted right after bootstrap.
@@ -698,10 +698,10 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_all_host_profiles_validate_with_exact_paths_and_routing(self) -> None:
         expected = {
-            "m1": ("/Users/example/VMs", "vellum-host-m1", False),
-            "studio": ("/Volumes/Example/VMs", "vellum-host-m3", False),
-            "m5": ("/Users/example/VMs", "vellum-host-m5", False),
-            "m5studio": ("/Volumes/Store/VMs", "vellum-host-m5studio", False),
+            "m1": ("/Users/danielraffel/VMs", "vellum-host-m1", False),
+            "studio": ("/Volumes/Workshop/VMs", "vellum-host-m3", False),
+            "m5": ("/Users/danielraffel/VMs", "vellum-host-m5", False),
+            "m5studio": ("/Volumes/Atelier/VMs", "vellum-host-m5studio", False),
         }
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
@@ -716,7 +716,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 )
                 data = tomllib.loads(config.read_text())
                 self.assertEqual(data["host"]["id"], host_id)
-                self.assertEqual(data["host"]["home"], "/Users/example")
+                self.assertEqual(data["host"]["home"], "/Users/danielraffel")
                 self.assertEqual(data["host"]["tart_home"], expected[host_id][0])
                 self.assertEqual(
                     data["host"].get("github_api_timeout_seconds"),
@@ -802,8 +802,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                         "enabled": False,
                         "minimum_macos_major": 27,
                         "minimum_tart_version": "2.36.0",
-                        "registry_username_file": "/Users/example/.config/pulp/secrets/ghcr-stackbench-username",
-                        "registry_token_file": "/Users/example/.config/pulp/secrets/ghcr-stackbench-token",
+                        "registry_username_file": "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-username",
+                        "registry_token_file": "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token",
                         "flat_rollback": "pulp-build-runner:latest",
                     },
                 )
@@ -874,9 +874,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                         expected_github_app = {
                             "SHIPYARD_GITHUB_APP_ID": "3878000",
                             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH":
-                                "/Users/example/.config/shipyard/github-apps/shipyard-local.private-key.pem",
+                                "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem",
                             "SHIPYARD_GITHUB_APP_CACHE_DIR":
-                                "/Users/example/.config/shipyard/ghapp-cache",
+                                "/Users/danielraffel/.config/shipyard/ghapp-cache",
                         }
                         self.assertTrue(all(
                             {key: value["EnvironmentVariables"][key]
@@ -1284,9 +1284,9 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(all(
                 value["EnvironmentVariables"]["SHIPYARD_GITHUB_APP_ID"] == "3878000"
                 and value["EnvironmentVariables"]["SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH"]
-                == "/Users/example/.config/shipyard/github-apps/shipyard-local.private-key.pem"
+                == "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
                 and value["EnvironmentVariables"]["SHIPYARD_GITHUB_APP_CACHE_DIR"]
-                == "/Users/example/.config/shipyard/ghapp-cache"
+                == "/Users/danielraffel/.config/shipyard/ghapp-cache"
                 for value in values
             ))
             self.assertTrue(all(value["EnvironmentVariables"]["TARTCI_ADMISSION_CLEAN_MODE"] == "required" for value in values))
@@ -1306,8 +1306,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS" not in value["EnvironmentVariables"]
                 for value in values if value not in pulp_values
             ))
-            self.assertTrue(all(value["EnvironmentVariables"]["TART_HOME"] == "/Users/example/VMs" for value in values))
-            self.assertTrue(all(Path(value["StandardOutPath"]).parent == Path("/Users/example/Library/Logs/tartci") for value in values))
+            self.assertTrue(all(value["EnvironmentVariables"]["TART_HOME"] == "/Users/danielraffel/VMs" for value in values))
+            self.assertTrue(all(Path(value["StandardOutPath"]).parent == Path("/Users/danielraffel/Library/Logs/tartci") for value in values))
             repos = {value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"] for value in values}
             self.assertEqual(
                 repos,
@@ -1368,7 +1368,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             agents = root / "agents"
             agents.mkdir()
             config = root / "fleet.toml"
-            config.write_text(CONFIG.read_text().replace("/Users/example", str(home)))
+            config.write_text(CONFIG.read_text().replace("/Users/danielraffel", str(home)))
             render = subprocess.run(
                 [str(ROOT / "tartci"), "fleet-macos", "render", str(config), "--output", str(agents)],
                 text=True, capture_output=True, check=False,
@@ -1554,19 +1554,19 @@ class MacosFleetLaneTests(unittest.TestCase):
         base = CONFIG.read_text()
         fixtures = {
             "partial": base.replace(
-                'cache_dir = "/Users/example/.config/shipyard/ghapp-cache"\n',
+                'cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache"\n',
                 "",
                 1,
             ),
             "bad-id": base.replace('id = "3878000"', 'id = "not-an-id"', 1),
             "key-outside-root": base.replace(
-                'private_key_path = "/Users/example/.config/shipyard/github-apps/shipyard-local.private-key.pem"',
+                'private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"',
                 'private_key_path = "/tmp/github-app.pem"',
                 1,
             ),
             "cache-traversal": base.replace(
-                'cache_dir = "/Users/example/.config/shipyard/ghapp-cache"',
-                'cache_dir = "/Users/example/.config/shipyard/nested/../ghapp-cache"',
+                'cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache"',
+                'cache_dir = "/Users/danielraffel/.config/shipyard/nested/../ghapp-cache"',
                 1,
             ),
         }
@@ -2312,7 +2312,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             "shared world-writable dir": ({"cache_root": "/Users/Shared/pulp-trusted"},
                                           "below host.home"),
             "the home itself": ({"cache_root": "/Users/x"}, "below host.home"),
-            "a volume mount point": ({"cache_root": "/Volumes/Example"}, "below host.home"),
+            "a volume mount point": ({"cache_root": "/Volumes/Workshop"}, "below host.home"),
         }
         for name, (overrides, message) in cases.items():
             with self.subTest(name=name):
@@ -2449,7 +2449,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertIn("before provider support and benchmark graduation", result.stderr)
 
     def test_stacked_image_secret_paths_reject_noncanonical_traversal(self) -> None:
-        token = "/Users/example/.config/pulp/secrets/ghcr-stackbench-token"
+        token = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
         fixtures = {
             "terminal-parent": token.replace("ghcr-stackbench-token", ".."),
             "terminal-current": token.replace("ghcr-stackbench-token", "."),
@@ -2468,8 +2468,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertIn("absolute host-local Pulp secret path", result.stderr)
 
     def test_stacked_image_secret_paths_must_be_distinct(self) -> None:
-        username = "/Users/example/.config/pulp/secrets/ghcr-stackbench-username"
-        token = "/Users/example/.config/pulp/secrets/ghcr-stackbench-token"
+        username = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-username"
+        token = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
         with tempfile.TemporaryDirectory() as td:
             bad = Path(td) / "stacked-secret-identical.toml"
             bad.write_text(CONFIG.read_text().replace(token, username, 1))
@@ -3502,7 +3502,7 @@ class ExecutedGenerationTests(unittest.TestCase):
             "source_commit": commit,
             "support_manifest_sha256": manifest_sha256,
             "profile_policy_sha256": "d" * 64,
-            "tart_home": "/Volumes/Example/VMs",
+            "tart_home": "/Volumes/Workshop/VMs",
         }, sort_keys=True))
         self.write_plist([str(executable), "--lane", "studio-pulp-gate"])
         return sealed_launch

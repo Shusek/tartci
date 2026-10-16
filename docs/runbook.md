@@ -3626,7 +3626,7 @@ touch ~/.config/tartci/reap-agent-cargo.enabled
 Every agent worktree of a repository shares one object store, and any git
 command can start `git maintenance run --auto` or `git repack` in the
 background. On m3 around 07:15Z on 2026-10-16, 53+ of them ran at once on
-`/Volumes/Workshop/Code/pulp` and the load reached 207. Three parts handle
+`<checkout>` and the load reached 207. Three parts handle
 this (`scripts/git_maintenance_guard.py`):
 
 - **Check (every watchdog pass, report only).** More than 3 `git
@@ -3650,7 +3650,7 @@ this (`scripts/git_maintenance_guard.py`):
 Enable it on m3 first:
 
 ```sh
-echo /Volumes/Workshop/Code/pulp > ~/.config/tartci/git-maintenance.repos
+echo "<checkout>" > ~/.config/tartci/git-maintenance.repos   # the shared checkout, absolute
 scripts/git_maintenance_guard.py enforce
 scripts/git_maintenance_guard.py nightly --dry-run
 touch ~/.config/tartci/git-maintenance.enabled
