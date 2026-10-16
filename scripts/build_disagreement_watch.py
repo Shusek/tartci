@@ -51,6 +51,9 @@ except ModuleNotFoundError:  # pragma: no cover - launchd hosts run this under 3
     tomllib = None  # type: ignore[assignment]
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from python_child import child_python  # noqa: E402
+
 DETECTOR = HERE / "build_disagreement.py"
 
 MIN_INTERVAL_MINUTES = 15
@@ -223,7 +226,7 @@ def cycle(profile_file: Path, state_path: Path, *, now: float | None = None,
                 "last_state": state.get("last_state")}
 
     report: dict[str, Any] = {"ran": False, "alarms": [], "deduplicated": []}
-    argv = [python or sys.executable, str(DETECTOR), "--enable", "--json", *detector_args(table)]
+    argv = [python or child_python(), str(DETECTOR), "--enable", "--json", *detector_args(table)]
     if replay:
         argv += list(replay)
     else:
