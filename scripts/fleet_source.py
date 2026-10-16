@@ -128,4 +128,3 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
                 "configured fleet source requires TARTCI_FLEET_SOURCE_REPOSITORY"
             )
     return FleetSource(root, profiles_dir, published_supply, bool(configured_root))
-
