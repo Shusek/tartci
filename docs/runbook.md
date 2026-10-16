@@ -3445,6 +3445,48 @@ non-gate budget), **not** a redundant safety patch. Do **not** "pin
 acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
 reserve. Keep the override (or remove it for a linux lane sized to the full
 12-core budget); either way the clamp keeps the gate safe.
+## Host hygiene: disk floor and foreign VMs
+
+The watchdog runs two report-only checks (`scripts/host_hygiene.py`). They
+never delete or stop anything. They run only on a host where
+`~/.config/tartci/host-hygiene.enabled` exists. Enable one host at a time: m1
+first, then m5, m3 and m5s, one per day.
+
+- **Disk floor.** The volumes that hold `$HOME` and the VM store must keep 20%
+  and 200 GB free. Below either, the log shows `WARN host-disk` and one issue
+  opens: `[tartci] <host> is below its disk floor: <N> GB free (<P>%)`
+  (`host_disk_floor`). The issue lists the top consumers with their sizes and
+  the command to reclaim each:
+  - `~/agent-scratch`, `~/agent-worktrees` and `~/Code/agent-worktrees`.
+    Their owners remove these; use `git worktree remove`, never `rm -rf`.
+  - Both Tart stores.
+  - The build trees. `tartci reclaim --fix` is the only automatic reclaim.
+
+  Sizes are measured at most every 6 h. The issue closes when the floor holds
+  again.
+- **Foreign VMs.** Hourly, the VM store and `~/.tart` are judged with the
+  image pruner's own ownership rule (`tart_image_prune.plan()`):
+  - An image is reported only when that plan would delete it. Every
+    `:latest` tag, golden, Pulp vm-image manifest image, newest rollback, and
+    image a tartci file names is tartci's.
+  - A non-image VM is reported when it is not this host's lane clone,
+    nothing tartci installed names it, and it has been running more than
+    4 h or stopped more than 14 days.
+
+  It opens one issue: `[tartci] <host> has <N> VM(s) nothing tartci uses`
+  (`host_foreign_vms`), with name, store, state, age, size and reason, plus
+  stop and delete commands for an operator to run after the owner agrees.
+  If the fleet profile is unreadable, nothing is judged. A store that cannot
+  be judged is logged as `WARN foreign-vms: could not list <store>`.
+- **Measuring cost.** `du` runs as a background task (`taskpolicy -b`), with
+  one 300 s deadline for the whole measurement inside the heal pass.
+
+```sh
+touch ~/.config/tartci/host-hygiene.enabled
+launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
+ls ~/.tartci/state/host-hygiene/      # consumers.json, foreign-vms.json
+```
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
