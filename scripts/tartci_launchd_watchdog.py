@@ -849,15 +849,30 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
         print(f"launchd-watchdog: REFUSE: no plist for {label} at {plist}",
               file=sys.stderr)
         return RELOAD_REFUSED if dry_run else RELOAD_FAILED
-    if not allow_mid_job:
+    def log(outcome: str) -> None:
+        # Who reloaded which lane (scripts/manual_change_log.py); never fails.
+        if dry_run:
+            return
+        try:
+            import manual_change_log  # noqa: PLC0415 - sibling module
+            manual_change_log.record("launchd reload", outcome,
+                                     [label] + (["--force"] if allow_mid_job else []))
+        except Exception:  # noqa: BLE001 - the record never blocks the reload
+            pass
+
+    if allow_mid_job:
+        log("forced: mid-job check skipped")
+    else:
         refusal = mid_job_refusal(label, launch_agents_dir)
         if refusal is not None:
+            log(f"refused: {refusal}")
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "
                   "tartci pool drain so it finishes its job and stops.\n"
                   "  Override (kills the job): tartci launchd reload "
-                  f"{label} --allow-mid-job", file=sys.stderr)
+                  f"{label} --force (or --allow-mid-job)", file=sys.stderr)
             return RELOAD_REFUSED
+        log("proceeding: lane idle")
     plan = plan_reload(label, plist)
     if not plan.proceed:
         print(f"launchd-watchdog: REFUSE: {plan.reason}", file=sys.stderr)
@@ -1613,7 +1628,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="report what heal/reload would do; take no action. "
                     "With --reload: exit 0 if it would proceed, 3 if refused")
-    ap.add_argument("--allow-mid-job", action="store_true",
+    ap.add_argument("--allow-mid-job", "--force", dest="allow_mid_job", action="store_true",
                     help="--reload only: proceed even though the lane is "
                     "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
