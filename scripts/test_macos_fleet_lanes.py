@@ -31,7 +31,7 @@ HOST_CONFIGS = {
     "m5studio": ROOT / "profiles" / "m5studio-macos-fleet.toml",
 }
 # The Pulp gate classes each host's pulp-gate serves.
-GATE_CLASSES = {}
+GATE_CLASSES = {"m1": ["pulp-build-pr-head"]}
 BOTH_GATE_CLASSES = ["pulp-build-merge-group", "pulp-build-pr-head"]
 
 
@@ -1330,14 +1330,15 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
             self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", pulp["EnvironmentVariables"])
             self.assertNotIn("TARTCI_MACOS_VM_CORES", pulp["EnvironmentVariables"])
-            # CONFIG is m1, which now serves both classes with merge-group first.
-            self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
-            self.assertIn("pulp-build-merge-group", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
+            # CONFIG is m1, which serves PR-head only (no merge-group).
+            self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-pr-head|"))
+            self.assertNotIn("pulp-build-merge-group",
+                             pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
             self.assertEqual(
                 pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
-                "pulp-build-merge-group|1\npulp-build-pr-head|1\n"
+                "pulp-build-pr-head|1\n"
                 "pulp-release-tagged|1\npulp-release-pr-gate|1",
             )
             self.assertEqual(
@@ -2024,9 +2025,8 @@ class MacosFleetLaneTests(unittest.TestCase):
     RELEASE_FIRST_ORDER = ("pulp-release-tagged,pulp-release-pr-gate,"
                            "pulp-build-merge-group,pulp-build-pr-head")
     SHIPPED_SLOT_ORDERS = {
-        ".m1.pulp-gate.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
-                                 "pulp-release-tagged,pulp-release-pr-gate"),
-        ".m1.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
+        ".m1.pulp-gate.plist": "pulp-build-pr-head,pulp-release-tagged,pulp-release-pr-gate",
+        ".m1.pulp-gate.slot2.plist": "pulp-release-tagged,pulp-release-pr-gate,pulp-build-pr-head",
         ".studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
         ".studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
                                           "pulp-release-tagged,pulp-release-pr-gate"),

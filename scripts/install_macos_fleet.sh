@@ -1097,6 +1097,10 @@ tartci_pool_lock_release
 lock_owned=0
 trap - EXIT
 rm -rf "$stage_dir" "$plan_dir"
+# Shared object stores this host lists get no automatic git maintenance: one
+# store's background repacks ran 53 at once on m3 (2026-10-16). No list, no-op.
+"$PYTHON_BIN" "$ROOT/scripts/git_maintenance_guard.py" enforce \
+  || echo "fleet install: could not enforce git maintenance settings (see above)" >&2
 echo "installed ${#changed_targets[@]} profile-rendered LaunchAgents; retired ${#retired_paths[@]} declared legacy LaunchAgents"
 echo "pinned interpreter $PYTHON_BIN in $pin_file"
 echo "verified receipt $RECEIPT; pool admission remains closed"
