@@ -648,6 +648,7 @@ def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
         capture_output=True,
         text=True,
         env=env,
+        timeout=30,
     )
     return process.returncode, process.stdout, process.stderr
 
@@ -1122,6 +1123,8 @@ def refresh_tools(interval_s: int = 1800, timeout_s: int = 600) -> str | None:
                               capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return f"timed out after {timeout_s}s"
+    except subprocess.TimeoutExpired as exc:
+        return TartVMProbe(None, f"Tart VM inventory timed out after 30s: {exc}", tart_cli, tart_home)
     except OSError as exc:
         return f"could not run: {exc}"
     if proc.returncode not in (0, 1) or "Traceback" in (proc.stderr or ""):

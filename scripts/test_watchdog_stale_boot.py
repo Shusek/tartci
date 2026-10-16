@@ -91,6 +91,27 @@ class StaleBootTests(unittest.TestCase):
         self.assertIsNone(wd.probe_stale_boot(str(self.plist), 42, now=2_000.0).stale)
         self.write_state(ts=10**400)
         self.assertIsNone(wd.probe_stale_boot(str(self.plist), 42, now=2_000.0).stale)
+        for value in (float("nan"), float("inf"), float("-inf"), "1970-01-01T00:16:40"):
+            self.write_state(ts=value)
+            self.assertIsNone(wd.probe_stale_boot(str(self.plist), 42, now=2_000.0).stale)
+
+    def test_qemu_lane_never_uses_tart_idle_for_recovery(self) -> None:
+        qemu = self.root / "qemu.plist"
+        qemu.write_bytes(plistlib.dumps({
+            "Label": "com.danielraffel.tartci.qemu-runner-windows",
+            "EnvironmentVariables": {
+                "TARTCI_STATE_DIR": str(self.state), "TARTCI_RUNNER_NAME": "lane",
+            },
+        }))
+        self.write_state(ts="1970-01-01T00:16:40Z")
+        original = wd._run
+        wd._run = self.launchctl_run(42)
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.qemu-runner-windows", str(qemu), 4_500,
+            vm_running=False, pool_participating=True,
+        )
+        self.assertNotEqual(health.verdict, "wedged", health.reason)
 
     def test_rendered_fleet_prefix_and_slot_identity_is_supported(self) -> None:
         rendered = self.root / "rendered.plist"
