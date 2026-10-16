@@ -24,7 +24,15 @@ git blob id of every other file, and it is written when the source is exported
 at that commit. A file cannot name the commit that contains it, so the marker,
 not `generated_from.commit` in the published supply, proves which commit the
 directory holds. `generated_from.repo` and `.commit` are informational;
-`generated_from.profiles_sha256` must still match the profiles.
+`generated_from.profiles` must name the exact profile files, and
+`generated_from.profiles_sha256` must still match the profiles. Profiles must be
+regular, parseable TOML files. Symlinks and malformed profiles are refused
+before a consumer reads them.
+
+The operator's fleet backup may use a different layout and may redact paths or
+credentials. It is a record for recovery and review. It must be converted into
+the export layout above from an unredacted, reviewed configuration before it is
+used as a TartCI source.
 
 ## Self-update keeps the source
 
@@ -65,6 +73,10 @@ Each self-update run then:
    installer it runs;
 4. reinstalls the current generation when the installed receipt was built from
    a different source commit.
+
+The receipt records the source commit and the SHA-256 digests of the exported
+profile set, published supply, and complete source tree. Those digests identify
+the bytes used by that installation; they do not replace the commit marker.
 
 A canary that is not a published host id refuses the run on every other
 host, naming the published ids, rather than leaving them on their installed

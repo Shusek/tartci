@@ -19,12 +19,18 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # macOS 3.9: explicit sources fail closed below
+    tomllib = None  # type: ignore[assignment]
+
 
 PROFILE_GLOB = "*-macos-fleet.toml"
 MARKER = ".tartci-fleet-source.json"
 MARKER_SCHEMA = "tartci.fleet-source/v1"
 PUBLISHED_SUPPLY = "fleet/advertised-labels.json"
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,15 @@ class FleetSource:
             _update_digest(digest, path, self.root)
         return digest.hexdigest()
 
+    @property
+    def provenance(self) -> dict[str, str]:
+        """Digests that identify the exact selected source bytes."""
+        return {
+            "tree_sha256": self.tree_sha256,
+            "profiles_sha256": self.profiles_sha256,
+            "published_supply_sha256": self.published_supply_sha256,
+        }
+
 
 def _update_digest(digest: hashlib._Hash, path: Path, root: Path) -> None:
     """Hash path names and bytes in a stable, length-delimited form."""
@@ -92,6 +107,28 @@ def source_files(root: Path) -> list[str]:
     return sorted(paths)
 
 
+def _symlinked_source_files(root: Path) -> list[str]:
+    """Return source paths that resolve through a symlink."""
+    paths = [path.relative_to(root).as_posix()
+             for path in (root / "profiles").glob(PROFILE_GLOB)
+             if path.is_symlink()]
+    supply = root / PUBLISHED_SUPPLY
+    if supply.is_symlink():
+        paths.append(PUBLISHED_SUPPLY)
+    return sorted(paths)
+
+
+def _profile_problem(path: Path) -> str | None:
+    """Return a parse error for one profile, or None when it is valid TOML."""
+    if tomllib is None:
+        return "Python 3.11+ with tomllib is required to validate profiles"
+    try:
+        tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        return f"{path.name} is not valid TOML: {exc}"
+    return None
+
+
 def write_marker(root: Path, repository: str, commit: str) -> Path:
     """Record repository, commit and the blob hash of every source file."""
     files = {path: blob_sha((root / path).read_bytes()) for path in source_files(root)}
@@ -106,7 +143,7 @@ def marker_problem(root: Path, repository: str, commit: str) -> str | None:
     """Why root is not an intact export of repository at commit, or None."""
     try:
         marker = json.loads((root / MARKER).read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return f"no readable {MARKER}"
     if not isinstance(marker, dict) or marker.get("schema") != MARKER_SCHEMA:
         return f"{MARKER} is not a {MARKER_SCHEMA} document"
@@ -133,6 +170,11 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
     profiles_dir = root / "profiles"
     published_supply = root / PUBLISHED_SUPPLY
     if configured_root:
+        symlinks = _symlinked_source_files(root)
+        if symlinks:
+            raise ValueError(
+                "configured fleet source contains symlinked source files: "
+                + ", ".join(symlinks))
         if not profiles_dir.is_dir():
             raise ValueError(f"configured fleet source has no profiles directory: {profiles_dir}")
         if not published_supply.is_file():
@@ -142,9 +184,13 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
             )
         if not list(profiles_dir.glob(PROFILE_GLOB)):
             raise ValueError(f"configured fleet source has no macOS fleet profiles: {profiles_dir}")
+        for profile in sorted(profiles_dir.glob(PROFILE_GLOB)):
+            problem = _profile_problem(profile)
+            if problem:
+                raise ValueError(f"configured fleet source profile is invalid: {problem}")
         try:
             published = json.loads(published_supply.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(
                 f"configured fleet source has invalid published supply: {published_supply}"
             ) from exc
@@ -169,6 +215,14 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
             raise ValueError(
                 "configured fleet source published supply has stale or incomplete profile metadata"
             )
+        expected_profiles = [
+            path.relative_to(root).as_posix()
+            for path in sorted(profiles_dir.glob(PROFILE_GLOB))
+        ]
+        if sorted(generated["profiles"]) != expected_profiles:
+            raise ValueError(
+                "configured fleet source published supply profile list does not match its files"
+            )
         configured_commit = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
         if not COMMIT.fullmatch(configured_commit):
             raise ValueError(
@@ -179,6 +233,10 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
         if not configured_repo:
             raise ValueError(
                 "configured fleet source requires TARTCI_FLEET_SOURCE_REPOSITORY"
+            )
+        if not REPOSITORY.fullmatch(configured_repo):
+            raise ValueError(
+                "configured fleet source repository must be OWNER/REPOSITORY"
             )
         problem = marker_problem(root, configured_repo, configured_commit)
         if problem:
