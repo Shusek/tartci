@@ -161,6 +161,19 @@ class DryRun(Base):
         self.assertNotIn(":latest", sv.DEFAULT_IMAGE)
 
 
+class WatchdogPass(Base):
+    def test_the_watchdog_pass_returns_the_lines_enforce_produced(self) -> None:
+        # Without the pass's return line every scratch-vm warning and deletion
+        # would happen silently.
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        name = self.make(ttl=1)
+        warn = watchdog.scratch_vm_pass(now=NOW + 1800, tart=self.tart)
+        self.assertIn(f"WARN scratch-vm: {name} (owner pulp-impl)", warn)
+        gone = watchdog.scratch_vm_pass(now=NOW + 3600, tart=self.tart)
+        self.assertIn(f"deleted scratch VM {name}", gone)
+        self.assertIsNone(watchdog.scratch_vm_pass(now=NOW + 3700, tart=self.tart))
+
+
 class Wiring(unittest.TestCase):
     def test_the_heal_pass_and_the_dispatcher_run_it(self) -> None:
         here = Path(sv.__file__).parent
