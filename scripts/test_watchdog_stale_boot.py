@@ -97,11 +97,16 @@ class StaleBootTests(unittest.TestCase):
 
     def test_qemu_lane_never_uses_tart_idle_for_recovery(self) -> None:
         qemu = self.root / "qemu.plist"
+        log = self.root / "qemu.log"
+        log.write_text("quiet\n")
+        import os
+        os.utime(log, (1.0, 1.0))
         qemu.write_bytes(plistlib.dumps({
             "Label": "com.danielraffel.tartci.qemu-runner-windows",
             "EnvironmentVariables": {
                 "TARTCI_STATE_DIR": str(self.state), "TARTCI_RUNNER_NAME": "lane",
             },
+            "StandardOutPath": str(log),
         }))
         self.write_state(ts="1970-01-01T00:16:40Z")
         original = wd._run
