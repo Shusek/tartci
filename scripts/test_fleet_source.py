@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -160,6 +161,14 @@ class FleetSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "provenance"):
                 fleet_source.resolve(Path("/public"))
 
+    def test_explicit_source_rejects_malformed_repository(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._exported(root)
+            os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "not-a-repository"
+            with self.assertRaisesRegex(ValueError, "OWNER/REPOSITORY"):
+                fleet_source.resolve(Path("/public"))
+
     def test_a_source_without_its_export_marker_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -224,6 +233,8 @@ class FleetSourceTests(unittest.TestCase):
                 fleet_source.resolve(Path("/public"))
 
     def test_a_profile_that_is_not_toml_is_refused(self):
+        if fleet_source.tomllib is None:
+            self.skipTest("Python 3.9 validates immutable exports at sync time")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "profiles").mkdir(parents=True)
@@ -258,6 +269,40 @@ class FleetSourceTests(unittest.TestCase):
             profile.symlink_to(Path(__file__))
             with self.assertRaisesRegex(ValueError, "symlinked source files"):
                 fleet_source.resolve(Path("/public"))
+
+    def test_symlinked_source_directories_are_refused(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as source_td:
+            root = Path(td)
+            source = Path(source_td)
+            env = configured_source(source)
+            os.environ.update(env)
+            (root / "profiles").symlink_to(source / "profiles", target_is_directory=True)
+            (root / "fleet").symlink_to(source / "fleet", target_is_directory=True)
+            os.environ["TARTCI_FLEET_SOURCE_ROOT"] = str(root)
+            with self.assertRaisesRegex(ValueError, "symlinked source files"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_real_profile_resolves_without_tomllib(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(fleet_source, "tomllib", None):
+            root = Path(td)
+            profiles = root / "profiles"
+            profiles.mkdir(parents=True)
+            original = Path(__file__).resolve().parents[1] / "profiles" / "m3-macos-fleet.toml"
+            shutil.copyfile(original, profiles / original.name)
+            (root / "fleet").mkdir()
+            supply = root / "fleet" / "advertised-labels.json"
+            digest = fleet_source.FleetSource(root, profiles, supply, True).profiles_sha256
+            supply.write_text(json.dumps({
+                "schema": "tartci.advertised-labels/v1", "registrations": [],
+                "generated_from": {"repo": PRIVATE_REPOSITORY, "commit": PRIVATE_COMMIT,
+                                   "profiles": ["profiles/m3-macos-fleet.toml"],
+                                   "profiles_sha256": digest},
+            }) + "\n")
+            fleet_source.write_marker(root, PRIVATE_REPOSITORY, PRIVATE_COMMIT)
+            os.environ.update({"TARTCI_FLEET_SOURCE_ROOT": str(root),
+                               "TARTCI_FLEET_SOURCE_COMMIT": PRIVATE_COMMIT,
+                               "TARTCI_FLEET_SOURCE_REPOSITORY": PRIVATE_REPOSITORY})
+            self.assertEqual(root.resolve(), fleet_source.resolve(Path("/public")).root)
 
     def test_blob_sha_matches_git(self):
         self.assertEqual("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", fleet_source.blob_sha(b""))

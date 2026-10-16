@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation complete; external-source rollout intentionally gated
+Status: implementation complete locally; review pending; external-source rollout intentionally gated
 
 ## Goal
 
@@ -18,21 +18,10 @@ paths, while TartCI's external-source contract requires a validated export with
 `profiles/*-macos-fleet.toml`, `fleet/advertised-labels.json`, and an export
 marker. A redacted snapshot must therefore never be selected as a live source.
 
-The private record was compared with TartCI `origin/main` at
-`396772a3686cf071145fea42f851cf328cb76b07`. The comparison found:
-
-- the private snapshot has no top-level published supply document;
-- the private profile files contain redacted values and cannot be parsed as
-  runnable TOML without restoration from the host;
-- the m1 snapshot is behind current public profile routing and lacks the newer
-  toolchain declarations;
-- the m3 and m5 profiles are structurally close, with private path and secret
-  values redacted;
-- the m5s snapshot is structurally close but has the sealed launcher policy and
-  host-specific values that must not be copied into public TartCI.
-
-No private snapshot is being copied into the public repository or activated on
-a host as part of this change.
+The private authority was compared with the current TartCI profile contract.
+It does not yet contain a complete validated export, so no private snapshot is
+being copied into this repository or activated on a host as part of this
+change.
 
 ## Implementation
 
@@ -65,21 +54,12 @@ No fleet mutation has been performed. Current installed hosts report the
 ordinary checked-in profile path and no configured external source. The canary
 and rollback steps remain gated on a validated private export.
 
-## Fleet evidence review
+## Scope boundary
 
-Read-only checks on m1, m5, and m5s found no OS reboot corresponding to the
-reported m5s disruption. m5s has been up since 2026-10-11 21:00 UTC. The
-recorded recovery failures were pool and launcher recovery failures caused by
-slow I/O on the external VM volume, followed by a successful watchdog recovery
-after 18 attempts. m5 has older recovery records for network relay readiness
-and a separate external VM count limit. These are real TartCI reliability
-issues, but they are outside the profile-source change and must not be reported
-as fixed by it.
-
-The profile-source change improves source integrity and receipt evidence. It
-does not repair volume I/O, Tart inventory stalls, pool transitions, or Windows
-guest failures. Those need separate, narrowly scoped changes with their own
-canary and rollback evidence.
+This change improves source integrity and receipt evidence. It does not repair
+volume I/O, Tart inventory stalls, pool transitions, or guest failures. Those
+need separate, narrowly scoped changes with their own canary and rollback
+evidence.
 
 ## Progress update
 
@@ -95,18 +75,16 @@ The branch is published for review at
 `feat/private-profile-source-refresh-20261016`. It has not been merged or
 installed on a fleet host.
 
-The current private repository tree was rechecked after implementation. It
-still contains only `machines/<host>/tartci/config/` snapshots and no
-`profiles/` export or `fleet/advertised-labels.json`. The live m3 profile could
-not be collected because its configured SSH key is rejected. A partial export
-from the reachable hosts would omit capacity and routing authority, so it is
-not being created or rolled out.
+The private authority still lacks a complete export with the required profile
+set and published supply document. A partial export would omit routing and
+capacity authority, so it is not being created or rolled out.
 
-The first GitHub Python 3.9 run exposed a compatibility gap in the initial
-validator: stock Python 3.9 has no `tomllib`, so valid configured sources were
-rejected. The resolver now uses a conservative syntax check on 3.9 and keeps
-full TOML parsing on 3.11+. The affected 3.9 source, peer, tailnet, and serving
-tests pass locally after the fix; the replacement CI run is pending.
+The first Python 3.9 run exposed a compatibility gap: stock Python 3.9 has no
+`tomllib`, so valid configured sources were rejected. Export now performs full
+TOML validation under the pinned 3.11+ interpreter before writing its immutable
+marker; Python 3.9 verifies the marker and resolves the already-validated
+bytes. The source, sync, self-update, and system-Python coverage tests pass
+locally after this fix.
 
 ## Stop conditions
 

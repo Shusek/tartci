@@ -63,6 +63,13 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_fleet_source.py",
+     "FleetSourceTests.test_a_profile_that_is_not_toml_is_refused"):
+        ("3.11-only: source resolution parses profile TOML when the interpreter provides "
+         "tomllib; Python 3.9 trusts the immutable export marker after sync validation"),
+    ("test_fleet_source_sync.py", "ExportTests"):
+        ("3.11-only: source export validates profile TOML before publishing the immutable "
+         "export; Python 3.9 cannot perform the export"),
     ("test_host_hygiene.py", "ForeignVms"):
         ("3.11-only: host_hygiene judges VM ownership with tart_image_prune.plan(), which "
          "reads the fleet profile with tomllib; without it nothing is judged foreign "
