@@ -58,7 +58,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary", "debug_hold", "launchd_watchdog",
+    "reuse_canary", "debug_hold", "launchd_watchdog", "mise",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -560,6 +560,14 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    if "mise" in data:
+        # The pinned mise binary (scripts/mise_pin.py); the installer verifies
+        # the binary itself before writing any LaunchAgent.
+        import mise_pin  # noqa: PLC0415 - sibling script, loaded only when declared
+
+        errors = mise_pin.table_errors(data["mise"])
+        if errors:
+            fail("; ".join(errors))
     watchdog = data.get("launchd_watchdog")
     if watchdog is not None:
         # The watchdog's frozen-lane threshold, rendered into its plist by the
