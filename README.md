@@ -48,9 +48,10 @@ job finishes -> VM deleted, lease released
   (Apple Virtualization).
 - **Windows** guests run on QEMU, since Apple Virtualization cannot install
   Windows.
-- **Golden images** are built once per host (`tartci prepare linux|macos`,
-  `tartci windows golden`) or copied from another host (`tartci
-  tart-image-sync` for Tart images, `tartci goldens sync` for Windows).
+- **Golden images** are built or tagged per lane. `tartci prepare linux` builds
+  the Pulp Linux golden, `tartci prepare macos` provides macOS golden helpers,
+  and `tartci windows golden` snapshots a prepared Windows VM. Copy Windows
+  images with `tartci goldens sync`; copy Tart images with `tartci tart-image-sync`.
 - **LaunchAgents** in `launchd/` keep the serving loops running across
   reboots.
 - **`tartci pool drain` and `tartci pool on`** take a Mac out of the pool and
@@ -100,12 +101,13 @@ baking goldens, onboarding a host and installing the agents.
 
 ## Learn more
 
-- [Runbook](docs/runbook.md): host setup, goldens, serving, and recovery,
-  step by step.
-- [Reference](docs/reference.md): the resource governor, serving behavior,
-  diagnostics, and the environment variables each lane reads.
-- [Gotchas](docs/gotchas.md): failure modes found in practice and their fixes.
-- [Onboarding a new repository](docs/new-repo-agent-guide.md).
+- [Runbook](docs/runbook.md): set up a host, build images, and serve jobs.
+- [Prepare](docs/prepare.md): what each `prepare` command does and when to use it.
+- [Reference](docs/reference.md): resource limits, serving behavior, diagnostics,
+  and environment variables.
+- [Gotchas](docs/gotchas.md): known failure modes and practical fixes.
+- [Onboarding a new repository](docs/new-repo-agent-guide.md): connect a repo to
+  an existing TartCI host.
 - [LaunchAgents](launchd/README.md) and the
   [published label table](fleet/README.md).
 - [AGENTS.md](AGENTS.md): a dense reference for coding agents.
