@@ -689,6 +689,13 @@ def published_hosts(home: Optional[pathlib.Path] = None,
     """(published host ids, this host's id or None) from main's published
     supply in the self-update checkout, as peer_stall_alert reads it."""
     home = home or pathlib.Path.home()
+    configured = os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip()
+    if configured:
+        try:
+            value = json.loads(pathlib.Path(configured).read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"published supply unreadable from {configured}: {exc}") from exc
+        return _published_host_rows(value, home)
     checkout = home / ".local" / "share" / "tartci" / "update-checkout"
     rc, out, err = (run or _run)(["git", "-C", str(checkout), "show",
                                   "origin/main:fleet/advertised-labels.json"])
@@ -698,6 +705,10 @@ def published_hosts(home: Optional[pathlib.Path] = None,
         value = None
     if not isinstance(value, dict):
         raise RuntimeError(f"published supply unreadable from {checkout}: {(err or out)[:200]}")
+    return _published_host_rows(value, home)
+
+
+def _published_host_rows(value: dict, home: pathlib.Path) -> Tuple[List[str], Optional[str]]:
     hosts = sorted({row["host_id"] for row in value.get("hosts") or []
                     if isinstance(row, dict) and isinstance(row.get("host_id"), str)})
     import vm_boot_alert  # noqa: PLC0415 - owns the profile's host id and its fallback
@@ -718,7 +729,7 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
     threshold = setting("TARTCI_TAILNET_OFFLINE_ALERT_SECS", OFFLINE_ALERT_SECS)
     if hosts is None:
         checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
-        if not (checkout / ".git").exists():
+        if not (checkout / ".git").exists() and not os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip():
             return {"skipped": True, "reason": "no self-update checkout", "hosts": {}}
         hosts, me = published_hosts()
     directory.mkdir(parents=True, exist_ok=True)

@@ -64,6 +64,16 @@
         <string>$HOME/.tartci</string>
         <key>TARTCI_GH_CLI</key>
         <string>ghapp</string>
+        <key>TARTCI_FLEET_SOURCE_ROOT</key>
+        <string></string>
+        <key>TARTCI_FLEET_SOURCE_COMMIT</key>
+        <string></string>
+        <key>TARTCI_FLEET_SOURCE_REPOSITORY</key>
+        <string></string>
+        <key>TARTCI_ADVERTISED_LABELS</key>
+        <string></string>
+        <key>TARTCI_JOB_CLAIM_SUPPLY</key>
+        <string></string>
     </dict>
 </dict>
 </plist>
