@@ -53,6 +53,15 @@ class StaleBootTests(unittest.TestCase):
         mismatch = wd.probe_stale_boot(str(self.plist), 43, now=2_000.0)
         self.assertFalse(mismatch.stale, mismatch.reason)
 
+    def test_stale_boot_without_supervisor_start_identity_is_unknown(self) -> None:
+        self.write_state()
+        path = self.state / "lane.state.json"
+        state = json.loads(path.read_text())
+        del state["supervisor_pid_started_at"]
+        path.write_text(json.dumps(state))
+        probe = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
+        self.assertIsNone(probe.stale, probe.reason)
+
     def test_sealed_launch_helper_child_pid_is_owned_by_launchd_parent(self) -> None:
         self.write_state()
         original = wd._run
@@ -114,6 +123,25 @@ class StaleBootTests(unittest.TestCase):
         self.addCleanup(setattr, wd, "_run", original)
         health = wd.gather_health(
             "com.danielraffel.tartci.qemu-runner-windows", str(qemu), 4_500,
+            vm_running=False, pool_participating=True,
+        )
+        self.assertNotEqual(health.verdict, "wedged", health.reason)
+
+    def test_linux_tart_lane_never_uses_macos_identity_or_tart_idle(self) -> None:
+        linux = self.root / "linux.plist"
+        log = self.root / "linux.log"
+        log.write_text("quiet\n")
+        import os
+        os.utime(log, (1.0, 1.0))
+        linux.write_bytes(plistlib.dumps({
+            "Label": "com.danielraffel.tartci.tart-runner-linux",
+            "StandardOutPath": str(log),
+        }))
+        original = wd._run
+        wd._run = self.launchctl_run(42)
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.tart-runner-linux", str(linux), 4_500,
             vm_running=False, pool_participating=True,
         )
         self.assertNotEqual(health.verdict, "wedged", health.reason)
