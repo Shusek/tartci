@@ -1238,7 +1238,8 @@ def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
 
 
 def rendered_plists(
-    data: dict, *, launch_entrypoint: Path | None = None
+    data: dict, *, launch_entrypoint: Path | None = None,
+    source: fleet_source.FleetSource | None = None,
 ) -> dict[str, bytes]:
     host_id = data["host"]["id"]
     result: dict[str, bytes] = {}
@@ -1251,7 +1252,8 @@ def rendered_plists(
             )
             result[name] = plistlib.dumps(
                 lane_plist(
-                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint
+                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint,
+                    source=source,
                 ),
                 sort_keys=False,
             )
@@ -1704,7 +1706,9 @@ def verify_receipt(
                 os.environ["TARTCI_RENDER_PYTHON"] = pinned
                 break
     try:
-        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+        expected = rendered_plists(
+            data, launch_entrypoint=launch_entrypoint, source=active_source
+        )
     finally:
         if previous_render_python is None:
             os.environ.pop("TARTCI_RENDER_PYTHON", None)
@@ -2647,6 +2651,7 @@ def lane_plist(
     *,
     slot: int = 1,
     launch_entrypoint: Path | None = None,
+    source: fleet_source.FleetSource | None = None,
 ) -> dict:
     host = data["host"]
     lane_id = lane["id"]
@@ -2690,8 +2695,9 @@ def lane_plist(
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
     configured_source = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
-    if configured_source:
+    if source is None and configured_source:
         source = fleet_source.resolve(TARTCI_ROOT)
+    if source is not None and source.configured:
         env.update({
             "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
             "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
