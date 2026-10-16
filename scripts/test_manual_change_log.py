@@ -50,5 +50,53 @@ class Tests(unittest.TestCase):
                 mcl.record("pool off", "x", [], env={}, start=1)
 
 
+class Redaction(unittest.TestCase):
+    PLANTED = {
+        "GH_TOKEN=ghp_abcdefghij0123456789 gh api repos/x": "ghp_abcdefghij0123456789",
+        'curl -H "Authorization: token gho_ABCDEFGHIJ0123456789" https://api.github.com':
+            "gho_ABCDEFGHIJ0123456789",
+        'curl -H "Authorization: Bearer eyJhbGciOi.payload.sig" u': "eyJhbGciOi.payload.sig",
+        "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' u": "dXNlcjpwYXNzd29yZA==",
+        "env SHIPYARD_GITHUB_APP_PRIVATE_KEY='-----BEGIN' MY_SECRET=s3cr3t run": "s3cr3t",
+        "tool --password hunter2 --api-key=k3y": "hunter2",
+        "echo github_pat_11ABCDEFGHIJ_klmnopq and ghs_abcdefghijklmnop": "ghs_abcdefghijklmnop",
+    }
+
+    def test_planted_secrets_never_reach_the_log(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "manual-changes.log"
+            table = {}
+            pid = 900
+            for command in self.PLANTED:
+                table[pid] = (pid - 1, command)
+                pid -= 1
+            with mock.patch.dict(os.environ, {"TARTCI_MANUAL_CHANGE_LOG": str(log)}):
+                mcl.record("pool off", "forced", ["--force", "GH_TOKEN=ghp_zzzzzzzzzz0123456789"],
+                           env={}, start=900, ps=lambda p: table.get(p))
+            text = log.read_text()
+            for command, secret in self.PLANTED.items():
+                with self.subTest(command=command[:30]):
+                    self.assertNotIn(secret, text)
+            self.assertNotIn("ghp_zzzzzzzzzz0123456789", text)
+            self.assertNotIn("k3y", text)
+            self.assertNotIn("github_pat_11ABCDEFGHIJ_klmnopq", text)
+            self.assertIn("[redacted]", text)
+            # Control: an ordinary command line is kept whole.
+            for plain in ("tartci pool off --force --plan", "ssh-keyscan -T 5 m5-lan",
+                          "git push --no-verify origin main"):
+                self.assertEqual(mcl.redact(plain), plain)
+
+    def test_the_log_is_owner_only_and_an_existing_one_is_tightened(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "manual-changes.log"
+            with mock.patch.dict(os.environ, {"TARTCI_MANUAL_CHANGE_LOG": str(log)}):
+                mcl.record("pool on", "requested", [], env={}, start=1)
+                self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+                log.chmod(0o644)
+                mcl.record("pool on", "requested", [], env={}, start=1)
+                self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(len(log.read_text().splitlines()), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,8 @@ on|off|drain|undrain` and every `tartci launchd reload` now appends a line to
 ~/Library/Logs/tartci/manual-changes.log (TARTCI_MANUAL_CHANGE_LOG overrides)
 with what was asked, whether it was refused or forced, how the caller got
 there (launchd, ssh with its client address, or a terminal) and the command
-line of each parent process, so the next one names itself.
+line of each parent process, so the next one names itself. Credentials in
+those command lines are redacted, and the log is owner-only (0600).
 
     manual_change_log.py ACTION OUTCOME [ARG...]
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -25,6 +27,28 @@ from pathlib import Path
 from typing import Callable, Optional
 
 MAX_PARENTS = 8
+# Parent command lines can carry credentials (a `GH_TOKEN=... gh api` prefix,
+# a curl `-H "Authorization: token ..."`). They are redacted before the write.
+REDACTIONS = (
+    # NAME=value for any variable whose name says it is a secret.
+    (re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*)"
+                r"=(\"[^\"]*\"|'[^']*'|\S+)"), r"\1=[redacted]"),
+    # --token VALUE / --password VALUE style flags.
+    (re.compile(r"(?i)((?:^|(?<=\s))--?[a-z0-9-]*(?:token|key|secret|password)[a-z0-9-]*\s+)"
+                r"(?!-)\S+"),
+     r"\1[redacted]"),
+    # Authorization headers, any scheme, and bare Bearer values.
+    (re.compile(r"(?i)(authorization\s*:\s*)(?:\S+\s+)?[^\s\"']+"), r"\1[redacted]"),
+    (re.compile(r"(?i)\b(bearer\s+)[^\s\"']+"), r"\1[redacted]"),
+    # GitHub token shapes wherever they appear.
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,})"), "[redacted]"),
+)
+
+
+def redact(text: str) -> str:
+    for pattern, replacement in REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def log_path() -> Path:
@@ -54,7 +78,7 @@ def parents(start: int, ps: Callable[[int], Optional[tuple[int, str]]] = _ps) ->
         if found is None:
             break
         ppid, command = found
-        chain.append({"pid": pid, "command": command[:400]})
+        chain.append({"pid": pid, "command": redact(command)[:400]})
         pid = ppid
     return chain
 
@@ -78,13 +102,18 @@ def record(action: str, outcome: str, args: list[str], *, env: Optional[dict] = 
            now: Optional[float] = None) -> dict:
     env = dict(os.environ) if env is None else env
     row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now or time.time())),
-           "action": action, "outcome": outcome, "args": args,
+           "action": action, "outcome": outcome, "args": [redact(a) for a in args],
            **caller(env), "parents": parents(os.getppid() if start is None else start, ps)}
     try:
         path = log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
+        # Owner-only: command lines name hosts, paths and callers.
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps(row, sort_keys=True) + "\n").encode())
+        finally:
+            os.close(fd)
     except OSError:
         pass
     return row

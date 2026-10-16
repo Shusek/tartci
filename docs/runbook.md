@@ -3410,6 +3410,12 @@ lanes change.
     client address and tty, or `terminal`;
   - up to eight parent processes with their command lines.
 
+  Credentials in those command lines are redacted before the write: a
+  `*TOKEN*`, `*KEY*`, `*SECRET*` or `*PASSWORD*` variable or flag value,
+  `Authorization:` and `Bearer` values, and GitHub token shapes (`ghp_`,
+  `gho_`, `ghs_`, `github_pat_`). The file is owner-only (0600), and a file
+  that already exists is tightened to 0600 on the next write.
+
   On m5 at 05:19Z on 2026-10-16 an off/on over ssh killed two required jobs
   and left no record of who ran it. To find the next one:
   `tail ~/Library/Logs/tartci/manual-changes.log | python3 -m json.tool --json-lines`.
