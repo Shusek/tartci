@@ -3503,6 +3503,73 @@ launchctl kickstart -k gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog
 ls ~/.tartci/state/host-hygiene/      # consumers.json, foreign-vms.json
 ```
 
+## Scratch VMs for agents
+
+`tartci scratch-vm` is the only sanctioned way for an agent, or a person, to
+make a test VM on a fleet host. A VM made any other way has no owner and no
+end: on 2026-10-16 an agent's repro VM ran on m1 for 11 h.
+
+```sh
+tartci scratch-vm create --owner <agent> --ttl <hours> [--from IMAGE] [--name scratch-...]
+TART_HOME=<store it prints> tart run <name>
+tartci scratch-vm list                       # owner, expiry, minutes left
+tartci scratch-vm extend <name> --ttl <hours> # a new TTL from now
+tartci scratch-vm delete <name>               # when done, before the TTL
+```
+
+- The TTL is at most 72 h.
+- The VM lives in the host's VM store, so the lanes' disk and VM-cap checks
+  count it.
+- Its record is `~/.tartci/state/scratch-vms/<name>.json`.
+- 30 minutes before the TTL, the watchdog logs `WARN scratch-vm: <name>
+  (owner X) is stopped and deleted at <time>`. At the TTL it stops and deletes
+  the VM, then the record. A failed delete keeps the record and retries on the
+  next pass.
+- Only VMs with such a record are ever touched, and only when the record's own
+  name starts with `scratch-`.
+- `tartci scratch-vm enforce --dry-run` prints what the next pass would warn
+  about or delete.
+- The default image is pinned by digest
+  (`ghcr.io/cirruslabs/ubuntu@sha256:cb46e376...`); pass `--from` for a local
+  golden.
+
+## Leaked lane clones
+
+`vm_reap` deletes a stopped clone of a loaded lane, `<runner>-<pid>-<n>`,
+once its supervisor is gone and no state file or lease names it.
+
+A clone left by a retired lane is a separate case. It is deleted only when
+every one of these holds:
+
+- **The retired lane's own state record names it.** A file
+  `~/.tartci/state/<lane>/*.state.json` records exactly that VM, a `tart-*`
+  provider, the same runner and the same supervisor pid. A name alone proves
+  nothing: an agent's `pulp-m1-repro-20261016-1` is kept. m1 had kept
+  `pulp-preamble-m1-target-06-99292-1` for two months, and its lane's state
+  file still recorded it.
+- **The name is shaped like this host's clone.** The runner carries the host
+  id as one of its words, and starts with an allowed CI prefix or the host id.
+- **Nothing tartci owns claims it.** It is not an image (no `:` tag), and the
+  image pruner's ownership rule does not claim it: the fleet profile, a
+  tartci config file or a LaunchAgent does not name it. An unreadable profile
+  keeps everything.
+- **It is truly abandoned.** Supervisor gone, no lease, stopped, and untouched
+  for 24 h.
+
+Deleting is off on each host until `~/.config/tartci/reap-retired-clones.enabled`
+exists. Until then the digest lists the clone under
+`orphans.retired_would_delete` and deletes nothing.
+
+Roll out one host per day, in this order: m1, m5, m3, m5s. On each host, run
+the dry run first and check that it names only clones you expect:
+
+```sh
+tartci doctor --reap --dry-run
+touch ~/.config/tartci/reap-retired-clones.enabled
+```
+
+`--dry-run` changes nothing, even combined with `--fix`.
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
