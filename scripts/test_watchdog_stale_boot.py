@@ -86,6 +86,12 @@ class StaleBootTests(unittest.TestCase):
         probe = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
         self.assertTrue(probe.stale, probe.reason)
 
+    def test_invalid_numeric_timestamps_fail_closed(self) -> None:
+        self.write_state(ts=True)
+        self.assertIsNone(wd.probe_stale_boot(str(self.plist), 42, now=2_000.0).stale)
+        self.write_state(ts=10**400)
+        self.assertIsNone(wd.probe_stale_boot(str(self.plist), 42, now=2_000.0).stale)
+
     def test_rendered_fleet_prefix_and_slot_identity_is_supported(self) -> None:
         rendered = self.root / "rendered.plist"
         rendered.write_bytes(plistlib.dumps({

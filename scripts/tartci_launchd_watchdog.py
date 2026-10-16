@@ -63,6 +63,7 @@ import argparse
 import datetime as dt
 import glob
 import json
+import math
 import os
 import plistlib
 from pathlib import Path
@@ -535,7 +536,7 @@ def probe_stale_boot(
         phase = state.get("phase")
         ts = state.get("ts")
         supervisor_pid = state.get("supervisor_pid")
-        if not isinstance(phase, str) or not isinstance(ts, (int, float, str)):
+        if not isinstance(phase, str) or isinstance(ts, bool) or not isinstance(ts, (int, float, str)):
             raise ValueError("missing phase or timestamp")
         if phase not in STALE_BOOT_PHASES:
             return StaleBootProbe(False, f"phase={phase}")
@@ -555,13 +556,15 @@ def probe_stale_boot(
             parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
         else:
             parsed_ts = float(ts)
+        if not math.isfinite(parsed_ts):
+            raise ValueError("timestamp is not finite")
         age = max(0.0, (time.time() if now is None else now) - parsed_ts)
         if age <= stale_after_s:
             return StaleBootProbe(False, f"phase={phase}, heartbeat age {int(age)}s")
         return StaleBootProbe(True, f"phase={phase}, heartbeat stale {int(age)}s")
     except FileNotFoundError:
         return StaleBootProbe(False, f"lane state file not present at {path}")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (OSError, OverflowError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return StaleBootProbe(None, f"lane state unavailable at {path}: {exc}")
 
 
@@ -814,7 +817,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     # fresh supervisor and a misleadingly healthy launchd job. The lane-local
     # heartbeat catches that case, but only an idle, readable Tart inventory may
     # authorize recovery.
-    if expected_loaded and vm_running is False:
+    if expected_loaded and ".tart-runner" in label and vm_running is False:
         boot_probe = probe_stale_boot(plist_path, launchd_pid)
         if boot_probe.stale:
             return AgentHealth(
