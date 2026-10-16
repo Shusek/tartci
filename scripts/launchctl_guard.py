@@ -97,7 +97,7 @@ except KeyError:
 BROAD_KILL_COMMAND_LINES = tuple(line.format(home=_HOME, user=_USER) for line in (
     # Shapes captured from ps -axo command on the fleet hosts, with this
     # account's home and name filled in at import: these are runtime data,
-    # so a home-anchored `pkill -f '^<home>/...'` must match them here.
+    # so a home-anchored pkill -f pattern on <home> must match them here.
     "{home}/.local/share/tartci-generations/aad356ca6bef941b2b675d695a0231acf89e4833-dbf3e8dbd7183aef/providers/tart-macos/runner.sh --loop",
     "{home}/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-pulp-gate",
     "/bin/zsh -c source {home}/.claude/shell-snapshots/snapshot-zsh-20261011.sh",
