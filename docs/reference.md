@@ -1,11 +1,12 @@
 # tartci reference
 
-Detailed behavior of tartci's governor, serving lanes, diagnostics and
-environment variables. Start with the [README](../README.md) for the overview
-and the [runbook](runbook.md) for step-by-step procedures.
+This page describes the parts of TartCI that matter when you operate a host:
+resource admission, serving behavior, diagnostics, and environment variables.
+Start with the [README](../README.md) for the overview, the [runbook](runbook.md)
+for host setup, and [Prepare VM images](prepare.md) for image commands.
 
 ## What tartci provides
-- **macOS + Linux** via **[Tart](https://github.com/cirruslabs/tart/)** (Apple Virtualization): native speed, CoW
+- **macOS + Linux** via **[Tart](https://github.com/openai/tart)** (Apple Virtualization): native speed, CoW
   clones, host-mounted ccache warm across clones.
 - **Windows** via **standalone QEMU** (hvf): AVF can't install Windows (no inbox
   virtio-blk driver; black installer display), so Windows is first-class on QEMU
