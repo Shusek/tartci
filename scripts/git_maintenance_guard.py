@@ -17,7 +17,10 @@ enforce   for every repository listed in ~/.config/tartci/git-maintenance.repos
 nightly   (watchdog, once a day, only where ~/.config/tartci/git-maintenance.enabled
           exists) run exactly one `nice -n 19 taskpolicy -b git maintenance run
           --task=gc --task=loose-objects` per listed repository, one at a time
-          behind a lock, and only while no gate lane is mid-job.
+          behind a lock, and only while no gate lane is mid-job, no other git
+          maintenance/repack/gc runs and the host's load is under 2x its cores.
+          Pruning is pinned (gc.pruneExpire=2.weeks.ago,
+          gc.worktreePruneExpire=3.months.ago) whatever the repo config says.
 
     git_maintenance_guard.py check | enforce | nightly [--dry-run]
 """
@@ -44,6 +47,11 @@ SETTINGS = (("gc.auto", "0"), ("maintenance.auto", "false"), ("gc.autoDetach", "
 MAINTENANCE_RE = re.compile(r"(?:^|/)git(?:\s+-C\s+(\S+))?(?:\s+-c\s+\S+)*\s+"
                             r"(maintenance\s+run|repack|gc)\b")
 LANE_GLOB = "com.danielraffel.tartci.tart-runner-macos-fleet.*.plist"
+# Pinned so a repo's own gc.pruneExpire=now (or worktreePruneExpire=now) can
+# never prune objects concurrent agents just wrote: m3's store has 712 worktrees.
+PRUNE_PINS = ("-c", "gc.pruneExpire=2.weeks.ago", "-c", "gc.worktreePruneExpire=3.months.ago")
+# The nightly run waits while the host is this loaded (1-minute load per core).
+LOAD_PER_CORE = 2.0
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -160,8 +168,22 @@ def lanes_busy(user_home: Path) -> bool:
     return any(row.state in (lane_busy.BUSY, lane_busy.UNKNOWN) for row in rows)
 
 
+def host_loaded() -> Optional[str]:
+    """Why the host is too loaded to start maintenance, or None."""
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        return None
+    cores = os.cpu_count() or 1
+    if load1 > LOAD_PER_CORE * cores:
+        return f"load {load1:.0f} is above {LOAD_PER_CORE:g} x {cores} cores"
+    return None
+
+
 def nightly(now: float, user_home: Path, *, run: Runner = _run,
-            busy: Callable[[Path], bool] = lanes_busy, dry_run: bool = False) -> list[str]:
+            busy: Callable[[Path], bool] = lanes_busy, dry_run: bool = False,
+            ps_out: Optional[str] = None,
+            loaded: Callable[[], Optional[str]] = host_loaded) -> list[str]:
     paths = repos(user_home)
     if not paths or not enabled(user_home):
         return []
@@ -184,14 +206,25 @@ def nightly(now: float, user_home: Path, *, run: Runner = _run,
         if busy(user_home):
             return [f"{_iso(now)} launchd-watchdog: git-maintenance: deferred, a gate lane "
                     "is mid-job"]
+        # m3's storm came from agents' host-side git, not from gate lanes: never
+        # add a run to maintenance already in progress, or to a loaded host.
+        if ps_out is None:
+            ps_out = run(["/bin/ps", "-axo", "pid=,etime=,command="], timeout=15).stdout
+        running = maintenance_processes(ps_out)
+        if running:
+            return [f"{_iso(now)} launchd-watchdog: git-maintenance: deferred, {len(running)} "
+                    f"git maintenance/repack/gc process(es) already running"]
+        reason = loaded()
+        if reason:
+            return [f"{_iso(now)} launchd-watchdog: git-maintenance: deferred, {reason}"]
         lines = [f"{_iso(now)} launchd-watchdog: git-maintenance: {text}"
                  for text in enforce(paths, run)]
         for repo in paths:
             argv = ["nice", "-n", "19"]
             if os.path.exists(TASKPOLICY):
                 argv += [TASKPOLICY, "-b"]
-            argv += ["git", "-C", str(repo), "maintenance", "run", "--task=gc",
-                     "--task=loose-objects"]
+            argv += ["git", "-C", str(repo), *PRUNE_PINS, "maintenance", "run",
+                     "--task=gc", "--task=loose-objects"]
             if dry_run:
                 lines.append(f"{_iso(now)} launchd-watchdog: git-maintenance: would run "
                              + " ".join(argv))
@@ -216,14 +249,15 @@ def nightly(now: float, user_home: Path, *, run: Runner = _run,
 def watchdog_pass(now: float, *, user_home: Optional[Path] = None, run: Runner = _run,
                   ps: Optional[Callable[[], str]] = None,
                   cwd: Optional[Callable[[int], str]] = None,
-                  busy: Callable[[Path], bool] = lanes_busy) -> list[str]:
+                  busy: Callable[[Path], bool] = lanes_busy,
+                  loaded: Callable[[], Optional[str]] = host_loaded) -> list[str]:
     user_home = user_home or Path(os.path.expanduser("~"))
     lines = []
     ps_out = ps() if ps else run(["/bin/ps", "-axo", "pid=,etime=,command="], timeout=15).stdout
     warning = check(ps_out, cwd or (lambda pid: cwd_of(pid, run)))
     if warning:
         lines.append(f"{_iso(now)} launchd-watchdog: WARN git-maintenance: {warning}")
-    lines += nightly(now, user_home, run=run, busy=busy)
+    lines += nightly(now, user_home, run=run, busy=busy, ps_out=ps_out, loaded=loaded)
     return lines
 
 

@@ -100,8 +100,10 @@ class Enforce(Base):
 
 
 class Nightly(Base):
-    def run_nightly(self, now: float = NOW, busy: bool = False) -> list[str]:
-        return gmg.nightly(now, self.home, run=self.git, busy=lambda home: busy)
+    def run_nightly(self, now: float = NOW, busy: bool = False, ps_out: str = "",
+                    loaded=None) -> list[str]:
+        return gmg.nightly(now, self.home, run=self.git, busy=lambda home: busy,
+                           ps_out=ps_out, loaded=loaded or (lambda: None))
 
     def test_off_without_the_enable_file(self) -> None:
         self.repos.write_text(REPO + "\n")
@@ -136,6 +138,60 @@ class Nightly(Base):
         # Not recorded as run: the next pass tries again.
         self.assertEqual(len(self.run_nightly(NOW + 600) and self.git.maintenance_runs()), 1)
 
+    def test_pruning_is_pinned_whatever_the_repo_config_says(self) -> None:
+        self.repos.write_text(REPO + "\n")
+        self.enable.write_text("")
+        self.run_nightly()
+        (argv,) = self.git.maintenance_runs()
+        at = argv.index("maintenance")
+        self.assertEqual(argv[at - 4:at], ["-c", "gc.pruneExpire=2.weeks.ago",
+                                           "-c", "gc.worktreePruneExpire=3.months.ago"])
+        self.assertNotIn("now", " ".join(argv))
+
+    def test_deferred_while_other_git_maintenance_runs(self) -> None:
+        # m3's storm came from agents' host-side git, not from gate lanes.
+        self.repos.write_text(REPO + "\n")
+        self.enable.write_text("")
+        lines = self.run_nightly(ps_out="1 00:05 /opt/homebrew/bin/git maintenance run --auto")
+        self.assertIn("deferred, 1 git maintenance/repack/gc process(es) already running", lines[0])
+        self.assertEqual(self.git.maintenance_runs(), [])
+        # Control: an ordinary git command does not defer it.
+        self.run_nightly(ps_out="2 00:05 /opt/homebrew/bin/git status")
+        self.assertEqual(len(self.git.maintenance_runs()), 1)
+
+    def test_deferred_while_the_host_is_loaded(self) -> None:
+        self.repos.write_text(REPO + "\n")
+        self.enable.write_text("")
+        lines = self.run_nightly(loaded=lambda: "load 207 is above 2 x 24 cores")
+        self.assertIn("deferred, load 207 is above 2 x 24 cores", lines[0])
+        self.assertEqual(self.git.maintenance_runs(), [])
+        with mock.patch.object(gmg.os, "getloadavg", return_value=(207.0, 150.0, 90.0)), \
+                mock.patch.object(gmg.os, "cpu_count", return_value=24):
+            self.assertEqual(gmg.host_loaded(), "load 207 is above 2 x 24 cores")
+        with mock.patch.object(gmg.os, "getloadavg", return_value=(40.0, 30.0, 20.0)), \
+                mock.patch.object(gmg.os, "cpu_count", return_value=24):
+            self.assertIsNone(gmg.host_loaded())
+
+    def test_an_unknown_lane_state_defers_the_run(self) -> None:
+        # Fail closed: a lane whose busy state cannot be read counts as busy.
+        import lane_busy  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m3.pulp-gate.plist").write_text("x")
+        self.repos.write_text(REPO + "\n")
+        self.enable.write_text("")
+        unknown = [lane_busy.LaneBusy("com.danielraffel.tartci.tart-runner-macos-fleet.m3.pulp-gate",
+                                      lane_busy.UNKNOWN, "host lease store unreadable", 4242)]
+        idle = [lane_busy.LaneBusy(unknown[0].label, lane_busy.IDLE, "no work", 4242)]
+        with mock.patch.object(lane_busy, "probe", return_value=unknown):
+            self.assertTrue(gmg.lanes_busy(self.home))
+            lines = gmg.nightly(NOW, self.home, run=self.git, ps_out="",
+                                loaded=lambda: None)
+        self.assertIn("deferred, a gate lane is mid-job", lines[0])
+        self.assertEqual(self.git.maintenance_runs(), [])
+        with mock.patch.object(lane_busy, "probe", return_value=idle):
+            self.assertFalse(gmg.lanes_busy(self.home))
+
     def test_two_runs_never_overlap(self) -> None:
         self.repos.write_text(REPO + "\n")
         self.enable.write_text("")
@@ -157,7 +213,7 @@ class Wiring(Base):
         import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
         line = watchdog.git_maintenance_pass(NOW, user_home=self.home, run=self.git,
                                              ps=lambda: STAMPEDE, cwd=lambda pid: REPO,
-                                             busy=lambda home: False)
+                                             busy=lambda home: False, loaded=lambda: None)
         self.assertIn("WARN git-maintenance", line)
         source = Path(watchdog.__file__).read_text()
         self.assertIn("git_line = git_maintenance_pass()", source)

@@ -3615,7 +3615,13 @@ this (`scripts/git_maintenance_guard.py`):
 - **Nightly.** Off unless `~/.config/tartci/git-maintenance.enabled` exists.
   Once a day it runs exactly one `nice -n 19 taskpolicy -b git maintenance run
   --task=gc --task=loose-objects` per listed repository, one at a time behind
-  a lock. It defers while any gate lane is mid-job or its state is unknown.
+  a lock. Pruning is pinned with `-c gc.pruneExpire=2.weeks.ago -c
+  gc.worktreePruneExpire=3.months.ago`, so a repo config of `now` can never
+  prune objects that concurrent agents just wrote. It defers in any of these
+  cases:
+  - a gate lane is mid-job or its state is unknown;
+  - any other git maintenance, repack or gc process is running;
+  - the 1-minute load is above twice the core count.
 
 Enable it on m3 first:
 
