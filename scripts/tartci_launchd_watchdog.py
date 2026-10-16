@@ -1383,6 +1383,18 @@ def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
     return "\n".join(lines) or None
 
 
+def agent_cargo_pass(now: float | None = None, **kwargs) -> str | None:
+    """About hourly, name agents' stale Cargo target dirs, and delete them on a
+    host that opted in (scripts/agent_cargo_reap.py). Never raises."""
+    try:
+        import agent_cargo_reap  # noqa: PLC0415 - sibling module
+        lines = agent_cargo_reap.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN agent-cargo check FAILED "
+                f"({type(exc).__name__}: {exc}); stale build caches would not be reported")
+    return "\n".join(lines) or None
+
+
 def git_maintenance_pass(now: float | None = None, **kwargs) -> str | None:
     """WARN on a git maintenance stampede; run the opted-in nightly pass
     (scripts/git_maintenance_guard.py). Never raises."""
@@ -1772,6 +1784,9 @@ def main(argv: list[str] | None = None) -> int:
         hygiene_line = host_hygiene_pass()
         if hygiene_line:
             print(hygiene_line)
+        cargo_line = agent_cargo_pass()
+        if cargo_line:
+            print(cargo_line)
         git_line = git_maintenance_pass()
         if git_line:
             print(git_line)

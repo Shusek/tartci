@@ -1266,8 +1266,8 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 runner["state_file"] = state_file
 
     # Only a complete census may rewrite the offline clocks: a row missing from
-    # a failed read is not a runner seen online.
-    if not unreadable:
+    # a failed read is not a runner seen online. A dry run writes nothing.
+    if not unreadable and not getattr(args, "dry_run", False):
         try:
             tracker_path.parent.mkdir(parents=True, exist_ok=True)
             tracker_path.write_text(json.dumps(offline_seen, sort_keys=True))
