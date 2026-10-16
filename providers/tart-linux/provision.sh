@@ -16,7 +16,6 @@
 #     [--rosetta|--no-rosetta]
 set -euo pipefail
 
-export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
 VM_USER="${PULP_VM_USER:-admin}"
 SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 BASE="ghcr.io/cirruslabs/ubuntu:24.04"   # pin to a @sha256 digest for a stable golden
@@ -29,6 +28,10 @@ SOURCE_PIN_RESOLVER="$COMMON/pulp-source-pin.py"
 # The resolver imports tomllib; an operator ssh shell may resolve python3 to 3.9.
 # shellcheck source=../common/toml-python.lib.sh
 . "$COMMON/toml-python.lib.sh"
+# shellcheck source=../common/tart-home.lib.sh
+. "$COMMON/tart-home.lib.sh"
+TART_HOME="$(tartci_default_tart_home)" || exit 1
+export TART_HOME
 RENDER_VERIFIER="$COMMON/pulp-render-generation.py"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
