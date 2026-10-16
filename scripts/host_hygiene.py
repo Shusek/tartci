@@ -18,9 +18,12 @@ foreign VMs
     and size. On 2026-10-16 an agent's manual repro VM ran on m1 for 11 h
     unnoticed, and three two-month-old images sat in the stores.
 
-A VM is tartci's when a fleet lane names it as a golden, a LaunchAgent tartci
-installed names it, or it has a lane clone's shape `<host>-<lane>-<pid>-<n>`
-for this host. Anything else is reported, never touched.
+Ownership is tart_image_prune.plan()'s, the one rule the image pruner already
+tests: an image is reported only when that plan would delete it (so every
+`:latest` tag, golden, Pulp vm-image manifest image, image a tartci file
+names, and newest rollback image is kept), and a non-image VM only when it is
+not this host's lane clone and nothing tartci installed names it. Anything
+reported is listed, never touched.
 
 Off unless ~/.config/tartci/host-hygiene.enabled exists, so it rolls out one
 host at a time.
@@ -29,7 +32,6 @@ from __future__ import annotations
 
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -136,13 +138,21 @@ def default_consumers(user_home: Path, stores: list[Path]) -> list[tuple[Path, s
     return rows
 
 
+TASKPOLICY = "/usr/sbin/taskpolicy"
+MEASURE_DEADLINE_SECONDS = 300
+
+
 def du_bytes(path: Path, timeout: float = DU_TIMEOUT_SECONDS) -> Optional[int]:
-    """Bytes under `path`, or None when absent, unreadable or too slow to count."""
+    """Bytes under `path`, or None when absent, unreadable or too slow to count.
+
+    Run as a background task (`taskpolicy -b`: throttled CPU and disk I/O);
+    `nice` alone does not lower disk I/O priority on macOS."""
     if not path.exists():
         return None
+    argv = ["du", "-sk", str(path)]
+    argv = [TASKPOLICY, "-b", *argv] if os.path.exists(TASKPOLICY) else ["nice", "-n", "20", *argv]
     try:
-        out = subprocess.run(["nice", "-n", "20", "du", "-sk", str(path)], capture_output=True,
-                             text=True, timeout=timeout, check=False)
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     try:
@@ -151,18 +161,28 @@ def du_bytes(path: Path, timeout: float = DU_TIMEOUT_SECONDS) -> Optional[int]:
         return None
 
 
-def consumers(rows: list[tuple[Path, str]], measure: Callable[[Path], Optional[int]],
-              cache: Path, now: float) -> list[dict]:
+def consumers(rows: list[tuple[Path, str]], measure: Callable[..., Optional[int]],
+              cache: Path, now: float, deadline_seconds: float = MEASURE_DEADLINE_SECONDS,
+              clock: Callable[[], float] = time.monotonic) -> list[dict]:
+    """Sizes of `rows`, at most every CONSUMERS_TTL_SECONDS, within one overall
+    deadline: each path gets what is left of it (and at most DU_TIMEOUT_SECONDS),
+    so the heal pass is never held longer than the deadline."""
     cached = _read_json(cache)
     if cached.get("measured_at", 0) and 0 <= now - cached["measured_at"] < CONSUMERS_TTL_SECONDS:
         return cached.get("rows", [])
     out = []
+    unmeasured = []
+    end = clock() + deadline_seconds
     for path, how in rows:
-        size = measure(path)
+        left = end - clock()
+        if left <= 1:
+            unmeasured.append(str(path))
+            continue
+        size = measure(path, timeout=min(DU_TIMEOUT_SECONDS, left))
         if size is not None:
             out.append({"path": str(path), "bytes": size, "reclaim": how})
     out.sort(key=lambda row: -row["bytes"])
-    _write_json(cache, {"measured_at": now, "rows": out})
+    _write_json(cache, {"measured_at": now, "rows": out, "unmeasured": unmeasured})
     return out
 
 
@@ -227,58 +247,74 @@ def _etime(value: str) -> Optional[float]:
     return (int(days or 0) * 86400) + nums[0] * 3600 + nums[1] * 60 + nums[2]
 
 
-def tartci_names(user_home: Path, profile: Optional[dict]) -> set[str]:
-    """Goldens the fleet lanes name, plus every string a tartci LaunchAgent carries."""
-    names: set[str] = set()
-    for lane in (profile or {}).get("lane") or []:
-        if isinstance(lane, dict) and isinstance(lane.get("golden"), str):
-            names.add(lane["golden"])
-    agents = Path(os.environ.get("TARTCI_LAUNCH_AGENTS_DIR")
-                  or user_home / "Library" / "LaunchAgents")
-    for plist in agents.glob("com.danielraffel.*.plist"):
-        try:
-            value = plistlib.loads(plist.read_bytes())
-        except Exception:  # noqa: BLE001 - an unreadable plist names nothing
-            continue
-        stack = [value]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, dict):
-                stack.extend(item.values())
-            elif isinstance(item, list):
-                stack.extend(item)
-            elif isinstance(item, str):
-                names.add(item)
-    return names
-
-
-def is_tartci_vm(name: str, host: str, owned_names: set[str]) -> bool:
-    if name in owned_names:
-        return True
+def own_clone(name: str, host: str) -> bool:
+    """This host's lane clone `<host>-<lane>-<pid>-<n>`: vm_reap.py's to judge."""
     match = CLONE_RE.match(name)
     return bool(match and match.group("runner").startswith(f"{host}-"))
 
 
-def foreign_vms(stores: list[Path], host: str, owned_names: set[str], now: float,
+def ownership_inputs(user_home: Path, profile_path: Path) -> Optional[dict]:
+    """What tart_image_prune.plan() judges ownership by, read once; None when
+    the fleet profile cannot be read (then nothing is judged foreign)."""
+    import tart_image_prune as prune  # noqa: PLC0415 - sibling module; one ownership rule
+    try:
+        values, data = prune.profile_strings(profile_path)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    repo = (data.get("reclaim") or {}).get("repo")
+    return {"profile_values": values,
+            "manifest": prune.manifest_bases(Path(repo) if isinstance(repo, str) else None),
+            "text": prune.reference_text([user_home / ".config/tartci", _tartci_home() / "state",
+                                          user_home / "Library/LaunchAgents"])}
+
+
+def foreign_vms(stores: list[Path], host: str, inputs: Optional[dict], now: float,
                 listing: Callable[[Path], Optional[list[dict]]] = tart_list,
-                ps_out: str = "") -> tuple[list[dict], list[str]]:
-    """(reportable foreign VMs, stores that could not be listed)."""
+                ps_out: str = "",
+                opened: Callable[[], Optional[list[str]]] = lambda: None
+                ) -> tuple[list[dict], list[str]]:
+    """(reportable VMs, stores that could not be judged).
+
+    One ownership rule, tart_image_prune.plan()'s: an IMAGE (a tagged name, or
+    one under a golden's base) is reported only when the plan would delete it,
+    so every `:latest` tag, golden, manifest image, named or newest-rollback
+    image is tartci's. A non-image VM is reported when it is not this host's
+    lane clone, nothing tartci installed names it, and it has run longer than
+    FOREIGN_RUNNING_HOURS or been stopped longer than FOREIGN_STOPPED_DAYS.
+    """
+    import tart_image_prune as prune  # noqa: PLC0415
     found, blind = [], []
+    if inputs is None:
+        return [], [f"{s} (fleet profile unreadable)" for s in stores]
     for store in stores:
         rows = listing(store)
         if rows is None:
             blind.append(str(store))
             continue
-        for row in rows:
-            name = str(row.get("Name") or "")
-            if not name or str(row.get("Source") or "local").lower() != "local":
-                continue  # OCI cache entries are Tart's to prune
-            if is_tartci_vm(name, host, owned_names):
+
+        def judged(open_list: Optional[list[str]]) -> dict:
+            return prune.plan(rows, vms_dir=store / "vms", profile_values=inputs["profile_values"],
+                              manifest=inputs["manifest"], text=inputs["text"],
+                              opened=open_list, now=now, min_idle_days=FOREIGN_STOPPED_DAYS)
+
+        report = judged([])
+        if any(i["verdict"] == "delete" for i in report["images"]):
+            # Confirm with the real open-file list only when something would be named.
+            report = judged(opened())
+        for image in report["images"]:
+            if image["verdict"] != "delete":
                 continue
-            running = str(row.get("State") or "").lower() == "running"
-            size = row.get("Size")
-            entry = {"name": name, "store": str(store), "state": "running" if running
-                     else "stopped", "size_gb": size}
+            ts = prune.accessed_ts(image.get("accessed"))
+            found.append({"name": image["name"], "store": str(store), "state": "stopped",
+                          "size_gb": round(image["size_bytes"] / prune.GIB),
+                          "age_hours": round((now - ts) / 3600, 1) if ts else 0.0,
+                          "why": image["reason"]})
+        for slot in report["slot_vms"]:
+            name = slot["name"]
+            if own_clone(name, host) or name in inputs["profile_values"] \
+                    or prune.named_in(name, inputs["text"]):
+                continue
+            running = str(slot.get("state") or "").lower() == "running"
             if running:
                 age = running_seconds(name, ps_out)
                 if age is None or age < FOREIGN_RUNNING_HOURS * 3600:
@@ -290,8 +326,10 @@ def foreign_vms(stores: list[Path], host: str, owned_names: set[str], now: float
                     continue
                 if age < FOREIGN_STOPPED_DAYS * 86400:
                     continue
-            entry["age_hours"] = round(age / 3600, 1)
-            found.append(entry)
+            found.append({"name": name, "store": str(store),
+                          "state": "running" if running else "stopped",
+                          "size_gb": round(slot["size_bytes"] / prune.GIB),
+                          "age_hours": round(age / 3600, 1), "why": "not tartci's"})
     found.sort(key=lambda e: (e["state"] != "running", -e["age_hours"]))
     return found, blind
 
@@ -302,12 +340,15 @@ def _age(hours: float) -> str:
 
 def render_foreign(host: str, since: str, vms: list[dict], detected: str) -> tuple[str, str]:
     lines = ["## What happened",
-             f"`{host}` carries VMs tartci did not make: running longer than "
-             f"{FOREIGN_RUNNING_HOURS} h, or stopped longer than {FOREIGN_STOPPED_DAYS} days. "
-             "A running one takes cores and memory the lanes lease; a stopped one takes disk.",
-             "", "## Evidence", "", "| VM | store | state | age | size |", "|---|---|---|---|---|"]
+             f"`{host}` carries VMs nothing tartci uses: images the image pruner would "
+             f"delete (unreferenced, idle over {FOREIGN_STOPPED_DAYS} days), and VMs tartci did "
+             f"not make that have run over {FOREIGN_RUNNING_HOURS} h or been stopped over "
+             f"{FOREIGN_STOPPED_DAYS} days. A running one takes cores and memory the lanes lease; "
+             "a stopped one takes disk.",
+             "", "## Evidence", "", "| VM | store | state | age | size | why |",
+             "|---|---|---|---|---|---|"]
     lines += [f"| `{v['name']}` | `{v['store']}` | {v['state']} | {_age(v['age_hours'])} | "
-              f"{v.get('size_gb', '?')} GB |" for v in vms]
+              f"{v.get('size_gb', '?')} GB | {v.get('why', '')} |" for v in vms]
     lines += ["", "## Likely cause",
               "A manual or agent test VM that was never deleted (on m1, 2026-10-16, an agent's "
               "repro VM ran 11 h), or an image kept for a rollback that is no longer needed. "
@@ -321,7 +362,7 @@ def render_foreign(host: str, since: str, vms: list[dict], detected: str) -> tup
               "## How to verify",
               "The next hourly check lists none of them; this issue then closes itself."]
     marker = tartci_incident.marker(host, FOREIGN_CLASS, since, detected)
-    return (f"[tartci] {host} has {len(vms)} VM(s) tartci did not make",
+    return (f"[tartci] {host} has {len(vms)} VM(s) nothing tartci uses",
             tartci_incident.with_marker("\n".join(lines), marker))
 
 
@@ -332,14 +373,17 @@ def _host_id() -> str:
     return interpreter_alert.host_id()
 
 
+def _profile_path() -> Path:
+    return Path(os.environ.get("TARTCI_MACOS_FLEET_PROFILE") or os.path.expanduser(
+        "~/.config/tartci/macos-fleet-profile.toml"))
+
+
 def _profile() -> Optional[dict]:
     try:
         import tomllib  # noqa: PLC0415 - the watchdog runs the pinned 3.11+
-        path = Path(os.environ.get("TARTCI_MACOS_FLEET_PROFILE") or os.path.expanduser(
-            "~/.config/tartci/macos-fleet-profile.toml"))
-        with path.open("rb") as handle:
+        with _profile_path().open("rb") as handle:
             return tomllib.load(handle)
-    except Exception:  # noqa: BLE001 - no profile is no golden names
+    except Exception:  # noqa: BLE001 - no profile is no store from it
         return None
 
 
@@ -356,9 +400,10 @@ def stores(user_home: Path, profile: Optional[dict]) -> list[Path]:
 
 def alert_pass(now: Optional[float] = None, *, user_home: Optional[Path] = None,
                vols: Optional[Callable[[list[Path]], list[dict]]] = None,
-               measure: Callable[[Path], Optional[int]] = du_bytes,
+               measure: Callable[..., Optional[int]] = du_bytes,
                listing: Callable[[Path], Optional[list[dict]]] = tart_list,
                ps: Optional[Callable[[], str]] = None,
+               lsof: Optional[Callable[[], Optional[list[str]]]] = None,
                issue: Optional[Callable[..., Any]] = None,
                close: Optional[Callable[..., Any]] = None) -> list[str]:
     """One watchdog pass: the WARN lines to log."""
@@ -395,8 +440,8 @@ def alert_pass(now: Optional[float] = None, *, user_home: Optional[Path] = None,
     last = _read_json(scan_state)
     if not (0 <= now - float(last.get("checked_at", 0)) < FOREIGN_INTERVAL_SECONDS):
         ps_text = (ps or _ps)()
-        vms, blind = foreign_vms(store_paths, host, tartci_names(user_home, profile), now,
-                                 listing, ps_text)
+        vms, blind = foreign_vms(store_paths, host, ownership_inputs(user_home, _profile_path()),
+                                 now, listing, ps_text, opened=lsof or _open_paths)
         last = {"checked_at": now, "vms": vms, "blind": blind}
         _write_json(scan_state, last)
     vms = last.get("vms") or []
@@ -413,6 +458,11 @@ def alert_pass(now: Optional[float] = None, *, user_home: Optional[Path] = None,
     for store in last.get("blind") or []:
         out.append(f"{detected} launchd-watchdog: WARN foreign-vms: could not list {store}")
     return out
+
+
+def _open_paths() -> Optional[list[str]]:
+    import tart_image_prune as prune  # noqa: PLC0415
+    return prune.open_paths(subprocess.run)
 
 
 def _ps() -> str:

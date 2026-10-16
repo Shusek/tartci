@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import plistlib
 import sys
 import tempfile
 import unittest
@@ -38,9 +37,13 @@ class Base(unittest.TestCase):
         (self.user / "Library" / "LaunchAgents").mkdir(parents=True)
         self.enable = self.user / ".config" / "tartci" / "host-hygiene.enabled"
         self.enable.write_text("")
+        self.profile = self.user / ".config" / "tartci" / "macos-fleet-profile.toml"
+        self.profile.write_text(
+            f'[host]\nid = "m1"\ntart_home = "{self.store}"\n'
+            '[[lane]]\nid = "pulp-gate"\ngolden = "pulp-build-runner:latest"\n')
         env = {"HOME": str(self.user), "TARTCI_HOME": str(self.user / ".tartci"),
                "TART_HOME": str(self.store),
-               "TARTCI_MACOS_FLEET_PROFILE": str(self.user / "absent.toml")}
+               "TARTCI_MACOS_FLEET_PROFILE": str(self.profile)}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -57,13 +60,15 @@ class Base(unittest.TestCase):
     def vm(self, store: Path, name: str, state: str = "stopped", age_days: float = 0,
            size: int = 20) -> None:
         self.listings.setdefault(store, []).append(
-            {"Name": name, "State": state, "Size": size, "Source": "local"})
+            {"Name": name, "State": state, "Size": size, "Source": "local",
+             "Running": state == "running",
+             "Accessed": hy._iso(NOW - age_days * 86400)})
         bundle = store / "vms" / name
         bundle.mkdir(parents=True, exist_ok=True)
         os.utime(bundle, (NOW - age_days * 86400, NOW - age_days * 86400))
 
     def run_pass(self, now: float = NOW, free_gb: float = 900, ps: str = "") -> list[str]:
-        def measure(path: Path):
+        def measure(path: Path, timeout: float = 0):
             self.measured.append(path)
             return {"agent-scratch": 432, "agent-worktrees": 138}.get(path.name, 1) * GB
 
@@ -71,7 +76,7 @@ class Base(unittest.TestCase):
             now, user_home=self.user,
             vols=lambda paths: [vol(str(paths[0]), free_gb, 2000)],
             measure=measure, listing=lambda store: self.listings.get(store, []),
-            ps=lambda: ps,
+            ps=lambda: ps, lsof=lambda: [],
             issue=lambda t, b: self.opened.append((t, b)) or (0, str(70 + len(self.opened))),
             close=lambda n: self.closed.append(n) or (0, "closed"))
 
@@ -102,9 +107,36 @@ class DiskFloor(Base):
         scratch = self.user / "agent-scratch" / "old-run"
         scratch.mkdir(parents=True)
         self.run_pass(free_gb=150)
-        self.assertEqual(self.run_pass(NOW + 300, free_gb=900), [])
+        self.assertEqual([x for x in self.run_pass(NOW + 300, free_gb=900) if "host-disk" in x], [])
         self.assertEqual(self.closed, ["71"])
         self.assertTrue(scratch.exists())
+
+    def test_measuring_stops_at_one_overall_deadline(self) -> None:
+        clock = [0.0]
+        timeouts = []
+
+        def slow(path: Path, timeout: float = 0):
+            timeouts.append(timeout)
+            clock[0] += 200
+            return 1
+
+        rows = [(Path(f"/p{i}"), "x") for i in range(4)]
+        out = hy.consumers(rows, slow, self.root / "c.json", NOW, deadline_seconds=300,
+                           clock=lambda: clock[0])
+        self.assertEqual(len(out), 2)
+        self.assertEqual(timeouts, [hy.DU_TIMEOUT_SECONDS, 100.0])
+        cached = hy._read_json(self.root / "c.json")
+        self.assertEqual(cached["unmeasured"], ["/p2", "/p3"])
+
+    def test_du_runs_as_a_background_task(self) -> None:
+        seen = []
+        (self.root / "d").mkdir()
+        with mock.patch.object(hy.os.path, "exists", side_effect=lambda p: True), \
+                mock.patch.object(hy.subprocess, "run",
+                                  side_effect=lambda argv, **kw: seen.append(argv) or
+                                  mock.Mock(stdout="8\t/d\n")):
+            self.assertEqual(hy.du_bytes(self.root / "d", timeout=5), 8 * 1024)
+        self.assertEqual(seen[0][:3], ["/usr/sbin/taskpolicy", "-b", "du"])
 
     def test_volumes_are_counted_once_per_device(self) -> None:
         stat = mock.Mock(return_value=mock.Mock(f_blocks=100, f_frsize=GB, f_bavail=10))
@@ -113,47 +145,75 @@ class DiskFloor(Base):
         self.assertEqual(rows[0]["paths"], ["/a", "/b"])
 
 
+NEEDS_TOMLLIB = unittest.skipIf(sys.version_info < (3, 11),
+                                "ownership reads the fleet profile (tomllib, 3.11+)")
+
+
+@NEEDS_TOMLLIB
 class ForeignVms(Base):
-    def test_old_stopped_and_long_running_foreign_vms_are_reported_not_touched(self) -> None:
+    def foreign_line(self, lines: list[str]) -> str:
+        return next((x for x in lines if "foreign-vms" in x), "")
+
+    def test_real_fleet_images_are_tartci_s_and_only_prunable_ones_are_reported(self) -> None:
+        # The names infra-review2 saw on m1, m5 and m3 (2026-10-16): goldens,
+        # every :latest bake tier and the newest rollback are tartci's.
+        for name in ("pulp-build-runner:latest", "pulp-linux-build:latest",
+                     "macos-build-base:latest", "macos-apple-xcode:latest",
+                     "pulp-build-base:latest"):
+            self.vm(self.store, name, age_days=90)
+        self.vm(self.store, "pulp-build-runner:m1-rollback-20260826-pre-m3", age_days=50)
+        self.vm(self.store, "pulp-build-runner:m1-rollback-20260701", age_days=100)
+        lines = self.run_pass()
+        line = self.foreign_line(lines)
+        self.assertIn("pulp-build-runner:m1-rollback-20260701 stopped", line)
+        for kept in ("pulp-build-runner:latest", "pulp-linux-build:latest",
+                     "macos-build-base:latest", "macos-apple-xcode:latest",
+                     "pulp-build-base:latest", "pulp-build-runner:m1-rollback-20260826-pre-m3"):
+            self.assertNotIn(kept, line)
+        (title, body), = [(t, b) for t, b in self.opened if "nothing tartci uses" in t]
+        self.assertIn("tart delete pulp-build-runner:m1-rollback-20260701", body)
+        self.assertNotIn("tart delete pulp-linux-build:latest", body)
+        self.assertEqual(tartci_incident.parse(body)["class"], "host_foreign_vms")
+
+    def test_manual_vms_are_reported_by_age_and_never_touched(self) -> None:
         self.vm(self.user / ".tart", "vellum-pr19-linux-20260811", age_days=60, size=6)
         self.vm(self.store, "lv2repro-pulpimpl", state="running", size=20)
         self.vm(self.store, "fresh-manual", age_days=3)                 # under 14 d
         self.vm(self.store, "m1-pulp-gate-01-23177-1", state="running")  # a lane clone
         ps = ("11:02:03 /opt/homebrew/bin/tart run --no-graphics lv2repro-pulpimpl\n"
-              "12:00:00 /opt/homebrew/bin/tart run --no-graphics m1-pulp-gate-01-23177-1\n")   # a long job, still tartci's
-        lines = self.run_pass(ps=ps)
-        line = next(x for x in lines if "foreign-vms" in x)
+              "12:00:00 /opt/homebrew/bin/tart run --no-graphics m1-pulp-gate-01-23177-1\n")
+        line = self.foreign_line(self.run_pass(ps=ps))
         self.assertIn("lv2repro-pulpimpl running 11.0 h", line)
         self.assertIn("vellum-pr19-linux-20260811 stopped 60 d", line)
         self.assertNotIn("fresh-manual", line)
         self.assertNotIn("m1-pulp-gate", line)
-        (title, body), = [(t, b) for t, b in self.opened if "did not make" in t]
-        self.assertEqual(title, "[tartci] m1 has 2 VM(s) tartci did not make")
+        (title, body), = [(t, b) for t, b in self.opened if "nothing tartci uses" in t]
+        self.assertEqual(title, "[tartci] m1 has 2 VM(s) nothing tartci uses")
         self.assertIn("tart stop lv2repro-pulpimpl", body)
-        self.assertEqual(tartci_incident.parse(body)["class"], "host_foreign_vms")
         self.assertTrue((self.user / ".tart" / "vms" / "vellum-pr19-linux-20260811").exists())
 
     def test_a_short_foreign_run_is_not_reported(self) -> None:
         self.vm(self.store, "lv2repro-pulpimpl", state="running")
         ps = "03:59:00 /opt/homebrew/bin/tart run lv2repro-pulpimpl\n"
-        self.assertEqual([x for x in self.run_pass(ps=ps) if "foreign" in x], [])
+        self.assertEqual(self.foreign_line(self.run_pass(ps=ps)), "")
 
-    def test_goldens_and_names_a_tartci_agent_carries_are_tartci_s(self) -> None:
-        self.vm(self.store, "pulp-linux-build:latest", age_days=60)
-        self.vm(self.store, "pulp-build-runner:latest", age_days=60)
+    def test_a_vm_a_tartci_agent_names_is_tartci_s(self) -> None:
+        self.vm(self.store, "linux-lane-golden", age_days=60)
         plist = self.user / "Library" / "LaunchAgents" / "com.danielraffel.pulp.tart-runner-linux.plist"
-        plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {
-            "TARTCI_GOLDEN": "pulp-linux-build:latest"}}))
-        profile = {"lane": [{"golden": "pulp-build-runner:latest"}]}
-        with mock.patch.object(hy, "_profile", return_value=profile):
-            lines = self.run_pass()
-        self.assertEqual([x for x in lines if "foreign" in x], [])
-        # Control: without the agent naming it, the linux golden is reported.
+        plist.write_text("<plist><dict><key>TARTCI_GOLDEN</key>"
+                         "<string>linux-lane-golden</string></dict></plist>")
+        self.assertEqual(self.foreign_line(self.run_pass()), "")
+        # Control: without the agent naming it, it is reported.
         plist.unlink()
         os.unlink(self.user / ".tartci" / "state" / "host-hygiene" / "foreign-vms.json")
-        with mock.patch.object(hy, "_profile", return_value=profile):
-            lines = self.run_pass()
-        self.assertIn("pulp-linux-build:latest", "".join(lines))
+        self.assertIn("linux-lane-golden", self.foreign_line(self.run_pass()))
+
+    def test_an_unreadable_profile_judges_nothing_foreign(self) -> None:
+        self.vm(self.store, "pulp-build-runner:m1-rollback-20260701", age_days=100)
+        self.profile.write_text("not = [toml")
+        lines = self.run_pass()
+        self.assertNotIn("rollback", self.foreign_line(lines))
+        self.assertIn("fleet profile unreadable", "".join(lines))
 
     def test_it_scans_hourly_and_reports_a_store_it_cannot_list(self) -> None:
         self.listings[self.store] = None

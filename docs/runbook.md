@@ -3462,21 +3462,24 @@ first, then m5, m3 and m5s, one per day.
   - Both Tart stores.
   - The build trees. `tartci reclaim --fix` is the only automatic reclaim.
 
-  Sizes are measured with `du` at most every 6 h, each with a 180 s limit. The
-  issue closes when the floor holds again.
-- **Foreign VMs.** Hourly, every local VM in the VM store and in `~/.tart`
-  that tartci did not make is reported in one issue
-  (`[tartci] <host> has <N> VM(s) tartci did not make`, `host_foreign_vms`),
-  with name, store, state, age and size. A VM is reported when it has been
-  running longer than 4 h or stopped longer than 14 days. A VM counts as
-  tartci's when any of these holds:
-  - a fleet lane names it as a golden;
-  - a tartci or pulp LaunchAgent names it;
-  - its name has this host's lane-clone shape `<host>-<lane>-<pid>-<n>`.
+  Sizes are measured at most every 6 h. The issue closes when the floor holds
+  again.
+- **Foreign VMs.** Hourly, the VM store and `~/.tart` are judged with the
+  image pruner's own ownership rule (`tart_image_prune.plan()`):
+  - An image is reported only when that plan would delete it. Every
+    `:latest` tag, golden, Pulp vm-image manifest image, newest rollback, and
+    image a tartci file names is tartci's.
+  - A non-image VM is reported when it is not this host's lane clone,
+    nothing tartci installed names it, and it has been running more than
+    4 h or stopped more than 14 days.
 
-  The issue gives the stop and delete commands for an operator to run after
-  the VM's owner agrees. A store that cannot be listed is logged as
-  `WARN foreign-vms: could not list <store>`.
+  It opens one issue: `[tartci] <host> has <N> VM(s) nothing tartci uses`
+  (`host_foreign_vms`), with name, store, state, age, size and reason, plus
+  stop and delete commands for an operator to run after the owner agrees.
+  If the fleet profile is unreadable, nothing is judged. A store that cannot
+  be judged is logged as `WARN foreign-vms: could not list <store>`.
+- **Measuring cost.** `du` runs as a background task (`taskpolicy -b`), with
+  one 300 s deadline for the whole measurement inside the heal pass.
 
 ```sh
 touch ~/.config/tartci/host-hygiene.enabled
