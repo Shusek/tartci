@@ -81,8 +81,8 @@ capacity authority, so it is not being created or rolled out.
 
 The private desired-state projection was reconciled against exact current
 TartCI and Pulp `origin/main` checkouts on 2026-10-16. Its checker passed the
-reconciled projection and rejects missing, empty, malformed, unknown, and
-stale host tier data. The projection is kept in the private authority
+reconciled projection and rejects missing, empty, malformed, unknown, duplicate,
+and stale host tier data. The projection is kept in the private authority
 repository and is not part of the public TartCI source tree.
 
 The first Python 3.9 run exposed a compatibility gap: stock Python 3.9 has no
@@ -96,7 +96,7 @@ The focused suites were rerun from a clean current-main worktree on
 2026-10-16: `test_fleet_source.py` passed 23 tests,
 `test_fleet_source_sync.py` passed 15 tests, and
 `test_fleet_self_update.py` passed 314 tests. The private projection checker
-tests pass 5 tests. The private review is open; external-source selection
+tests pass 6 tests. The private review is open; external-source selection
 remains disabled while the complete export is still missing.
 
 ## Stop conditions
