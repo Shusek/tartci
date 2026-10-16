@@ -843,6 +843,71 @@ class OrphanedLaneVmTests(unittest.TestCase):
             self.tmp / "vms" / "absent", time.time(), 3600, lambda pid: False),
             (False, "vm_bundle_unreadable"))
 
+    def retired(self, name: str, age: float, host_id="m1", prefixes=("pulp-",),
+                alive=lambda pid: False, leases=frozenset()):
+        return vm_reap.orphan_verdict(name, False, self.RUNNERS, {}, set(leases),
+                                      self.bundle(name, age), time.time(), 3600, alive,
+                                      host_id=host_id, prefixes=list(prefixes))
+
+    def test_a_retired_lanes_clone_on_this_host_is_deleted_after_a_day(self) -> None:
+        # m1 kept pulp-preamble-m1-target-06-99292-1 for two months: its lane
+        # was retired, so no loaded runner matched it.
+        name = "pulp-preamble-m1-target-06-99292-1"
+        verdict = self.retired(name, 2 * 86400)
+        self.assertTrue(verdict[0], verdict)
+        self.assertIn("retired lane", verdict[1])
+        self.assertTrue(self.retired("m1-old-lane-01-5-1", 2 * 86400)[0])
+
+    def test_a_retired_lane_clone_keeps_every_doubt(self) -> None:
+        name = "pulp-preamble-m1-target-06-99292-1"
+        cases = {
+            "recent": dict(age=6 * 3600),
+            "supervisor_pid_alive": dict(age=2 * 86400, alive=lambda pid: pid == 99292),
+            "lease_names_it": dict(age=2 * 86400, leases={name}),
+        }
+        for reason, kwargs in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(self.retired(name, **kwargs), (False, reason))
+        # Not provably this host's: another host's id, no host id word, an
+        # unlisted prefix, or no known host id at all.
+        for other, kwargs in (("pulp-preamble-m5-target-06-99292-1", {}),
+                              ("pulp-linux-build-proof-2-20260811-1", {}),
+                              ("vellum-m1-scratch-01-7-1", {}),
+                              ("pulp-preamble-m1-target-06-99292-1", {"host_id": None})):
+            with self.subTest(name=other, **{k: str(v) for k, v in kwargs.items()}):
+                self.assertEqual(self.retired(other, 60 * 86400, **kwargs),
+                                 (False, "not_a_lane_vm"))
+
+    def test_the_digest_on_m1_reaps_the_retired_clone_and_nothing_foreign(self) -> None:
+        import fleet_lane_discovery as fld
+        lane = fld.Lane("com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate",
+                        "pulp-gate", self.tmp / "state" / "pulp-gate", "m1-pulp-gate-01")
+        (self.tmp / "state" / "pulp-gate").mkdir(parents=True)
+        (self.tmp / "leases").mkdir()
+        (self.tmp / "leases" / "leases.json").write_text("[]")
+        vms = [{"Name": "pulp-preamble-m1-target-06-99292-1", "State": "stopped", "Size": 44},
+               {"Name": "pulp-linux-build-proof-2.336.0-20260811", "State": "stopped", "Size": 18},
+               {"Name": "vellum-pr19-linux-20260811", "State": "stopped", "Size": 6}]
+        for vm in vms:
+            self.bundle(vm["Name"], 60 * 86400)
+        deleted = []
+        args = vm_reap.parse_args(["--repo", "danielraffel/pulp", "--fix"])
+        with mock.patch.dict(os.environ, {"TART_HOME": str(self.tmp),
+                                          "TARTCI_LEASE_DIR": str(self.tmp / "leases")}), \
+             mock.patch.object(vm_reap, "scoped_view", return_value=False), \
+             mock.patch.object(fld, "discover_lanes", return_value=([lane], [])), \
+             mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(vm_reap, "tart_vms", return_value=vms), \
+             mock.patch.object(vm_reap, "macos_running_count", return_value=0), \
+             mock.patch.object(vm_reap, "github_runners", return_value=[]), \
+             mock.patch.object(vm_reap, "pid_alive", return_value=False), \
+             mock.patch.object(vm_reap, "delete_vm",
+                               side_effect=lambda name, running: deleted.append(name) or
+                               [f"vm_deleted:{name}"]):
+            digest, _ = vm_reap.build_digest(args)
+        self.assertEqual(deleted, ["pulp-preamble-m1-target-06-99292-1"])
+        self.assertEqual(digest["orphans"]["delete"], ["pulp-preamble-m1-target-06-99292-1"])
+
     def test_the_digest_deletes_only_the_orphan_and_reports_it(self) -> None:
         import fleet_lane_discovery as fld
         lane = fld.Lane("com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate",

@@ -562,6 +562,21 @@ def lease_references(store_dir: pathlib.Path | None = None) -> set[str] | None:
     return names
 
 
+# A clone left by a lane this host no longer runs (a retired lane, or one
+# renamed) has no loaded runner to match, so the rule above never owned it:
+# m1 kept pulp-preamble-m1-target-06-99292-1 for two months. Such a runner
+# name is still provably this host's when it carries the host id as one of its
+# dash-separated words and starts with an allowed CI prefix or the host id; it
+# must also sit untouched for RETIRED_LANE_MIN_AGE_SECS.
+RETIRED_LANE_MIN_AGE_SECS = 24 * 3600
+
+
+def retired_lane_runner(runner: str, host_id: str | None, prefixes: list[str]) -> bool:
+    if not host_id or host_id not in runner.split("-"):
+        return False
+    return runner.startswith(f"{host_id}-") or starts_with_any(runner, prefixes)
+
+
 def orphan_verdict(
     name: str,
     running: bool,
@@ -572,17 +587,27 @@ def orphan_verdict(
     now: float,
     min_age_secs: int,
     alive: Any = pid_alive,
+    host_id: str | None = None,
+    prefixes: list[str] | None = None,
 ) -> tuple[bool, str]:
     """(delete?, why) for a VM no state file owns. Every doubt keeps it.
 
     Deleted only when ALL hold: the name is `<runner>-<pid>-<n>` for a lane
-    loaded on this host right now; that supervisor pid is not alive; no state
-    file names the VM; no lease record (live or stale) names it; it is
-    stopped; and its bundle has not changed for `min_age_secs`.
+    loaded on this host right now, or for a retired lane of this host (see
+    `retired_lane_runner`, which also needs a day untouched); that supervisor
+    pid is not alive; no state file names the VM; no lease record (live or
+    stale) names it; it is stopped; and its bundle has not changed for
+    `min_age_secs`.
     """
     match = ORPHAN_NAME_RE.match(name)
-    if not match or match.group("runner") not in lane_runners:
+    retired = False
+    if not match:
         return False, "not_a_lane_vm"
+    if match.group("runner") not in lane_runners:
+        if not retired_lane_runner(match.group("runner"), host_id, prefixes or []):
+            return False, "not_a_lane_vm"
+        retired = True
+        min_age_secs = max(min_age_secs, RETIRED_LANE_MIN_AGE_SECS)
     if running:
         return False, "running"
     if name in states_by_vm:
@@ -599,7 +624,8 @@ def orphan_verdict(
         return False, "vm_bundle_unreadable"
     if age < min_age_secs:
         return False, "recent"
-    return True, f"supervisor {match.group('pid')} gone, stopped {int(age)}s"
+    lane = "retired lane " if retired else ""
+    return True, f"{lane}supervisor {match.group('pid')} gone, stopped {int(age)}s"
 
 
 def split_paths(value: str | None) -> list[str]:
@@ -774,6 +800,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if derived not in prefixes:
             prefixes.append(derived)
     lane_runners = {lane.runner_name for lane in lanes or [] if lane.runner_name}
+    # The host id is the first word every loaded lane's runner shares.
+    host_words = {runner.split("-", 1)[0] for runner in lane_runners}
+    host_id = host_words.pop() if len(host_words) == 1 else None
     leases_seen = lease_references() if lane_runners else set()
     store = ensure_tart_home()
     tart_home = pathlib.Path(store["path"])
@@ -885,7 +914,8 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 if not owned and not protected_name:
                     orphaned, orphan_reason = orphan_verdict(
                         name, running, lane_runners, states_by_vm, leases_seen,
-                        tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs)
+                        tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs,
+                        host_id=host_id, prefixes=prefixes)
                     if orphaned:
                         stale = True
                         action = "delete_orphaned_stopped_vm"

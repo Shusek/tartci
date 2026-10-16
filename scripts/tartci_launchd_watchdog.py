@@ -1358,6 +1358,19 @@ def interpreter_grant_pass(now: float | None = None, probe=None, issue=None,
                 f"({type(exc).__name__}: {exc}); a revoked grant would not be reported")
 
 
+def scratch_vm_pass(now: float | None = None, tart=None) -> str | None:
+    """Warn 30 min before a scratch VM's TTL, then stop and delete it
+    (scripts/scratch_vm.py). Acts only on VMs that command recorded. Never raises."""
+    try:
+        import scratch_vm  # noqa: PLC0415 - sibling module
+        kwargs = {} if tart is None else {"tart": tart}
+        lines = scratch_vm.enforce(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN scratch-vm check FAILED "
+                f"({type(exc).__name__}: {exc}); no scratch VM was stopped")
+    return "\n".join(lines) or None
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1725,6 +1738,9 @@ def main(argv: list[str] | None = None) -> int:
         grant_line = interpreter_grant_pass()
         if grant_line:
             print(grant_line)
+        scratch_line = scratch_vm_pass()
+        if scratch_line:
+            print(scratch_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

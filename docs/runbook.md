@@ -3445,6 +3445,41 @@ non-gate budget), **not** a redundant safety patch. Do **not** "pin
 acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
 reserve. Keep the override (or remove it for a linux lane sized to the full
 12-core budget); either way the clamp keeps the gate safe.
+## Scratch VMs for agents
+
+`tartci scratch-vm` is the only sanctioned way for an agent, or a person, to
+make a test VM on a fleet host. A VM made any other way has no owner and no
+end: on 2026-10-16 an agent's repro VM ran on m1 for 11 h.
+
+```sh
+tartci scratch-vm create --owner <agent> --ttl <hours> [--from IMAGE] [--name scratch-...]
+TART_HOME=<store it prints> tart run <name>
+tartci scratch-vm list                       # owner, expiry, minutes left
+tartci scratch-vm extend <name> --ttl <hours> # a new TTL from now
+tartci scratch-vm delete <name>               # when done, before the TTL
+```
+
+- The TTL is at most 72 h.
+- The VM lives in the host's VM store, so the lanes' disk and VM-cap checks
+  count it.
+- Its record is `~/.tartci/state/scratch-vms/<name>.json`.
+- 30 minutes before the TTL, the watchdog logs `WARN scratch-vm: <name>
+  (owner X) is stopped and deleted at <time>`. At the TTL it stops and deletes
+  the VM, then the record. A failed delete keeps the record and retries on the
+  next pass.
+- Only VMs with such a record are ever touched.
+
+## Leaked lane clones
+
+`vm_reap` deletes a stopped lane clone `<runner>-<pid>-<n>` whose supervisor
+is gone and that no state file or lease names. This covers clones of loaded
+lanes, and since 2026-10-16 also clones of retired lanes on this host. A
+runner name counts as this host's when it carries the host id as one of its
+dash-separated words and starts with an allowed CI prefix or the host id. A
+retired lane's clone must also be untouched for 24 h. m1 had kept
+`pulp-preamble-m1-target-06-99292-1` for two months. A VM whose name is not
+provably this host's is never touched; the foreign-VM report covers those.
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
