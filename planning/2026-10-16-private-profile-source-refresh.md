@@ -102,6 +102,12 @@ not be collected because its configured SSH key is rejected. A partial export
 from the reachable hosts would omit capacity and routing authority, so it is
 not being created or rolled out.
 
+The first GitHub Python 3.9 run exposed a compatibility gap in the initial
+validator: stock Python 3.9 has no `tomllib`, so valid configured sources were
+rejected. The resolver now uses a conservative syntax check on 3.9 and keeps
+full TOML parsing on 3.11+. The affected 3.9 source, peer, tailnet, and serving
+tests pass locally after the fix; the replacement CI run is pending.
+
 ## Stop conditions
 
 Stop and retain the public default if the private authority remains redacted,
