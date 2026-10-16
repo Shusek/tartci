@@ -244,6 +244,12 @@ trap cleanup_plan EXIT
   echo "fleet install refused: the profile's [mise] binary is not the pinned one (see above)" >&2
   exit 3
 }
+# A profile with [rustup] keeps the host's rustup from checking for or
+# installing its own updates; refuse the install if rustup does not record it.
+"$PYTHON_BIN" "$ROOT/scripts/rustup_settings.py" apply "$CONFIG" >/dev/null || {
+  echo "fleet install refused: the profile's [rustup] could not be set to never self-update (see above)" >&2
+  exit 3
+}
 "$PYTHON_BIN" "$PY" render "$CONFIG" --output "$plan_dir" >/dev/null
 "$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" verify "$SUPPORT_MANIFEST" \
   --root "$SUPPORT_SOURCE" >/dev/null

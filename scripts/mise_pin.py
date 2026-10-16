@@ -73,8 +73,11 @@ def verify(table: dict) -> str | None:
         return (f"{path} has sha256 {found}, but the profile pins {table['sha256']} "
                 f"(mise {table['version']}); {fix}")
     try:
+        # MISE_DISABLE_UPDATE_WARNING: `--version` otherwise asks GitHub for a
+        # newer mise, and the pinned binary never queries.
         out = subprocess.run([str(path), "--version"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=20, check=False)
+                             encoding="utf-8", errors="replace", timeout=20, check=False,
+                             env=dict(os.environ, MISE_DISABLE_UPDATE_WARNING="1"))
     except (OSError, subprocess.SubprocessError) as exc:
         return f"{path} --version did not run: {exc}"
     words = out.stdout.split()
