@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -65,6 +66,13 @@ class FleetSourceTests(unittest.TestCase):
             source = fleet_source.resolve(root)
             self.assertEqual(root.resolve(), source.root)
             self.assertFalse(source.configured)
+
+    def test_valid_source_remains_selectable_without_tomllib(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(fleet_source, "tomllib", None):
+            root = Path(td)
+            os.environ.update(configured_source(root))
+            source = fleet_source.resolve(Path("/public"))
+            self.assertEqual(root.resolve(), source.root)
 
     def test_explicit_source_requires_profiles_and_published_supply(self):
         with tempfile.TemporaryDirectory() as td:
