@@ -1383,6 +1383,18 @@ def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
     return "\n".join(lines) or None
 
 
+def git_maintenance_pass(now: float | None = None, **kwargs) -> str | None:
+    """WARN on a git maintenance stampede; run the opted-in nightly pass
+    (scripts/git_maintenance_guard.py). Never raises."""
+    try:
+        import git_maintenance_guard  # noqa: PLC0415 - sibling module
+        lines = git_maintenance_guard.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN git-maintenance check FAILED "
+                f"({type(exc).__name__}: {exc}); a maintenance stampede would not be reported")
+    return "\n".join(lines) or None
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1760,6 +1772,9 @@ def main(argv: list[str] | None = None) -> int:
         hygiene_line = host_hygiene_pass()
         if hygiene_line:
             print(hygiene_line)
+        git_line = git_maintenance_pass()
+        if git_line:
+            print(git_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()

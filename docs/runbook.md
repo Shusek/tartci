@@ -3570,6 +3570,35 @@ touch ~/.config/tartci/reap-retired-clones.enabled
 
 `--dry-run` changes nothing, even combined with `--fix`.
 
+## Git maintenance on shared object stores
+
+Every agent worktree of a repository shares one object store, and any git
+command can start `git maintenance run --auto` or `git repack` in the
+background. On m3 around 07:15Z on 2026-10-16, 53+ of them ran at once on
+`/Volumes/Workshop/Code/pulp` and the load reached 207. Three parts handle
+this (`scripts/git_maintenance_guard.py`):
+
+- **Check (every watchdog pass, report only).** More than 3 `git
+  maintenance`/`repack`/`gc` processes on a host logs `WARN git-maintenance`,
+  naming each repository with its count and the oldest process.
+- **Enforce.** For each repository listed in
+  `~/.config/tartci/git-maintenance.repos` (one absolute path per line), set
+  `gc.auto=0`, `maintenance.auto=false` and `gc.autoDetach=false`. The fleet
+  installer and every nightly run do this. Without the file it is a no-op.
+- **Nightly.** Off unless `~/.config/tartci/git-maintenance.enabled` exists.
+  Once a day it runs exactly one `nice -n 19 taskpolicy -b git maintenance run
+  --task=gc --task=loose-objects` per listed repository, one at a time behind
+  a lock. It defers while any gate lane is mid-job or its state is unknown.
+
+Enable it on m3 first:
+
+```sh
+echo /Volumes/Workshop/Code/pulp > ~/.config/tartci/git-maintenance.repos
+scripts/git_maintenance_guard.py enforce
+scripts/git_maintenance_guard.py nightly --dry-run
+touch ~/.config/tartci/git-maintenance.enabled
+```
+
 ## M3 disk-denial worktree recovery
 
 The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
