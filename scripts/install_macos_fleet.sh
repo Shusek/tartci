@@ -237,6 +237,13 @@ cleanup_plan() {
 }
 trap cleanup_plan EXIT
 "$PYTHON_BIN" "$PY" validate "$CONFIG"
+# A profile that pins mise ([mise]) names one exact binary by digest. Refuse a
+# missing or different binary here, before any LaunchAgent or receipt changes;
+# the message names the expected and found digest and the fix.
+"$PYTHON_BIN" "$ROOT/scripts/mise_pin.py" check "$CONFIG" >/dev/null || {
+  echo "fleet install refused: the profile's [mise] binary is not the pinned one (see above)" >&2
+  exit 3
+}
 "$PYTHON_BIN" "$PY" render "$CONFIG" --output "$plan_dir" >/dev/null
 "$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" verify "$SUPPORT_MANIFEST" \
   --root "$SUPPORT_SOURCE" >/dev/null
@@ -1054,6 +1061,8 @@ mv -f "$pin_tmp" "$pin_file"
 durable_file "$pin_file"
 # A working pin is in place: the watchdog's unpinned-interpreter issue closes.
 rm -f "$(tartci_interpreter_refusal_file)"
+# The verified mise pin (or its removal, when the profile no longer pins one).
+"$PYTHON_BIN" "$ROOT/scripts/mise_pin.py" write "$CONFIG" "$HOME/.config/tartci/mise.pin"
 
 if [ -d "$ENTRYPOINT" ] && [ ! -L "$ENTRYPOINT" ]; then
   echo "fleet install refuses a directory at the canonical TartCI entrypoint: $ENTRYPOINT" >&2
