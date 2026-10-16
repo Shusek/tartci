@@ -697,7 +697,7 @@ def probe_tart_vm_running() -> TartVMProbe:
             tart_cli,
             tart_home,
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         return TartVMProbe(
             None,
             f"Tart VM inventory unavailable via {tart_cli} in {tart_home}: {exc}",
@@ -821,7 +821,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     # fresh supervisor and a misleadingly healthy launchd job. The lane-local
     # heartbeat catches that case, but only an idle, readable Tart inventory may
     # authorize recovery.
-    if expected_loaded and ".tart-runner" in label and vm_running is False:
+    if expected_loaded and ".tart-runner-macos" in label and vm_running is False:
         boot_probe = probe_stale_boot(plist_path, launchd_pid)
         if boot_probe.stale:
             return AgentHealth(
@@ -835,7 +835,9 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
             )
     # The inventory probe is Tart-specific. Never let an idle Tart store
     # authorize recovery of a QEMU lane, whose guest state is independent.
-    classify_vm_running = None if ".qemu-runner" in label else vm_running
+    classify_vm_running = (
+        None if ".qemu-runner" in label or ".tart-runner-linux" in label else vm_running
+    )
     verdict, reason = classify(
         state, last_exit, log_age, effective_stale_s, classify_vm_running, expected_loaded,
         restart_grace_s, vm_probe_reason
@@ -1123,8 +1125,6 @@ def refresh_tools(interval_s: int = 1800, timeout_s: int = 600) -> str | None:
                               capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return f"timed out after {timeout_s}s"
-    except subprocess.TimeoutExpired as exc:
-        return TartVMProbe(None, f"Tart VM inventory timed out after 30s: {exc}", tart_cli, tart_home)
     except OSError as exc:
         return f"could not run: {exc}"
     if proc.returncode not in (0, 1) or "Traceback" in (proc.stderr or ""):
