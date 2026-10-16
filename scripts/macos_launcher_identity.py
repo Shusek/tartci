@@ -78,8 +78,24 @@ def verify(path_value: str|Path,*,identifier:str,team_id:str,sha256:str|None=Non
         raise IdentityError("launcher sealed lane configuration is malformed")
     if bundle_digest(path)!=digest: raise IdentityError("launcher bundle changed during verification")
     return {"schema":1,"path":canonical,"sha256":digest,"owner_uid":path.stat().st_uid,"mode":stat.S_IMODE(path.stat().st_mode),"identifier":actual_identifier,"team_id":actual_team,"designated_requirement":designated,"designated_requirement_sha256":hashlib.sha256(designated.encode()).hexdigest(),"hardened_runtime":True,"authority_class":"developer-id-application","architecture":"arm64","source_commit":metadata["source_commit"],"profile_policy_sha256":metadata["profile_policy_sha256"],"support_manifest_sha256":metadata["support_manifest_sha256"],"lane_ids":sorted(lanes["lanes"])}
+def same_bundle(live: str|Path, source: str|Path)->bool:
+    """Whether the live launcher is byte-for-byte the (already verified) source.
+
+    Reinstalling an identical bundle replaces the app directory, which can
+    reset its per-app privacy consent (Removable Volumes); an identical live
+    bundle is left in place instead. Compares paths, modes and contents,
+    signature included; any doubt reads as different.
+    """
+    live,source=Path(live),Path(source)
+    try:
+        if live.is_symlink() or not live.is_dir() or live.stat().st_uid!=os.getuid(): return False
+        if source.is_symlink() or not source.is_dir(): return False
+        return bundle_digest(live)==bundle_digest(source)
+    except (IdentityError,OSError):
+        return False
 def main()->int:
-    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="command",required=True); command=sub.add_parser("verify"); command.add_argument("path"); command.add_argument("--identifier",required=True); command.add_argument("--team-id",required=True); command.add_argument("--sha256"); command.add_argument("--profile-policy-sha256"); command.add_argument("--source-commit"); command.add_argument("--tart-home"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="command",required=True); same=sub.add_parser("same"); same.add_argument("live"); same.add_argument("source"); command=sub.add_parser("verify"); command.add_argument("path"); command.add_argument("--identifier",required=True); command.add_argument("--team-id",required=True); command.add_argument("--sha256"); command.add_argument("--profile-policy-sha256"); command.add_argument("--source-commit"); command.add_argument("--tart-home"); args=parser.parse_args()
+    if args.command=="same": return 0 if same_bundle(args.live,args.source) else 1
     try: record=verify(args.path,identifier=args.identifier,team_id=args.team_id,sha256=args.sha256,profile_policy_sha256=args.profile_policy_sha256,source_commit=args.source_commit,tart_home=args.tart_home)
     except (IdentityError,OSError,subprocess.TimeoutExpired) as error: parser.exit(1,f"macos launcher identity rejected: {error}\n")
     print(json.dumps(record,sort_keys=True,separators=(",",":"))); return 0

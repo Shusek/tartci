@@ -422,6 +422,7 @@ launcher_target=""
 launcher_candidate=""
 launcher_backup=""
 launcher_touched=0
+launcher_unchanged=0
 support_root=""
 installed_support_manifest=""
 launch_entrypoint=""
@@ -688,13 +689,21 @@ PY
     echo "launch helper parent chain must be owned, home-relative, and non-symlinked" >&2
     exit 3
   }
-  launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
-  /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
-  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
-    --source-commit "$launcher_source_commit" >/dev/null
+  # An identical live bundle stays in place: replacing the app directory can
+  # reset its per-app Removable Volumes consent, and then the helper's open()
+  # on an external-volume Tart store blocks.
+  if "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" same \
+      "$launcher_target" "$LAUNCH_HELPER_SOURCE"; then
+    launcher_unchanged=1
+  else
+    launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
+    /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
+    "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
+      --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+      --sha256 "$launcher_sha256" \
+      --profile-policy-sha256 "$launcher_profile_policy_sha256" \
+      --source-commit "$launcher_source_commit" >/dev/null
+  fi
 elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
   echo "--launch-helper-source is invalid for a profile without launch_helper" >&2
   exit 2
@@ -958,7 +967,14 @@ if [ -n "$launcher_target" ]; then
   }
 fi
 
-if [ -n "$launcher_target" ]; then
+if [ -n "$launcher_target" ] && [ "$launcher_unchanged" = 1 ]; then
+  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
+    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
+    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
+    --source-commit "$launcher_source_commit" >/dev/null
+  echo "launcher: unchanged, left in place: $launcher_target"
+elif [ -n "$launcher_target" ]; then
   if { [ -e "$launcher_target" ] || [ -L "$launcher_target" ]; } \
       && { [ -L "$launcher_target" ] || [ ! -d "$launcher_target" ]; }; then
     echo "fleet install requires a regular app directory at the launch helper path: $launcher_target" >&2
