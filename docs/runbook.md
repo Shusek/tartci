@@ -1,12 +1,28 @@
-# tartci runbook — from-scratch setup (macOS + Linux + Windows)
+# tartci runbook: set up a host and serve CI jobs
 
-This is the honest, command-first guide to standing up local CI build VMs on a
-fresh Apple Silicon Mac. It mirrors the proven bring-up: **Linux + macOS on Tart
-(Apple Virtualization), Windows on standalone QEMU** (AVF can't install Windows).
+This guide covers a new Apple Silicon host, the VM images it needs, and the
+commands that serve GitHub Actions jobs. It includes three lanes:
 
-What's **scripted** vs **manual** is called out per section. Where a wrapper
-exists (`./tartci up <os>`), use it; where it doesn't yet, the raw commands here
-are the ground truth.
+- macOS and Linux guests through Tart and Apple Virtualization.
+- Windows guests through QEMU and Hypervisor.framework.
+- Optional x86_64 smoke tests through emulation. These do not replace a native
+  x86_64 check on GitHub-hosted hardware.
+
+Start with `tartci doctor`, then `tartci setup`. Use the command that matches
+what you need:
+
+| Command | Use it for |
+| --- | --- |
+| `tartci prepare linux` | Build the repository's Pulp-oriented Linux golden. |
+| `tartci prepare macos <subcommand>` | Inspect, resize, tag, or check a macOS golden. It does not build a complete macOS golden. |
+| `tartci windows golden` | Snapshot and tag a prepared Windows QEMU VM as a golden. |
+| `tartci up <os>` | Run one build directly, then remove its VM. |
+| `tartci serve <os>` | Serve GitHub Actions jobs. The default is one disposable VM per job; selected macOS lanes can use warm mode. |
+
+The sections below separate commands TartCI runs from steps that still require
+manual provisioning. Where a TartCI wrapper exists, use it; the remaining
+steps are manual procedures. The images stay on the host and are never
+committed.
 
 Conventions used below (no operator-specific data — substitute your own):
 
@@ -604,7 +620,7 @@ golden is never mutated; all per-run state lives in the disposable clone.
 
 ---
 
-## 3. Linux lane (Tart) — the easy, fully-proven win
+## 3. Linux lane (Tart)
 
 End-to-end: pull base → bump resources → durable keys + mounts → deps → Skia →
 build → test. Native arm64 builds at full speed; x64 is cross+emulate (§3.8).
@@ -838,7 +854,7 @@ fails closed.
 
 ---
 
-## 4. Windows lane (QEMU) — the hard-won recipe
+## 4. Windows lane (QEMU)
 
 AVF can't install Windows (no inbox virtio-blk driver → 0 bytes written; black
 installer display), so Windows is **first-class on standalone QEMU/hvf**, not a
