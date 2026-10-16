@@ -27,7 +27,16 @@ class FleetSource:
 
     @property
     def source_commit(self) -> str | None:
+        if not self.configured:
+            return None
         value = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
+        return value or None
+
+    @property
+    def repository(self) -> str | None:
+        if not self.configured:
+            return None
+        value = os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY", "").strip()
         return value or None
 
 
@@ -56,6 +65,10 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
             raise ValueError(
                 "configured fleet source requires TARTCI_FLEET_SOURCE_COMMIT "
                 "to be a 40-character commit"
+            )
+        if not os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY", "").strip():
+            raise ValueError(
+                "configured fleet source requires TARTCI_FLEET_SOURCE_REPOSITORY"
             )
     return FleetSource(root, profiles_dir, published_supply, bool(configured_root))
 

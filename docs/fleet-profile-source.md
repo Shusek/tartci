@@ -19,9 +19,9 @@ fleet/advertised-labels.json
 
 TartCI validates both paths before reading the source. If an explicit source
 is missing, empty, or invalid, the command fails. It does not silently use the
-public checkout instead. `TARTCI_FLEET_SOURCE_COMMIT` is optional for local
-read-only commands and should be set by an installed private source so receipts
-can identify the exact desired-state revision.
+public checkout instead. `TARTCI_FLEET_SOURCE_COMMIT` is required for an
+external source. It pins the desired-state revision so receipts and status
+output can identify exactly what was selected.
 
 This setting does not move or publish fleet profiles. Keep host identities,
 paths, labels, receipts, and snapshots in a private operator repository. Keep

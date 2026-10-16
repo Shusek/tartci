@@ -2603,6 +2603,15 @@ def lane_plist(
         "TARTCI_LAUNCHD": "1",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    configured_source = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
+    if configured_source:
+        source = fleet_source.resolve(TARTCI_ROOT)
+        env.update({
+            "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
+            "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
+            "TARTCI_ADVERTISED_LABELS": str(source.published_supply),
+            "TARTCI_JOB_CLAIM_SUPPLY": str(source.published_supply),
+        })
     # The installer resolves and probes one interpreter before rendering. Keep
     # that exact path in every LaunchAgent so TartCILauncher and ghapp cannot
     # follow a later PATH relink.
@@ -2948,7 +2957,8 @@ def persistent_runners(data: dict) -> list[dict]:
 
 
 def advertised_labels_snapshot(paths: list[Path], commit: str | None,
-                               root: Path | None = None) -> dict:
+                               root: Path | None = None,
+                               repository: str = ADVERTISED_LABELS_REPO) -> dict:
     registrations: list[dict] = []
     persistent: list[dict] = []
     hosts: list[dict] = []
@@ -2963,7 +2973,7 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
     return {
         "schema": ADVERTISED_LABELS_SCHEMA,
         "generated_from": {
-            "repo": ADVERTISED_LABELS_REPO,
+            "repo": repository,
             "commit": commit,
             "profiles": [_display_path(path, root) for path in paths],
         },
@@ -2983,7 +2993,9 @@ def published_snapshot(root: Path | None = None) -> dict:
     carries no commit; its provenance is the git ref it was read from.
     """
     root = root or TARTCI_ROOT
-    return advertised_labels_snapshot(fleet_profiles(root), None, root)
+    source = fleet_source.resolve(root, allow_environment=root == TARTCI_ROOT)
+    return advertised_labels_snapshot(
+        fleet_profiles(root), None, root, source.repository or ADVERTISED_LABELS_REPO)
 
 
 def render_published(snapshot: dict) -> str:
@@ -3650,7 +3662,8 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("name profile files or pass --all")
             source = fleet_source.resolve(TARTCI_ROOT)
             snapshot = advertised_labels_snapshot(
-                paths, source.source_commit or git_head(source.root), source.root)
+                paths, source.source_commit or git_head(source.root), source.root,
+                source.repository or ADVERTISED_LABELS_REPO)
             print(json.dumps(snapshot, indent=2) if args.json else render_advertised(snapshot))
             return 0
         if args.command == "verify-supply":

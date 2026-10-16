@@ -713,10 +713,13 @@ def profile_drift_probe(support_root: Path, installed: Path,
     if python is None:
         return None, "no Python 3.11+ interpreter with tomllib is available"
     script = support_root / "scripts" / "macos_fleet_lanes.py"
+    command = [python, str(script), "profile-drift", "--installed", str(installed)]
+    if not os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip():
+        command.extend(["--profiles-dir", str(support_root / "profiles")])
+    command.append("--json")
     try:
         proc = subprocess.run(
-            [python, str(script), "profile-drift", "--installed", str(installed),
-             "--profiles-dir", str(support_root / "profiles"), "--json"],
+            command,
             capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, f"drift check did not complete: {exc}"
