@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import launch_set as ls
+import tartci_support_manifest as support_manifest
 
 TEAM = "AB12CD34EF"
 STORE = "/Volumes/Example/VMs"
@@ -27,7 +28,8 @@ PIN = "/usr/bin/python3"
 def make_generation(root: Path, name: str = "a" * 40 + "-1", *, pin: str = PIN,
                     tartci: str = "#!/bin/bash\nexit 0\n") -> Path:
     """A support generation the real `tartci_support_manifest.py verify
-    --immutable` accepts once frozen, with v2's entrypoint and shim."""
+    --immutable` accepts once frozen, with v1's `.tartci-launch` as
+    stage-install writes it, and v2's entrypoint and shim."""
     generation = root / name
     (generation / "scripts").mkdir(parents=True)
     members = []
@@ -45,6 +47,9 @@ def make_generation(root: Path, name: str = "a" * 40 + "-1", *, pin: str = PIN,
         {"schema": 2, "repository": "https://github.com/danielraffel/tartci.git",
          "source_commit": "a" * 40, "members": members}))
     os.chmod(generation / ls.MANIFEST_NAME, 0o444)
+    launch = generation / support_manifest.LAUNCH_NAME
+    launch.write_bytes(support_manifest.canonical_wrapper_bytes(generation))
+    os.chmod(launch, 0o555)
     ls.write_runtime(generation, pin)
     return generation
 
@@ -234,6 +239,27 @@ class LaunchSetTests(unittest.TestCase):
         # Publishing the same generation again keeps the rollback target.
         self.assertEqual(str(older), self.publish(self.generation)["previous"])
 
+    def test_the_v1_launch_file_of_every_generation_is_pinned_by_digest(self) -> None:
+        self.written()
+        value = json.loads((self.generation / ls.SET_NAME).read_text())
+        self.assertEqual([".tartci-launch"], [f["path"] for f in value["files"]])
+        ls.freeze(self.generation)
+        self.assertIsNone(ls.verify_contents(self.generation, self.root))
+        launch = self.generation / ".tartci-launch"
+        os.chmod(self.generation, 0o755)
+        os.chmod(launch, 0o755)
+        launch.write_bytes(launch.read_bytes() + b"#")
+        ls.freeze(self.generation)
+        self.assertIn(".tartci-launch does not match its digest",
+                      ls.verify_contents(self.generation, self.root))
+        # Control: a set that does not pin it names it as unhashed.
+        os.chmod(self.generation, 0o755)
+        value["files"] = []
+        ls.write(self.generation, value)
+        ls.freeze(self.generation)
+        self.assertIn(".tartci-launch is not in the signed manifest",
+                      ls.verify_contents(self.generation, self.root))
+
     def test_contents_are_checked_against_every_digest(self) -> None:
         self.written()
         ls.freeze(self.generation)
@@ -339,6 +365,146 @@ class LaunchSetTests(unittest.TestCase):
         self.written()
         ls.freeze(self.generation)
         self.assertIn("unsafe member path", ls.verify_contents(self.generation, self.root))
+
+
+class LaunchSetInstallTests(unittest.TestCase):
+    """install(): what `fleet-macos install` runs for a v2 host after staging."""
+
+    def setUp(self) -> None:
+        self.td = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.td.name))
+        self.root = base / "generations"
+        self.root.mkdir()
+        os.chmod(self.root, 0o755)
+        self.pointer = base / "config" / "launcher-generation.json"
+        self.floor = base / "config" / "launcher-floor.json"
+        self.render = base / "rendered"
+        self.render.mkdir()
+        self.write_plist("studio-pulp-gate")
+        self.generation = self.staged("a" * 40 + "-1")
+
+    def tearDown(self) -> None:
+        for dirpath, dirs, _files in os.walk(self.td.name):
+            for name in dirs:
+                os.chmod(os.path.join(dirpath, name), 0o755)
+        self.td.cleanup()
+
+    def staged(self, name: str) -> Path:
+        """A generation as stage-install leaves it: frozen, no v2 runtime."""
+        generation = make_generation(self.root, name)
+        (generation / ls.SHIM).unlink()
+        (generation / "bin").rmdir()
+        (generation / ls.ENTRYPOINT).unlink()
+        ls.freeze(generation)
+        return generation
+
+    def write_plist(self, lane: str, **extra: str) -> None:
+        import plistlib  # noqa: PLC0415
+        env = {"TARTCI_QUEUE_LANE_ID": lane, "TART_HOME": STORE, "PATH": "/usr/bin:/bin",
+               "TARTCI_PYTHON": PIN, **extra}
+        (self.render / f"com.example.{lane}.plist").write_bytes(
+            plistlib.dumps({"Label": lane, "EnvironmentVariables": env}))
+
+    def install(self, generation: Path, codesign=None, keychain: str = "/k.keychain-db",
+                ready=lambda: None) -> dict:
+        return ls.install(generation, render_dir=self.render, tart_home=STORE, pin=PIN,
+                          pointer=self.pointer, floor=self.floor, root=self.root, team_id=TEAM,
+                          identity="Developer ID Application: Example", keychain=keychain,
+                          signing_ready=ready, run=codesign or FakeCodesign())
+
+    def signed(self, codesign: FakeCodesign) -> int:
+        return sum(1 for call in codesign.calls if "--sign" in call)
+
+    def test_install_writes_the_runtime_signs_the_set_and_points_at_it(self) -> None:
+        value = self.install(self.generation)
+        self.assertEqual(str(self.generation), value["generation"])
+        self.assertEqual(str(self.generation), ls.read_pointer(self.pointer)["generation"])
+        launch = json.loads((self.generation / ls.SET_NAME).read_text())
+        self.assertEqual(1, launch["sequence"])
+        self.assertEqual(["studio-pulp-gate"], sorted(launch["lanes"]))
+        self.assertEqual(str(self.generation / ls.SHIM),
+                         launch["lanes"]["studio-pulp-gate"]["environment"]["TARTCI_PYTHON"])
+        self.assertEqual(ls.shim_bytes(PIN), (self.generation / ls.SHIM).read_bytes())
+        self.assertIsNone(ls.verify_contents(self.generation, self.root))
+        for dirpath, dirs, files in os.walk(self.generation):
+            for name in dirs + files:
+                self.assertEqual(0, os.lstat(os.path.join(dirpath, name)).st_mode & 0o222, name)
+
+    def test_the_sequence_moves_past_the_floor_and_the_previous_set(self) -> None:
+        self.floor.parent.mkdir(parents=True, exist_ok=True)
+        self.floor.write_text(json.dumps({"sequence": 7, "previous_sequence": 6}))
+        self.install(self.generation)
+        self.assertEqual(8, json.loads((self.generation / ls.SET_NAME).read_text())["sequence"])
+        newer = self.staged("b" * 40 + "-1")
+        value = self.install(newer)
+        self.assertEqual(9, json.loads((newer / ls.SET_NAME).read_text())["sequence"])
+        self.assertEqual(str(self.generation), value["previous"])
+
+    def test_reinstalling_the_pointed_generation_with_the_same_lanes_signs_nothing(self) -> None:
+        self.install(self.generation)
+        before = (self.generation / ls.SET_NAME).read_bytes()
+        codesign = FakeCodesign()
+        value = self.install(self.generation, codesign)
+        self.assertTrue(value["unchanged"])
+        self.assertEqual(0, self.signed(codesign))
+        self.assertEqual(before, (self.generation / ls.SET_NAME).read_bytes())
+
+    def test_reinstalling_with_changed_lanes_reissues_the_set_in_the_frozen_generation(self) -> None:
+        self.install(self.generation)
+        self.write_plist("studio-forge-gate")
+        codesign = FakeCodesign()
+        value = self.install(self.generation, codesign)
+        self.assertNotIn("unchanged", value)
+        self.assertEqual(1, self.signed(codesign))
+        launch = json.loads((self.generation / ls.SET_NAME).read_text())
+        self.assertEqual(2, launch["sequence"])
+        self.assertEqual(["studio-forge-gate", "studio-pulp-gate"], sorted(launch["lanes"]))
+        self.assertIsNone(ls.verify_contents(self.generation, self.root))
+
+    def test_a_keychain_that_is_not_ready_writes_nothing(self) -> None:
+        codesign = FakeCodesign()
+        with self.assertRaisesRegex(ls.LaunchSetError, "not ready, pointer unchanged"):
+            self.install(self.generation, codesign, ready=lambda: "locked")
+        self.assertFalse(self.pointer.exists())
+        self.assertFalse((self.generation / ls.SET_NAME).exists())
+        self.assertFalse((self.generation / ls.ENTRYPOINT).exists())
+        self.assertEqual([], codesign.calls)
+
+    def test_a_failed_signature_leaves_the_pointer_and_freezes_the_generation(self) -> None:
+        with self.assertRaisesRegex(ls.LaunchSetError, "signing failed"):
+            self.install(self.generation, FakeCodesign(sign_rc=1))
+        self.assertFalse(self.pointer.exists())
+        self.assertEqual(0o555, self.generation.stat().st_mode & 0o777)
+
+    def test_rendered_lanes_must_be_unique_and_present(self) -> None:
+        import plistlib  # noqa: PLC0415
+        (self.render / "dup.plist").write_bytes(plistlib.dumps(
+            {"EnvironmentVariables": {"TARTCI_QUEUE_LANE_ID": "studio-pulp-gate"}}))
+        with self.assertRaisesRegex(ls.LaunchSetError, "rendered twice"):
+            ls.lanes_from_plists(self.render)
+        empty = self.render / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(ls.LaunchSetError, "no lane LaunchAgents"):
+            ls.lanes_from_plists(empty)
+
+    def test_the_keychain_must_be_a_keychain_file(self) -> None:
+        self.assertIn("no dedicated", ls.keychain_problem(None))
+        self.assertIn("not a keychain", ls.keychain_problem(str(self.render / "x.keychain-db")))
+        keychain = self.render / "signing.keychain-db"
+        keychain.write_text("")
+        self.assertIsNone(ls.keychain_problem(str(keychain)))
+
+    def test_the_command_refuses_without_a_keychain_file(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(HERE / "launch_set.py"), "install",
+             "--generation", str(self.generation), "--render-dir", str(self.render),
+             "--tart-home", STORE, "--pin", PIN, "--pointer", str(self.pointer),
+             "--floor", str(self.floor), "--root", str(self.root), "--team-id", TEAM,
+             "--identity", "X", "--keychain", str(self.render / "missing.keychain-db")],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("not a keychain file", result.stderr)
+        self.assertFalse(self.pointer.exists())
 
 
 if __name__ == "__main__":

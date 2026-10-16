@@ -110,6 +110,9 @@ struct PythonPin: Decodable { let pin: String; let shim: Entrypoint }
 struct LaunchSet: Decodable {
     let schema: Int; let sequence: Int; let tart_home: String; let manifest_sha256: String
     let entrypoint: Entrypoint; let python: PythonPin; let lanes: [String: Lane]
+    /// Generation files that are not manifest members but are pinned by digest:
+    /// the v1 `.tartci-launch` stage-install writes into every generation.
+    let files: [ManifestMember]?
 }
 // v2's own entrypoint and interpreter shim (scripts/launch_set.py builds the
 // same bytes). Lane Python runs only through the shim: the pinned
@@ -334,7 +337,9 @@ private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String
         fail("interpreter shim does not exec the signed pin", code: 77)
     }
     let shim = requireMember(generation, set.python.shim.path, set.python.shim.sha256)
-    requireNothingUnhashed(generation, allowed: Set(manifest.members.map { $0.path } + [
+    let pinned = set.files ?? []
+    for file in pinned { _ = requireMember(generation, file.path, file.sha256) }
+    requireNothingUnhashed(generation, allowed: Set(manifest.members.map { $0.path } + pinned.map { $0.path } + [
         set.entrypoint.path, set.python.shim.path, ".tartci-launch-set.json", ".tartci-launch-set.sig",
         ".tartci-support-manifest.json"]))
     guard let lane = set.lanes[laneID] else { fail("lane is not in the signed launch set", code: 77) }
