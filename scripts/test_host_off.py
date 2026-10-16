@@ -287,10 +287,51 @@ class VolumeProbeTests(unittest.TestCase):
 
     def test_the_probe_is_not_background_throttled_and_says_why_it_timed_out(self) -> None:
         plists: list[dict] = []
-        with mock.patch.object(macos_launcher_probe.subprocess, "run", self.fake_run(plists)):
-            with self.assertRaisesRegex(ValueError, r"probe wait elapsed [0-9.]+s;.*volume I/O slow"):
+        slow = {"ms": 4200.0}
+        with mock.patch.object(macos_launcher_probe.subprocess, "run", self.fake_run(plists)), \
+                mock.patch.object(macos_launcher_probe, "parent_write_ms", return_value=slow) as control:
+            with self.assertRaisesRegex(ValueError, r"probe wait elapsed [0-9.]+s;.*volume I/O slow; "
+                                        r"same-dir write from parent took 4200 ms"):
                 macos_launcher_probe.run(self.helper, self.profile, timeout_seconds=0.3)
+        control.assert_called_once_with(self.profile["host"]["tart_home"])
         self.assertEqual(plists[0]["ProcessType"], "Standard")
+
+    def test_a_fast_control_write_blames_the_helper_not_the_volume(self) -> None:
+        # m3: the helper sat in its own open() while a shell write to the same
+        # directory took 32 ms.
+        plists: list[dict] = []
+        with mock.patch.object(macos_launcher_probe.subprocess, "run", self.fake_run(plists)), \
+                mock.patch.object(macos_launcher_probe, "parent_write_ms", return_value={"ms": 32.4}):
+            with self.assertRaises(ValueError) as raised:
+                macos_launcher_probe.run(self.helper, self.profile, timeout_seconds=0.3)
+        message = str(raised.exception)
+        self.assertIn("helper blocked in open(); same-dir write from parent took 32 ms", message)
+        self.assertIn("Grant Removable Volumes to TartCI Launcher", message)
+        self.assertNotIn("volume I/O slow", message)
+
+    def test_the_timeout_message_names_each_control_outcome(self) -> None:
+        message = macos_launcher_probe.timeout_message
+        self.assertIn("did not finish within 10s", message(60, 60.1, "/v", {"timed_out": True, "timeout": 10.0}))
+        self.assertIn("volume I/O slow", message(60, 60.1, "/v", {"timed_out": True, "timeout": 10.0}))
+        self.assertIn("failed too (PermissionError: x)", message(60, 60.1, "/v", {"error": "PermissionError: x"}))
+        self.assertIn("helper blocked in open()", message(60, 60.1, "/v", {"ms": 999.0}))
+        self.assertIn("volume I/O slow", message(60, 60.1, "/v", {"ms": 1000.0}))
+
+    def test_the_control_write_is_real_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            measured = macos_launcher_probe.parent_write_ms(td)
+            self.assertIn("ms", measured)
+            self.assertEqual([], os.listdir(td))
+            self.assertIn("error", macos_launcher_probe.parent_write_ms(os.path.join(td, "missing")))
+
+            def stuck(*args, **kwargs):
+                time.sleep(5)
+                raise OSError("late")
+            with mock.patch.object(macos_launcher_probe.tempfile, "mkstemp", stuck):
+                started = time.monotonic()
+                self.assertEqual({"timed_out": True, "timeout": 0.2},
+                                 macos_launcher_probe.parent_write_ms(td, timeout=0.2))
+                self.assertLess(time.monotonic() - started, 2)
 
     def test_the_default_deadline_outlasts_a_slow_volume(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
