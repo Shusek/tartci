@@ -18,9 +18,9 @@ import fleet_doctor as fd
 import store_stall as ss
 
 STORE = "/Volumes/Example/VMs"
-REPO = "/Volumes/Code-Example/Code/pulp"
+REPO = "/Volumes/Example2/Code/pulp"
 PROFILE = {"host": {"tart_home": STORE},
-           "reclaim": {"repo": REPO, "worktrees_root": "/Volumes/Code-Example/Code/worktrees"}}
+           "reclaim": {"repo": REPO, "worktrees_root": "/Volumes/Example2/Code/worktrees"}}
 
 
 def fake_probe(path: str, argv: list[str]) -> dict:
@@ -64,14 +64,14 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual("ok", value["state"])
 
     def test_the_finding_says_how_long_an_older_process_has_been_hanging(self) -> None:
-        ps = ("    05:00:12 /usr/bin/git -C /Volumes/Code-Example/Code/pulp rev-parse HEAD\n"
-              "       00:40 /usr/bin/git -C /Volumes/Code-Example/Code/pulp status\n"
+        ps = ("    05:00:12 /usr/bin/git -C /Volumes/Example2/Code/pulp rev-parse HEAD\n"
+              "       00:40 /usr/bin/git -C /Volumes/Example2/Code/pulp status\n"
               " 1-02:00:00 /usr/bin/git -C /Users/someone/elsewhere status\n"
-              "    09:00:00 /bin/zsh /Volumes/Code-Example/script.sh\n")
+              "    09:00:00 /bin/zsh /Volumes/Example2/script.sh\n")
         never = lambda argv, timeout, env: None  # noqa: E731 - every probe hangs
         value = ss.probe([fake_probe(REPO, ["/usr/bin/git", "-C", REPO, "rev-parse"])],
                          timeout=1, runner=never, ps_output=ps)
-        self.assertIn("/Volumes/Code-Example: fake did not finish within 1s; an older git on "
+        self.assertIn("/Volumes/Example2: fake did not finish within 1s; an older git on "
                       "it has been hanging for 5.0 h", value["detail"])
         self.assertEqual(5 * 3600 + 12, value["stalled"][0]["hanging_s"])
 
@@ -85,8 +85,8 @@ class ProbeTests(unittest.TestCase):
         found = ss.targets(PROFILE)
         whats = {(item["volume"], item["what"]) for item in found}
         self.assertIn(("/Volumes/Example", "VM store listing"), whats)
-        self.assertIn(("/Volumes/Code-Example", "git rev-parse"), whats)
-        self.assertIn(("/Volumes/Code-Example", "worktrees listing"), whats)
+        self.assertIn(("/Volumes/Example2", "git rev-parse"), whats)
+        self.assertIn(("/Volumes/Example2", "worktrees listing"), whats)
         self.assertEqual([], ss.targets({}))
 
     def test_status_reads_the_installed_profile(self) -> None:
