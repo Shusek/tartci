@@ -3631,6 +3631,55 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         self.assertEqual(drained, len(self.sys.mutations()), "no second drain within rate_hours")
 
 
+class SealedHostFleetSourceTests(Base):
+    """A sealed-launcher host refuses [fleet_source] before anything happens: a
+    source move would not rebuild the launcher, whose policy digest covers the
+    moved profile, so the install would fail after the drain every turn."""
+    sealed = True
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        self.cfg.fleet_source_repository = "ORG/private-fleet-authority"
+        self.cfg.fleet_source_canary = "studio"
+        self.pin = self.home / ".config/tartci/m3-launcher-approved.sha256"
+        self.pin_before = self.pin.read_bytes()
+
+    def assertNothingMoved(self) -> None:
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(any("drain" in a for a, _ in self.sys.calls), "no drain call")
+        self.assertFalse(any(len(a) > 2 and "private-fleet-authority" in a[2]
+                             for a, _ in self.sys.calls if a[:1] == [FAKE_GH]),
+                         "the private source is never read")
+        self.assertFalse(self.cfg.fleet_source_store.exists(), "nothing exported")
+        self.assertEqual(self.pin_before, self.pin.read_bytes(), "launcher pin unchanged")
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ, "no source selected")
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual("unknown", skew["state"])
+        self.assertIn("fleet source refused on a sealed-launcher host", skew["reason"])
+        self.assertIn("remove [fleet_source]", skew["reason"])
+
+    def test_an_apply_refuses_before_any_drain(self) -> None:
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertNothingMoved()
+
+    def test_a_plan_refuses_the_same_way(self) -> None:
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        self.assertNothingMoved()
+
+    def test_without_the_setting_a_sealed_host_is_unaffected(self) -> None:
+        self.cfg.fleet_source_repository = None
+        self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+
+    # Base's pause test runs with this class's [fleet_source], which now
+    # refuses first by design; Base covers it without the setting.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
+
+
 def fleet_source_supply() -> str:
     import fleet_source
     return fleet_source.PUBLISHED_SUPPLY

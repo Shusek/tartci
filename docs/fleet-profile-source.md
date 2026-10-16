@@ -66,6 +66,18 @@ Each self-update run then:
 4. reinstalls the current generation when the installed receipt was built from
    a different source commit.
 
+## Not on a sealed-launcher host
+
+A host with a sealed TartCI Launcher (`[launch_helper]` in its profile: the
+external-volume hosts) refuses `[fleet_source]` before reading the source or
+draining anything. The sealed launcher's policy digest covers the profile, and
+a source move reinstalls the same generation without rebuilding the launcher,
+so the installer would refuse the live launcher after the drain and roll back
+on every turn. The refusal names the cause and the fix (remove
+`[fleet_source]` on that host). A sealed host takes a private source once a
+source move rebuilds the launcher, which launcher v2 makes unnecessary by
+taking the policy out of the app.
+
 A plan (`--plan`) writes and prunes nothing: it uses an export that already
 exists and otherwise reports that an apply would export it.
 

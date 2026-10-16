@@ -715,6 +715,19 @@ def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict 
     repository = cfg.fleet_source_repository
     if repository is None:
         return None
+    if launch_helper(cfg) is not None:
+        # A source move is a same-generation refresh, which keeps the live
+        # sealed launcher; the installer then verifies that launcher against
+        # the moved profile's policy digest, fails after the drain, and rolls
+        # back, every turn. Refuse before anything is read or drained.
+        raise Refused(
+            "fleet source refused on a sealed-launcher host: a [fleet_source] move changes the "
+            "profile the sealed TartCI Launcher's policy digest covers, and a source move does "
+            "not rebuild the launcher, so the install would fail after the drain and roll back "
+            "every turn. Fix: remove [fleet_source] from self-update.toml on this host; a "
+            "sealed host takes a private source once a source move rebuilds the launcher "
+            "(launcher v2). Verify: `tartci fleet-macos self-update --plan` no longer reports "
+            "this refusal")
     if cfg.fleet_source_canary is None:
         raise Refused("fleet source has no canary: set [fleet_source] canary to the host that "
                       "installs a new source commit first")
