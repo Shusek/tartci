@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Security
@@ -68,12 +69,172 @@ private func sealedStore(_ root: URL) -> String {
         let url = root.appendingPathComponent("Contents/Resources/bundle.json")
         value = try JSONDecoder().decode(SealedMetadata.self, from: Data(contentsOf: url))
     } catch { fail("cannot read sealed bundle metadata: \(error)", code: 77) }
-    let parts = value.tart_home.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
-    guard value.tart_home.hasPrefix("/Volumes/"), parts.count >= 3,
-          parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+    guard isExternalStore(value.tart_home) else {
         fail("sealed Tart store is not an external-volume path", code: 77)
     }
     return value.tart_home
+}
+private func isExternalStore(_ path: String) -> Bool {
+    let parts = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+    return path.hasPrefix("/Volumes/") && parts.count >= 3
+        && parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+}
+
+// MARK: launcher v2: a stable app that runs a signed launch set from a generation
+//
+// policy.json (schema 2, inside the signed app) pins the team, the Tart store,
+// the generations root and the pointer. The app itself carries no support tree,
+// so its bytes, and its Removable Volumes consent, survive ordinary updates.
+// What a lane runs is the generation the pointer names, accepted only when:
+//   - the launch set's detached signature satisfies a requirement built from
+//     policy.team_id (never from anything inside the generation);
+//   - the generation, every member and every directory up to the generations
+//     root is owned by this user and not group- or world-writable, with no
+//     symlink anywhere;
+//   - the manifest, every member and the entrypoint match their digests.
+// Any failure exits 77 and runs nothing.
+struct Policy: Decodable {
+    let schema: Int; let identifier: String; let team_id: String
+    let tart_home: String; let generations_root: String; let pointer: String
+}
+struct Pointer: Decodable { let schema: Int; let generation: String }
+struct Entrypoint: Decodable { let path: String; let sha256: String }
+struct LaunchSet: Decodable {
+    let schema: Int; let tart_home: String; let manifest_sha256: String
+    let entrypoint: Entrypoint; let lanes: [String: Lane]
+}
+struct ManifestMember: Decodable { let path: String; let sha256: String }
+struct SupportManifest: Decodable { let members: [ManifestMember] }
+private let launchSetIdentifier = "com.danielraffel.tartci.launch-set"
+
+private func loadPolicy(_ root: URL) -> Policy? {
+    let url = root.appendingPathComponent("Contents/Resources/policy.json")
+    guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+    let policy: Policy
+    do { policy = try JSONDecoder().decode(Policy.self, from: Data(contentsOf: url)) }
+    catch { fail("cannot read launcher policy: \(error)", code: 77) }
+    guard policy.schema == 2,
+          policy.team_id.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
+          isExternalStore(policy.tart_home),
+          policy.generations_root.hasPrefix("/"), !policy.generations_root.hasSuffix("/"),
+          policy.pointer.hasPrefix("/") else { fail("launcher policy is invalid", code: 77) }
+    return policy
+}
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+/// Not a symlink, owned by this user, not group- or world-writable.
+private func requireTrusted(_ path: String) {
+    var info = stat()
+    guard lstat(path, &info) == 0 else { fail("cannot inspect \(path)", code: 77) }
+    guard (info.st_mode & S_IFMT) != S_IFLNK else { fail("\(path) is a symlink", code: 77) }
+    guard info.st_uid == getuid() else { fail("\(path) is not owned by this user", code: 77) }
+    guard info.st_mode & 0o022 == 0 else { fail("\(path) is group- or world-writable", code: 77) }
+}
+/// `path` and every directory from it up to and including `top`.
+private func requireTrustedChain(_ path: String, upTo top: String) {
+    guard path == top || path.hasPrefix(top + "/") else { fail("\(path) is outside \(top)", code: 77) }
+    var current = path
+    while true {
+        requireTrusted(current)
+        if current == top { return }
+        current = (current as NSString).deletingLastPathComponent
+    }
+}
+/// The bytes of a trusted regular file, read through one descriptor.
+private func readTrusted(_ path: String) -> Data {
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { fail("cannot open \(path): \(String(cString: strerror(errno)))", code: 77) }
+    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    var info = stat()
+    guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(),
+          info.st_mode & 0o022 == 0 else { fail("\(path) is not a trusted regular file", code: 77) }
+    return handle.readDataToEndOfFile()
+}
+private func requireSafeRelative(_ relative: String) {
+    let parts = relative.split(separator: "/", omittingEmptySubsequences: false)
+    guard !relative.hasPrefix("/"), !parts.isEmpty,
+          parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+        fail("unsafe member path \(relative)", code: 77)
+    }
+}
+private func launchSetRequirement(_ policy: Policy) -> String {
+#if TARTCI_TESTING
+    if let override = ProcessInfo.processInfo.environment["TARTCI_TEST_LAUNCH_SET_REQUIREMENT"] {
+        return override
+    }
+#endif
+    return "anchor apple generic and certificate leaf[subject.OU] = \"\(policy.team_id)\" "
+        + "and identifier \"\(launchSetIdentifier)\""
+}
+/// Verify the detached signature over exactly the bytes that will be used:
+/// they and the signature are copied into a private directory first, so
+/// neither can change between verification and use. The check is
+/// /usr/bin/codesign (SIP-protected): Security.framework has no public API
+/// for a detached signature.
+private func verifyLaunchSet(_ data: Data, signature: Data, _ policy: Policy) {
+    var template = Array((NSTemporaryDirectory() + "tartci-launch-set.XXXXXX").utf8CString)
+    guard let made = mkdtemp(&template) else { fail("cannot create a private directory", code: 70) }
+    let directory = String(cString: made)
+    defer { try? FileManager.default.removeItem(atPath: directory) }
+    let copy = URL(fileURLWithPath: directory).appendingPathComponent("launch-set.json")
+    let sig = URL(fileURLWithPath: directory).appendingPathComponent("launch-set.sig")
+    do { try data.write(to: copy); try signature.write(to: sig) }
+    catch { fail("cannot stage the launch set: \(error)", code: 70) }
+    let check = Process()
+    check.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    check.arguments = ["--verify", "--strict", "--detached", sig.path,
+                       "-R=" + launchSetRequirement(policy), copy.path]
+    check.environment = ["PATH": "/usr/bin:/bin"]
+    check.standardOutput = FileHandle.nullDevice
+    check.standardError = FileHandle.nullDevice
+    do { try check.run() } catch { fail("cannot run codesign: \(error)", code: 77) }
+    check.waitUntilExit()
+    guard check.terminationReason == .exit, check.terminationStatus == 0 else {
+        fail("launch set signature is invalid or not from the pinned team", code: 77)
+    }
+}
+private func requireMember(_ generation: String, _ relative: String, _ expected: String) -> String {
+    requireSafeRelative(relative)
+    let path = generation + "/" + relative
+    requireTrustedChain(path, upTo: generation)
+    guard sha256Hex(readTrusted(path)) == expected else { fail("\(relative) does not match its digest", code: 77) }
+    return path
+}
+/// The entrypoint and environment for one lane of the pointed-to generation.
+private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String, [String: String]) {
+    let root = policy.generations_root
+    requireTrusted(root)
+    let pointer: Pointer
+    do { pointer = try JSONDecoder().decode(Pointer.self, from: readTrusted(policy.pointer)) }
+    catch { fail("cannot read the launcher pointer: \(error)", code: 77) }
+    let generation = pointer.generation
+    let name = generation.hasPrefix(root + "/") ? String(generation.dropFirst(root.count + 1)) : ""
+    guard pointer.schema == 1, !name.isEmpty, !name.contains("/"), !name.hasPrefix("."),
+          let resolved = realpath(generation, nil) else { fail("pointer names no generation under \(root)", code: 77) }
+    defer { free(resolved) }
+    guard String(cString: resolved) == generation else { fail("generation path is not canonical", code: 77) }
+    requireTrustedChain(generation, upTo: root)
+    let setData = readTrusted(generation + "/.tartci-launch-set.json")
+    verifyLaunchSet(setData, signature: readTrusted(generation + "/.tartci-launch-set.sig"), policy)
+    let set: LaunchSet
+    do { set = try JSONDecoder().decode(LaunchSet.self, from: setData) }
+    catch { fail("signed launch set is malformed: \(error)", code: 77) }
+    guard set.schema == 1, set.tart_home == policy.tart_home else { fail("launch set has the wrong Tart store", code: 77) }
+    let manifestData = readTrusted(generation + "/.tartci-support-manifest.json")
+    guard sha256Hex(manifestData) == set.manifest_sha256 else { fail("support manifest does not match the launch set", code: 77) }
+    let manifest: SupportManifest
+    do { manifest = try JSONDecoder().decode(SupportManifest.self, from: manifestData) }
+    catch { fail("support manifest is malformed: \(error)", code: 77) }
+    for member in manifest.members { _ = requireMember(generation, member.path, member.sha256) }
+    guard set.entrypoint.path == ".tartci-launch" else { fail("unexpected entrypoint \(set.entrypoint.path)", code: 77) }
+    let launch = requireMember(generation, set.entrypoint.path, set.entrypoint.sha256)
+    guard let lane = set.lanes[laneID] else { fail("lane is not in the signed launch set", code: 77) }
+    guard lane.environment["TART_HOME"] == policy.tart_home else { fail("signed lane has the wrong Tart store", code: 77) }
+    guard lane.environment.keys.allSatisfy({ !$0.hasPrefix("DYLD_") }) else {
+        fail("signed lane contains a forbidden dynamic-loader variable", code: 77)
+    }
+    return (launch, set.entrypoint.sha256, lane.environment)
 }
 private func probeStore(_ store: String) -> Never {
     let root = URL(fileURLWithPath: store, isDirectory: true)
@@ -122,22 +283,37 @@ private func finish(_ child: pid_t, _ initial: Int32?) -> Never {
 let arguments = Array(CommandLine.arguments.dropFirst())
 let root = appRoot()
 verifySealedBundle(root)
-let store = sealedStore(root)
+let policy = loadPolicy(root)
+let store = policy?.tart_home ?? sealedStore(root)
 if arguments == ["--probe-store"] {
     probeStore(store)
 }
 guard arguments.count == 2, arguments[0] == "--lane",
       arguments[1].range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", options: .regularExpression) != nil else { fail(usage) }
-let config = loadConfiguration(root)
-guard let lane = config.lanes[arguments[1]] else { fail("lane is not in the signed fleet enum", code: 77) }
-guard lane.environment["TART_HOME"] == store else { fail("signed lane has the wrong Tart store", code: 77) }
-guard lane.environment.keys.allSatisfy({ !$0.hasPrefix("DYLD_") }) else {
-    fail("signed lane contains a forbidden dynamic-loader variable", code: 77)
+let launch: String
+let environment: [String: String]
+var launchDigest: String? = nil
+if let policy {
+    (launch, launchDigest, environment) = resolveV2(policy, lane: arguments[1])
+} else {
+    let config = loadConfiguration(root)
+    guard let lane = config.lanes[arguments[1]] else { fail("lane is not in the signed fleet enum", code: 77) }
+    guard lane.environment["TART_HOME"] == store else { fail("signed lane has the wrong Tart store", code: 77) }
+    guard lane.environment.keys.allSatisfy({ !$0.hasPrefix("DYLD_") }) else {
+        fail("signed lane contains a forbidden dynamic-loader variable", code: 77)
+    }
+    launch = root.appendingPathComponent("Contents/Resources/support/.tartci-launch").path
+    environment = lane.environment
 }
-let launch = root.appendingPathComponent("Contents/Resources/support/.tartci-launch").path
 guard access(launch, R_OK | X_OK) == 0 else { fail("sealed TartCI entrypoint is unavailable", code: 77) }
 for number in [SIGTERM, SIGINT, SIGHUP] { signal(number, signalHandler) }
-let child = spawn(launch, ["serve", "macos", "--loop"], lane.environment)
+// macOS has no fexecve, and the entrypoint finds its generation from its own
+// path, so it is spawned by path: its digest is checked again immediately
+// before the spawn, through a fresh no-follow descriptor.
+if let launchDigest, sha256Hex(readTrusted(launch)) != launchDigest {
+    fail("entrypoint changed after verification", code: 77)
+}
+let child = spawn(launch, ["serve", "macos", "--loop"], environment)
 var status: Int32 = 0
 while true {
     let result = waitpid(child, &status, WNOHANG)

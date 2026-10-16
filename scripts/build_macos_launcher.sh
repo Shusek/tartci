@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-usage(){ echo "usage: $0 --output PATH.app --approval-output PATH --identity STRING --support-root PATH --profile PATH [--python PATH] [--keychain PATH]" >&2; exit 64; }
-output="" approval_output="" identity="" support_root="" profile="" keychain="" render_python="" print_render_python=0
+usage(){ echo "usage: $0 --output PATH.app --approval-output PATH --identity STRING --support-root PATH --profile PATH [--python PATH] [--keychain PATH] [--layout v1|v2]" >&2; exit 64; }
+output="" approval_output="" identity="" support_root="" profile="" keychain="" render_python="" print_render_python=0 layout="v1"
 while [[ $# -gt 0 ]]; do case "$1" in
   --output) output="${2:-}"; shift 2;; --identity) identity="${2:-}"; shift 2;;
   --approval-output) approval_output="${2:-}"; shift 2;;
@@ -9,7 +9,13 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --profile) profile="${2:-}"; shift 2;;
   --python) render_python="${2:-}"; shift 2;;
   --print-render-python) print_render_python=1; shift;;
-  --keychain) keychain="${2:-}"; shift 2;; *) usage;; esac; done
+  --keychain) keychain="${2:-}"; shift 2;;
+  --layout) layout="${2:-}"; shift 2;; *) usage;; esac; done
+# v1 seals the support tree and lanes into the app (every commit is a new
+# app). v2 is the stable app: executable, Info.plist and policy.json only; a
+# lane runs the signed launch set of the generation the pointer names
+# (scripts/launch_set.py).
+[[ "$layout" = v1 || "$layout" = v2 ]] || usage
 # Name the keychain when given: a bare --sign walks the search list, and a
 # locked keychain there raises a password dialog in the GUI session.
 keychain_args=(); [[ -n "$keychain" ]] && keychain_args=(--keychain "$keychain")
@@ -66,6 +72,29 @@ profile="$(cd "$(dirname "$profile")" && pwd -P)/$(basename "$profile")"
 export TARTCI_RENDER_PYTHON="$render_python" TARTCI_PYTHON="$render_python"
 "$render_python" "$support_root/scripts/tartci_support_manifest.py" verify "$support_root/.tartci-support-manifest.json" --root "$support_root" --immutable >/dev/null
 parent="$(dirname "$output")"; mkdir -p "$parent"; stage="$(mktemp -d "$parent/.tartci-launcher-app.XXXXXX")"; trap 'rm -rf "$stage"' EXIT
+if [[ "$layout" = v2 ]]; then
+  app="$stage/TartCILauncher.app"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  "$render_python" - "$profile" "$app/Contents/Resources/policy.json" <<'PY'
+import json, re, sys, tomllib
+from pathlib import Path
+profile = tomllib.loads(Path(sys.argv[1]).read_text())
+host, helper = profile["host"], profile["launch_helper"]
+tart_home = host["tart_home"]
+parts = tart_home.split("/")[1:]
+if not tart_home.startswith("/Volumes/") or len(parts) < 3 or any(p in ("", ".", "..") for p in parts):
+    raise SystemExit(f"launch helper requires an external-volume Tart store, got {tart_home!r}")
+if not re.fullmatch(r"[A-Z0-9]{10}", helper["team_id"]):
+    raise SystemExit("launch_helper.team_id must be a ten-character Apple Team ID")
+home = host["home"].rstrip("/")
+Path(sys.argv[2]).write_text(json.dumps({
+    "schema": 2, "identifier": helper["identifier"], "team_id": helper["team_id"],
+    "tart_home": tart_home,
+    "generations_root": f"{home}/.local/share/tartci-generations",
+    "pointer": f"{home}/.config/tartci/launcher-generation.json",
+}, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+fi
+if [[ "$layout" = v1 ]]; then
 rendered_dir="$stage/rendered"; mkdir -p "$rendered_dir"
 "$render_python" "$support_root/scripts/macos_fleet_lanes.py" render "$profile" --output "$rendered_dir" >/dev/null
 app="$stage/TartCILauncher.app"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/support"
@@ -127,6 +156,7 @@ launch.write_text(
 launch.chmod(0o555)
 PY
 chmod -R a-w "$app/Contents/Resources/support"
+fi
 cat >"$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>tartci-launcher</string><key>CFBundleIdentifier</key><string>com.danielraffel.tartci.launcher</string><key>CFBundleName</key><string>TartCI Launcher</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSBackgroundOnly</key><true/><key>NSRemovableVolumesUsageDescription</key><string>TartCI uses an external volume for isolated local CI virtual machines.</string></dict></plist>
 PLIST
