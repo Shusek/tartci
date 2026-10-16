@@ -70,6 +70,9 @@ def head(api: Api, repository: str, ref: str = "main") -> tuple[str, str]:
         raise SyncError(f"repos/{repository}/commits/{ref}: no commit id")
     if not isinstance(tree, str) or not fleet_source.COMMIT.fullmatch(tree):
         raise SyncError(f"repos/{repository}/commits/{ref}: no tree id")
+    if fleet_source.COMMIT.fullmatch(ref) and commit != ref:
+        # A commit was asked for by id: never export a different one.
+        raise SyncError(f"repos/{repository}/commits/{ref[:12]} answered {commit[:12]}")
     return commit, tree
 
 

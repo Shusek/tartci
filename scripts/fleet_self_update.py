@@ -738,8 +738,16 @@ def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict 
         return result.rc, result.out, result.err
 
     installed = installed_fleet_source_commit(cfg)
+    me = self_host_id(cfg)
+    if me != cfg.fleet_source_canary:
+        # A mistyped canary would leave every host on its installed commit
+        # forever with nothing saying why: refuse instead.
+        published = set(published_peers(cfg, sys_)) | {me}
+        if cfg.fleet_source_canary not in published:
+            raise Refused(f"[fleet_source] canary {cfg.fleet_source_canary!r} is not a published "
+                          f"host id ({', '.join(sorted(published))}); fix self-update.toml")
     try:
-        if self_host_id(cfg) == cfg.fleet_source_canary:
+        if me == cfg.fleet_source_canary:
             commit, tree = fleet_source_sync.head(api, repository)
             why = "canary: main's head"
         else:
