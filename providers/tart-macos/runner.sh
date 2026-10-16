@@ -867,12 +867,9 @@ runtime_emit_complete(){
 }
 
 # Running macOS guests per `tart list`, or `unknown` when the inventory cannot
-# be read. A slow or failed listing is NOT a full host: reporting the hard cap
-# here once made an empty host look 2/2 busy for as long as `tart list` stayed
-# slow. One bounded retry with a longer timeout rides out a transient stall;
-# after that the caller must treat occupancy as unknown and fall back to the
-# reservation files (tartci_claim_macos_slot), which every lane writes before
-# it boots and keeps until its VM is proved gone.
+# be read. A slow or failed listing is not a full host. One bounded retry with
+# a longer timeout rides out a transient stall; after that new clones wait for
+# inventory to recover. Reservations cannot prove Tart or storage is healthy.
 running_macos_vms(){
   local count inventory_timeout retry_timeout
   inventory_timeout="${TARTCI_TART_INVENTORY_TIMEOUT_SECS:-5}"
@@ -1826,8 +1823,18 @@ install_and_preflight_aqua_runner(){
 boot_vm_to_ssh(){
   local i="$1" vm="$2" labels="$3" lease_priority="$4" logdir="${5:-}" boot_phase="${6:-booting}"
   local proof_group="${7:-}"
-  local lease_cores lease_mem lease_rc boot_log rpid ip=""
+  local lease_cores lease_mem lease_rc boot_log rpid ip="" inventory
   BOOT_LEASE_DENIED=0
+  # This is the shared cold-boot boundary, including --once, warm parking and
+  # a cold fallback after warm handoff. Check before taking a lease or cloning.
+  inventory="$(running_macos_vms)"
+  case "$inventory" in
+    ''|*[!0-9]*)
+      note "[$i] Tart inventory unavailable — deferring new macOS VM clone"
+      event inventory_unknown "phase=pre_clone"
+      heartbeat inventory-unavailable
+      return 75 ;;
+  esac
   if ! lease_cores="$(tartci_vm_lease_cores tart-macos)"; then
     note "[$i] VM size unavailable (gate-reserve rule could not be computed) — not booting"
     return 1
@@ -2645,6 +2652,16 @@ if [ "$LOOP" = 1 ]; then
     blind=0
     reset_blind_restarts
     clear_scan_error
+    if [ "$r" = unknown ]; then
+      tartci_vm_lease_waiter_withdraw
+      note "Tart inventory unavailable — deferring new macOS VM clones; retrying in ${POLL}s"
+      [ "${q:-0}" -le 0 ] || event demand_waiting \
+        "queued=$q running=unknown/$cap reason=inventory_unknown" \
+        queued="$q" running=unknown cap="$cap" poll="$POLL" reason=inventory_unknown
+      heartbeat inventory-unavailable
+      sleep "$POLL"
+      continue
+    fi
     # Only probe priority demand when THIS lane actually has work — no point
     # spending a gh round-trip (and the API quota the secondary-rate-limit cares
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0

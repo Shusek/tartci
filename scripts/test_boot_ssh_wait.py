@@ -131,6 +131,42 @@ class BootSshWaitTests(unittest.TestCase):
 
 
 class BootHelperUsesTheBoundedWaitTests(unittest.TestCase):
+    def test_unreadable_inventory_has_no_lease_or_clone_side_effect(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        script = (
+            "set -u\n"
+            "running_macos_vms(){ echo unknown; }\n"
+            "note(){ :; }\n"
+            "event(){ :; }\n"
+            "heartbeat(){ echo \"phase=$1\"; }\n"
+            "tartci_vm_lease_cores(){ echo LEASE_CALLED; exit 91; }\n"
+            "tartci_acquire_vm_lease(){ echo LEASE_CALLED; exit 91; }\n"
+            "tartci_vm_lease_guard_run(){ echo CLONE_CALLED; exit 91; }\n"
+            "discard_current_vm(){ echo DELETE_CALLED; exit 91; }\n"
+            "tartci_release_vm_lease(){ echo RELEASE_CALLED; exit 91; }\n"
+            + body + "\n"
+            "boot_vm_to_ssh 1 test-vm macos normal; rc=$?\n"
+            "echo \"rc=$rc lease_denied=$BOOT_LEASE_DENIED\"\n"
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("phase=inventory-unavailable", result.stdout)
+        self.assertIn("rc=75 lease_denied=0", result.stdout)
+        self.assertNotIn("LEASE_CALLED", result.stdout)
+        self.assertNotIn("CLONE_CALLED", result.stdout)
+        self.assertNotIn("DELETE_CALLED", result.stdout)
+        self.assertNotIn("RELEASE_CALLED", result.stdout)
+
+    def test_unreadable_inventory_refuses_before_lease_or_clone(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        check = body.index('inventory="$(running_macos_vms)"')
+        lease = body.index("tartci_acquire_vm_lease")
+        clone = body.index("tartci_vm_lease_guard_run tart clone")
+        self.assertLess(check, lease)
+        self.assertLess(check, clone)
+        self.assertIn("heartbeat inventory-unavailable", body[check:lease])
+
     def test_the_boot_helper_waits_through_the_bounded_function(self) -> None:
         body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
         self.assertIn('tartci_vm_ssh_wait "$VM_USER@$ip"', body)
