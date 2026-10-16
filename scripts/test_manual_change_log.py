@@ -60,19 +60,27 @@ class Redaction(unittest.TestCase):
         "env SHIPYARD_GITHUB_APP_PRIVATE_KEY='-----BEGIN' MY_SECRET=s3cr3t run": "s3cr3t",
         "tool --password hunter2 --api-key=k3y": "hunter2",
         "echo github_pat_11ABCDEFGHIJ_klmnopq and ghs_abcdefghijklmnop": "ghs_abcdefghijklmnop",
+        "git clone https://user:hunter2url@example.com/x.git": "hunter2url",
+        "git clone https://oauth2:glpat-SECRETtoken@gitlab.com/x.git": "glpat-SECRETtoken",
+        "security unlock-keychain -p hunter2pass /Users/x/signing.keychain-db": "hunter2pass",
+        "curl -u admin:hunter2curl https://api.example.com": "hunter2curl",
+        "AWS_SECRET_ACCESS_KEY=awsSecretValue aws s3 ls": "awsSecretValue",
     }
 
     def test_planted_secrets_never_reach_the_log(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "manual-changes.log"
-            table = {}
-            pid = 900
-            for command in self.PLANTED:
-                table[pid] = (pid - 1, command)
-                pid -= 1
+            # One record per planted command, each as the caller's parent: the
+            # chain is capped at MAX_PARENTS, so one long chain would drop some.
             with mock.patch.dict(os.environ, {"TARTCI_MANUAL_CHANGE_LOG": str(log)}):
+                for command in self.PLANTED:
+                    mcl.record("pool off", "forced", ["--force"], env={}, start=900,
+                               ps=lambda p, c=command: (1, c) if p == 900 else None)
                 mcl.record("pool off", "forced", ["--force", "GH_TOKEN=ghp_zzzzzzzzzz0123456789"],
-                           env={}, start=900, ps=lambda p: table.get(p))
+                           env={}, start=1)
+            rows = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(len(rows), len(self.PLANTED) + 1)
+            self.assertTrue(all(r["parents"] for r in rows[:-1]))
             text = log.read_text()
             for command, secret in self.PLANTED.items():
                 with self.subTest(command=command[:30]):
@@ -83,7 +91,11 @@ class Redaction(unittest.TestCase):
             self.assertIn("[redacted]", text)
             # Control: an ordinary command line is kept whole.
             for plain in ("tartci pool off --force --plan", "ssh-keyscan -T 5 m5-lan",
-                          "git push --no-verify origin main"):
+                          "git push --no-verify origin main",
+                          "ssh -o StrictHostKeyChecking=accept-new m5",
+                          "codesign --keychain /Users/x/pulp.keychain-db -s ID a.app",
+                          "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH=/x/key.pem shipyard pr",
+                          "sort -u names.txt", "git clone https://github.com/o/r.git"):
                 self.assertEqual(mcl.redact(plain), plain)
 
     def test_the_log_is_owner_only_and_an_existing_one_is_tightened(self) -> None:

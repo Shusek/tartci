@@ -27,16 +27,28 @@ from pathlib import Path
 from typing import Callable, Optional
 
 MAX_PARENTS = 8
-# Parent command lines can carry credentials (a `GH_TOKEN=... gh api` prefix,
-# a curl `-H "Authorization: token ..."`). They are redacted before the write.
+# Parent command lines can carry credentials: a `GH_TOKEN=... gh api` prefix,
+# a curl `-H "Authorization: token ..."` or `-u user:pass`, a URL with
+# `user:pass@`, the fleet's `security unlock-keychain -p "$PW"` once the shell
+# has expanded it. They are redacted before the write.
 REDACTIONS = (
-    # NAME=value for any variable whose name says it is a secret.
-    (re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*)"
+    # NAME=value where the name ENDS in a secret word (GH_TOKEN=, API_KEY=,
+    # AWS_SECRET_ACCESS_KEY=); StrictHostKeyChecking=accept-new is context.
+    (re.compile(r"(?i)\b([A-Z0-9_-]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?))"
                 r"=(\"[^\"]*\"|'[^']*'|\S+)"), r"\1=[redacted]"),
-    # --token VALUE / --password VALUE style flags.
-    (re.compile(r"(?i)((?:^|(?<=\s))--?[a-z0-9-]*(?:token|key|secret|password)[a-z0-9-]*\s+)"
-                r"(?!-)\S+"),
+    # --token VALUE / --password VALUE: a flag that ends in the secret word
+    # (--keychain PATH is not one).
+    (re.compile(r"(?i)((?:^|(?<=\s))--?[a-z0-9-]*(?:token|key|secret|password|passwd)\s+)"
+                r"(?!-)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[redacted]"),
+    # Credentials in a URL: https://user:pass@host, https://oauth2:TOKEN@host.
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
+    # security unlock-keychain -p PASSWORD (the fleet's signing recipe, with
+    # the password already expanded by the shell).
+    (re.compile(r"(?i)(\bsecurity\b[^|;&\n]*?\s-p\s+)(\"[^\"]*\"|'[^']*'|\S+)"),
      r"\1[redacted]"),
+    # curl -u / --user USER:PASS.
+    (re.compile(r"(?i)((?:^|(?<=\s))(?:-u|--user)(?:\s+|=))(\"[^\"]*:[^\"]*\"|'[^']*:[^']*'|"
+                r"[^\s:]*:\S*)"), r"\1[redacted]"),
     # Authorization headers, any scheme, and bare Bearer values.
     (re.compile(r"(?i)(authorization\s*:\s*)(?:\S+\s+)?[^\s\"']+"), r"\1[redacted]"),
     (re.compile(r"(?i)\b(bearer\s+)[^\s\"']+"), r"\1[redacted]"),

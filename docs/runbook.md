@@ -3410,10 +3410,15 @@ lanes change.
     client address and tty, or `terminal`;
   - up to eight parent processes with their command lines.
 
-  Credentials in those command lines are redacted before the write: a
-  `*TOKEN*`, `*KEY*`, `*SECRET*` or `*PASSWORD*` variable or flag value,
-  `Authorization:` and `Bearer` values, and GitHub token shapes (`ghp_`,
-  `gho_`, `ghs_`, `github_pat_`). The file is owner-only (0600), and a file
+  Credentials in those command lines are redacted before the write:
+  - the value of a variable or flag whose name ends in TOKEN, KEY, SECRET,
+    PASSWORD or CREDENTIAL(S), so `StrictHostKeyChecking=` and `--keychain`
+    survive;
+  - a URL's `user:pass@`;
+  - `security unlock-keychain -p` passwords;
+  - curl `-u`/`--user USER:PASS`;
+  - `Authorization:` and `Bearer` values;
+  - GitHub token shapes (`ghp_`, `gho_`, `ghs_`, `github_pat_`). The file is owner-only (0600), and a file
   that already exists is tightened to 0600 on the next write.
 
   On m5 at 05:19Z on 2026-10-16 an off/on over ssh killed two required jobs
