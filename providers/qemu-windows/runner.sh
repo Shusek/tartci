@@ -31,6 +31,8 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -72,6 +74,7 @@ CURRENT_WIN_PORT_LOCK=""
 CURRENT_WIN_PORT_LOCK_DEVICE=""
 CURRENT_WIN_PORT_LOCK_INODE=""
 CURRENT_WIN_QPID=""
+CURRENT_WIN_QPID_STARTED_AT=""
 CURRENT_WIN_STATE_DIR=""
 CURRENT_WIN_LEASE_ID_EXPECTED=""
 CURRENT_WIN_CPUS=""
@@ -285,6 +288,15 @@ PY
 
 # PRINT_HOST_HEALTH=0 (kept as a structural marker for the port-lock fixture)
 
+# Golden admission streams a potentially large qcow2. Resolve the interpreter
+# once through the host pin so a launchd PATH change cannot silently select a
+# different Python (or one without the required tomllib support). This comes
+# after the print-exits (above the qemu check), which need no interpreter and
+# must answer on a host whose pin is broken.
+TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
+export TARTCI_PYTHON
+[[ "$RUNNER_NAME_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
+  || die "unsafe Windows runner name prefix"
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
@@ -319,12 +331,56 @@ delete_runner_registration(){
 
 cleanup_active_windows_job(){
   [ "$CURRENT_WIN_CLEANED_UP" = 0 ] || return 0
-  CURRENT_WIN_CLEANED_UP=1
+  local state
   if [ -n "$CURRENT_WIN_QPID" ]; then
-    kill -9 "$CURRENT_WIN_QPID" 2>/dev/null || true
+    state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]] \
+      && { [ -z "$CURRENT_WIN_QPID_STARTED_AT" ] \
+           || [ "$(tartci_pid_started_at "$CURRENT_WIN_QPID")" != "$CURRENT_WIN_QPID_STARTED_AT" ]; }; then
+      note "QEMU PID identity is unknown or changed; preserving job and lease for recovery"
+      return 1
+    fi
+  fi
+  if [ -n "$CURRENT_WIN_QPID" ] && [ -n "$state" ] && [[ "$state" != Z* ]]; then
+    kill "$CURRENT_WIN_QPID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+      [[ -z "$state" || "$state" == Z* ]] && break
+      sleep 1
+    done
+    state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]] \
+      && [ "$(tartci_pid_started_at "$CURRENT_WIN_QPID")" = "$CURRENT_WIN_QPID_STARTED_AT" ]; then
+      kill -KILL "$CURRENT_WIN_QPID" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+        [[ -z "$state" || "$state" == Z* ]] && break
+        sleep 1
+      done
+    fi
+    state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]]; then
+      note "QEMU still alive; preserving job and lease for recovery"
+      return 1
+    fi
     wait "$CURRENT_WIN_QPID" 2>/dev/null || true
   fi
-  [ -z "$CURRENT_WIN_JOBDIR" ] || rm -rf "$CURRENT_WIN_JOBDIR"
+  if [ -n "$CURRENT_WIN_JOBDIR" ]; then
+    [[ "$CURRENT_WIN_JOBDIR" == "$WORKROOT/$CURRENT_WIN_JOB" \
+       && "$CURRENT_WIN_JOB" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ \
+       && ! -L "$CURRENT_WIN_JOBDIR" ]] || {
+      note "unsafe Windows job path; preserving lease for recovery"
+      return 1
+    }
+    chflags nouchg "$CURRENT_WIN_JOBDIR/golden.qcow2" \
+      "$CURRENT_WIN_JOBDIR/golden.qcow2.sha256" 2>/dev/null || true
+    if [ -e "$CURRENT_WIN_JOBDIR" ]; then
+      if ! rm -r "$CURRENT_WIN_JOBDIR" || [ -e "$CURRENT_WIN_JOBDIR" ]; then
+        note "Windows job directory could not be deleted; preserving lease for recovery"
+        return 1
+      fi
+    fi
+  fi
   if [ -n "$CURRENT_WIN_PORT_LOCK" ]; then
     release_ssh_port_lock "$CURRENT_WIN_PORT_LOCK" \
       "$CURRENT_WIN_PORT_LOCK_DEVICE" "$CURRENT_WIN_PORT_LOCK_INODE" \
@@ -345,9 +401,11 @@ cleanup_active_windows_job(){
   CURRENT_WIN_PORT_LOCK_DEVICE=""
   CURRENT_WIN_PORT_LOCK_INODE=""
   CURRENT_WIN_QPID=""
+  CURRENT_WIN_QPID_STARTED_AT=""
   CURRENT_WIN_STATE_DIR=""
   CURRENT_WIN_LEASE_ID_EXPECTED=""
   CURRENT_WIN_CPUS=""
+  CURRENT_WIN_CLEANED_UP=1
   return 0
 }
 
@@ -391,18 +449,24 @@ run_one(){ # $1=iteration index
   tartci_prepare_and_check_disk_root_observed "$WORKROOT/port-locks" "" "" qemu-windows \
     "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
 
-  local port port_lock port_lock_device port_lock_inode jobdir logdir overlay efivars qpid
+  local port port_lock port_lock_device port_lock_inode jobdir logdir overlay jobbase efivars qpid
   read -r port port_lock port_lock_device port_lock_inode < <(allocate_ssh_port)
   [ -n "$port" ] && [ -n "$port_lock" ] \
     && [ -n "$port_lock_device" ] && [ -n "$port_lock_inode" ] \
     || die "failed to allocate SSH port"
   jobdir="$WORKROOT/$job"
+  if [ -e "$jobdir" ] || [ -L "$jobdir" ]; then
+    release_ssh_port_lock "$port_lock" "$port_lock_device" "$port_lock_inode" || true
+    note "[$i] Windows job directory already exists; refusing collision: $jobdir"
+    return 1
+  fi
   CURRENT_WIN_JOB="$job"
   CURRENT_WIN_JOBDIR="$jobdir"
   CURRENT_WIN_PORT_LOCK="$port_lock"
   CURRENT_WIN_PORT_LOCK_DEVICE="$port_lock_device"
   CURRENT_WIN_PORT_LOCK_INODE="$port_lock_inode"
   CURRENT_WIN_QPID=""
+  CURRENT_WIN_QPID_STARTED_AT=""
   CURRENT_WIN_STATE_DIR=""
   CURRENT_WIN_LEASE_ID_EXPECTED=""
   CURRENT_WIN_CPUS=""
@@ -422,7 +486,7 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
     return "$prepare_rc"
   fi
-  overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
+  overlay="$jobdir/overlay.qcow2"; jobbase="$jobdir/golden.qcow2"; efivars="$jobdir/efivars.fd"
   state_dir="$(tartci_provider_state_dir qemu-windows)"
   CURRENT_WIN_STATE_DIR="$state_dir"
   write_state(){
@@ -433,6 +497,7 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_WORK_DIR="$jobdir" \
     TARTCI_STATE_LOG_DIR="$logdir" \
     TARTCI_STATE_OVERLAY="$overlay" \
+    TARTCI_STATE_GOLDEN_SNAPSHOT="$jobbase" \
     TARTCI_STATE_PORT_LOCK="$WORKROOT/port-locks/$port_lock" \
     TARTCI_STATE_SSH_PORT="$port" \
     TARTCI_STATE_QEMU_PID="${qpid:-}" \
@@ -440,6 +505,11 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_KEEP_FAILED="${2:-}" \
     tartci_write_vm_state qemu-windows "$job" "$job" "$1" ephemeral "$state_dir"
   }
+  if ! nice -n 20 "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN"; then
+    note "[$i] Windows golden failed SHA-256 admission; refusing clone before lease/JIT"
+    cleanup_active_windows_job
+    return 1
+  fi
   lease_cores="$(tartci_vm_lease_cores qemu-windows "$WIN_CPUS")"
   lease_mem="$(tartci_vm_lease_mem_mb qemu-windows "$WIN_MEMORY_MB")"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
@@ -456,8 +526,13 @@ run_one(){ # $1=iteration index
   CURRENT_WIN_CPUS="$effective_win_cpus"
   write_state preparing
 
-  note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
-  if ! tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
+  if ! "$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$jobbase"; then
+    note "[$i] Windows golden failed private snapshot admission"
+    cleanup_active_windows_job
+    return 1
+  fi
+  note "[$i] CoW overlay off verified private snapshot + boot (ssh 127.0.0.1:$port)"
+  if ! tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$jobbase" -F qcow2 "$overlay" >/dev/null; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     cleanup_active_windows_job
     return 1
@@ -475,6 +550,7 @@ run_one(){ # $1=iteration index
     -display none >"$logdir/qemu.log" 2>&1 & CURRENT_WIN_QPID=$!
   qpid="$CURRENT_WIN_QPID"
   qemu_started="$(tartci_pid_started_at "$qpid")"
+  CURRENT_WIN_QPID_STARTED_AT="$qemu_started"
   write_state booting
 
   cleanup_job(){
@@ -490,6 +566,7 @@ run_one(){ # $1=iteration index
       CURRENT_WIN_PORT_LOCK_DEVICE=""
       CURRENT_WIN_PORT_LOCK_INODE=""
       CURRENT_WIN_QPID=""
+      CURRENT_WIN_QPID_STARTED_AT=""
       CURRENT_WIN_STATE_DIR=""
       CURRENT_WIN_LEASE_ID_EXPECTED=""
       CURRENT_WIN_CPUS=""

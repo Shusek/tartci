@@ -1063,13 +1063,36 @@ gh auth status -h github.com
 mkdir -p "$HOME/.tartci/goldens" "$HOME/VMs/tmp" "$HOME/VMs/logs"
 ```
 
-Install the Windows golden on each host:
+Install a Windows golden with its separately supplied, trusted SHA-256 sidecar
+on each host. If the source has no sidecar, establish its provenance and issue
+one before this step; do not compute a new checksum from an untrusted copy.
 
 ```bash
-cp /path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2 \
-  "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
-shasum -a 256 "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+source_golden=/path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2
+test -f "$source_golden.sha256" || { echo "trusted source sidecar required" >&2; exit 1; }
+golden="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+cp "$source_golden" "$golden"
+cp "$source_golden.sha256" "$golden.sha256"
+python3 scripts/verify_windows_golden.py --no-cache "$golden"
 ```
+
+The manual clone and Windows runner require an adjacent `.qcow2.sha256`
+sidecar. The first shared-source check streams the image; subsequent checks can
+use a private cache keyed by image identity and sidecar digest. After taking a
+VM lease, each job makes a private APFS CoW snapshot, fully hashes its exact
+bytes against the sidecar, seals it, and creates the overlay against that
+snapshot. If APFS cloning or hashing fails, the job refuses to boot. Use
+`python3 scripts/verify_windows_golden.py --no-cache /path/to/base.qcow2`
+for a forensic recheck. A checksum proves that the disk matches its recorded
+bytes; the boot/toolchain probe and provenance receipt are separate admission
+requirements. Do not regenerate a mismatched sidecar to silence a refusal.
+The runner, the manual clone and the snapshot script hash with the host's
+pinned interpreter (`tartci_toml_python_path`, see "Pinned interpreter"), never
+PATH's `python3`: the hash reads the whole golden from the VM store, and macOS
+grants for that store belong to the binary. Each job logs `Windows snapshot
+hash: <N>s for <bytes> bytes (<interpreter>)`, which is the per-job cost of the
+full hash. When the Windows lane is next enabled, enable it on one host (m1 or
+m5) and see one green job before the other.
 
 Keep the runner code on a home-backed path so launchd and non-interactive SSH do
 not depend on a mounted workspace:
