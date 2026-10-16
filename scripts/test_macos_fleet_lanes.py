@@ -96,6 +96,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "schema": "tartci.advertised-labels/v1",
                 "generated_from": {
                     "repo": "ORG/private-fleet-authority",
+                    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "profiles": ["profiles/canary-macos-fleet.toml"],
                     "profiles_sha256": source.profiles_sha256,
                 },

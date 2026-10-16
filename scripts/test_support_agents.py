@@ -233,6 +233,7 @@ class Plan(Case):
             (source / "fleet" / "advertised-labels.json").write_text(
                 '{"schema":"tartci.advertised-labels/v1",'
                 f'"generated_from":{{"repo":"ORG/private-fleet-authority",'
+                f'"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
                 f'"profiles":["profiles/canary-macos-fleet.toml"],'
                 f'"profiles_sha256":"{digest}"}},"registrations":[]}}\n')
             values = {
