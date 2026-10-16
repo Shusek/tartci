@@ -19,7 +19,10 @@ CONFIG=""
 SUPPORT_MANIFEST=""
 SUPPORT_SOURCE=""
 LAUNCH_HELPER_SOURCE=""
-USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--preflight|--skip-preflight] [--apply]"
+LAUNCHER_LAYOUT=""
+LAUNCH_SET_IDENTITY=""
+LAUNCH_SET_KEYCHAIN=""
+USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--launcher-layout v1|v2] [--launch-set-identity ID --launch-set-keychain PATH] [--preflight|--skip-preflight] [--apply]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
@@ -39,6 +42,20 @@ while [ "$#" -gt 0 ]; do
       shift
       [ "$#" -gt 0 ] || { echo "--launch-helper-source requires a path" >&2; exit 2; }
       LAUNCH_HELPER_SOURCE="$1"
+      ;;
+    --launcher-layout)
+      shift
+      case "${1:-}" in v1|v2) LAUNCHER_LAYOUT="$1" ;; *) echo "--launcher-layout must be v1 or v2" >&2; exit 2 ;; esac
+      ;;
+    --launch-set-identity)
+      shift
+      [ "$#" -gt 0 ] || { echo "--launch-set-identity requires a signing identity" >&2; exit 2; }
+      LAUNCH_SET_IDENTITY="$1"
+      ;;
+    --launch-set-keychain)
+      shift
+      [ "$#" -gt 0 ] || { echo "--launch-set-keychain requires a keychain path" >&2; exit 2; }
+      LAUNCH_SET_KEYCHAIN="$1"
       ;;
     -*) echo "$USAGE" >&2; exit 2 ;;
     *) [ -z "$CONFIG" ] || { echo "$USAGE" >&2; exit 2; }; CONFIG="$1" ;;
@@ -295,6 +312,38 @@ for target in "$AGENTS_DIR"/com.danielraffel.tartci.tart-runner-macos-fleet.*.pl
   is_expected_name "$(basename "$target")" || stale_targets+=("$target")
 done
 
+# Which launcher layout this install writes (scripts/launcher_layout.py): v2
+# only on a host that opted in. A refused opt-in file, or a v2 host whose
+# opt-in is gone, stops here, before the dry run reports anything.
+plan_launcher_layout=""
+plan_installed_layout=""
+plan_has_helper="$("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_fleet_lanes as fleet
+print("yes" if fleet.load(Path(sys.argv[1])).get("launch_helper") is not None else "no")
+PY
+)" || exit 2
+if [ "$plan_has_helper" = yes ]; then
+  layout_args=(--home "$HOME" --receipt "$RECEIPT")
+  [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
+  plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
+  plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT")" || exit 3
+elif [ -n "$LAUNCHER_LAYOUT" ]; then
+  echo "--launcher-layout is invalid for a profile without launch_helper" >&2
+  exit 2
+fi
+if [ "$plan_launcher_layout" = v2 ]; then
+  [ -n "$LAUNCH_SET_IDENTITY" ] && [ -n "$LAUNCH_SET_KEYCHAIN" ] || {
+    echo "launcher v2 needs --launch-set-identity and --launch-set-keychain: a launch set is signed only through the dedicated signing keychain" >&2
+    exit 2
+  }
+elif [ -n "$LAUNCH_SET_IDENTITY$LAUNCH_SET_KEYCHAIN" ]; then
+  echo "--launch-set-identity and --launch-set-keychain are only for launcher v2" >&2
+  exit 2
+fi
+
 echo "macOS fleet profile install plan:"
 echo "  config=$CONFIG"
 echo "  install_count=${#candidates[@]}"
@@ -313,6 +362,12 @@ echo "  entrypoint=$ENTRYPOINT"
 echo "  agent_hygiene_entrypoint=$AGENT_HYGIENE_ENTRYPOINT"
 echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
+if [ -n "$plan_launcher_layout" ]; then
+  echo "  launcher_layout=$plan_launcher_layout installed=${plan_installed_layout:-none}"
+  if [ -n "$plan_installed_layout" ] && [ "$plan_installed_layout" != "$plan_launcher_layout" ]; then
+    echo "  launcher_change=$plan_installed_layout->$plan_launcher_layout (a new launcher: it needs its own approval digest and the Removable Volumes grant)"
+  fi
+fi
 echo "  activation=deferred to tartci pool on"
 
 # Authenticate the exact support commit before the dry-run exit. This makes
@@ -423,6 +478,11 @@ launcher_candidate=""
 launcher_backup=""
 launcher_touched=0
 launcher_unchanged=0
+launcher_layout=""
+launcher_source_commit=""
+pointer_file="$HOME/.config/tartci/launcher-generation.json"
+pointer_backup=""
+pointer_touched=0
 support_root=""
 installed_support_manifest=""
 launch_entrypoint=""
@@ -434,6 +494,13 @@ retired_backups=()
 
 rollback() {
   local i target backup
+  if [ "$pointer_touched" = 1 ]; then
+    # Lanes go back to the generation the pointer named before this install.
+    rm -f "$pointer_file"
+    if [ -n "$pointer_backup" ] && [ -e "$pointer_backup" ]; then
+      mv -f "$pointer_backup" "$pointer_file" || true
+    fi
+  fi
   if [ "$launcher_touched" = 1 ]; then
     rm -rf -- "$launcher_target"
     if [ -n "$launcher_backup" ] && { [ -e "$launcher_backup" ] || [ -L "$launcher_backup" ]; }; then
@@ -625,7 +692,30 @@ actual_host_id="$("$shipyard_bin" runner tag 2>/dev/null)" || {
   echo "fleet profile host mismatch: profile=$profile_host_id shipyard=$actual_host_id" >&2
   exit 3
 }
+# The layout the plan reported is the one this install writes; re-read now
+# that the profile is locked, and refuse if anything changed in between.
+verify_launcher() {  # PATH [SOURCE_COMMIT]: the launcher identity record, or refuse
+  if [ "$launcher_layout" = v2 ]; then
+    "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify-v2 "$1" \
+      --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+      --sha256 "$launcher_sha256" --profile "$locked_config" \
+      --support-root "$SUPPORT_SOURCE"
+  else
+    "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$1" \
+      --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+      --sha256 "$launcher_sha256" \
+      --profile-policy-sha256 "$launcher_profile_policy_sha256" \
+      ${2:+--source-commit "$2"}
+  fi
+}
 if [ "$launch_helper_json" != "null" ]; then
+  layout_args=(--home "$HOME" --receipt "$RECEIPT")
+  [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
+  launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
+  [ "$launcher_layout" = "$plan_launcher_layout" ] || {
+    echo "launcher layout changed after the plan ($plan_launcher_layout -> $launcher_layout); run the install again" >&2
+    exit 3
+  }
   launcher_target="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
   launcher_approval_path="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["approval_sha256_path"])' <<<"$launch_helper_json")"
   launcher_identifier="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
@@ -652,9 +742,10 @@ print(value.strip())
 PY
 )"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
-  # A sealed launcher owns the lane environment; reject a source bundle that
-  # was rendered without the same verified interpreter as this install.
-  "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
+  # A v1 launcher owns the lane environment; reject a source bundle that
+  # was rendered without the same verified interpreter as this install. A v2
+  # app carries no lanes: the launch set pins them, below.
+  [ "$launcher_layout" = v2 ] || "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
 import json, sys
 from pathlib import Path
 bundle, expected = Path(sys.argv[1]), sys.argv[2]
@@ -664,11 +755,10 @@ if not lanes or any((row.get("environment") or {}).get("TARTCI_PYTHON") != expec
                     for row in lanes.values()):
     raise SystemExit(f"launch helper lanes are missing pinned interpreter: {expected}")
 PY
-  launcher_identity_json="$("$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256")"
-  launcher_source_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
+  launcher_identity_json="$(verify_launcher "$LAUNCH_HELPER_SOURCE")" || exit 3
+  # A v1 app is sealed to one commit; a v2 app to its inputs, checked above.
+  [ "$launcher_layout" = v2 ] \
+    || launcher_source_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
   mkdir -p "$(dirname "$launcher_target")"
   "$PYTHON_BIN" - "$profile_home" "$launcher_target" <<'PY' || {
 import os
@@ -698,11 +788,7 @@ PY
   else
     launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
     /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
-    "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
-      --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-      --sha256 "$launcher_sha256" \
-      --profile-policy-sha256 "$launcher_profile_policy_sha256" \
-      --source-commit "$launcher_source_commit" >/dev/null
+    verify_launcher "$launcher_candidate" "$launcher_source_commit" >/dev/null
   fi
 elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
   echo "--launch-helper-source is invalid for a profile without launch_helper" >&2
@@ -955,7 +1041,7 @@ source_authority_commit="$(verify_source_commit "$support_commit")" || source_au
   echo "fleet install could not authenticate the exact TartCI source commit" >&2
   exit 3
 }
-if [ -n "$launcher_target" ]; then
+if [ -n "$launcher_target" ] && [ "$launcher_layout" = v1 ]; then
   [ "$launcher_source_commit" = "$support_commit" ] || {
     echo "fleet install requires launcher and support cohorts from the same exact commit" >&2
     exit 3
@@ -968,11 +1054,7 @@ if [ -n "$launcher_target" ]; then
 fi
 
 if [ -n "$launcher_target" ] && [ "$launcher_unchanged" = 1 ]; then
-  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
-    --source-commit "$launcher_source_commit" >/dev/null
+  verify_launcher "$launcher_target" "$launcher_source_commit" >/dev/null
   echo "launcher: unchanged, left in place: $launcher_target"
 elif [ -n "$launcher_target" ]; then
   if { [ -e "$launcher_target" ] || [ -L "$launcher_target" ]; } \
@@ -991,12 +1073,31 @@ elif [ -n "$launcher_target" ]; then
   mv "$launcher_candidate" "$launcher_target"
   launcher_candidate=""
   durable_tree "$launcher_target"
-  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
-    --source-commit "$launcher_source_commit" >/dev/null
+  verify_launcher "$launcher_target" "$launcher_source_commit" >/dev/null
   maybe_test_crash launcher
+fi
+
+# Launcher v2 runs what the generation's signed launch set says: write the
+# set for these lanes, sign it through the dedicated keychain, and point at
+# it. The previous pointer is kept for rollback().
+if [ "$launcher_layout" = v2 ]; then
+  if [ -e "$pointer_file" ] || [ -L "$pointer_file" ]; then
+    pointer_backup="$backup_dir/$(basename "$pointer_file").previous"
+    cp -p "$pointer_file" "$pointer_backup"
+    durable_directory "$backup_dir"
+  fi
+  pointer_touched=1
+  "$PYTHON_BIN" "$ROOT/scripts/launch_set.py" install \
+    --generation "$support_root" --render-dir "$render_dir" \
+    --tart-home "$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["tart_home"])' "$launcher_target/Contents/Resources/policy.json")" \
+    --pin "$PYTHON_BIN" --pointer "$pointer_file" \
+    --floor "$HOME/.config/tartci/launcher-floor.json" \
+    --root "$(cd "$SUPPORT_GENERATIONS" && pwd -P)" --team-id "$launcher_team_id" \
+    --identity "$LAUNCH_SET_IDENTITY" --keychain "$LAUNCH_SET_KEYCHAIN" >/dev/null || {
+    echo "fleet install could not publish the launcher v2 launch set (see above)" >&2
+    exit 3
+  }
+  durable_file "$pointer_file"
 fi
 
 for candidate in "${candidates[@]}"; do
@@ -1052,6 +1153,7 @@ receipt_tmp="$(mktemp "$(dirname "$RECEIPT")/.macos-fleet-install.json.XXXXXX")"
   --entrypoint "$ENTRYPOINT" --entrypoint-source "$wrapper_candidate" \
   --launch-entrypoint "$launch_entrypoint" \
   --source-authority-commit "$source_authority_commit" \
+  ${launcher_layout:+--launcher-layout "$launcher_layout"} \
   --output "$receipt_tmp" >/dev/null
 if [ -e "$RECEIPT" ] || [ -L "$RECEIPT" ]; then receipt_backup="$backup_dir/$(basename "$RECEIPT").previous"; mv "$RECEIPT" "$receipt_backup"; durable_directory "$(dirname "$RECEIPT")"; durable_directory "$backup_dir"; fi
 receipt_touched=1
