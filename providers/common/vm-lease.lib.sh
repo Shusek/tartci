@@ -111,7 +111,9 @@ tartci_check_macos_disk_floor_with_cleanup_once(){
   local path="$1" lane="$2" runner="$3" rc=0
   tartci_check_disk_floor_observed "$path" tart-macos "$lane" "$runner" || rc=$?
   [ "$rc" -ne 0 ] || return 0
-  [ "$path" = /Volumes/Workshop/VMs ] || return "$rc"
+  # Only the Tart store the cleanup authority was rendered for (host.tart_home).
+  [ -n "${TARTCI_WORKTREE_CLEANUP_TART_HOME:-}" ] || return "$rc"
+  [ "$path" = "$TARTCI_WORKTREE_CLEANUP_TART_HOME" ] || return "$rc"
   [ -n "${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}" ] || return "$rc"
   tartci_try_worktree_cleanup "$TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON" || return "$rc"
   # One exact remeasurement only. A second denial remains authoritative.
