@@ -78,6 +78,28 @@ class Scan(unittest.TestCase):
         problems = ppl.scan(root, ppl.tracked(root))
         self.assertEqual([p.split(":")[0] for p in problems], ["scripts/y.py"])
 
+    # Their host paths now come from the profile, so the lint covers them.
+    DELISTED = ("scripts/macos_fleet_lanes.py", "scripts/worktree_cleanup.py",
+                "providers/common/vm-lease.lib.sh", "providers/tart-linux/provision.sh",
+                "providers/tart-linux/run.sh", "providers/tart-linux/runner.sh",
+                "scripts/test_worktree_cleanup.py", "scripts/test_vm_lease_helper.py")
+
+    def test_the_delisted_files_are_linted_again(self) -> None:
+        root = Path(ppl.__file__).resolve().parent.parent
+        allowed = ppl.allowlisted(root)
+        for rel in self.DELISTED:
+            with self.subTest(rel=rel):
+                self.assertNotIn(rel, allowed)
+                text = (root / rel).read_text()
+                self.assertEqual([], ppl.findings_in(text), "the file itself is clean")
+                # Positive control: one real path planted in the real file,
+                # under the real allow-list, fails the lint.
+                planted = self.repo({rel: text + f"\n# {REAL_VOLUME}/VMs\n",
+                                     ppl.ALLOWLIST: (root / ppl.ALLOWLIST).read_text()})
+                problems = ppl.scan(planted, ppl.tracked(planted))
+                self.assertEqual([rel], sorted({p.split(":")[0] for p in problems}))
+                self.assertEqual(1, ppl.main(["--root", str(planted)]))
+
     def test_this_repository_is_clean(self) -> None:
         root = Path(ppl.__file__).resolve().parent.parent
         if not (root / ".git").exists():
