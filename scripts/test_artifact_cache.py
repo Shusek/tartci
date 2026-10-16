@@ -497,8 +497,8 @@ class RefreshAgentTests(unittest.TestCase):
         # The runners mount [host].cache_root; a host that moved its CI cache
         # off the home default must have this agent refresh the moved cache.
         self.assertEqual(self._installed_cache(
-            '[host]\nid = "studio"\ncache_root = "/Volumes/Workshop/ci/pulp-ci"\n'),
-            "/Volumes/Workshop/ci/pulp-ci")
+            '[host]\nid = "studio"\ncache_root = "/Volumes/Example/ci/pulp-ci"\n'),
+            "/Volumes/Example/ci/pulp-ci")
 
     def test_installer_keeps_the_home_default_without_a_declared_cache_root(self) -> None:
         self.assertEqual(self._installed_cache(None), "~/.cache/pulp-ci")

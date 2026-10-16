@@ -326,7 +326,7 @@ class WatchdogIssue(unittest.TestCase):
         record = self.home / "state" / "interpreter-switch-refused"
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text("2026-10-15T13:59:30Z\t/new/python3.12\t/old/python3.15\t"
-                          "did not finish a write to /Volumes/Atelier/VMs within 60s\n")
+                          "did not finish a write to /Volumes/Store/VMs within 60s\n")
         line = self.run_pass()
         self.assertIn("the lanes kept /old/python3.15; /new/python3.12 failed the launchd "
                       "preflight", line)
@@ -360,7 +360,7 @@ class InterpreterPreflight(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "", "")
             text = prints(args)
             return subprocess.CompletedProcess(args, 0 if text else 1, text, "")
-        profile = {"host": {"tart_home": "/Volumes/Atelier/VMs"}}
+        profile = {"host": {"tart_home": "/Volumes/Store/VMs"}}
         with mock.patch.object(ip, "launchctl", side_effect=fake):
             return ip.run(profile, "/new/python3.12", timeout=timeout), calls
 
@@ -385,7 +385,7 @@ class InterpreterPreflight(unittest.TestCase):
         self.assertIn("exit 1", reason)
         self.assertIn("Removable Volumes", reason)
         reason, _ = self.run_with(lambda args: "")
-        self.assertIn("did not finish a write to /Volumes/Atelier/VMs", reason)
+        self.assertIn("did not finish a write to /Volumes/Store/VMs", reason)
         self.assertIn("Full Disk Access", reason)
 
 

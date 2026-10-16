@@ -61,7 +61,7 @@ def write_bundle(home: pathlib.Path, commit: str, manifest: str) -> str:
     (bundle / hp.SEALED_BUNDLE_MARKER).write_text(json.dumps({
         "schema": 1, "source_commit": commit,
         "support_manifest_sha256": manifest,
-        "profile_policy_sha256": "0" * 64, "tart_home": "/Volumes/Workshop/VMs"}))
+        "profile_policy_sha256": "0" * 64, "tart_home": "/Volumes/Example/VMs"}))
     program = bundle / "Contents" / "MacOS" / "tartci-launcher"
     program.write_text("#!/bin/sh\n")
     return str(program)

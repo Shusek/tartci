@@ -14,7 +14,7 @@ M1_PLISTS = [
     "com.danielraffel.tartci.tart-runner-macos-fleet.m1.spectr-gate.plist",
     "com.danielraffel.tartci.tart-runner-macos-fleet.m1.vellum-gate.plist",
 ]
-M1_SLOT2_LOG = "/Users/danielraffel/Library/Logs/tartci/macos-fleet-pulp-gate-slot2.log"
+M1_SLOT2_LOG = "/Users/example/Library/Logs/tartci/macos-fleet-pulp-gate-slot2.log"
 BLIND = "SCAN BLIND 1/9\nSCAN BLIND 2/9\nSCAN BLIND 3/9\n"
 
 

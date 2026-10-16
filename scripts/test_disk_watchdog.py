@@ -249,7 +249,7 @@ class Pieces(unittest.TestCase):
         ps = "\n".join([
             "  PID  PPID STAT ELAPSED WCHAN  COMMAND",
             "  101     1 Ss   01:00   -      /sbin/launchd",
-            "  202     1 U    07:00:00 -     python3 -c probe /Volumes/Atelier",
+            "  202     1 U    07:00:00 -     python3 -c probe /Volumes/Store",
             "  303     1 D+   00:05   -      cp a b",
             "  404     1 R    00:01   -      ps",
         ])

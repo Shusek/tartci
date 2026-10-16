@@ -45,7 +45,7 @@
   PILOT vs GRADUATE: the default labels routed below include the non-required
   shared pool label `pulp-build-linux` and a host-specific label. Use
   `pulp-host-macstudio` on the primary Mac Studio and `pulp-host-m5` on the
-  overflow M5/blackbook. The workflow resolver should choose the Mac Studio
+  overflow M5/laptop. The workflow resolver should choose the Mac Studio
   selector first, the M5 selector second, and GitHub-hosted when each local
   selector is already at its configured in-progress capacity; queued Actions jobs
   cannot change `runs-on` after dispatch.
