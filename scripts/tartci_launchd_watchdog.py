@@ -547,11 +547,10 @@ def probe_stale_boot(
         if not _launchd_owns_pid(launchd_pid, supervisor_pid_int):
             return StaleBootProbe(False, "state supervisor pid does not match launchd")
         started_at = state.get("supervisor_pid_started_at")
-        if started_at:
-            if not isinstance(started_at, str) or not _pid_start_matches(
-                supervisor_pid_int, started_at
-            ):
-                return StaleBootProbe(False, "supervisor pid start time does not match state")
+        if not isinstance(started_at, str) or not started_at.strip():
+            return StaleBootProbe(None, "lane state has no supervisor start identity")
+        if not _pid_start_matches(supervisor_pid_int, started_at):
+            return StaleBootProbe(False, "supervisor pid start time does not match state")
         if isinstance(ts, str):
             parsed_ts = dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
         else:
