@@ -844,10 +844,10 @@ class OrphanedLaneVmTests(unittest.TestCase):
             (False, "vm_bundle_unreadable"))
 
     def retired(self, name: str, age: float, host_id="m1", prefixes=("pulp-",),
-                alive=lambda pid: False, leases=frozenset()):
+                alive=lambda pid: False, leases=frozenset(), named=lambda n: False):
         return vm_reap.orphan_verdict(name, False, self.RUNNERS, {}, set(leases),
                                       self.bundle(name, age), time.time(), 3600, alive,
-                                      host_id=host_id, prefixes=list(prefixes))
+                                      host_id=host_id, prefixes=list(prefixes), named=named)
 
     def test_a_retired_lanes_clone_on_this_host_is_deleted_after_a_day(self) -> None:
         # m1 kept pulp-preamble-m1-target-06-99292-1 for two months: its lane
@@ -864,19 +864,40 @@ class OrphanedLaneVmTests(unittest.TestCase):
             "recent": dict(age=6 * 3600),
             "supervisor_pid_alive": dict(age=2 * 86400, alive=lambda pid: pid == 99292),
             "lease_names_it": dict(age=2 * 86400, leases={name}),
+            "named_by_tartci": dict(age=2 * 86400, named=lambda n: n == name),
         }
         for reason, kwargs in cases.items():
             with self.subTest(reason=reason):
                 self.assertEqual(self.retired(name, **kwargs), (False, reason))
         # Not provably this host's: another host's id, no host id word, an
         # unlisted prefix, or no known host id at all.
-        for other, kwargs in (("pulp-preamble-m5-target-06-99292-1", {}),
+        for other, kwargs in (("pulp-build-runner:pre-m1-rollback-1-2", {}),  # an image, never a clone
+                              ("pulp-preamble-m5-target-06-99292-1", {}),
                               ("pulp-linux-build-proof-2-20260811-1", {}),
                               ("vellum-m1-scratch-01-7-1", {}),
                               ("pulp-preamble-m1-target-06-99292-1", {"host_id": None})):
             with self.subTest(name=other, **{k: str(v) for k, v in kwargs.items()}):
                 self.assertEqual(self.retired(other, 60 * 86400, **kwargs),
                                  (False, "not_a_lane_vm"))
+
+    @unittest.skipIf(sys.version_info < (3, 11), "reads the fleet profile (tomllib)")
+    def test_tartci_names_uses_the_image_pruners_ownership_rule(self) -> None:
+        home = self.tmp / "home"
+        (home / ".config/tartci").mkdir(parents=True)
+        (home / "Library/LaunchAgents").mkdir(parents=True)
+        profile = home / ".config/tartci/macos-fleet-profile.toml"
+        profile.write_text('[[lane]]\ngolden = "pulp-build-runner:latest"\n')
+        (home / "Library/LaunchAgents/com.danielraffel.x.plist").write_text(
+            "<string>pulp-linux-golden-7-1</string>")
+        with mock.patch.dict(os.environ, {"HOME": str(home),
+                                          "TARTCI_FLEET_PROFILE": str(profile)}), \
+             mock.patch.object(vm_reap.pathlib.Path, "home", return_value=home):
+            names = vm_reap.TartciNames()
+            self.assertTrue(names("pulp-build-runner:latest"))
+            self.assertTrue(names("pulp-linux-golden-7-1"))
+            self.assertFalse(names("pulp-preamble-m1-target-06-99292-1"))
+            profile.write_text("not = [toml")
+            self.assertTrue(vm_reap.TartciNames()("pulp-preamble-m1-target-06-99292-1"))
 
     def test_the_digest_on_m1_reaps_the_retired_clone_and_nothing_foreign(self) -> None:
         import fleet_lane_discovery as fld
@@ -901,6 +922,7 @@ class OrphanedLaneVmTests(unittest.TestCase):
              mock.patch.object(vm_reap, "macos_running_count", return_value=0), \
              mock.patch.object(vm_reap, "github_runners", return_value=[]), \
              mock.patch.object(vm_reap, "pid_alive", return_value=False), \
+             mock.patch.object(vm_reap, "TartciNames", return_value=lambda name: False), \
              mock.patch.object(vm_reap, "delete_vm",
                                side_effect=lambda name, running: deleted.append(name) or
                                [f"vm_deleted:{name}"]):

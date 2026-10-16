@@ -3476,7 +3476,10 @@ is gone and that no state file or lease names. This covers clones of loaded
 lanes, and since 2026-10-16 also clones of retired lanes on this host. A
 runner name counts as this host's when it carries the host id as one of its
 dash-separated words and starts with an allowed CI prefix or the host id. A
-retired lane's clone must also be untouched for 24 h. m1 had kept
+retired lane's clone must also be untouched for 24 h. It is kept when
+the image pruner's ownership rule claims it, i.e. the fleet profile, a tartci
+state or config file, or a LaunchAgent names it, or it is an image (any name
+with a `:` tag). If the profile cannot be read, every retired clone is kept. m1 had kept
 `pulp-preamble-m1-target-06-99292-1` for two months. A VM whose name is not
 provably this host's is never touched; the foreign-VM report covers those.
 

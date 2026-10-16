@@ -571,6 +571,31 @@ def lease_references(store_dir: pathlib.Path | None = None) -> set[str] | None:
 RETIRED_LANE_MIN_AGE_SECS = 24 * 3600
 
 
+class TartciNames:
+    """Whether the fleet profile, a tartci state or config file, or a
+    LaunchAgent names a VM: tart_image_prune's ownership rule, read once and
+    only when a retired-lane candidate needs it. Unreadable reads as named."""
+
+    def __init__(self) -> None:
+        self._text: str | None = None
+        self._values: set[str] | None = None
+
+    def __call__(self, name: str) -> bool:
+        import tart_image_prune as prune  # noqa: PLC0415 - one ownership rule
+        if self._text is None:
+            home = pathlib.Path.home()
+            try:
+                self._values, _ = prune.profile_strings(pathlib.Path(os.environ.get(
+                    "TARTCI_FLEET_PROFILE", str(home / ".config/tartci/macos-fleet-profile.toml"))))
+            except (OSError, ValueError, RuntimeError):
+                self._values = None
+            self._text = prune.reference_text([home / ".config/tartci", home / ".tartci/state",
+                                               home / "Library/LaunchAgents"])
+        if self._values is None:
+            return True
+        return name in self._values or prune.named_in(name, self._text)
+
+
 def retired_lane_runner(runner: str, host_id: str | None, prefixes: list[str]) -> bool:
     if not host_id or host_id not in runner.split("-"):
         return False
@@ -589,6 +614,7 @@ def orphan_verdict(
     alive: Any = pid_alive,
     host_id: str | None = None,
     prefixes: list[str] | None = None,
+    named: Any = None,
 ) -> tuple[bool, str]:
     """(delete?, why) for a VM no state file owns. Every doubt keeps it.
 
@@ -604,8 +630,13 @@ def orphan_verdict(
     if not match:
         return False, "not_a_lane_vm"
     if match.group("runner") not in lane_runners:
-        if not retired_lane_runner(match.group("runner"), host_id, prefixes or []):
+        if ":" in name or not retired_lane_runner(match.group("runner"), host_id,
+                                                   prefixes or []):
             return False, "not_a_lane_vm"
+        # The image pruner's ownership rule: a VM any tartci file, the fleet
+        # profile or a LaunchAgent names (a golden, a rollback image) is kept.
+        if named is None or named(name):
+            return False, "named_by_tartci"
         retired = True
         min_age_secs = max(min_age_secs, RETIRED_LANE_MIN_AGE_SECS)
     if running:
@@ -804,6 +835,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     host_words = {runner.split("-", 1)[0] for runner in lane_runners}
     host_id = host_words.pop() if len(host_words) == 1 else None
     leases_seen = lease_references() if lane_runners else set()
+    tartci_names = TartciNames()
     store = ensure_tart_home()
     tart_home = pathlib.Path(store["path"])
     protected = [p for p in args.protected_names.split(",") if p]
@@ -915,7 +947,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     orphaned, orphan_reason = orphan_verdict(
                         name, running, lane_runners, states_by_vm, leases_seen,
                         tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs,
-                        host_id=host_id, prefixes=prefixes)
+                        host_id=host_id, prefixes=prefixes, named=tartci_names)
                     if orphaned:
                         stale = True
                         action = "delete_orphaned_stopped_vm"
