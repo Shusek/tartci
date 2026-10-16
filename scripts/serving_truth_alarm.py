@@ -17,7 +17,7 @@ Rules, each scoped to this host (`me`, its advertised host_id):
   precheck, admission success or assignment breaks the streak.
 - host_error_burst: one first-error across 3 heads within the burst window.
 - lane_death_by_signal: a lane with an assigned job died by a quarantining
-  signal before its terminal receipt.
+  signal before its terminal receipt and before its VM was torn down.
 
 Each (rule, host) is one episode with its own lifecycle and, outside shadow
 mode, its own GitHub issue whose body ends with the tartci-incident marker
@@ -344,7 +344,11 @@ def classify(events: Iterable[dict], jobs: Iterable[dict] = (), *, me: str,
         event, runner = row.get("event"), _runner(row)
         if event == "job_assigned":
             held[runner] = row
-        elif event == "job_terminal_receipt":
+        elif event in ("job_terminal_receipt", "teardown"):
+            # The lane's VM is gone once it is torn down, so the job it held
+            # can no longer die. A supervisor stopped later (a self-update or
+            # a reload of an idle lane) still logs the last job's quarantine
+            # (m1, m3 and m5, 2026-10-15 and 10-16).
             held.pop(runner, None)
         elif event == "supervisor_signal" and (_time(row) or -1) >= start:
             found = re.search(r"quarantine=([^\s]+)", _detail(row))
@@ -540,7 +544,7 @@ def alert_pass(state: Path, rows: List[dict], jobs: List[dict], *, me: str,
     closer = close or host_off._close_issue
     by_key = {trip["episode_key"]: trip for trip in trips}
     out: dict = {"trips": trips, "receipts": [], "shadow": shadow, "opened": [], "fixed": [],
-                 "demand_errors": list(demand_errors)}
+                 "opened_keys": [], "demand_errors": list(demand_errors)}
 
     for key, trip in by_key.items():
         if key in episodes:
@@ -557,6 +561,7 @@ def alert_pass(state: Path, rows: List[dict], jobs: List[dict], *, me: str,
                          "title": title, "issue_body": body, "issue": None,
                          "receipt": str(receipt)}
         out["receipts"].append(str(receipt))
+        out["opened_keys"].append(key)
         host_off.event(state, "serving_truth_alarm", f"{trip['rule']} on {trip['host']}",
                        {"episode_key": key, "receipt": str(receipt)}, end)
 

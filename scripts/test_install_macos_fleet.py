@@ -451,6 +451,31 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
         self.assertFalse((self.home / ".config/tartci/mise.pin").exists())
 
+    def fake_rustup(self, records: bool) -> Path:
+        rustup = self.root / ".cargo/bin/rustup"
+        rustup.parent.mkdir(parents=True, exist_ok=True)
+        body = ('printf \'version = "12"\\nauto_self_update = "%s"\\n\' "$3" > "$RUSTUP_HOME/settings.toml"\n'
+                if records else "")
+        rustup.write_text(f"#!/bin/sh\n{body}")
+        rustup.chmod(0o755)
+        self.config.write_text(self.config.read_text()
+                               + f'\n[rustup]\npath = "{rustup}"\nauto_self_update = "disable"\n')
+        (self.root / "rustup-home").mkdir(exist_ok=True)
+        return self.root / "rustup-home"
+
+    def test_rustup_is_set_to_never_self_update(self) -> None:
+        home = self.fake_rustup(records=True)
+        result = self.run_installer("--apply", RUSTUP_HOME=str(home))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('auto_self_update = "disable"', (home / "settings.toml").read_text())
+
+    def test_a_rustup_that_keeps_self_update_refuses_the_install(self) -> None:
+        home = self.fake_rustup(records=False)
+        result = self.run_installer("--apply", RUSTUP_HOME=str(home))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("expected 'disable'", result.stderr)
+        self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
+
     def preflight(self, rc: int) -> Path:
         script = self.root / f"preflight-{rc}"
         script.write_text("#!/bin/sh\n"
