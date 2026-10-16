@@ -90,19 +90,24 @@ class Plan(Base):
 
     def test_a_rebuild_an_hour_ago_keeps_an_old_target(self) -> None:
         # .fingerprint keeps its first-build mtime; a rebuild shows in its
-        # entries, or in deps/. Either alone must keep the target.
+        # entries or in deps/, and a no-op build moves only the profile dir
+        # (measured on m1: debug/ changed while deps/ and .fingerprint did
+        # not). Any one alone must keep the target.
         self.flag.write_text("")
-        for recent in ("fingerprint entry", "deps"):
+        for recent in ("fingerprint entry", "deps", "debug dir", "release dir"):
             with self.subTest(recent=recent):
-                target = self.target(f"sy-{recent[:4]}/target", 30)
+                target = self.target(f"sy-{recent.replace(' ', '-')}/target", 30)
                 entry = target / "debug" / ".fingerprint" / "tartci-1234"
                 entry.mkdir()
                 (target / "debug" / "deps").mkdir()
+                (target / "release").mkdir()
                 old = NOW - 30 * DAY
                 for path in (entry, target / "debug" / "deps", target / "debug" / ".fingerprint",
-                             target / "debug", target):
+                             target / "debug", target / "release", target):
                     os.utime(path, (old, old))
-                fresh = entry if recent == "fingerprint entry" else target / "debug" / "deps"
+                fresh = {"fingerprint entry": entry, "deps": target / "debug" / "deps",
+                         "debug dir": target / "debug",
+                         "release dir": target / "release"}[recent]
                 os.utime(fresh, (NOW - 3600, NOW - 3600))
                 self.assertGreater(acr.last_built(target), NOW - 2 * 3600)
                 # Control, same target with everything old: stale.

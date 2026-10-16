@@ -138,8 +138,8 @@ class VmLeaseHelperTests(unittest.TestCase):
               export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipt_dir}
               export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1
               export TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
-              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp
-              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code
+              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Example/Code/pulp
+              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Example/Code
               export TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
               export TARTCI_WORKTREE_CLEANUP_APPLY=1
               export TARTCI_RUNNER_REPO=Generous-Corp/pulp
@@ -184,7 +184,7 @@ print('{{"ok":true,"reason":"acquired"}}')
                   export TARTCI_ROOT={root} TARTCI_DISK_DENIAL_RECEIPT_DIR={root / "receipts"}
                   export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1 TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
                   export TARTCI_WORKTREE_CLEANUP_APPLY=1
-                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
+                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Example/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Example/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
                   export TARTCI_RUNNER_REPO=Generous-Corp/pulp TARTCI_RECEIPT_HOST_ID=studio
                   export TARTCI_QUEUE_LANE_ID=studio-pulp-gate
                   mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
@@ -205,8 +205,28 @@ print('{{"ok":true,"reason":"acquired"}}')
                     return {retry_rc}
                   }}
                   tartci_try_worktree_cleanup() {{ return {cleanup_rc}; }}
-                  tartci_check_macos_disk_floor_with_cleanup_once /Volumes/Workshop/VMs lane runner
+                  export TARTCI_WORKTREE_CLEANUP_TART_HOME=/Volumes/Example/VMs
+                  tartci_check_macos_disk_floor_with_cleanup_once /Volumes/Example/VMs lane runner
                   rc=$?; test "$calls" -eq {expected_calls}; test "$rc" -eq {expected_rc}
+                ''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macos_preflight_cleanup_runs_only_for_the_rendered_tart_store(self) -> None:
+        # Without the rendered store, or for any other path, a denial stays a
+        # denial and cleanup is never tried.
+        for exported, path in (("", "/Volumes/Example/VMs"),
+                               ("export TARTCI_WORKTREE_CLEANUP_TART_HOME=/Volumes/Example/VMs",
+                                "/Volumes/Example/Other")):
+            with self.subTest(exported=exported, path=path):
+                result = _run_bash(f'''
+                  source {HELPER}; calls=0; cleaned=0
+                  tartci_check_disk_floor_observed() {{
+                    calls=$((calls+1)); TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON='{{"fresh":true}}'; return 75
+                  }}
+                  tartci_try_worktree_cleanup() {{ cleaned=1; return 0; }}
+                  {exported}
+                  tartci_check_macos_disk_floor_with_cleanup_once {path} lane runner
+                  rc=$?; test "$rc" -eq 75; test "$calls" -eq 1; test "$cleaned" -eq 0
                 ''')
                 self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -825,12 +845,12 @@ PY
             f"""
             set -euo pipefail
             source {HELPER}
-            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Workshop/Code/tart
+            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Example/Code/tart
             """
         )
         proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, "/Volumes/Workshop")
+        self.assertEqual(proc.stdout, "/Volumes/Example")
 
     def test_all_vm_providers_launch_the_writer_through_the_guardian(self) -> None:
         expected = {

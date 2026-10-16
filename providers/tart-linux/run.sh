@@ -31,7 +31,11 @@
 # Sanitizers, SIMD/Highway dispatch, and RT timing are unreliable emulated.
 set -euo pipefail
 
-export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
+_TARTCI_LINUX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=../common/tart-home.lib.sh
+. "$_TARTCI_LINUX_ROOT/providers/common/tart-home.lib.sh"
+TART_HOME="$(tartci_default_tart_home)" || exit 1
+export TART_HOME
 GOLDEN="${PULP_LINUX_GOLDEN:-pulp-linux-build:latest}"
 VM_USER="${PULP_VM_USER:-admin}"
 SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"

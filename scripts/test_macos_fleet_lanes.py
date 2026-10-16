@@ -148,6 +148,66 @@ class MacosFleetLaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "reviewed M3"):
                 fleet.load(path)
 
+    def _m3_with_cleanup(self, td: str, **values: object) -> Path:
+        """The M3 profile with worktree_cleanup values replaced."""
+        import re as _re
+        body = HOST_CONFIGS["studio"].read_text()
+        for key, value in values.items():
+            literal = f'"{value}"' if isinstance(value, str) else str(value).lower()
+            body, n = _re.subn(rf"(?m)^{key} = .*$", f"{key} = {literal}", body, count=1)
+            self.assertEqual(1, n, key)
+        path = Path(td) / "m3.toml"
+        path.write_text(body)
+        return path
+
+    def test_worktree_cleanup_paths_come_from_the_profile_within_limits(self) -> None:
+        tart_home = fleet.load(HOST_CONFIGS["studio"])["host"]["tart_home"]
+        volume = "/".join(tart_home.split("/")[:3])       # this profile's /Volumes/<volume>
+        with tempfile.TemporaryDirectory() as td:
+            data = fleet.load(self._m3_with_cleanup(
+                td, primary=f"{volume}/Src/team/pulp", prefix=f"{volume}/Src",
+                max_trees=2, max_gib=64, timeout_seconds=60, cooldown_seconds=7200))
+            self.assertEqual(f"{volume}/Src/team/pulp", data["worktree_cleanup"]["primary"])
+            for values, pattern in (
+                    ({"prefix": volume, "primary": f"{volume}/pulp"}, "below an external volume root"),
+                    # The volume root itself, with a primary deep enough on its own.
+                    ({"prefix": volume, "primary": f"{volume}/Src/pulp"}, "below an external volume root"),
+                    ({"prefix": f"{volume}/Src", "primary": f"{volume}/Other/pulp"}, "inside"),
+                    ({"prefix": f"{volume}/Src", "primary": f"{volume}/Src"}, "below an external volume root"),
+                    ({"prefix": "/Users/example/Code", "primary": "/Users/example/Code/pulp"},
+                     "below an external volume root"),
+                    ({"prefix": f"{volume}/Src/..", "primary": f"{volume}/Src/../pulp"},
+                     "below an external volume root"),
+                    ({"prefix": "/Volumes/OtherVolume/Src", "primary": "/Volumes/OtherVolume/Src/pulp"},
+                     "same volume as host.tart_home"),
+                    ({"max_trees": 9}, "max_trees must be an integer from 1 to 8"),
+                    ({"max_gib": 513}, "max_gib must be an integer from 1 to 512"),
+                    ({"timeout_seconds": 301}, "timeout_seconds must be an integer from 1 to 300"),
+                    ({"max_trees": 0}, "max_trees must be an integer from 1 to 8"),
+                    ({"cooldown_seconds": 3599}, "cooldown_seconds must be an integer from 3600"),
+                    ({"repo": "Generous-Corp/forge"}, "reviewed M3"),
+                    ({"main_ref": "origin/other"}, "reviewed M3")):
+                with self.subTest(values=values):
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        fleet.load(self._m3_with_cleanup(td, **values))
+
+    def test_worktree_cleanup_stays_on_the_m3_host(self) -> None:
+        body = HOST_CONFIGS["studio"].read_text()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m3.toml"
+            path.write_text(body.replace('id = "studio"', 'id = "elsewhere"', 1))
+            with self.assertRaisesRegex(ValueError, "private M3 profile"):
+                fleet.load(path)
+
+    def test_enabled_cleanup_renders_the_tart_store_it_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m3.toml"
+            path.write_text(HOST_CONFIGS["studio"].read_text().replace("apply = false", "apply = true"))
+            data = fleet.load(path)
+            stores = {plistlib.loads(body)["EnvironmentVariables"].get("TARTCI_WORKTREE_CLEANUP_TART_HOME")
+                      for body in fleet.rendered_plists(data).values()}
+        self.assertEqual({None, data["host"]["tart_home"]}, stores)
+
     def test_build_disagreement_table_is_accepted_and_policed(self) -> None:
         self.assertIs(fleet.load(HOST_CONFIGS["studio"])["build_disagreement"]["enabled"], True)
         body = HOST_CONFIGS["studio"].read_text()
