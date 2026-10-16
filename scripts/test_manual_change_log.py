@@ -51,20 +51,28 @@ class Tests(unittest.TestCase):
 
 
 class Redaction(unittest.TestCase):
+    # Each secret is a 24-character token found nowhere else, so its absence
+    # from the log can only mean it was redacted (test_leak_needles).
     PLANTED = {
-        "GH_TOKEN=ghp_abcdefghij0123456789 gh api repos/x": "ghp_abcdefghij0123456789",
-        'curl -H "Authorization: token gho_ABCDEFGHIJ0123456789" https://api.github.com':
-            "gho_ABCDEFGHIJ0123456789",
-        'curl -H "Authorization: Bearer eyJhbGciOi.payload.sig" u': "eyJhbGciOi.payload.sig",
-        "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' u": "dXNlcjpwYXNzd29yZA==",
-        "env SHIPYARD_GITHUB_APP_PRIVATE_KEY='-----BEGIN' MY_SECRET=s3cr3t run": "s3cr3t",
-        "tool --password hunter2 --api-key=k3y": "hunter2",
-        "echo github_pat_11ABCDEFGHIJ_klmnopq and ghs_abcdefghijklmnop": "ghs_abcdefghijklmnop",
-        "git clone https://user:hunter2url@example.com/x.git": "hunter2url",
-        "git clone https://oauth2:glpat-SECRETtoken@gitlab.com/x.git": "glpat-SECRETtoken",
-        "security unlock-keychain -p hunter2pass /Users/x/signing.keychain-db": "hunter2pass",
-        "curl -u admin:hunter2curl https://api.example.com": "hunter2curl",
-        "AWS_SECRET_ACCESS_KEY=awsSecretValue aws s3 ls": "awsSecretValue",
+        "GH_TOKEN=ghp_Qm7ZxV2kLp9WtR4nYc8HbJ3s gh api repos/x": "ghp_Qm7ZxV2kLp9WtR4nYc8HbJ3s",
+        'curl -H "Authorization: token gho_Ht5NwQ8zLd2VkP7rXm4CyB9e" https://api.github.com':
+            "gho_Ht5NwQ8zLd2VkP7rXm4CyB9e",
+        'curl -H "Authorization: Bearer Br3XkW8mQz5LtN2vPc7YhJ4d" u': "Br3XkW8mQz5LtN2vPc7YhJ4d",
+        "curl -H 'Authorization: Basic Ba9QwE4rTz7YuI2oPl5KjH8g' u": "Ba9QwE4rTz7YuI2oPl5KjH8g",
+        "env MY_SECRET=Sc6VbN1mQw8ErT3yUi9OpA4s run": "Sc6VbN1mQw8ErT3yUi9OpA4s",
+        "tool --password Pw2LkJ7hGf4DsA9zXc6VbN3m": "Pw2LkJ7hGf4DsA9zXc6VbN3m",
+        "tool --api-key=Ak5QzW8xEc3RvT6bYn1UmI4o": "Ak5QzW8xEc3RvT6bYn1UmI4o",
+        "echo github_pat_11Gp4HnJ8kLm2QwE7rTy5UiO": "github_pat_11Gp4HnJ8kLm2QwE7rTy5UiO",
+        "echo ghs_Gs9TyU3iOp6AsD1fGh8JkL4z": "ghs_Gs9TyU3iOp6AsD1fGh8JkL4z",
+        "git clone https://user:Ur7PqW2eRt9YuI4oPa6SdF3g@example.com/x.git":
+            "Ur7PqW2eRt9YuI4oPa6SdF3g",
+        "git clone https://oauth2:glpat-Gl4KjH9gFd2SaZ7xCv5BnM8q@gitlab.com/x.git":
+            "glpat-Gl4KjH9gFd2SaZ7xCv5BnM8q",
+        "security unlock-keychain -p Kc8MnB3vCx6ZaS1dFg4HjK7l /Users/x/signing.keychain-db":
+            "Kc8MnB3vCx6ZaS1dFg4HjK7l",
+        "curl -u admin:Cu2WqE5rTy8UiO3pAs6DfG9h https://api.example.com":
+            "Cu2WqE5rTy8UiO3pAs6DfG9h",
+        "AWS_SECRET_ACCESS_KEY=Aw6ZxC9vBn2MqW5eRt8YuI1o aws s3 ls": "Aw6ZxC9vBn2MqW5eRt8YuI1o",
     }
 
     def test_planted_secrets_never_reach_the_log(self) -> None:
@@ -76,7 +84,7 @@ class Redaction(unittest.TestCase):
                 for command in self.PLANTED:
                     mcl.record("pool off", "forced", ["--force"], env={}, start=900,
                                ps=lambda p, c=command: (1, c) if p == 900 else None)
-                mcl.record("pool off", "forced", ["--force", "GH_TOKEN=ghp_zzzzzzzzzz0123456789"],
+                mcl.record("pool off", "forced", ["--force", "GH_TOKEN=ghp_Ar4GsX9cVb2NmQ7wEr5TyU8i"],
                            env={}, start=1)
             rows = [json.loads(line) for line in log.read_text().splitlines()]
             self.assertEqual(len(rows), len(self.PLANTED) + 1)
@@ -85,9 +93,7 @@ class Redaction(unittest.TestCase):
             for command, secret in self.PLANTED.items():
                 with self.subTest(command=command[:30]):
                     self.assertNotIn(secret, text)
-            self.assertNotIn("ghp_zzzzzzzzzz0123456789", text)
-            self.assertNotIn("k3y", text)
-            self.assertNotIn("github_pat_11ABCDEFGHIJ_klmnopq", text)
+            self.assertNotIn("ghp_Ar4GsX9cVb2NmQ7wEr5TyU8i", text)
             self.assertIn("[redacted]", text)
             # Control: an ordinary command line is kept whole.
             for plain in ("tartci pool off --force --plan", "ssh-keyscan -T 5 m5-lan",
