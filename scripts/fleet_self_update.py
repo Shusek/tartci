@@ -190,6 +190,10 @@ EXIT_FAILED = 4        # a mutation ran and failed; see the receipt for what was
 EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
 
+class LauncherConsent(Exception):
+    """A new sealed launcher is installed but its volume probe fails."""
+
+
 class Refused(Exception):
     """A precondition failed before anything on the host changed."""
 
@@ -1366,6 +1370,74 @@ def mid_job_lanes(plan_text: str) -> list[str]:
                 break
             rows.append(line.strip()[:300])
     return rows
+
+
+# pool on's readiness failure from macos_launcher_probe (any outcome: a denial
+# exits at once, a blocked open() times out).
+LAUNCH_PROBE_FAILED = re.compile(r"launch helper volume probe")
+
+
+def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float) -> None:
+    """One issue when a new launcher's volume probe fails and the host is left
+    OFF without a rollback. Best effort: never raises."""
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "launcher-probe-alert.json"
+        since = _iso(now)
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update installed `{target[:12]}`, which replaced TartCI "
+                "Launcher, and then `pool on` failed the launch-helper volume probe. "
+                "Self-update STOPPED with the host OFF and did not roll back.", "",
+                "## Evidence",
+                f"- pool on: `{probe.strip()[:600]}`",
+                "- the self-update receipt's `pool-on` and `failed` steps", "",
+                "## Likely cause",
+                "Replacing the launcher app reset its per-app Removable Volumes consent, so "
+                "the helper blocks in open() on the external-volume Tart store. A rollback "
+                "would replace the app again and reset the consent again, so none was done.",
+                "",
+                "## Fix", "```sh",
+                "# 1. System Settings > Privacy & Security > Files and Folders >",
+                "#    TartCI Launcher > Removable Volumes (on)",
+                "# 2. then, on the host:",
+                "tartci pool on",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. The consent is a person's decision in System Settings, and a rollback "
+                "would undo it again.", "",
+                "## How to verify",
+                "`tartci pool on` passes the launch-helper volume probe and the lanes start. "
+                "This issue closes after the next self-update that completes.",
+            ])
+            title = f"[tartci] {me} is OFF: grant Removable Volumes to TartCI Launcher, then pool on"
+            marker = tartci_incident.marker(me, "launcher_probe_failed", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=True, resolved=False, since=since,
+            raise_event=lambda: host_off.event(cfg.state_dir, "launcher_probe_failed",
+                                               probe[:300], {"target": target}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never changes the outcome
+        print(f"self-update: launcher-probe alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def close_launcher_probe_alert(cfg: Config) -> None:
+    """Close the issue once a self-update completes. Best effort."""
+    path = cfg.state_dir / "launcher-probe-alert.json"
+    if not path.is_file():
+        return
+    try:
+        import host_off  # noqa: PLC0415
+        host_off.episode_alert(path, active=False, resolved=True, since=None,
+                               raise_event=lambda: None, render=lambda: ("", ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"self-update: launcher-probe alert close failed: {exc}", flush=True)
 
 
 def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: float,
@@ -2580,6 +2652,8 @@ class Run:
             self._snapshot()
             try:
                 self._update()
+            except LauncherConsent as exc:
+                return self._stop_for_consent(str(exc))
             except Refused as exc:
                 return self._safe_recover(f"refused after drain: {exc}", refused=True)
             except Failed as exc:
@@ -2590,6 +2664,7 @@ class Run:
             except Exception as exc:  # noqa: BLE001 - never leave the host out
                 return self._safe_recover(f"{type(exc).__name__} during {self.phase}: {exc}")
             self._record_skew_after_apply()
+            close_launcher_probe_alert(self.cfg)
             self.receipt.finish("succeeded")
             prune_dirs(self.cfg.state_dir / "rollback", KEEP_SNAPSHOTS)
             return EXIT_OK
@@ -2692,6 +2767,9 @@ class Run:
         self._relay()
         self.phase = "pool-on"
         if not self._pool_on():
+            if self.approval is not None and LAUNCH_PROBE_FAILED.search(
+                    getattr(self, "pool_on_text", "") or ""):
+                raise LauncherConsent(self.pool_on_text)
             raise Failed("pool on failed after install")
         self.phase = "verify"
         verify(cfg, sys_, self.target, self.receipt)
@@ -2842,6 +2920,7 @@ class Run:
             if restore_receipt:
                 args.append("--restore-receipt")
             on = installed_tartci(self.cfg, self.sys, *args)
+            self.pool_on_text = on.text
             if on.rc == 0:
                 self.receipt.step("pool-on", "installed shim" +
                                   ("; restored prior receipted serving set without fresh relay proof"
@@ -3004,6 +3083,26 @@ class Run:
             return installed_commit(self.cfg)[0]
         except Refused:
             return None
+
+    def _stop_for_consent(self, probe: str) -> int:
+        """Stop with the new launcher installed and the host OFF; never roll back.
+
+        Rolling back replaces TartCILauncher.app a second time, which can reset
+        its Removable Volumes consent again; the new bundle stays in place and
+        a person grants the consent, then turns the pool on.
+        """
+        self.receipt.step("failed", f"pool on failed after installing a new launcher: {probe[:500]}",
+                          ok=False)
+        self._repin_to_live()
+        launcher_probe_alert(self.cfg, self.me, self.target, probe, self.sys.now())
+        return self._terminal(
+            "failed",
+            f"launch helper volume probe failed after installing a new launcher for "
+            f"{self.target[:12]}; STOPPED and NOT rolled back (a rollback replaces the launcher "
+            "again and can reset its consent). Grant Removable Volumes to TartCI Launcher "
+            "(System Settings > Privacy & Security > Files and Folders), then run "
+            f"`tartci pool on`. Probe: {probe[:300]}",
+            pool_state=self._pool_state_quiet())
 
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
         self.receipt.step("refused" if refused else "failed", reason, ok=False)
