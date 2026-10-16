@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,7 +51,18 @@ class FleetSourceTests(unittest.TestCase):
             (root / "profiles").mkdir()
             (root / "profiles" / "canary-macos-fleet.toml").write_text("schema = 1\n")
             (root / "fleet").mkdir()
-            (root / "fleet" / "advertised-labels.json").write_text("{}\n")
+            profile_digest = fleet_source.FleetSource(
+                root, root / "profiles", root / "fleet" / "advertised-labels.json", True
+            ).profiles_sha256
+            (root / "fleet" / "advertised-labels.json").write_text(json.dumps({
+                "schema": "tartci.advertised-labels/v1",
+                "generated_from": {
+                    "repo": "danielraffel/pulp-planning",
+                    "profiles": ["profiles/canary-macos-fleet.toml"],
+                    "profiles_sha256": profile_digest,
+                },
+                "registrations": [{}],
+            }) + "\n")
             os.environ["TARTCI_FLEET_SOURCE_ROOT"] = str(root)
             os.environ["TARTCI_FLEET_SOURCE_COMMIT"] = "0123456789abcdef0123456789abcdef01234567"
             os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "danielraffel/pulp-planning"
@@ -61,6 +73,8 @@ class FleetSourceTests(unittest.TestCase):
             self.assertEqual(
                 "0123456789abcdef0123456789abcdef01234567", source.source_commit)
             self.assertEqual("danielraffel/pulp-planning", source.repository)
+            self.assertRegex(source.tree_sha256, r"^[0-9a-f]{64}$")
+            self.assertRegex(source.published_supply_sha256, r"^[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":

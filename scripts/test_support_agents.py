@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -220,6 +221,27 @@ class BootstrapOnly(Case):
 
 @unittest.skipIf(sa.tomllib is None, "needs tomllib")
 class Plan(Case):
+    def test_watchdog_carries_private_source_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td)
+            (source / "profiles").mkdir()
+            (source / "profiles" / "canary-macos-fleet.toml").write_text("schema = 1\n")
+            (source / "fleet").mkdir()
+            (source / "fleet" / "advertised-labels.json").write_text(
+                '{"schema":"tartci.advertised-labels/v1",'
+                '"generated_from":{},"registrations":[]}\n')
+            values = {
+                "TARTCI_FLEET_SOURCE_ROOT": str(source),
+                "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+                "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+            }
+            with mock.patch.dict(os.environ, values, clear=False):
+                environment = sa._watchdog_env({})
+            self.assertEqual(environment["TARTCI_FLEET_SOURCE_ROOT"], str(source.resolve()))
+            self.assertEqual(environment["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
+            self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"],
+                             "danielraffel/pulp-planning")
+
     def test_missing_matching_and_differing_are_named_and_nothing_is_written(self):
         self.write_profile(table(THREE))
         self.install_rendered("reclaim")

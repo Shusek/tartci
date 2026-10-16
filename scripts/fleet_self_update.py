@@ -1549,6 +1549,14 @@ def census_env(repository: str | None = None) -> dict[str, str]:
     }
     if repository is not None:
         env["GH_REPO"] = repository
+    for name in (
+        "TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+        "TARTCI_FLEET_SOURCE_REPOSITORY", "TARTCI_ADVERTISED_LABELS",
+        "TARTCI_JOB_CLAIM_SUPPLY",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            env[name] = value
     return env
 
 

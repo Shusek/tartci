@@ -83,6 +83,37 @@ def copy_support_cohort(root: Path) -> None:
 
 
 class MacosFleetLaneTests(unittest.TestCase):
+    def test_private_source_variables_are_rendered_into_lane_plists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            profiles = root / "profiles"
+            supply = root / "fleet" / "advertised-labels.json"
+            profiles.mkdir()
+            (profiles / "canary-macos-fleet.toml").write_text(CONFIG.read_text())
+            supply.parent.mkdir()
+            source = fleet.fleet_source.FleetSource(root, profiles, supply, True)
+            supply.write_text(json.dumps({
+                "schema": "tartci.advertised-labels/v1",
+                "generated_from": {
+                    "repo": "danielraffel/pulp-planning",
+                    "profiles": ["profiles/canary-macos-fleet.toml"],
+                    "profiles_sha256": source.profiles_sha256,
+                },
+                "registrations": [{}],
+            }))
+            with mock.patch.dict(os.environ, {
+                "TARTCI_FLEET_SOURCE_ROOT": str(root),
+                "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+                "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+            }, clear=False):
+                data = fleet.load(CONFIG)
+                env = fleet.lane_plist(data, data["lane"][0])["EnvironmentVariables"]
+            self.assertEqual(env["TARTCI_FLEET_SOURCE_ROOT"], str(root.resolve()))
+            self.assertEqual(env["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
+            self.assertEqual(env["TARTCI_FLEET_SOURCE_REPOSITORY"], "danielraffel/pulp-planning")
+            self.assertEqual(env["TARTCI_ADVERTISED_LABELS"], str(supply.resolve()))
+            self.assertEqual(env["TARTCI_JOB_CLAIM_SUPPLY"], str(supply.resolve()))
+
     def test_m3_worktree_cleanup_contract_is_dormant_and_rendered(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         self.assertFalse(data["worktree_cleanup"]["apply"])

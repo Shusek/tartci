@@ -1487,6 +1487,9 @@ def write_receipt(
             "root": str(fleet_source_state.root),
             "configured": fleet_source_state.configured,
             "commit": fleet_source_state.source_commit,
+            "repository": fleet_source_state.repository,
+            "tree_sha256": fleet_source_state.tree_sha256,
+            "published_supply_sha256": fleet_source_state.published_supply_sha256,
             "profiles_dir": str(fleet_source_state.profiles_dir),
             "published_supply": str(fleet_source_state.published_supply),
         },
@@ -1518,6 +1521,28 @@ def verify_receipt(
         fail("install receipt paths do not match the canonical installed paths")
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
+    active_source = fleet_source.resolve(TARTCI_ROOT)
+    recorded_source = receipt.get("fleet_source")
+    source_keys = {
+        "root", "configured", "commit", "repository", "tree_sha256",
+        "published_supply_sha256", "profiles_dir", "published_supply",
+    }
+    if active_source.configured:
+        if not isinstance(recorded_source, dict) or set(recorded_source) != source_keys:
+            fail("install receipt fleet source is missing or malformed")
+    if isinstance(recorded_source, dict):
+        expected_source = {
+            "root": str(active_source.root),
+            "configured": active_source.configured,
+            "commit": active_source.source_commit,
+            "repository": active_source.repository,
+            "tree_sha256": active_source.tree_sha256,
+            "published_supply_sha256": active_source.published_supply_sha256,
+            "profiles_dir": str(active_source.profiles_dir),
+            "published_supply": str(active_source.published_supply),
+        }
+        if recorded_source != expected_source:
+            fail("installed fleet source does not match its receipt")
     support = receipt.get("support")
     support_keys = {
         "root", "manifest_path", "manifest_sha256", "repository", "source_commit",
@@ -2609,6 +2634,7 @@ def lane_plist(
         env.update({
             "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
             "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
+            "TARTCI_FLEET_SOURCE_REPOSITORY": source.repository or "",
             "TARTCI_ADVERTISED_LABELS": str(source.published_supply),
             "TARTCI_JOB_CLAIM_SUPPLY": str(source.published_supply),
         })
@@ -2920,7 +2946,7 @@ def _display_path(path: Path, root: Path | None = None) -> str:
 
 
 TARTCI_ROOT = Path(__file__).resolve().parents[1]
-PUBLISHED_SUPPLY = fleet_source.resolve(TARTCI_ROOT).published_supply
+PUBLISHED_SUPPLY = fleet_source.resolve(TARTCI_ROOT, allow_environment=False).published_supply
 PUBLISHED_SUPPLY_URL = (
     "https://raw.githubusercontent.com/danielraffel/tartci/main/fleet/advertised-labels.json"
 )
@@ -2976,6 +3002,12 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
             "repo": repository,
             "commit": commit,
             "profiles": [_display_path(path, root) for path in paths],
+            "profiles_sha256": fleet_source.FleetSource(
+                root or TARTCI_ROOT,
+                (root or TARTCI_ROOT) / "profiles",
+                (root or TARTCI_ROOT) / "fleet" / "advertised-labels.json",
+                bool(commit),
+            ).profiles_sha256,
         },
         "registrations": registrations,
         # Additive to v1: runners a host owns whose labels tartci does not set.
@@ -2987,15 +3019,22 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
 
 
 def published_snapshot(root: Path | None = None) -> dict:
-    """The committed form: every fleet profile, commit null.
+    """The committed form containing every fleet profile.
 
-    A file cannot name the commit that contains it, so the published copy
-    carries no commit; its provenance is the git ref it was read from.
+    Public checkouts keep the historical null commit. An explicitly configured
+    private source carries its pinned source commit and repository.
     """
     root = root or TARTCI_ROOT
     source = fleet_source.resolve(root, allow_environment=root == TARTCI_ROOT)
-    return advertised_labels_snapshot(
-        fleet_profiles(root), None, root, source.repository or ADVERTISED_LABELS_REPO)
+    paths = fleet_profiles(root)
+    if not paths:
+        raise ValueError(f"no macOS fleet profiles found under {source.profiles_dir}")
+    snapshot = advertised_labels_snapshot(
+        paths, source.source_commit if source.configured else None, root,
+        source.repository or ADVERTISED_LABELS_REPO)
+    if not snapshot["registrations"] and not snapshot["hosts"]:
+        raise ValueError("fleet source publishes no registrations or hosts")
+    return snapshot
 
 
 def render_published(snapshot: dict) -> str:
@@ -3055,7 +3094,11 @@ def published_commit(source: str | Path) -> str | None:
     text = str(source)
     configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
     configured_commit = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
-    if configured_root and configured_commit and _SHA.fullmatch(configured_commit):
+    configured_supply = (Path(configured_root).expanduser().resolve()
+                         / "fleet" / "advertised-labels.json") if configured_root else None
+    if (configured_supply is not None and configured_commit
+            and _SHA.fullmatch(configured_commit)
+            and Path(text).expanduser().resolve() == configured_supply):
         return configured_commit
     if text.startswith(("https://", "http://")):
         if text != PUBLISHED_SUPPLY_URL:
@@ -3424,7 +3467,7 @@ def reachable(registration: dict, repo: str, workflow: str,
 # copy to itself. This compares the two semantically, by key path.
 
 DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
-DEFAULT_PROFILES_DIR = fleet_source.resolve(TARTCI_ROOT).profiles_dir
+DEFAULT_PROFILES_DIR = fleet_source.resolve(TARTCI_ROOT, allow_environment=False).profiles_dir
 
 
 def _flatten(value: object, prefix: str = "") -> dict[str, object]:
@@ -3613,7 +3656,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify-supply",
         help="read-only: installed profile's registrations vs the published supply")
     supply.add_argument("--installed", type=Path, default=None)
-    supply.add_argument("--published", default=str(PUBLISHED_SUPPLY),
+    supply.add_argument("--published", default=None,
                         help=f"file or URL (default: repo copy; main: {PUBLISHED_SUPPLY_URL})")
     supply.add_argument("--receipt", type=Path, default=DEFAULT_INSTALL_RECEIPT,
                         help="installed fleet receipt naming this host's tartci commit")
@@ -3629,12 +3672,17 @@ def main(argv: list[str] | None = None) -> int:
         "profile-drift",
         help="read-only: installed profile vs its checked-in source (by name)")
     drift.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE)
-    drift.add_argument("--profiles-dir", type=Path, default=DEFAULT_PROFILES_DIR)
+    drift.add_argument("--profiles-dir", type=Path, default=None)
     drift.add_argument("--strict", action="store_true",
                        help="exit 1 on drift (exit 2 on unknown in every mode)")
     drift.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        active_source = fleet_source.resolve(TARTCI_ROOT)
+        if args.command == "verify-supply" and args.published is None:
+            args.published = str(active_source.published_supply)
+        if args.command == "profile-drift" and args.profiles_dir is None:
+            args.profiles_dir = active_source.profiles_dir
         if args.command == "advertised-labels":
             if args.publish or args.check:
                 if args.profiles:
