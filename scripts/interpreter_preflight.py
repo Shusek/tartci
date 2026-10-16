@@ -61,21 +61,23 @@ def launchctl(*args: str, timeout: float = 5) -> subprocess.CompletedProcess:
                           check=False, timeout=timeout)
 
 
-def run(profile: dict, python: str, timeout: float = TIMEOUT_SECONDS) -> str | None:
-    """None when the new interpreter passed, else the reason it did not."""
+def run(profile: dict, python: str, timeout: float = TIMEOUT_SECONDS,
+        label: str = LABEL) -> str | None:
+    """None when the interpreter passed, else the reason it did not. `label`
+    names the one-shot launchd job; separate callers use separate labels."""
     host = profile.get("host") or {}
     store = str(host.get("tart_home") or "")
     if not store:
         return "the profile has no host.tart_home to prove"
     domain = f"gui/{os.getuid()}"
-    target = f"{domain}/{LABEL}"
+    target = f"{domain}/{label}"
     if launchctl("print", target).returncode == 0:
         launchctl("bootout", target)
     with tempfile.TemporaryDirectory(prefix="tartci-interpreter-preflight.") as td:
-        plist = Path(td) / f"{LABEL}.plist"
+        plist = Path(td) / f"{label}.plist"
         log = Path(td) / "probe.log"
         plist.write_bytes(plistlib.dumps({
-            "Label": LABEL,
+            "Label": label,
             "ProgramArguments": [python, "-c", PROBE, store],
             "RunAtLoad": True,
             "ProcessType": "Standard",
