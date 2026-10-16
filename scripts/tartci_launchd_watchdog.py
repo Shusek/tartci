@@ -1536,9 +1536,13 @@ def serving_truth_pass(now: float | None = None) -> str | None:
         return (f"{stamp} launchd-watchdog: WARN serving-truth check FAILED "
                 f"({type(exc).__name__}: {exc}); no serving alarm was raised")
     parts = []
-    if out.get("trips"):
-        parts.append(f"{len(out['trips'])} rule trip(s) on {me} "
-                     f"({', '.join(t['rule'] for t in out['trips'])}), evidence recorded")
+    # Once per episode: a trip whose episode is already open was reported when
+    # it opened, and its evidence stays in the lookback for hours.
+    new = [t for t in out.get("trips") or []
+           if t.get("episode_key") in out.get("opened_keys", ())]
+    if new:
+        parts.append(f"{len(new)} rule trip(s) on {me} "
+                     f"({', '.join(t['rule'] for t in new)}), evidence recorded")
     if out.get("demand_errors"):
         parts.append(f"gate demand partly unread: {out['demand_errors'][0]}")
     if not parts:

@@ -57,6 +57,14 @@ class MisePinTests(unittest.TestCase):
         table = self.table(path=str(self.root / f"none/mise-{VERSION}/bin/mise"))
         self.assertIn("is not installed at", mise_pin.verify(table))
 
+    def test_the_version_probe_never_asks_for_a_newer_mise(self) -> None:
+        # Reports the pinned version only when the update check is off.
+        self.binary.write_text(
+            '#!/bin/sh\n[ "$MISE_DISABLE_UPDATE_WARNING" = 1 ] && echo "%s macos-arm64" || echo "0.0.0"\n'
+            % VERSION, encoding="utf-8")
+        self.binary.chmod(0o755)
+        self.assertIsNone(mise_pin.verify(self.table()))
+
     def test_the_binary_must_report_the_pinned_version(self) -> None:
         self.write_binary("2026.5.16")
         self.assertIn("--version reports 2026.5.16", mise_pin.verify(self.table()))
