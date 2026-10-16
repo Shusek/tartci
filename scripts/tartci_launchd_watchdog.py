@@ -1360,11 +1360,11 @@ def interpreter_grant_pass(now: float | None = None, probe=None, issue=None,
 
 def scratch_vm_pass(now: float | None = None, tart=None) -> str | None:
     """Warn 30 min before a scratch VM's TTL, then stop and delete it
-    (scripts/scratch_vm.py). Acts only on VMs that command recorded. Never raises."""
+    (scripts/scratch_vm_ttl.py). Acts only on VMs that command recorded. Never raises."""
     try:
-        import scratch_vm  # noqa: PLC0415 - sibling module
+        import scratch_vm_ttl  # noqa: PLC0415 - sibling module; standard library only
         kwargs = {} if tart is None else {"tart": tart}
-        lines = scratch_vm.enforce(utcnow() if now is None else now, **kwargs)
+        lines = scratch_vm_ttl.enforce(utcnow() if now is None else now, **kwargs)
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return (f"{_iso(utcnow())} launchd-watchdog: WARN scratch-vm check FAILED "
                 f"({type(exc).__name__}: {exc}); no scratch VM was stopped")

@@ -922,6 +922,14 @@ class OrphanedLaneVmTests(unittest.TestCase):
                 "pulp-preamble-m1-target-06", "99292")
         path.write_text(json.dumps(good))
         self.assertTrue(vm_reap.retired_lane_record(*args))
+        # A symlinked record is no proof: it may point anywhere.
+        elsewhere = self.tmp / "elsewhere.json"
+        elsewhere.write_text(json.dumps(good))
+        path.unlink()
+        path.symlink_to(elsewhere)
+        self.assertFalse(vm_reap.retired_lane_record(*args))
+        path.unlink()
+        path.write_text(json.dumps(good))
         for key, wrong in (("vm", "pulp-preamble-m1-target-06-99292-2"),
                            ("runner", "pulp-preamble-m1-target-05"),
                            ("supervisor_pid", "1"), ("provider", "qemu-windows")):
