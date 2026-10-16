@@ -52,6 +52,7 @@ class FakeRepository:
         self.truncated = False
         self.unreadable = False
         self.corrupt: set[str] = set()   # paths whose served bytes differ from the tree
+        self.extra: list[dict] = []        # raw tree entries served as listed
 
     def entries(self) -> list[dict]:
         out = [{"path": "README.md", "type": "blob",
@@ -59,14 +60,14 @@ class FakeRepository:
                {"path": "profiles", "type": "tree", "sha": "e" * 40}]
         out += [{"path": path, "type": "blob", "sha": fleet_source.blob_sha(data)}
                 for path, data in sorted(self.files.items())]
-        return out
+        return out + self.extra
 
     def __call__(self, path: str) -> tuple[int, str, str]:
         self.calls.append(path)
         if self.unreadable:
             return 1, "", "HTTP 404: Not Found"
         base = f"repos/{self.repository}"
-        if path == f"{base}/commits/main":
+        if path in (f"{base}/commits/main", f"{base}/commits/{self.commit}"):
             return 0, json.dumps({"sha": self.commit,
                                   "commit": {"tree": {"sha": self.tree}}}), ""
         if path == f"{base}/git/trees/{self.tree}?recursive=1":
@@ -150,6 +151,29 @@ class ExportTests(unittest.TestCase):
             self.export()
         self.assertFalse((self.store / COMMIT).exists())
         self.assertEqual([], [p for p in self.store.iterdir()])  # no staging left behind
+
+    def test_only_profiles_and_the_supply_are_written_never_outside_the_export(self) -> None:
+        planted = b"planted\n"
+        self.repo.files["profiles/../../escape-macos-fleet.toml"] = planted
+        self.repo.files["profiles/nested/inner-macos-fleet.toml"] = planted
+        self.repo.files["fleet/../profiles/x-macos-fleet.toml"] = planted
+        root = self.export()
+        self.assertEqual(sorted(path for path in self.repo.files if path.count("/") == 1
+                                and ".." not in path),
+                         fleet_source.source_files(root))
+        written = [p for p in Path(self.td.name).rglob("*") if p.is_file()]
+        self.assertFalse(any(p.read_bytes() == planted for p in written), written)
+        self.assertTrue(all(root in p.parents for p in written), written)
+
+    def test_a_tree_entry_without_a_blob_id_is_refused_before_any_read(self) -> None:
+        for sha in ("../../repos/other/contents/x", "", None):
+            with self.subTest(sha=sha):
+                self.repo.extra = [{"path": "profiles/odd-macos-fleet.toml", "type": "blob",
+                                    "sha": sha}]
+                self.repo.calls.clear()
+                with self.assertRaisesRegex(sync.SyncError, "no blob id"):
+                    self.export()
+                self.assertFalse(any(str(sha) in call for call in self.repo.calls if sha))
 
     def test_a_truncated_tree_is_refused(self) -> None:
         self.repo.truncated = True

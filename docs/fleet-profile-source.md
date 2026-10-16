@@ -33,11 +33,30 @@ Name the private repository in `~/.config/tartci/self-update.toml`:
 ```toml
 [fleet_source]
 repository = "ORG/private-fleet-authority"
+canary = "m1"          # the host that installs a new source commit first
 ```
+
+Every host names the same canary. Without a canary the setting refuses; a
+`[fleet_source]` that is not a table, or has another key, refuses the run as a
+configuration error.
+
+A move is one host first:
+
+- The canary adopts the repository's `main`. When a self-update installs that
+  commit and verifies the host (pool on and its checks), it records
+  `{repository, commit, verified_at}` in
+  `~/.tartci/state/self-update/fleet-source-verified.json`.
+- Every other host reads that record from the canary over SSH, aged on the
+  canary's clock. It adopts the canary's commit once it has served there for
+  30 minutes, and otherwise stays on the commit it was installed from (or on
+  the public profiles if it has never used the private source).
+- A commit the canary fails to install or verify is never recorded, so no
+  other host moves to it. A failed reinstall is not retried within the
+  self-update rate limit (6 h).
 
 Each self-update run then:
 
-1. reads the repository's `main` through the GitHub API, using the same `ghapp
+1. reads the selected commit through the GitHub API, using the same `ghapp
    api` path as the TartCI repository, so no git credential is needed;
 2. exports `profiles/*-macos-fleet.toml` and `fleet/advertised-labels.json` at
    that commit into `~/.local/share/tartci/fleet-sources/<commit>/`, checking
@@ -46,6 +65,9 @@ Each self-update run then:
    installer it runs;
 4. reinstalls the current generation when the installed receipt was built from
    a different source commit.
+
+A plan (`--plan`) writes and prunes nothing: it uses an export that already
+exists and otherwise reports that an apply would export it.
 
 Exports are immutable per commit, so an agent installed from one commit keeps
 reading its own directory while a newer commit is exported beside it. The

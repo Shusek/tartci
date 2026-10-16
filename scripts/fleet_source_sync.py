@@ -117,6 +117,8 @@ def export(api: Api, repository: str, commit: str, tree: str, store: Path) -> Pa
     staging = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=store))
     try:
         for entry in entries:
+            if not isinstance(entry.get("sha"), str) or not fleet_source.COMMIT.fullmatch(entry["sha"]):
+                raise SyncError(f"{entry['path']}: tree entry has no blob id")
             blob = _json(api, f"repos/{repository}/git/blobs/{entry['sha']}")
             if blob.get("encoding") != "base64" or not isinstance(blob.get("content"), str):
                 raise SyncError(f"{entry['path']}: blob is not base64 content")
