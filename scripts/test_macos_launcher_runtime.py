@@ -149,6 +149,7 @@ V2_ENTRY = (
     "case \"$TARTCI_TEST_MODE\" in\n"
     "  exit-zero) exit 0 ;;\n"
     "  exit-one) exit 1 ;;\n"
+    "  env) echo \"${PYTHONDONTWRITEBYTECODE-unset}:${PYTHONPYCACHEPREFIX-unset}\" > \"$HOME/env.out\"; exit 0 ;;\n"
     "  *) exit 99 ;;\n"
     "esac\n"
 )
@@ -182,23 +183,33 @@ class LauncherV2RuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self._cleanup)
-        work = Path(self.td.name)
+        # Canonical, so the launcher's realpath check passes whatever TMPDIR is.
+        self.work = work = Path(os.path.realpath(self.td.name))
         os.chmod(work, 0o755)
         self.root = work / "generations"
         self.root.mkdir(mode=0o755)
-        self.pointer = work / "launcher-generation.json"
-        resources = self.launcher.parent.parent / "Resources"
-        resources.mkdir(exist_ok=True)
-        (resources / "policy.json").write_text(json.dumps({
-            "schema": 2, "identifier": "com.danielraffel.tartci.launcher", "team_id": V2_TEAM,
-            "tart_home": V2_STORE, "generations_root": str(self.root),
-            "pointer": str(self.pointer)}))
+        self.home = work / "home"
+        (self.home / ".config/tartci").mkdir(parents=True, mode=0o755)
+        for directory in (self.home, self.home / ".config", self.home / ".config/tartci"):
+            os.chmod(directory, 0o755)
+        self.pointer = self.home / ".config/tartci/launcher-generation.json"
+        self.floor = self.home / ".config/tartci/launcher-floor.json"
+        self.write_policy(self.root)
         self.generation = self.fixture.make_generation(self.root)
         (self.generation / self.ls.ENTRYPOINT).write_text(V2_ENTRY)
         self.lanes = {mode: {"environment": {"HOME": str(work), "PATH": "/usr/bin:/bin",
                                              "TART_HOME": V2_STORE, "TARTCI_TEST_MODE": mode}}
-                      for mode in ("exit-zero", "exit-one")}
+                      for mode in ("exit-zero", "exit-one", "env")}
+        self.lanes["env"]["environment"]["PYTHONPYCACHEPREFIX"] = str(work / "cache")
         self.seal()
+
+    def write_policy(self, root) -> None:
+        resources = self.launcher.parent.parent / "Resources"
+        resources.mkdir(exist_ok=True)
+        (resources / "policy.json").write_text(json.dumps({
+            "schema": 2, "identifier": "com.danielraffel.tartci.launcher", "team_id": V2_TEAM,
+            "tart_home": V2_STORE, "generations_root": str(root), "home": str(self.home),
+            "pointer": str(self.pointer), "floor": str(self.floor)}))
 
     def _cleanup(self) -> None:
         for dirpath, dirs, _files in os.walk(self.td.name):
@@ -206,13 +217,14 @@ class LauncherV2RuntimeTests(unittest.TestCase):
                 os.chmod(os.path.join(dirpath, name), 0o755)
         self.td.cleanup()
 
-    def seal(self, *, identifier: str = "com.danielraffel.tartci.launch-set", value=None) -> None:
+    def seal(self, *, identifier: str = "com.danielraffel.tartci.launch-set", value=None,
+             sequence: int = 1) -> None:
         """Write, ad-hoc sign and freeze the launch set; point at it."""
         os.chmod(self.generation, 0o755)
         for name in (self.ls.SET_NAME, self.ls.SIG_NAME):
             (self.generation / name).unlink(missing_ok=True)
         self.ls.write(self.generation, value or self.ls.build(self.generation, self.lanes,
-                                                              tart_home=V2_STORE))
+                                                              tart_home=V2_STORE, sequence=sequence))
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", identifier,
                         "--detached", str(self.generation / self.ls.SIG_NAME),
                         str(self.generation / self.ls.SET_NAME)], check=True, capture_output=True)
@@ -285,7 +297,7 @@ class LauncherV2RuntimeTests(unittest.TestCase):
             with self.subTest(path=str(path), mode=oct(mode)):
                 before = path.stat().st_mode & 0o777
                 os.chmod(path, mode)
-                self.assertRefused("writable" if path != self.pointer else "trusted")
+                self.assertRefused("writable")
                 os.chmod(path, before)
         self.assertEqual(0, self.run_lane().returncode)
 
@@ -308,11 +320,79 @@ class LauncherV2RuntimeTests(unittest.TestCase):
                 self.assertRefused("pointer names no generation")
 
     def test_a_signed_lane_on_another_store_is_refused(self) -> None:
-        value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE)
+        value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, sequence=1)
         value["lanes"]["exit-zero"]["environment"]["TART_HOME"] = "/Volumes/Other/VMs"
         self.seal(value=value)
         self.assertRefused("wrong Tart store")
 
+
+
+    def plant(self, relative: str) -> None:
+        """A file the manifest does not name, in an otherwise frozen generation."""
+        for dirpath, _dirs, _files in os.walk(self.generation):
+            os.chmod(dirpath, 0o755)
+        target = self.generation / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x00planted")
+        self.ls.freeze(self.generation)
+
+    def test_a_planted_bytecode_cache_is_refused(self) -> None:
+        self.plant("scripts/__pycache__/x.cpython-311.pyc")
+        self.assertRefused("a bytecode cache in the generation is never hashed")
+
+    def test_an_empty_bytecode_cache_directory_is_refused(self) -> None:
+        for dirpath, _dirs, _files in os.walk(self.generation):
+            os.chmod(dirpath, 0o755)
+        (self.generation / "scripts/__pycache__").mkdir()
+        self.ls.freeze(self.generation)
+        self.assertRefused("a bytecode cache in the generation is never hashed")
+
+    def test_a_planted_file_outside_the_manifest_is_refused(self) -> None:
+        self.plant("planted.py")
+        self.assertRefused("planted.py is not in the signed manifest")
+
+    def test_python_neither_writes_nor_reads_a_bytecode_cache(self) -> None:
+        self.assertEqual(0, self.run_lane("env").returncode, self.run_lane("env").stderr)
+        self.assertEqual("1:unset\n", (self.work / "env.out").read_text())
+
+    def test_a_symlink_above_the_generations_root_is_refused(self) -> None:
+        alias = self.work / "alias"
+        alias.symlink_to(self.work)
+        self.write_policy(alias / "generations")
+        self.point(alias / "generations" / self.generation.name)
+        self.assertRefused("not canonical")
+
+    def test_a_nested_pointer_name_is_refused(self) -> None:
+        self.point(self.generation / "scripts")
+        self.assertRefused("pointer names no generation")
+
+    def test_a_symlinked_pointer_is_refused(self) -> None:
+        real = self.pointer.with_name("real-pointer.json")
+        os.rename(self.pointer, real)
+        self.pointer.symlink_to(real)
+        self.assertRefused("is a symlink")
+
+    def test_a_writable_pointer_directory_is_refused(self) -> None:
+        for directory in (self.pointer.parent, self.home / ".config", self.home):
+            with self.subTest(directory=str(directory)):
+                os.chmod(directory, 0o775)
+                self.assertRefused("writable")
+                os.chmod(directory, 0o755)
+        self.assertEqual(0, self.run_lane().returncode)
+
+    def test_an_older_set_is_refused_except_the_rollback_one(self) -> None:
+        for sequence in (4, 6):
+            self.seal(sequence=sequence)
+            self.assertEqual(0, self.run_lane().returncode)
+        self.assertEqual({"schema": 1, "sequence": 6, "previous_sequence": 4},
+                         json.loads(self.floor.read_text()))
+        self.seal(sequence=4)               # the rollback generation still runs
+        self.assertEqual(0, self.run_lane().returncode)
+        self.seal(sequence=3)
+        self.assertRefused("older than the last one run (6)")
+        self.seal(sequence=6)
+        self.assertEqual(0, self.run_lane().returncode)
+        self.assertEqual(0o600, self.floor.stat().st_mode & 0o777)
 
 
 @unittest.skipUnless(os.uname().sysname == "Darwin", "macOS native launcher")
@@ -362,6 +442,15 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
     test_a_symlinked_member_is_refused = None
     test_a_pointer_outside_the_root_is_refused = None
     test_a_signed_lane_on_another_store_is_refused = None
+    test_a_planted_bytecode_cache_is_refused = None
+    test_a_planted_file_outside_the_manifest_is_refused = None
+    test_an_empty_bytecode_cache_directory_is_refused = None
+    test_python_neither_writes_nor_reads_a_bytecode_cache = None
+    test_a_symlink_above_the_generations_root_is_refused = None
+    test_a_nested_pointer_name_is_refused = None
+    test_a_symlinked_pointer_is_refused = None
+    test_a_writable_pointer_directory_is_refused = None
+    test_an_older_set_is_refused_except_the_rollback_one = None
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,8 @@ per-app Removable Volumes consent survives ordinary TartCI updates. What a
 lane runs moves out of the app into the support generation, described by
 `.tartci-launch-set.json`:
 
-    {"schema": 1, "source_commit": ..., "tart_home": ...,
+    {"schema": 1, "sequence": <monotonic per host>, "source_commit": ...,
+     "tart_home": ...,
      "manifest_sha256": <sha256 of .tartci-support-manifest.json>,
      "entrypoint": {"path": ".tartci-launch", "sha256": ...},
      "lanes": {"<lane id>": {"environment": {...}}}}
@@ -58,11 +59,16 @@ def requirement(team_id: str) -> str:
     """The code requirement a launch set's signature must satisfy."""
     if not TEAM_ID.fullmatch(team_id):
         raise LaunchSetError(f"not a ten-character Apple Team ID: {team_id!r}")
-    return (f'anchor apple generic and certificate leaf[subject.OU] = "{team_id}" '
-            f'and identifier "{LAUNCH_SET_IDENTIFIER}"')
+    # Developer ID only: the intermediate's Developer ID CA marker and the
+    # leaf's Developer ID Application marker refuse Apple Development certs.
+    return ('anchor apple generic'
+            ' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+            ' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+            f' and certificate leaf[subject.OU] = "{team_id}"'
+            f' and identifier "{LAUNCH_SET_IDENTIFIER}"')
 
 
-def build(generation: Path, lanes: dict, *, tart_home: str) -> dict:
+def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int) -> dict:
     """The launch set for one generation from its manifest and rendered lanes."""
     manifest = generation / MANIFEST_NAME
     entry = generation / ENTRYPOINT
@@ -70,6 +76,8 @@ def build(generation: Path, lanes: dict, *, tart_home: str) -> dict:
         source_commit = json.loads(manifest.read_text())["source_commit"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise LaunchSetError(f"unreadable support manifest {manifest}: {exc}") from exc
+    if type(sequence) is not int or sequence < 1:
+        raise LaunchSetError("a launch set needs a positive integer sequence")
     if not lanes or not all(isinstance(k, str) and LANE.fullmatch(k) for k in lanes):
         raise LaunchSetError("a launch set needs at least one valid lane id")
     for lane, row in lanes.items():
@@ -80,6 +88,7 @@ def build(generation: Path, lanes: dict, *, tart_home: str) -> dict:
             raise LaunchSetError(f"lane {lane} sets a dynamic-loader variable")
     return {
         "schema": SCHEMA,
+        "sequence": sequence,
         "source_commit": source_commit,
         "tart_home": tart_home,
         "manifest_sha256": _sha256(manifest),
@@ -184,6 +193,18 @@ def verify_contents(generation: Path, root: Path) -> Optional[str]:
     if hashlib.sha256(manifest_bytes).hexdigest() != value.get("manifest_sha256"):
         return "the support manifest does not match the launch set"
     entry = value.get("entrypoint") or {}
+    allowed = {m.get("path") for m in members} | {entry.get("path"), SET_NAME, SIG_NAME,
+                                                  MANIFEST_NAME}
+    for dirpath, dirs, files in os.walk(generation):
+        for name in dirs + files:
+            full = Path(dirpath) / name
+            relative = full.relative_to(generation).as_posix()
+            if name == "__pycache__":
+                return f"{relative}: a bytecode cache in the generation is never hashed"
+            if full.is_symlink():
+                return f"{relative} is a symlink"
+            if full.is_file() and relative not in allowed:
+                return f"{relative} is not in the signed manifest"
     for relative, expected in [(m.get("path"), m.get("sha256")) for m in members] + [
             (entry.get("path"), entry.get("sha256"))]:
         if (not isinstance(relative, str) or relative.startswith("/")
@@ -235,6 +256,16 @@ def publish(generation: Path, *, pointer: Path, root: Path, team_id: str,
         raise LaunchSetError(f"launch set does not verify, pointer unchanged: {problem}")
     current = read_pointer(pointer)
     previous = current.get("generation") if current else None
+    if previous and previous != str(generation):
+        # The launcher refuses a set older than the last one it ran; refuse to
+        # point it at one in the first place.
+        try:
+            before = json.loads((Path(previous) / SET_NAME).read_text()).get("sequence", 0)
+            after = json.loads((generation / SET_NAME).read_text())["sequence"]
+        except (OSError, ValueError, KeyError) as exc:
+            raise LaunchSetError(f"cannot compare launch set sequences, pointer unchanged: {exc}") from exc
+        if not isinstance(before, int) or after <= before:
+            raise LaunchSetError(f"launch set sequence {after} is not after {before}, pointer unchanged")
     value = {"schema": POINTER_SCHEMA, "generation": str(generation),
              "previous": previous if previous != str(generation) else (current or {}).get("previous")}
     pointer.parent.mkdir(parents=True, exist_ok=True)

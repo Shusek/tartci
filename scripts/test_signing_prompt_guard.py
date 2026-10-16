@@ -194,7 +194,9 @@ class LauncherV2BuildTests(LauncherBuildTests):
             "team_id": profile["launch_helper"]["team_id"],
             "tart_home": profile["host"]["tart_home"],
             "generations_root": f"{home}/.local/share/tartci-generations",
-            "pointer": f"{home}/.config/tartci/launcher-generation.json"}, policy)
+            "home": home,
+            "pointer": f"{home}/.config/tartci/launcher-generation.json",
+            "floor": f"{home}/.config/tartci/launcher-floor.json"}, policy)
         self.assertRegex(approval.read_text(), r"^[0-9a-f]{64}\n$")
 
     def test_an_unknown_layout_is_refused(self) -> None:

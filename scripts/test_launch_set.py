@@ -64,10 +64,11 @@ class FakeCodesign:
 class LaunchSetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.td = tempfile.TemporaryDirectory()
-        self.root = Path(self.td.name) / "generations"
+        # Canonical, so the trust checks see the same path whatever TMPDIR is.
+        self.root = Path(os.path.realpath(self.td.name)) / "generations"
         self.root.mkdir()
         os.chmod(self.root, 0o755)
-        self.pointer = Path(self.td.name) / "config" / "launcher-generation.json"
+        self.pointer = self.root.parent / "config" / "launcher-generation.json"
         self.generation = make_generation(self.root)
 
     def tearDown(self) -> None:
@@ -76,9 +77,10 @@ class LaunchSetTests(unittest.TestCase):
                 os.chmod(os.path.join(dirpath, name), 0o755)
         self.td.cleanup()
 
-    def written(self, generation: Path | None = None) -> Path:
+    def written(self, generation: Path | None = None, sequence: int = 2) -> Path:
         generation = generation or self.generation
-        ls.write(generation, ls.build(generation, LANES, tart_home=STORE))
+        os.chmod(generation, 0o755)
+        ls.write(generation, ls.build(generation, LANES, tart_home=STORE, sequence=sequence))
         return generation
 
     def publish(self, generation: Path, codesign=None, ready=lambda: None) -> dict:
@@ -87,7 +89,8 @@ class LaunchSetTests(unittest.TestCase):
                           signing_ready=ready, run=codesign or FakeCodesign())
 
     def test_the_set_pins_the_manifest_entrypoint_and_lanes(self) -> None:
-        value = ls.build(self.generation, LANES, tart_home=STORE)
+        value = ls.build(self.generation, LANES, tart_home=STORE, sequence=7)
+        self.assertEqual(7, value["sequence"])
         self.assertEqual("a" * 40, value["source_commit"])
         self.assertEqual(hashlib.sha256((self.generation / ls.MANIFEST_NAME).read_bytes()).hexdigest(),
                          value["manifest_sha256"])
@@ -99,11 +102,17 @@ class LaunchSetTests(unittest.TestCase):
                       {"x": {"environment": {"TART_HOME": STORE, "DYLD_INSERT_LIBRARIES": "/x"}}},
                       {"../x": {"environment": {"TART_HOME": STORE}}}, {}):
             with self.subTest(lanes=lanes), self.assertRaises(ls.LaunchSetError):
-                ls.build(self.generation, lanes, tart_home=STORE)
+                ls.build(self.generation, lanes, tart_home=STORE, sequence=1)
+        for sequence in (0, -1, "2", 2.0, True):
+            with self.subTest(sequence=sequence), self.assertRaisesRegex(ls.LaunchSetError, "sequence"):
+                ls.build(self.generation, LANES, tart_home=STORE, sequence=sequence)
 
     def test_the_requirement_pins_the_policy_team(self) -> None:
-        self.assertEqual('anchor apple generic and certificate leaf[subject.OU] = "AB12CD34EF" '
-                         'and identifier "com.danielraffel.tartci.launch-set"', ls.requirement(TEAM))
+        self.assertEqual('anchor apple generic'
+                         ' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+                         ' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+                         ' and certificate leaf[subject.OU] = "AB12CD34EF"'
+                         ' and identifier "com.danielraffel.tartci.launch-set"', ls.requirement(TEAM))
         for bad in ("ab12cd34ef", "AB12", 'X" or "1', ""):
             with self.subTest(bad=bad), self.assertRaises(ls.LaunchSetError):
                 ls.requirement(bad)
@@ -121,7 +130,7 @@ class LaunchSetTests(unittest.TestCase):
         self.assertEqual(ls.LAUNCH_SET_IDENTIFIER, argv[argv.index("--identifier") + 1])
 
     def test_a_keychain_that_is_not_ready_leaves_the_pointer_unchanged(self) -> None:
-        older = self.written(make_generation(self.root, "b" * 40 + "-1"))
+        older = self.written(make_generation(self.root, "b" * 40 + "-1"), sequence=1)
         self.publish(older)
         before = self.pointer.read_bytes()
         codesign = FakeCodesign()
@@ -136,7 +145,7 @@ class LaunchSetTests(unittest.TestCase):
         self.assertFalse(self.pointer.exists())
 
     def test_publish_freezes_verifies_and_keeps_the_rollback_generation(self) -> None:
-        older = self.written(make_generation(self.root, "b" * 40 + "-1"))
+        older = self.written(make_generation(self.root, "b" * 40 + "-1"), sequence=1)
         self.assertEqual({"schema": 1, "generation": str(older), "previous": None}, self.publish(older))
         value = self.publish(self.written())
         self.assertEqual({"schema": 1, "generation": str(self.generation),
@@ -166,6 +175,41 @@ class LaunchSetTests(unittest.TestCase):
                 os.chmod(path, 0o444)
                 os.chmod(path.parent, 0o555)
         self.assertIsNone(ls.verify_contents(self.generation, self.root))
+
+    def test_a_file_the_manifest_does_not_name_is_refused(self) -> None:
+        self.written()
+        ls.freeze(self.generation)
+        cases = (("scripts/__pycache__/x.cpython-311.pyc", "bytecode cache"),
+                 ("scripts/__pycache__/", "bytecode cache"),          # even empty
+                 ("scripts/extra.py", "scripts/extra.py is not in the signed manifest"),
+                 ("planted", "planted is not in the signed manifest"))
+        for relative, why in cases:
+            with self.subTest(relative=relative):
+                target = self.generation / relative
+                for directory in (self.generation, self.generation / "scripts"):
+                    os.chmod(directory, 0o755)
+                if relative.endswith("/"):
+                    target.mkdir()
+                else:
+                    target.parent.mkdir(exist_ok=True)
+                    target.write_bytes(b"\x00planted")
+                self.assertIn(why, ls.verify_contents(self.generation, self.root) or "")
+                if target.is_file():
+                    target.unlink()
+                if target.name == "__pycache__" or target.parent.name == "__pycache__":
+                    (self.generation / "scripts/__pycache__").rmdir()
+                ls.freeze(self.generation)
+        self.assertIsNone(ls.verify_contents(self.generation, self.root))
+
+    def test_publish_refuses_a_sequence_that_does_not_advance(self) -> None:
+        newer = self.written(make_generation(self.root, "c" * 40 + "-1"), sequence=5)
+        self.publish(newer)
+        before = self.pointer.read_bytes()
+        for sequence in (5, 4):
+            with self.subTest(sequence=sequence):
+                with self.assertRaisesRegex(ls.LaunchSetError, "is not after 5, pointer unchanged"):
+                    self.publish(self.written(sequence=sequence))
+                self.assertEqual(before, self.pointer.read_bytes())
 
     def test_writable_or_symlinked_paths_are_untrusted(self) -> None:
         self.written()

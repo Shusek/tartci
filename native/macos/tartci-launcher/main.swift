@@ -91,16 +91,23 @@ private func isExternalStore(_ path: String) -> Bool {
 //   - the generation, every member and every directory up to the generations
 //     root is owned by this user and not group- or world-writable, with no
 //     symlink anywhere;
-//   - the manifest, every member and the entrypoint match their digests.
+//   - the manifest, every member and the entrypoint match their digests, and
+//     the generation holds no other file: no __pycache__, no .pyc, nothing
+//     the manifest does not name, so nothing unhashed can be imported;
+//   - the pointer and its directories up to policy.home are trusted the same way;
+//   - the set's sequence is not below the last one this host ran, except the
+//     one before it (a rollback).
 // Any failure exits 77 and runs nothing.
 struct Policy: Decodable {
     let schema: Int; let identifier: String; let team_id: String
-    let tart_home: String; let generations_root: String; let pointer: String
+    let tart_home: String; let generations_root: String
+    let home: String; let pointer: String; let floor: String
 }
 struct Pointer: Decodable { let schema: Int; let generation: String }
+struct Floor: Codable { let schema: Int; let sequence: Int; let previous_sequence: Int? }
 struct Entrypoint: Decodable { let path: String; let sha256: String }
 struct LaunchSet: Decodable {
-    let schema: Int; let tart_home: String; let manifest_sha256: String
+    let schema: Int; let sequence: Int; let tart_home: String; let manifest_sha256: String
     let entrypoint: Entrypoint; let lanes: [String: Lane]
 }
 struct ManifestMember: Decodable { let path: String; let sha256: String }
@@ -117,7 +124,9 @@ private func loadPolicy(_ root: URL) -> Policy? {
           policy.team_id.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
           isExternalStore(policy.tart_home),
           policy.generations_root.hasPrefix("/"), !policy.generations_root.hasSuffix("/"),
-          policy.pointer.hasPrefix("/") else { fail("launcher policy is invalid", code: 77) }
+          policy.home.hasPrefix("/"), !policy.home.hasSuffix("/"),
+          policy.pointer.hasPrefix(policy.home + "/"),
+          policy.floor.hasPrefix(policy.home + "/") else { fail("launcher policy is invalid", code: 77) }
     return policy
 }
 private func sha256Hex(_ data: Data) -> String {
@@ -164,8 +173,14 @@ private func launchSetRequirement(_ policy: Policy) -> String {
         return override
     }
 #endif
-    return "anchor apple generic and certificate leaf[subject.OU] = \"\(policy.team_id)\" "
-        + "and identifier \"\(launchSetIdentifier)\""
+    // Developer ID only: the intermediate's Developer ID CA marker and the
+    // leaf's Developer ID Application marker, so the team's Apple Development
+    // and other Apple-issued certificates are refused.
+    return "anchor apple generic"
+        + " and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+        + " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        + " and certificate leaf[subject.OU] = \"\(policy.team_id)\""
+        + " and identifier \"\(launchSetIdentifier)\""
 }
 /// Verify the detached signature over exactly the bytes that will be used:
 /// they and the signature are copied into a private directory first, so
@@ -201,10 +216,60 @@ private func requireMember(_ generation: String, _ relative: String, _ expected:
     guard sha256Hex(readTrusted(path)) == expected else { fail("\(relative) does not match its digest", code: 77) }
     return path
 }
+/// Every file in the generation is a manifest member or one of the launch
+/// set's own files; there is no __pycache__, symlink or special file.
+private func requireNothingUnhashed(_ generation: String, allowed: Set<String>) {
+    guard let walker = FileManager.default.enumerator(atPath: generation) else {
+        fail("cannot list \(generation)", code: 77)
+    }
+    for case let relative as String in walker {
+        let path = generation + "/" + relative
+        var info = stat()
+        guard lstat(path, &info) == 0 else { fail("cannot inspect \(path)", code: 77) }
+        let kind = info.st_mode & S_IFMT
+        if (relative as NSString).lastPathComponent == "__pycache__" {
+            fail("\(relative): a bytecode cache in the generation is never hashed", code: 77)
+        }
+        if kind == S_IFDIR { continue }
+        guard kind == S_IFREG else { fail("\(relative) is not a regular file", code: 77) }
+        guard allowed.contains(relative) else { fail("\(relative) is not in the signed manifest", code: 77) }
+    }
+}
+/// The last sequence this host ran, and the one before it (a rollback).
+private func requireNotDowngraded(_ policy: Policy, _ sequence: Int) {
+    guard sequence >= 1 else { fail("launch set has no sequence", code: 77) }
+    guard access(policy.floor, F_OK) == 0 else { return }
+    requireTrustedChain(policy.floor, upTo: policy.home)
+    let floor: Floor
+    do { floor = try JSONDecoder().decode(Floor.self, from: readTrusted(policy.floor)) }
+    catch { fail("cannot read the launcher floor: \(error)", code: 77) }
+    guard floor.schema == 1 else { fail("launcher floor is invalid", code: 77) }
+    guard sequence >= floor.sequence || sequence == floor.previous_sequence else {
+        fail("launch set \(sequence) is older than the last one run (\(floor.sequence))", code: 77)
+    }
+}
+private func recordFloor(_ policy: Policy, _ sequence: Int) {
+    var current: Floor? = nil
+    if access(policy.floor, F_OK) == 0 {
+        current = try? JSONDecoder().decode(Floor.self, from: readTrusted(policy.floor))
+    }
+    if let current, sequence <= current.sequence { return }
+    let value = Floor(schema: 1, sequence: sequence, previous_sequence: current?.sequence)
+    guard let data = try? JSONEncoder().encode(value) else { fail("cannot encode the launcher floor", code: 70) }
+    let temporary = policy.floor + ".\(getpid()).tmp"
+    let fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { fail("cannot write the launcher floor", code: 70) }
+    let wrote = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
+    close(fd)
+    guard wrote == data.count, rename(temporary, policy.floor) == 0 else {
+        unlink(temporary); fail("cannot write the launcher floor", code: 70)
+    }
+}
 /// The entrypoint and environment for one lane of the pointed-to generation.
 private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String, [String: String]) {
     let root = policy.generations_root
     requireTrusted(root)
+    requireTrustedChain(policy.pointer, upTo: policy.home)
     let pointer: Pointer
     do { pointer = try JSONDecoder().decode(Pointer.self, from: readTrusted(policy.pointer)) }
     catch { fail("cannot read the launcher pointer: \(error)", code: 77) }
@@ -221,6 +286,7 @@ private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String
     do { set = try JSONDecoder().decode(LaunchSet.self, from: setData) }
     catch { fail("signed launch set is malformed: \(error)", code: 77) }
     guard set.schema == 1, set.tart_home == policy.tart_home else { fail("launch set has the wrong Tart store", code: 77) }
+    requireNotDowngraded(policy, set.sequence)
     let manifestData = readTrusted(generation + "/.tartci-support-manifest.json")
     guard sha256Hex(manifestData) == set.manifest_sha256 else { fail("support manifest does not match the launch set", code: 77) }
     let manifest: SupportManifest
@@ -229,12 +295,21 @@ private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String
     for member in manifest.members { _ = requireMember(generation, member.path, member.sha256) }
     guard set.entrypoint.path == ".tartci-launch" else { fail("unexpected entrypoint \(set.entrypoint.path)", code: 77) }
     let launch = requireMember(generation, set.entrypoint.path, set.entrypoint.sha256)
+    requireNothingUnhashed(generation, allowed: Set(manifest.members.map { $0.path } + [
+        set.entrypoint.path, ".tartci-launch-set.json", ".tartci-launch-set.sig",
+        ".tartci-support-manifest.json"]))
     guard let lane = set.lanes[laneID] else { fail("lane is not in the signed launch set", code: 77) }
     guard lane.environment["TART_HOME"] == policy.tart_home else { fail("signed lane has the wrong Tart store", code: 77) }
     guard lane.environment.keys.allSatisfy({ !$0.hasPrefix("DYLD_") }) else {
         fail("signed lane contains a forbidden dynamic-loader variable", code: 77)
     }
-    return (launch, set.entrypoint.sha256, lane.environment)
+    recordFloor(policy, set.sequence)
+    // Python never writes bytecode beside the source, and never reads a cache
+    // kept elsewhere (a PYTHONPYCACHEPREFIX tree would be unhashed code too).
+    var environment = lane.environment
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
+    return (launch, set.entrypoint.sha256, environment)
 }
 private func probeStore(_ store: String) -> Never {
     let root = URL(fileURLWithPath: store, isDirectory: true)

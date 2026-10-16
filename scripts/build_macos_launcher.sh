@@ -90,7 +90,9 @@ Path(sys.argv[2]).write_text(json.dumps({
     "schema": 2, "identifier": helper["identifier"], "team_id": helper["team_id"],
     "tart_home": tart_home,
     "generations_root": f"{home}/.local/share/tartci-generations",
+    "home": home,
     "pointer": f"{home}/.config/tartci/launcher-generation.json",
+    "floor": f"{home}/.config/tartci/launcher-floor.json",
 }, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 fi
