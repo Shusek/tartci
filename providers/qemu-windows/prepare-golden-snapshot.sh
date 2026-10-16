@@ -3,16 +3,21 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SOURCE="${1:?source qcow2 required}"
-SNAPSHOT="${2:?snapshot qcow2 required}"
 # shellcheck source=providers/common/toml-python.lib.sh
 source "$ROOT/providers/common/toml-python.lib.sh"
-# The caller passes its pinned interpreter as TARTCI_PYTHON; without one this
-# resolves the host pin, and under launchd refuses rather than use PATH.
-PYTHON_BIN="$(tartci_toml_python_path)" || {
-  echo "no pinned interpreter to hash the Windows snapshot with" >&2
-  exit 127
+SOURCE="${1:?source qcow2 required}"
+SNAPSHOT="${2:?snapshot qcow2 required}"
+# Callers normally pass the already-resolved host interpreter through the
+# environment. The optional third argument keeps direct operator use explicit
+# while still refusing an unpinned launchd interpreter.
+if [ -n "${3:-}" ]; then
+  export TARTCI_PYTHON="$3"
+fi
+TARTCI_PYTHON="$(tartci_toml_python_path)" || {
+  echo "Windows snapshot admission requires a pinned Python 3.11+ interpreter" >&2
+  exit 1
 }
+export TARTCI_PYTHON
 [[ ! -e "$SNAPSHOT" && ! -L "$SNAPSHOT" ]] || {
   echo "Windows snapshot already exists: $SNAPSHOT" >&2
   exit 1
@@ -47,9 +52,17 @@ cmp -s "$SOURCE.sha256" "$SNAPSHOT.sha256" || {
   exit 1
 }
 chflags uchg "$SNAPSHOT" "$SNAPSHOT.sha256"
-# Every job hashes the whole snapshot (about 26 GB): log the cost so it is
-# visible when deciding whether the immutable clone alone would do.
-hash_started="$(date +%s)"
-nice -n 20 "$PYTHON_BIN" "$ROOT/scripts/verify_windows_golden.py" --no-cache "$SNAPSHOT"
-echo "Windows snapshot hash: $(( $(date +%s) - hash_started ))s for $(wc -c <"$SNAPSHOT" | tr -d ' ') bytes ($PYTHON_BIN)" >&2
+hash_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+hash_started_epoch="$(date +%s)"
+if nice -n 20 "$TARTCI_PYTHON" "$ROOT/scripts/verify_windows_golden.py" --no-cache "$SNAPSHOT"; then
+  hash_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  hash_finished_epoch="$(date +%s)"
+  printf 'windows golden hash start=%s end=%s seconds=%s\n' \
+    "$hash_started_at" "$hash_finished_at" "$((hash_finished_epoch - hash_started_epoch))" >&2
+else
+  rc=$?
+  printf 'windows golden hash start=%s end=%s status=failed\n' \
+    "$hash_started_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+  exit "$rc"
+fi
 snapshot_ready=1

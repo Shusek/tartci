@@ -31,6 +31,8 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -84,6 +86,12 @@ now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
 
+# Golden admission streams a potentially large qcow2. Resolve the interpreter
+# once through the host pin so a launchd PATH change cannot silently select a
+# different Python (or one without the required tomllib support).
+TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
+export TARTCI_PYTHON
+
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
@@ -92,8 +100,6 @@ source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
-# shellcheck source=providers/common/toml-python.lib.sh
-source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
@@ -223,11 +229,6 @@ esac; done
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 [[ "$RUNNER_NAME_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
   || die "unsafe Windows runner name prefix"
-# The interpreter that hashes the golden is the host's pinned one, never
-# whatever python3 PATH resolves to under launchd: macOS grants for the VM
-# store belong to the binary (see toml-python.lib.sh).
-GOLDEN_PYTHON="$(tartci_toml_python_path)" \
-  || die "no pinned interpreter to verify the Windows golden with"
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
@@ -436,7 +437,7 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_KEEP_FAILED="${2:-}" \
     tartci_write_vm_state qemu-windows "$job" "$job" "$1" ephemeral "$state_dir"
   }
-  if ! nice -n 20 "$GOLDEN_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN"; then
+  if ! nice -n 20 "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN"; then
     note "[$i] Windows golden failed SHA-256 admission; refusing clone before lease/JIT"
     cleanup_active_windows_job
     return 1
@@ -457,8 +458,7 @@ run_one(){ # $1=iteration index
   CURRENT_WIN_CPUS="$effective_win_cpus"
   write_state preparing
 
-  if ! TARTCI_PYTHON="$GOLDEN_PYTHON" \
-      "$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$jobbase"; then
+  if ! "$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$jobbase"; then
     note "[$i] Windows golden failed private snapshot admission"
     cleanup_active_windows_job
     return 1

@@ -268,6 +268,59 @@ else:
             self.assertFalse((root / "windows" / "win-ephr-host-1.state.json").exists())
             self.assertIn("path_deleted", "\n".join(digest["fixed"]))
 
+    def test_qemu_snapshot_outside_job_never_unseals(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags") as chflags:
+            root = Path(td)
+            work = root / "tartci-win" / "win-ephr-host-outside"
+            outside = root / "other" / "golden.qcow2"
+            work.mkdir(parents=True)
+            outside.parent.mkdir()
+            outside.write_bytes(b"fixture")
+            (outside.parent / "golden.qcow2.sha256").write_text("fixture\n")
+
+            with self.assertRaisesRegex(ValueError, "unsafe Windows golden snapshot"):
+                vm_reap.unseal_windows_snapshot(
+                    {"runner": work.name, "work_dir": str(work), "golden_snapshot": str(outside)}
+                )
+
+            chflags.assert_not_called()
+
+    def test_qemu_snapshot_symlink_never_unseals(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags") as chflags:
+            root = Path(td)
+            work = root / "tartci-win" / "win-ephr-host-symlink"
+            target = root / "outside.qcow2"
+            work.mkdir(parents=True)
+            target.write_bytes(b"fixture")
+            snapshot = work / "golden.qcow2"
+            snapshot.symlink_to(target)
+
+            with self.assertRaisesRegex(ValueError, "linked Windows golden snapshot"):
+                vm_reap.unseal_windows_snapshot(
+                    {"runner": work.name, "work_dir": str(work), "golden_snapshot": str(snapshot)}
+                )
+
+            chflags.assert_not_called()
+
+    def test_qemu_snapshot_through_linked_parent_never_unseals(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags") as chflags:
+            root = Path(td)
+            real_parent = root / "real"
+            linked_parent = root / "linked"
+            real_work = real_parent / "tartci-win" / "win-ephr-host-parent"
+            work = linked_parent / "tartci-win" / "win-ephr-host-parent"
+            real_work.mkdir(parents=True)
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            snapshot = work / "golden.qcow2"
+            snapshot.write_bytes(b"fixture")
+
+            with self.assertRaisesRegex(ValueError, "linked Windows job directory"):
+                vm_reap.unseal_windows_snapshot(
+                    {"runner": work.name, "work_dir": str(work), "golden_snapshot": str(snapshot)}
+                )
+
+            chflags.assert_not_called()
+
     @unittest.skipUnless(sys.platform == "darwin", "immutable snapshot uses macOS flags")
     def test_qemu_windows_reap_unseals_recorded_private_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as td:

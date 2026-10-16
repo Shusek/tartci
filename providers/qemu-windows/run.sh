@@ -24,12 +24,12 @@
 set -euo pipefail
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
-# shellcheck source=providers/common/toml-python.lib.sh
-source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -55,6 +55,11 @@ note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed (brew install qemu)"
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found"
+
+# Resolve once before reading the golden. This must not follow a mutable PATH
+# entry when the provider is launched by launchd.
+TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
+export TARTCI_PYTHON
 
 while [ $# -gt 0 ]; do case "$1" in
   --golden) GOLDEN="$2"; shift 2;;
@@ -86,10 +91,7 @@ esac
 tartci_vm_leases_enabled || die "manual Windows clone requires a VM lease"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
-# The host's pinned interpreter hashes the golden, never PATH's python3.
-GOLDEN_PYTHON="$(tartci_toml_python_path)" \
-  || die "no pinned interpreter to verify the Windows golden with"
-nice -n 20 "$GOLDEN_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN" \
+nice -n 20 "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN" \
   || die "Windows clone golden failed SHA-256 admission"
 
 # Firmware code + a vars TEMPLATE. The golden's ESP is BOOTAA64-auto-boot, so a
@@ -214,8 +216,7 @@ mkdir "$JOBDIR" || die "Windows job directory already exists or cannot be create
 JOBDIR_OWNED=1
 write_state preparing
 
-TARTCI_PYTHON="$GOLDEN_PYTHON" \
-  "$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$JOBBASE" \
+"$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$JOBBASE" \
   || die "Windows clone golden failed private snapshot admission"
 note "CoW overlay off verified private snapshot → $OVERLAY"
 tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$JOBBASE" -F qcow2 "$OVERLAY" >/dev/null

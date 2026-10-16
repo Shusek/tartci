@@ -25,6 +25,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -672,20 +673,53 @@ def remove_owned_path(path_text: Any, runner_name: str) -> str | None:
     return f"path_deleted:{path}"
 
 
+def reject_symlink_components(path: pathlib.Path, description: str) -> None:
+    """Refuse a path whose existing components include a symlink.
+
+    Comparing the state-file strings alone is insufficient: a parent symlink
+    can make ``work_dir/golden.qcow2`` resolve outside the owned job directory
+    while preserving the same lexical spelling.  ``lstat`` keeps this check
+    independent of the target's file type and also covers a symlinked sidecar.
+    Missing final files are allowed because recovery may be cleaning up a
+    partially-created job; any existing parent component must still be real.
+    """
+    if not path.is_absolute():
+        raise ValueError(f"relative {description} recovery path")
+    # macOS exposes the temporary directory through these system aliases. They
+    # are resolved before checking job-owned components; a symlink introduced
+    # below either alias remains rejected.
+    system_aliases = {
+        pathlib.Path("/var"): pathlib.Path("/private/var"),
+        pathlib.Path("/tmp"): pathlib.Path("/private/tmp"),
+    }
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"cannot inspect {description} recovery path") from exc
+        if stat.S_ISLNK(mode):
+            if current in system_aliases and pathlib.Path(os.path.realpath(current)) == system_aliases[current]:
+                continue
+            raise ValueError(f"linked Windows {description} recovery path")
+
+
 def unseal_windows_snapshot(state: dict[str, Any]) -> None:
     """Clear the immutable flag only on this job's recorded private backing file."""
     work = safe_owned_path(state.get("work_dir"), str(state.get("runner") or ""))
     snapshot_text = state.get("golden_snapshot")
     if not work or not isinstance(snapshot_text, str) or not snapshot_text:
         return
-    if work.is_symlink():
-        raise ValueError("linked Windows job directory recovery path")
+    reject_symlink_components(work, "job directory")
     snapshot = pathlib.Path(snapshot_text)
-    if snapshot != work / "golden.qcow2" or snapshot.is_symlink():
+    if snapshot != work / "golden.qcow2":
         raise ValueError("unsafe Windows golden snapshot recovery path")
+    reject_symlink_components(snapshot, "golden snapshot")
     for path in (snapshot, pathlib.Path(f"{snapshot}.sha256")):
-        if path.is_symlink():
-            raise ValueError("linked Windows golden snapshot recovery path")
+        reject_symlink_components(path, "golden snapshot")
         if path.exists():
             if not path.is_file():
                 raise ValueError("non-file Windows golden snapshot recovery path")
