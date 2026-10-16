@@ -270,6 +270,11 @@ class InstallMacosFleetTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         subprocess.run(["git", "init", "-q", str(self.support_source)], check=True)
+        # No background gc: a detached auto-gc after the fixture commit repacks
+        # .git/objects while tearDown walks it ("Directory not empty").
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false")):
+            subprocess.run(["git", "-C", str(self.support_source), "config", key, value],
+                           check=True)
         subprocess.run(["git", "-C", str(self.support_source), "config", "user.email", "test@example.com"], check=True)
         subprocess.run(["git", "-C", str(self.support_source), "config", "user.name", "Test"], check=True)
         subprocess.run([
@@ -1629,7 +1634,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             "source_commit": commit,
             "support_manifest_sha256": manifest_sha256,
             "profile_policy_sha256": "d" * 64,
-            "tart_home": "/Volumes/Workshop/VMs",
+            "tart_home": "/Volumes/Example/VMs",
         }, sort_keys=True))
         approval = self.home / ".config/tartci/m3-launcher-approved.sha256"
         approval.write_text("e" * 64 + "\n")
@@ -1637,7 +1642,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         helper_config = self.root / "fleet-launch-helper.toml"
         helper_config.write_text(
             self.config.read_text()
-            .replace(f'tart_home = "{self.home}/VMs"', 'tart_home = "/Volumes/Workshop/VMs"')
+            .replace(f'tart_home = "{self.home}/VMs"', 'tart_home = "/Volumes/Example/VMs"')
             .replace("[github_app]", textwrap.dedent(f"""\
                 [launch_helper]
                 path = "{bundle}"
@@ -1759,7 +1764,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             "source_commit": "a" * 40,
             "support_manifest_sha256": "f" * 64,
             "profile_policy_sha256": "d" * 64,
-            "tart_home": "/Volumes/Workshop/VMs",
+            "tart_home": "/Volumes/Example/VMs",
         }, sort_keys=True))
         record = json.loads(fixture["output"].read_text())["launch_helper"]
         with mock.patch.object(

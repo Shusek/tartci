@@ -532,7 +532,7 @@ class BodyAndMappingTests(Base):
         title, body = self.issues.opened[0]
         for needle in ("## What happened", "offline on the tailnet for 240 min (4.0 h)",
                        "last seen 2026-10-14T20:30:12Z", "## Evidence",
-                       "daniels-macbook-pro-1.example-tailnet.ts.net", "## Likely cause",
+                       "laptop-host-1.example-tailnet.ts.net", "## Likely cause",
                        "Tailscale turned off", "asleep", "power", "## Fix",
                        "open -a Tailscale", "## Safe to auto-apply", "No. tartci never starts",
                        "## How to verify", "`m1-lan` (192.0.2.50): up"):

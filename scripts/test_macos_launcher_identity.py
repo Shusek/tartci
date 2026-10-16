@@ -12,7 +12,7 @@ TeamIdentifier=95CX6P84C4
 """; REQUIREMENT='designated => identifier "com.danielraffel.tartci.launcher" and anchor apple generic\n'
 class Tests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(); self.app=Path(self.temp.name)/"Launcher.app"; self.exe=self.app/"Contents/MacOS/tartci-launcher"; self.exe.parent.mkdir(parents=True); self.exe.write_bytes(b"mach-o"); self.exe.chmod(0o755); resources=self.app/"Contents/Resources"; (resources/"support").mkdir(parents=True); manifest=b'{"schema":2}\n'; (resources/"support/.tartci-support-manifest.json").write_bytes(manifest); (resources/"lanes.json").write_text('{"schema":1,"lanes":{"studio-pulp-gate":{"environment":{"TART_HOME":"/Volumes/Workshop/VMs"}}}}'); (resources/"bundle.json").write_text(json.dumps({"schema":1,"source_commit":"a"*40,"support_manifest_sha256":hashlib.sha256(manifest).hexdigest(),"profile_policy_sha256":"b"*64,"tart_home":"/Volumes/Workshop/VMs"}))
+        self.temp=tempfile.TemporaryDirectory(); self.app=Path(self.temp.name)/"Launcher.app"; self.exe=self.app/"Contents/MacOS/tartci-launcher"; self.exe.parent.mkdir(parents=True); self.exe.write_bytes(b"mach-o"); self.exe.chmod(0o755); resources=self.app/"Contents/Resources"; (resources/"support").mkdir(parents=True); manifest=b'{"schema":2}\n'; (resources/"support/.tartci-support-manifest.json").write_bytes(manifest); (resources/"lanes.json").write_text('{"schema":1,"lanes":{"studio-pulp-gate":{"environment":{"TART_HOME":"/Volumes/Example/VMs"}}}}'); (resources/"bundle.json").write_text(json.dumps({"schema":1,"source_commit":"a"*40,"support_manifest_sha256":hashlib.sha256(manifest).hexdigest(),"profile_policy_sha256":"b"*64,"tart_home":"/Volumes/Example/VMs"}))
     def tearDown(self): self.temp.cleanup()
     def inspect(self,detail=DETAIL):
         return mock.patch.object(identity,"_run",side_effect=lambda cmd: REQUIREMENT if "-r-" in cmd else ("arm64\n" if "/usr/bin/lipo" in cmd else detail))
@@ -30,17 +30,17 @@ class Tests(unittest.TestCase):
     def set_store(self,store):
         meta=self.app/"Contents/Resources/bundle.json"; value=json.loads(meta.read_text()); value["tart_home"]=store; meta.write_text(json.dumps(value))
     def test_any_external_volume_store_is_accepted_and_pinned_by_caller(self):
-        self.set_store("/Volumes/Atelier/VMs")
+        self.set_store("/Volumes/Store/VMs")
         with self.inspect(): self.verify()
-        with self.inspect(): self.verify(tart_home="/Volumes/Atelier/VMs")
+        with self.inspect(): self.verify(tart_home="/Volumes/Store/VMs")
         # Control: the same bundle against another host's store is refused.
-        with self.inspect(),self.assertRaises(identity.IdentityError): self.verify(tart_home="/Volumes/Workshop/VMs")
+        with self.inspect(),self.assertRaises(identity.IdentityError): self.verify(tart_home="/Volumes/Example/VMs")
     def test_non_external_sealed_store_is_rejected(self):
-        for store in ("/Users/x/VMs","/Volumes/Atelier","/Volumes/Atelier/../VMs",""):
+        for store in ("/Users/x/VMs","/Volumes/Store","/Volumes/Store/../VMs",""):
             with self.subTest(store=store):
                 self.set_store(store)
                 with self.inspect(),self.assertRaises(identity.IdentityError): self.verify()
-        self.set_store("/Volumes/Atelier/VMs")
+        self.set_store("/Volumes/Store/VMs")
         with self.inspect(): self.verify()
     def test_sealed_metadata_bindings_are_checked(self):
         with self.inspect(): self.verify(profile_policy_sha256="b"*64,source_commit="a"*40)

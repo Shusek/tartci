@@ -2,7 +2,7 @@
 """Keep git's automatic maintenance from stampeding a shared object store.
 
 On m3 at about 07:15Z on 2026-10-16 the load reached 207. Every agent worktree
-of /Volumes/Workshop/Code/pulp shares one object store, and each `git` command
+of the shared pulp checkout shares one object store, and each `git` command
 any of them ran could start `git maintenance run --auto` / `git repack -d -l
 --cruft` in the background: 53+ of them ran at once (159 git processes, some
 for 2.7 h). Three parts, all opt-in per host:

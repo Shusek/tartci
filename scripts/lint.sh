@@ -91,6 +91,14 @@ PY
   if [ "$toml_rc" = 0 ]; then ok "manifests: all TOML parse"; else bad "manifests: TOML parse failed"; fi
 fi
 
+# ── 4. public paths ─────────────────────────────────────────────────────────
+# A public repo carries no real home directory, external volume or host name.
+if python3 scripts/public_path_lint.py; then
+  ok "public paths: no real /Users, /Volumes or host names in tracked files"
+else
+  bad "public paths: real paths or host names above (scripts/public_path_lint.py)"
+fi
+
 echo
 [ "$fail" = 0 ] && ok "lint: all checks passed" || bad "lint: failures above"
 exit "$fail"
