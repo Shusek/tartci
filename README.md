@@ -22,6 +22,12 @@ Use tartci if you:
 tartci is a set of shell and Python scripts plus docs. It holds no VM images:
 those are baked or pulled onto each host and never committed.
 
+The public contract is the CLI, provider behavior, and per-project manifests.
+Host profiles, runner labels, receipts, host paths, and fleet snapshots describe
+one deployment. Do not copy those values into a new installation. Keep a real
+fleet's desired state and live receipts in its private operator repository;
+examples in this repository are not requirements for using TartCI.
+
 ## How it works
 
 ```

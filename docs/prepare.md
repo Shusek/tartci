@@ -77,7 +77,6 @@ when a fleet profile declares one. That check does not install mise, change
 image or project setup explicitly installs it and runs `mise install`.
 
 The manifest already has a `[toolchain]` section, but providers do not yet
-interpret it as a mise environment. A sensible next step would be to make a
-repository's mise lock file an explicit image input, verify it while baking,
-and run the same setup in configure-on-boot mode. That would make image rebuilds
-repeatable without changing the current lanes implicitly.
+interpret it as a mise environment. Treat that as a current limitation: image
+recipes must install and verify their own mise toolchain until the provider
+contract gains explicit support for a lock file.

@@ -17,7 +17,7 @@ what you need:
 | `tartci prepare macos <subcommand>` | Inspect, resize, tag, or check a macOS golden. It does not build a complete macOS golden. |
 | `tartci windows golden` | Snapshot and tag a prepared Windows QEMU VM as a golden. |
 | `tartci up <os>` | Run one build directly, then remove its VM. |
-| `tartci serve <os>` | Serve GitHub Actions jobs with one disposable VM per job. |
+| `tartci serve <os>` | Serve GitHub Actions jobs. The default is one disposable VM per job; selected macOS lanes can use warm mode. |
 
 The sections below separate commands TartCI runs from steps that still require
 manual provisioning. Where a TartCI wrapper exists, use it; the remaining
