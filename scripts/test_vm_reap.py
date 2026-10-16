@@ -269,7 +269,7 @@ else:
             self.assertIn("path_deleted", "\n".join(digest["fixed"]))
 
     def test_qemu_snapshot_outside_job_never_unseals(self) -> None:
-        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags") as chflags:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags", create=True) as chflags:
             root = Path(td)
             work = root / "tartci-win" / "win-ephr-host-outside"
             outside = root / "other" / "golden.qcow2"
@@ -286,7 +286,7 @@ else:
             chflags.assert_not_called()
 
     def test_qemu_snapshot_symlink_never_unseals(self) -> None:
-        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags") as chflags:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags", create=True) as chflags:
             root = Path(td)
             work = root / "tartci-win" / "win-ephr-host-symlink"
             target = root / "outside.qcow2"
@@ -303,7 +303,7 @@ else:
             chflags.assert_not_called()
 
     def test_qemu_snapshot_through_linked_parent_never_unseals(self) -> None:
-        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags") as chflags:
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(vm_reap.os, "chflags", create=True) as chflags:
             root = Path(td)
             real_parent = root / "real"
             linked_parent = root / "linked"
