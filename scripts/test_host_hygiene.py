@@ -265,6 +265,26 @@ class OptIn(Base):
         self.assertEqual((self.opened, self.measured), ([], []))
 
 
+class WatchdogPass(Base):
+    def test_the_watchdog_pass_returns_the_lines_host_hygiene_produced(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        line = watchdog.host_hygiene_pass(
+            NOW, user_home=self.user,
+            vols=lambda paths: [vol(str(paths[0]), 150, 2000)],
+            measure=lambda path, timeout=0: GB, listing=lambda store: [],
+            ps=lambda: "", lsof=lambda: [],
+            issue=lambda t, b: (0, "71"), close=lambda n: (0, "closed"))
+        self.assertIn("WARN host-disk", line)
+        # Control: with the floor holding, the pass reports no disk line.
+        os.unlink(self.user / ".tartci" / "state" / "host-hygiene" / "foreign-vms.json")
+        self.assertNotIn("host-disk", watchdog.host_hygiene_pass(
+            NOW + 3600, user_home=self.user,
+            vols=lambda paths: [vol(str(paths[0]), 900, 2000)],
+            measure=lambda path, timeout=0: GB, listing=lambda store: [],
+            ps=lambda: "", lsof=lambda: [],
+            issue=lambda t, b: (0, "71"), close=lambda n: (0, "closed")) or "")
+
+
 class Wiring(unittest.TestCase):
     def test_the_heal_pass_runs_it(self) -> None:
         source = (Path(hy.__file__).parent / "tartci_launchd_watchdog.py").read_text()
