@@ -35,7 +35,8 @@ def make_generation(root: Path, name: str = "a" * 40 + "-1", *, pin: str = PIN,
             ("tartci", tartci.encode(), 0o755),
             ("scripts/x.py", b"print(1)\n", 0o644),
             ("scripts/tartci_support_manifest.py",
-             (HERE / "tartci_support_manifest.py").read_bytes(), 0o644)):
+             (HERE / "tartci_support_manifest.py").read_bytes(), 0o644),
+            ("scripts/python_child.py", (HERE / "python_child.py").read_bytes(), 0o644)):
         path = generation / relative
         path.write_bytes(data)
         os.chmod(path, mode)

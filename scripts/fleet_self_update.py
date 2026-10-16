@@ -62,6 +62,7 @@ import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness jud
 import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate jobs
 import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
+from python_child import child_python  # noqa: E402 - the interpreter children start with
 import fleet_source  # noqa: E402 - resolves the optional private fleet source
 
 try:
@@ -242,8 +243,9 @@ class System:
         if argv and argv[0] == "python3":
             # Helpers need tomllib (3.11+). This process was started by
             # tartci_toml_python, so its interpreter qualifies; a bare python3
-            # on PATH is /usr/bin/python3 (3.9) under ssh and launchd.
-            argv = [sys.executable, *argv[1:]]
+            # on PATH is /usr/bin/python3 (3.9) under ssh and launchd. Under
+            # launcher v2 that interpreter is the lane's shim (python_child).
+            argv = [child_python(), *argv[1:]]
         try:
             proc = subprocess.run(argv, cwd=cwd, env=merged, capture_output=True,
                                   text=True, timeout=timeout, check=False)
@@ -1614,7 +1616,7 @@ _PYTHON_SHIM_DIR: str | None = None
 
 
 def python_shim_dir() -> str:
-    """A private directory whose `python3` is this interpreter.
+    """A private directory whose `python3` is this process's child interpreter.
 
     Prepended to PATH for every tartci call, so the installed generation AND an
     older one being rolled back to (whose shell helpers may call a bare
@@ -1624,7 +1626,7 @@ def python_shim_dir() -> str:
     global _PYTHON_SHIM_DIR
     if _PYTHON_SHIM_DIR is None or not os.path.isdir(_PYTHON_SHIM_DIR):
         directory = tempfile.mkdtemp(prefix="tartci-self-update-python-")
-        os.symlink(sys.executable, os.path.join(directory, "python3"))
+        os.symlink(child_python(), os.path.join(directory, "python3"))
         _PYTHON_SHIM_DIR = directory
     return _PYTHON_SHIM_DIR
 
@@ -1653,7 +1655,7 @@ def census_env(repository: str | None = None) -> dict[str, str]:
     # the interpreter every tartci helper runs under, including on rollback.
     env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
-        "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
+        "TARTCI_PYTHON": child_python(),
         "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
@@ -1964,8 +1966,7 @@ def launch_python(profile: Path) -> str:
     declared = host.get("python") if isinstance(host, dict) else None
     if isinstance(declared, str) and declared.startswith("/"):
         return os.path.realpath(declared)
-    return os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON")
-                            or os.environ.get("TARTCI_PYTHON") or sys.executable)
+    return os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or child_python())
 
 
 def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, target: str,

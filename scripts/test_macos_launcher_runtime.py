@@ -154,6 +154,14 @@ V2_TARTCI = (
     "  exit-one) exit 1 ;;\n"
     "  env) echo \"${PYTHONDONTWRITEBYTECODE-unset}:${PYTHONNOUSERSITE-unset}:$TARTCI_PYTHON:$(command -v python3)\" > \"$HOME/env.out\"; exit 0 ;;\n"
     "  python) \"$TARTCI_PYTHON\" -c pass && python3 -c pass || exit 98; exit 0 ;;\n"
+    # A lane script starting a child the way support code does: through
+    # python_child.child_python() (or, as the control, sys.executable).
+    "  child|child-control) \"$TARTCI_PYTHON\" -c \"import json, subprocess, sys; "
+    "sys.path.insert(0, '$(dirname \"$0\")/scripts'); from python_child import child_python; "
+    "py = sys.executable if '$TARTCI_TEST_MODE' == 'child-control' else child_python(); "
+    "probe = 'import json, sys; print(json.dumps([sys.flags.no_site, sys.flags.ignore_environment]))'; "
+    "open('$HOME/child.out', 'w').write(subprocess.run([py, '-c', probe], capture_output=True, "
+    "text=True, check=True).stdout)\" || exit 97; exit 0 ;;\n"
     "  *) exit 99 ;;\n"
     "esac\n"
 )
@@ -216,7 +224,8 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         self.lanes = {mode: {"environment": {"HOME": str(work), "PATH": "/usr/bin:/bin",
                                              "TART_HOME": V2_STORE, "TARTCI_TEST_MODE": mode,
                                              "TARTCI_PYTHON": self.pin}}
-                      for mode in ("exit-zero", "exit-one", "env", "python")}
+                      for mode in ("exit-zero", "exit-one", "env", "python", "child",
+                                   "child-control")}
         self.seal()
 
     def write_policy(self, root) -> None:
@@ -415,6 +424,40 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         self.assertTrue(str(site).startswith(str(self.work)), site)
         self.assertPlantsDoNotRun(brew, site)
 
+    def test_a_child_started_by_lane_python_stays_isolated(self) -> None:
+        # The shim execs the pin, so inside the lane sys.executable is the bare
+        # pin; child_python() keeps the grandchild on the shim.
+        marker = self.work / "planted.ran"
+        self.plant_site(self.venv_site, marker)
+        result = self.run_lane("child")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("[1, 1]", (self.work / "child.out").read_text().strip())
+        self.assertFalse(marker.exists(), "site start-up code ran in the grandchild")
+        # Control: a grandchild started with sys.executable runs site, plant included.
+        result = self.run_lane("child-control")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("[0, 0]", (self.work / "child.out").read_text().strip())
+        self.assertTrue(marker.exists(), "the control must run the plant")
+
+    def test_safe_paths_allow_at_and_refuse_shell_characters(self) -> None:
+        # A Homebrew Cellar pin carries "@": accepted.
+        at = self.work / "python@3" / "bin"
+        at.mkdir(parents=True)
+        (at / "python3").symlink_to(self.pin)
+        self.repin(str(at / "python3"))
+        self.assertEqual(0, self.run_lane().returncode, self.run_lane().stderr)
+        # A pin with a space (or any shell character) never matches: the
+        # launcher refuses whatever digest the set carries for it.
+        for pin in ("/opt/py thon/python3", "/opt/$(id)/python3", '/opt/"/python3'):
+            with self.subTest(pin=pin):
+                value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE,
+                                      python=self.pin, sequence=1)
+                value["python"]["pin"] = pin
+                value["python"]["shim"]["sha256"] = hashlib.sha256(
+                    f'#!/bin/sh\nexec {pin} -B -E -s -S "$@"\n'.encode()).hexdigest()
+                self.seal(value=value)
+                self.assertRefused("interpreter shim does not exec the signed pin")
+
     def test_a_lane_interpreter_that_is_not_the_shim_is_refused(self) -> None:
         for key in ("TARTCI_PYTHON", "SHIPYARD_GHAPP_PYTHON_BINARY"):
             with self.subTest(key=key):
@@ -577,6 +620,8 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
     test_a_path_whose_first_python3_is_not_the_shim_is_refused = None
     test_a_shim_that_does_not_exec_the_signed_pin_is_refused = None
     test_a_signed_entrypoint_that_is_not_v2s_is_refused = None
+    test_a_child_started_by_lane_python_stays_isolated = None
+    test_safe_paths_allow_at_and_refuse_shell_characters = None
     test_a_python_start_up_variable_in_the_set_is_refused = None
     test_a_corrupt_floor_is_refused = None
     test_a_fifo_in_the_generation_is_refused = None

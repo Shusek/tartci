@@ -60,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_lane_discovery  # noqa: E402
 import lane_busy  # noqa: E402
+from python_child import child_python  # noqa: E402
 
 SCHEMA = "tartci.gate-supply/v1"
 
@@ -384,7 +385,7 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
                         os.environ.get("TARTCI_TART_INVENTORY_RETRY_TIMEOUT_SECS", "15")):
             try:
                 out = subprocess.run(
-                    [sys.executable, str(Path(__file__).with_name("tart_inventory.py")),
+                    [child_python(), str(Path(__file__).with_name("tart_inventory.py")),
                      "--timeout-seconds", timeout],
                     text=True, capture_output=True, check=False, timeout=float(timeout) + 15,
                     stdin=subprocess.DEVNULL)

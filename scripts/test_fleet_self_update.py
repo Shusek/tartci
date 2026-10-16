@@ -2452,6 +2452,46 @@ class LauncherConsentTests(Base):
             self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
 
 
+class ChildPythonCallSiteTests(unittest.TestCase):
+    """self-update starts every Python child with python_child.child_python():
+    under launcher v2 sys.executable is the bare pin, not the lane's shim."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.shim = Path(td.name) / "python3"
+        self.shim.write_text("#!/bin/sh\nexec true\n")
+        self.shim.chmod(0o755)
+        os.environ["TARTCI_PYTHON"] = str(self.shim)
+        su._PYTHON_SHIM_DIR = None
+        self.addCleanup(setattr, su, "_PYTHON_SHIM_DIR", None)
+
+    def test_system_run_the_path_shim_and_census_use_the_child_interpreter(self) -> None:
+        seen = []
+        with mock.patch.object(su.subprocess, "run",
+                               side_effect=lambda argv, **kw: seen.append(argv) or
+                               subprocess.CompletedProcess(argv, 0, "", "")):
+            su.System().run(["python3", "scripts/x.py"])
+        self.assertEqual(str(self.shim), seen[0][0])
+        directory = su.python_shim_dir()
+        self.assertEqual(str(self.shim), os.readlink(os.path.join(directory, "python3")))
+        self.assertEqual(str(self.shim), su.census_env()["TARTCI_PYTHON"])
+
+    def test_v1_keeps_the_interpreter_it_ran_before(self) -> None:
+        os.environ.pop("TARTCI_PYTHON")
+        seen = []
+        with mock.patch.object(su.subprocess, "run",
+                               side_effect=lambda argv, **kw: seen.append(argv) or
+                               subprocess.CompletedProcess(argv, 0, "", "")):
+            su.System().run(["python3", "scripts/x.py"])
+        self.assertEqual(sys.executable, seen[0][0])
+        self.assertEqual(sys.executable, os.readlink(os.path.join(su.python_shim_dir(), "python3")))
+        self.assertEqual(sys.executable, su.census_env()["TARTCI_PYTHON"])
+
+
 class SealedRollbackTests(Base):
     sealed = True
 
