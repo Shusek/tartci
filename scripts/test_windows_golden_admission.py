@@ -12,6 +12,10 @@ import unittest
 
 VERIFY = Path(__file__).with_name("verify_windows_golden.py")
 SNAPSHOT = VERIFY.parent.parent / "providers/qemu-windows/prepare-golden-snapshot.sh"
+# The snapshot script hashes with the pinned interpreter, which must be 3.11+
+# (tomllib); the test hands it this one.
+NEEDS_PINNABLE = unittest.skipIf(sys.version_info < (3, 11),
+                                 "the snapshot interpreter must be 3.11+ (tomllib)")
 
 
 class WindowsGoldenAdmissionTests(unittest.TestCase):
@@ -88,13 +92,77 @@ class WindowsGoldenAdmissionTests(unittest.TestCase):
         self.assertIn("(hashed)", result.stdout)
         self.assertFalse(record.is_symlink())
 
+    def shadowed_path(self) -> str:
+        # A python3 first on PATH that fails loudly and leaves a trace: the
+        # golden must never be hashed by whatever PATH resolves to.
+        shadow = self.root / "shadow-bin"
+        shadow.mkdir(exist_ok=True)
+        self.shadow_trace = self.root / "shadow-python3-ran"
+        for name in ("python3", "python3.12", "python3.11"):
+            stub = shadow / name
+            stub.write_text(f"#!/bin/sh\ntouch {self.shadow_trace}\nexit 97\n")
+            stub.chmod(0o755)
+        return f"{shadow}:/usr/bin:/bin"
+
+    def snapshot_env(self, **extra):
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        env = {"HOME": str(home), "PATH": self.shadowed_path(),
+               "TARTCI_PYTHON": sys.executable}
+        env.update(extra)
+        return {k: v for k, v in env.items() if v is not None}
+
+    @NEEDS_PINNABLE
+    @unittest.skipUnless(sys.platform == "darwin", "APFS CoW snapshot needs macOS")
+    def test_the_snapshot_is_sealed_hashed_by_the_pinned_interpreter_and_timed(self):
+        import stat  # noqa: PLC0415
+        self.sidecar()
+        snapshot = self.root / "snapshot.qcow2"
+        result = subprocess.run([str(SNAPSHOT), str(self.image), str(snapshot)],
+                                capture_output=True, text=True, check=False,
+                                env=self.snapshot_env())
+        self.addCleanup(lambda: subprocess.run(
+            ["chflags", "nouchg", str(snapshot), f"{snapshot}.sha256"],
+            capture_output=True, check=False))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.shadow_trace.exists(), "PATH's python3 hashed the golden")
+        for path in (snapshot, Path(f"{snapshot}.sha256")):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.stat().st_flags & stat.UF_IMMUTABLE)
+        self.assertRegex(result.stderr, r"Windows snapshot hash: \d+s for \d+ bytes")
+        self.assertIn(sys.executable, result.stderr)
+
+    def test_without_a_pin_under_launchd_the_snapshot_is_refused_not_hashed_by_path(self):
+        self.sidecar()
+        snapshot = self.root / "snapshot.qcow2"
+        result = subprocess.run([str(SNAPSHOT), str(self.image), str(snapshot)],
+                                capture_output=True, text=True, check=False,
+                                env=self.snapshot_env(TARTCI_PYTHON=None, TARTCI_LAUNCHD="1"))
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn("refusing an unpinned interpreter", result.stderr)
+        self.assertFalse(self.shadow_trace.exists())
+        self.assertFalse(snapshot.exists())
+
+    def test_the_windows_providers_never_hash_with_path_python3(self):
+        providers = VERIFY.parent.parent / "providers/qemu-windows"
+        for name in ("runner.sh", "run.sh", "prepare-golden-snapshot.sh"):
+            with self.subTest(name=name):
+                text = (providers / name).read_text()
+                self.assertIn("verify_windows_golden.py", text)
+                for line in text.splitlines():
+                    if "verify_windows_golden.py" in line:
+                        self.assertNotRegex(line, r"(^|\s)python3\s")
+                self.assertIn("tartci_toml_python_path", text)
+
+    @NEEDS_PINNABLE
     @unittest.skipUnless(sys.platform == "darwin", "APFS CoW snapshot needs macOS")
     def test_private_snapshot_survives_source_swap_and_refuses_bad_receipt(self):
         self.sidecar()
         snapshot = self.root / "snapshot.qcow2"
         original = self.image.read_bytes()
         result = subprocess.run([str(SNAPSHOT), str(self.image), str(snapshot)],
-                                capture_output=True, text=True, check=False)
+                                capture_output=True, text=True, check=False,
+                                env=self.snapshot_env())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.addCleanup(lambda: subprocess.run(
             ["chflags", "nouchg", str(snapshot), f"{snapshot}.sha256"],
@@ -109,7 +177,8 @@ class WindowsGoldenAdmissionTests(unittest.TestCase):
         bad.write_bytes(b"other bytes")
         Path(f"{bad}.sha256").write_text("0" * 64 + "  old.qcow2\n")
         refused = subprocess.run([str(SNAPSHOT), str(bad), str(self.root / "refused.qcow2")],
-                                 capture_output=True, text=True, check=False)
+                                 capture_output=True, text=True, check=False,
+                                 env=self.snapshot_env())
         self.assertNotEqual(refused.returncode, 0)
         self.assertFalse((self.root / "refused.qcow2").exists())
 

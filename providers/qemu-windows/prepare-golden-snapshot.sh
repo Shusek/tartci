@@ -5,6 +5,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SOURCE="${1:?source qcow2 required}"
 SNAPSHOT="${2:?snapshot qcow2 required}"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$ROOT/providers/common/toml-python.lib.sh"
+# The caller passes its pinned interpreter as TARTCI_PYTHON; without one this
+# resolves the host pin, and under launchd refuses rather than use PATH.
+PYTHON_BIN="$(tartci_toml_python_path)" || {
+  echo "no pinned interpreter to hash the Windows snapshot with" >&2
+  exit 127
+}
 [[ ! -e "$SNAPSHOT" && ! -L "$SNAPSHOT" ]] || {
   echo "Windows snapshot already exists: $SNAPSHOT" >&2
   exit 1
@@ -39,5 +47,9 @@ cmp -s "$SOURCE.sha256" "$SNAPSHOT.sha256" || {
   exit 1
 }
 chflags uchg "$SNAPSHOT" "$SNAPSHOT.sha256"
-nice -n 20 python3 "$ROOT/scripts/verify_windows_golden.py" --no-cache "$SNAPSHOT"
+# Every job hashes the whole snapshot (about 26 GB): log the cost so it is
+# visible when deciding whether the immutable clone alone would do.
+hash_started="$(date +%s)"
+nice -n 20 "$PYTHON_BIN" "$ROOT/scripts/verify_windows_golden.py" --no-cache "$SNAPSHOT"
+echo "Windows snapshot hash: $(( $(date +%s) - hash_started ))s for $(wc -c <"$SNAPSHOT" | tr -d ' ') bytes ($PYTHON_BIN)" >&2
 snapshot_ready=1

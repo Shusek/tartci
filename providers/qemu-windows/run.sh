@@ -28,6 +28,8 @@ TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -84,7 +86,10 @@ esac
 tartci_vm_leases_enabled || die "manual Windows clone requires a VM lease"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
-nice -n 20 python3 "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN" \
+# The host's pinned interpreter hashes the golden, never PATH's python3.
+GOLDEN_PYTHON="$(tartci_toml_python_path)" \
+  || die "no pinned interpreter to verify the Windows golden with"
+nice -n 20 "$GOLDEN_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN" \
   || die "Windows clone golden failed SHA-256 admission"
 
 # Firmware code + a vars TEMPLATE. The golden's ESP is BOOTAA64-auto-boot, so a
@@ -209,7 +214,8 @@ mkdir "$JOBDIR" || die "Windows job directory already exists or cannot be create
 JOBDIR_OWNED=1
 write_state preparing
 
-"$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$JOBBASE" \
+TARTCI_PYTHON="$GOLDEN_PYTHON" \
+  "$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$JOBBASE" \
   || die "Windows clone golden failed private snapshot admission"
 note "CoW overlay off verified private snapshot → $OVERLAY"
 tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$JOBBASE" -F qcow2 "$OVERLAY" >/dev/null

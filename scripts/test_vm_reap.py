@@ -294,6 +294,73 @@ else:
             self.assertFalse(work.exists())
             self.assertFalse((root / "windows" / f"{job}.state.json").exists())
 
+    def test_unseal_refuses_any_path_but_this_jobs_snapshot(self) -> None:
+        # A state file names the path; a stale or corrupted one must never get
+        # the shared golden (or any other file) unsealed.
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            job = "tartci-win-job-557"
+            work = base / "tartci-win" / job
+            work.mkdir(parents=True)
+            (work / "golden.qcow2").write_bytes(b"private")
+            shared = base / "goldens" / "windows.qcow2"
+            shared.parent.mkdir()
+            shared.write_bytes(b"shared golden")
+            Path(f"{shared}.sha256").write_text("0" * 64 + "  windows.qcow2\n")
+            linked_snapshot = base / "tartci-win" / "job-558"
+            linked_snapshot.mkdir()
+            (linked_snapshot / "golden.qcow2").symlink_to(shared)
+            linked_work = base / "tartci-win" / "job-559"
+            linked_work.symlink_to(base / "goldens", target_is_directory=True)
+            (base / "goldens" / "golden.qcow2").write_bytes(b"other")
+            cases = {
+                "outside the work dir": (work, shared),
+                "a sibling of the snapshot": (work, work / "other.qcow2"),
+                "a linked snapshot": (linked_snapshot, linked_snapshot / "golden.qcow2"),
+                "through a linked work dir": (linked_work, linked_work / "golden.qcow2"),
+            }
+            (work / "other.qcow2").write_bytes(b"other")
+            for name, (work_dir, snapshot) in cases.items():
+                with self.subTest(name), mock.patch.object(vm_reap.os, "chflags",
+                                                           create=True) as chflags:
+                    with self.assertRaises(ValueError):
+                        vm_reap.unseal_windows_snapshot(
+                            {"runner": job, "work_dir": str(work_dir),
+                             "golden_snapshot": str(snapshot)})
+                    chflags.assert_not_called()
+
+    def test_unseal_clears_only_this_jobs_snapshot_and_sidecar(self) -> None:
+        # Control, same instrument: the recorded private snapshot is unsealed.
+        with tempfile.TemporaryDirectory() as td:
+            job = "tartci-win-job-560"
+            work = Path(td) / "tartci-win" / job
+            work.mkdir(parents=True)
+            snapshot = work / "golden.qcow2"
+            snapshot.write_bytes(b"private")
+            Path(f"{snapshot}.sha256").write_text("0" * 64 + "  golden.qcow2\n")
+            with mock.patch.object(vm_reap.os, "chflags", create=True) as chflags:
+                vm_reap.unseal_windows_snapshot(
+                    {"runner": job, "work_dir": str(work), "golden_snapshot": str(snapshot)})
+            self.assertEqual([c.args for c in chflags.call_args_list],
+                             [(snapshot, 0), (Path(f"{snapshot}.sha256"), 0)])
+
+    @unittest.skipUnless(sys.platform == "darwin", "immutable snapshot uses macOS flags")
+    def test_a_refused_unseal_leaves_the_shared_golden_immutable(self) -> None:
+        import stat  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as td:
+            job = "tartci-win-job-561"
+            work = Path(td) / "tartci-win" / job
+            work.mkdir(parents=True)
+            shared = Path(td) / "windows.qcow2"
+            shared.write_bytes(b"shared golden")
+            subprocess.run(["chflags", "uchg", str(shared)], check=True)
+            self.addCleanup(lambda: subprocess.run(["chflags", "nouchg", str(shared)],
+                                                   capture_output=True, check=False))
+            with self.assertRaises(ValueError):
+                vm_reap.unseal_windows_snapshot(
+                    {"runner": job, "work_dir": str(work), "golden_snapshot": str(shared)})
+            self.assertTrue(shared.stat().st_flags & stat.UF_IMMUTABLE)
+
     def test_qemu_snapshot_with_missing_pid_is_preserved(self) -> None:
         for pid, started in (("", ""), ("999998", "")):
             with self.subTest(pid=pid), tempfile.TemporaryDirectory() as td:
