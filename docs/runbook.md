@@ -3621,12 +3621,18 @@ Enable it one host at a time, after a dry run, starting with m1:
 ```sh
 scripts/agent_cargo_reap.py --dry-run      # from the installed generation
 touch ~/.config/tartci/reap-agent-cargo.enabled
+```
+
+Rollout: m1 opted in at 09:09Z on 2026-10-16. Its dry run named nothing: the
+only CACHEDIR.TAG dirs there were two pytest caches, which the reap skips. m5,
+m3 and m5s stay report-only until their own dry runs are reviewed.
+
 ## Git maintenance on shared object stores
 
 Every agent worktree of a repository shares one object store, and any git
 command can start `git maintenance run --auto` or `git repack` in the
 background. On m3 around 07:15Z on 2026-10-16, 53+ of them ran at once on
-`/Volumes/Workshop/Code/pulp` and the load reached 207. Three parts handle
+`<checkout>` and the load reached 207. Three parts handle
 this (`scripts/git_maintenance_guard.py`):
 
 - **Check (every watchdog pass, report only).** More than 3 `git
@@ -3650,7 +3656,7 @@ this (`scripts/git_maintenance_guard.py`):
 Enable it on m3 first:
 
 ```sh
-echo /Volumes/Workshop/Code/pulp > ~/.config/tartci/git-maintenance.repos
+echo "<checkout>" > ~/.config/tartci/git-maintenance.repos   # the shared checkout, absolute
 scripts/git_maintenance_guard.py enforce
 scripts/git_maintenance_guard.py nightly --dry-run
 touch ~/.config/tartci/git-maintenance.enabled

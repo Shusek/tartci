@@ -382,7 +382,7 @@ exit 0
                         "Label": linux_label,
                         "ProgramArguments": [
                             "/bin/bash",
-                            "/Users/danielraffel/.local/share/tartci/providers/tart-linux/runner.sh",
+                            "/Users/example/.local/share/tartci/providers/tart-linux/runner.sh",
                             "--loop",
                         ],
                     },
@@ -424,7 +424,7 @@ exit 0
                         "Label": unknown_label,
                         "ProgramArguments": [
                             "/bin/bash",
-                            "/Users/danielraffel/.local/share/tartci/providers/tart-unknown/runner.sh",
+                            "/Users/example/.local/share/tartci/providers/tart-unknown/runner.sh",
                             "--loop",
                         ],
                     },
