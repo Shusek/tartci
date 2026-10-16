@@ -84,11 +84,16 @@ canary and rollback evidence.
 ## Progress update
 
 The resolver now rejects symlinked source files, malformed profile TOML,
-profile metadata that names a different file set, and malformed repository
-coordinates. Selected-source receipts now include the profile, published-supply,
-and complete-tree digests. The focused source, source-sync, self-update,
-published-supply, lane, and installer tests pass. M1 lint and the public-path
-audit remain required before a review request.
+profile metadata that names a different file set, malformed repository
+coordinates, and non-UTF-8 marker or supply files. Selected-source receipts now
+include the profile, published-supply, and complete-tree digests. The focused
+source, source-sync, self-update, published-supply, lane, and installer tests
+pass. The exact published head was checked out in an isolated M1 worktree;
+M1 lint and the source, source-sync, and self-update suites passed there.
+
+The branch is published for review at
+`feat/private-profile-source-refresh-20261016`. It has not been merged or
+installed on a fleet host.
 
 ## Stop conditions
 
