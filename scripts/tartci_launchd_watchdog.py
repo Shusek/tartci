@@ -1371,6 +1371,18 @@ def scratch_vm_pass(now: float | None = None, tart=None) -> str | None:
     return "\n".join(lines) or None
 
 
+def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
+    """Disk floor and foreign VMs on this host, report-only
+    (scripts/host_hygiene.py). Off unless the host opts in. Never raises."""
+    try:
+        import host_hygiene  # noqa: PLC0415 - sibling module
+        lines = host_hygiene.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-hygiene check FAILED "
+                f"({type(exc).__name__}: {exc}); a full disk or a stray VM would not be reported")
+    return "\n".join(lines) or None
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1745,6 +1757,9 @@ def main(argv: list[str] | None = None) -> int:
         scratch_line = scratch_vm_pass()
         if scratch_line:
             print(scratch_line)
+        hygiene_line = host_hygiene_pass()
+        if hygiene_line:
+            print(hygiene_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
