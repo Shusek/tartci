@@ -106,9 +106,36 @@ struct Policy: Decodable {
 struct Pointer: Decodable { let schema: Int; let generation: String }
 struct Floor: Codable { let schema: Int; let sequence: Int; let previous_sequence: Int? }
 struct Entrypoint: Decodable { let path: String; let sha256: String }
+struct PythonPin: Decodable { let pin: String; let shim: Entrypoint }
 struct LaunchSet: Decodable {
     let schema: Int; let sequence: Int; let tart_home: String; let manifest_sha256: String
-    let entrypoint: Entrypoint; let lanes: [String: Lane]
+    let entrypoint: Entrypoint; let python: PythonPin; let lanes: [String: Lane]
+}
+// v2's own entrypoint and interpreter shim (scripts/launch_set.py builds the
+// same bytes). Lane Python runs only through the shim: the pinned
+// interpreter with -B -E -s -S, so no site-packages .pth or sitecustomize,
+// user site or PYTHON* variable runs; -I is not used because its -P drops the
+// script directory sibling imports need.
+private let entrypointName = ".tartci-launch-v2"
+private let shimName = "bin/python3"
+private let shimFlags = "-B -E -s -S"
+private func isSafePath(_ path: String) -> Bool {
+    path.range(of: "^/[A-Za-z0-9._+@/-]+$", options: .regularExpression) != nil
+}
+private func shimBytes(_ pin: String) -> Data { Data("#!/bin/sh\nexec \(pin) \(shimFlags) \"$@\"\n".utf8) }
+private func entrypointBytes(_ generation: String) -> Data {
+    Data(("#!/bin/bash\n"
+        + "\(generation)/\(shimName) \(generation)/scripts/tartci_support_manifest.py verify "
+        + "\(generation)/.tartci-support-manifest.json --root \(generation) --immutable >/dev/null || exit $?\n"
+        + "exec /bin/bash \(generation)/tartci \"$@\"\n").utf8)
+}
+/// The first python3 on PATH, or nil.
+private func firstPython(onPath path: String) -> String? {
+    for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
+        let candidate = String(directory) + "/python3"
+        if !directory.isEmpty, access(candidate, X_OK) == 0 { return candidate }
+    }
+    return nil
 }
 struct ManifestMember: Decodable { let path: String; let sha256: String }
 struct SupportManifest: Decodable { let members: [ManifestMember] }
@@ -296,10 +323,19 @@ private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String
     do { manifest = try JSONDecoder().decode(SupportManifest.self, from: manifestData) }
     catch { fail("support manifest is malformed: \(error)", code: 77) }
     for member in manifest.members { _ = requireMember(generation, member.path, member.sha256) }
-    guard set.entrypoint.path == ".tartci-launch" else { fail("unexpected entrypoint \(set.entrypoint.path)", code: 77) }
+    guard set.entrypoint.path == entrypointName else { fail("unexpected entrypoint \(set.entrypoint.path)", code: 77) }
+    guard isSafePath(generation), sha256Hex(entrypointBytes(generation)) == set.entrypoint.sha256 else {
+        fail("entrypoint is not v2's for this generation", code: 77)
+    }
     let launch = requireMember(generation, set.entrypoint.path, set.entrypoint.sha256)
+    // The shim must exec exactly the signed pin.
+    guard set.python.shim.path == shimName, isSafePath(set.python.pin),
+          sha256Hex(shimBytes(set.python.pin)) == set.python.shim.sha256 else {
+        fail("interpreter shim does not exec the signed pin", code: 77)
+    }
+    let shim = requireMember(generation, set.python.shim.path, set.python.shim.sha256)
     requireNothingUnhashed(generation, allowed: Set(manifest.members.map { $0.path } + [
-        set.entrypoint.path, ".tartci-launch-set.json", ".tartci-launch-set.sig",
+        set.entrypoint.path, set.python.shim.path, ".tartci-launch-set.json", ".tartci-launch-set.sig",
         ".tartci-support-manifest.json"]))
     guard let lane = set.lanes[laneID] else { fail("lane is not in the signed launch set", code: 77) }
     guard lane.environment["TART_HOME"] == policy.tart_home else { fail("signed lane has the wrong Tart store", code: 77) }
@@ -312,12 +348,23 @@ private func resolveV2(_ policy: Policy, lane laneID: String) -> (String, String
     if let python = lane.environment.keys.sorted().first(where: { $0.hasPrefix("PYTHON") }) {
         fail("signed lane sets \(python); Python start-up variables are the launcher's", code: 77)
     }
+    for key in ["TARTCI_PYTHON", "SHIPYARD_GHAPP_PYTHON_BINARY"] {
+        if let named = lane.environment[key], named != shim {
+            fail("signed lane \(key) is \(named), not the generation's interpreter shim", code: 77)
+        }
+    }
     recordFloor(policy, set.sequence)
-    // No bytecode is written beside the source, and the user site-packages
-    // (~/Library/Python/...), whose .pth files run at start-up, is not used.
+    // Every python3 a lane runs by name or by TARTCI_PYTHON is the shim. A
+    // call that names /usr/bin/python3 explicitly is not: its site-packages is
+    // root-owned, and PYTHONNOUSERSITE keeps its user site out.
     var environment = lane.environment
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONNOUSERSITE"] = "1"
+    environment["TARTCI_PYTHON"] = shim
+    environment["PATH"] = generation + "/bin:" + (lane.environment["PATH"] ?? "/usr/bin:/bin")
+    guard let first = firstPython(onPath: environment["PATH"]!), first == shim else {
+        fail("the first python3 on the lane's PATH is not the interpreter shim", code: 77)
+    }
     return (launch, set.entrypoint.sha256, environment)
 }
 private func probeStore(_ store: String) -> Never {

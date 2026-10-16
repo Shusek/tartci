@@ -45,7 +45,19 @@ SCHEMA = 1
 SET_NAME = ".tartci-launch-set.json"
 SIG_NAME = ".tartci-launch-set.sig"
 MANIFEST_NAME = ".tartci-support-manifest.json"
-ENTRYPOINT = ".tartci-launch"
+# v2's own entrypoint and interpreter shim. The v1 `.tartci-launch` (the
+# canonical wrapper bytes every v1 host checks) is not touched.
+ENTRYPOINT = ".tartci-launch-v2"
+SHIM = "bin/python3"
+# Lane Python never runs site (-S: no site-packages .pth or sitecustomize,
+# including a user-owned Homebrew site-packages), the user site (-s) or
+# PYTHON* variables (-E), and writes no bytecode (-B). -I is not used: it also
+# implies -P, which drops the script's own directory that sibling imports need.
+SHIM_FLAGS = "-B -E -s -S"
+# Paths written into the shim and entrypoint unquoted, so the launcher can
+# rebuild the exact bytes: absolute, no space, quote or shell metacharacter.
+SAFE_PATH = re.compile(r"^/[A-Za-z0-9._+@/-]+$")
+INTERPRETER_KEYS = ("TARTCI_PYTHON", "SHIPYARD_GHAPP_PYTHON_BINARY")
 LAUNCH_SET_IDENTIFIER = "com.danielraffel.tartci.launch-set"
 POINTER_SCHEMA = 1
 TEAM_ID = re.compile(r"^[A-Z0-9]{10}$")
@@ -75,7 +87,35 @@ def requirement(team_id: str) -> str:
             f' and identifier "{LAUNCH_SET_IDENTIFIER}"')
 
 
-def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int) -> dict:
+def shim_bytes(pin: str) -> bytes:
+    """The generation's bin/python3: the pinned interpreter, isolated."""
+    if not SAFE_PATH.fullmatch(pin):
+        raise LaunchSetError(f"pinned interpreter is not a plain absolute path: {pin!r}")
+    return f'#!/bin/sh\nexec {pin} {SHIM_FLAGS} "$@"\n'.encode()
+
+
+def entrypoint_bytes(generation: Path) -> bytes:
+    """v2's entrypoint: verify the support cohort through the shim, then run it."""
+    root = str(generation)
+    if not SAFE_PATH.fullmatch(root):
+        raise LaunchSetError(f"generation path is not a plain absolute path: {root!r}")
+    return ("#!/bin/bash\n"
+            f"{root}/{SHIM} {root}/scripts/tartci_support_manifest.py verify "
+            f"{root}/{MANIFEST_NAME} --root {root} --immutable >/dev/null || exit $?\n"
+            f'exec /bin/bash {root}/tartci "$@"\n').encode()
+
+
+def write_runtime(generation: Path, pin: str) -> None:
+    """Write v2's entrypoint and interpreter shim into a writable generation."""
+    (generation / "bin").mkdir(exist_ok=True)
+    for relative, data in ((SHIM, shim_bytes(pin)), (ENTRYPOINT, entrypoint_bytes(generation))):
+        path = generation / relative
+        path.unlink(missing_ok=True)
+        path.write_bytes(data)
+        os.chmod(path, 0o555)
+
+
+def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int, python: str) -> dict:
     """The launch set for one generation from its manifest and rendered lanes."""
     manifest = generation / MANIFEST_NAME
     entry = generation / ENTRYPOINT
@@ -85,6 +125,14 @@ def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int) -> di
         raise LaunchSetError(f"unreadable support manifest {manifest}: {exc}") from exc
     if type(sequence) is not int or sequence < 1:
         raise LaunchSetError("a launch set needs a positive integer sequence")
+    shim_path = str(generation / SHIM)
+    for relative, expected in ((SHIM, shim_bytes(python)), (ENTRYPOINT, entrypoint_bytes(generation))):
+        try:
+            actual = (generation / relative).read_bytes()
+        except OSError as exc:
+            raise LaunchSetError(f"{relative} is missing; write_runtime writes it") from exc
+        if actual != expected:
+            raise LaunchSetError(f"{relative} is not the expected bytes for this generation and pin")
     if not lanes or not all(isinstance(k, str) and LANE.fullmatch(k) for k in lanes):
         raise LaunchSetError("a launch set needs at least one valid lane id")
     for lane, row in lanes.items():
@@ -93,10 +141,14 @@ def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int) -> di
             raise LaunchSetError(f"lane {lane} does not run on the Tart store {tart_home}")
         if any(key.startswith("DYLD_") for key in env):
             raise LaunchSetError(f"lane {lane} sets a dynamic-loader variable")
-        python = sorted(key for key in env if key.startswith("PYTHON"))
-        if python:
-            raise LaunchSetError(f"lane {lane} sets {python[0]}; Python start-up variables "
+        variables = sorted(key for key in env if key.startswith("PYTHON"))
+        if variables:
+            raise LaunchSetError(f"lane {lane} sets {variables[0]}; Python start-up variables "
                                  "are the launcher's")
+        for key in INTERPRETER_KEYS:
+            if key in env and env[key] not in (python, shim_path):
+                raise LaunchSetError(f"lane {lane} {key} is {env[key]}, not the pinned "
+                                     f"interpreter {python}")
     return {
         "schema": SCHEMA,
         "sequence": sequence,
@@ -104,7 +156,12 @@ def build(generation: Path, lanes: dict, *, tart_home: str, sequence: int) -> di
         "tart_home": tart_home,
         "manifest_sha256": _sha256(manifest),
         "entrypoint": {"path": ENTRYPOINT, "sha256": _sha256(entry)},
-        "lanes": {lane: {"environment": dict(sorted(row["environment"].items()))}
+        "python": {"pin": python, "shim": {"path": SHIM, "sha256": _sha256(generation / SHIM)}},
+        # Every interpreter a lane names is the shim.
+        "lanes": {lane: {"environment": dict(sorted(
+                      {**row["environment"],
+                       **{key: shim_path for key in INTERPRETER_KEYS
+                          if key in row["environment"]}}.items()))}
                   for lane, row in sorted(lanes.items())},
     }
 
@@ -204,8 +261,9 @@ def verify_contents(generation: Path, root: Path) -> Optional[str]:
     if hashlib.sha256(manifest_bytes).hexdigest() != value.get("manifest_sha256"):
         return "the support manifest does not match the launch set"
     entry = value.get("entrypoint") or {}
-    allowed = {m.get("path") for m in members} | {entry.get("path"), SET_NAME, SIG_NAME,
-                                                  MANIFEST_NAME}
+    shim = (value.get("python") or {}).get("shim") or {}
+    allowed = {m.get("path") for m in members} | {entry.get("path"), shim.get("path"),
+                                                  SET_NAME, SIG_NAME, MANIFEST_NAME}
     for dirpath, dirs, files in os.walk(generation):
         for name in dirs + files:
             full = Path(dirpath) / name
@@ -219,7 +277,7 @@ def verify_contents(generation: Path, root: Path) -> Optional[str]:
             if full.is_file() and relative not in allowed:
                 return f"{relative} is not in the signed manifest"
     for relative, expected in [(m.get("path"), m.get("sha256")) for m in members] + [
-            (entry.get("path"), entry.get("sha256"))]:
+            (entry.get("path"), entry.get("sha256")), (shim.get("path"), shim.get("sha256"))]:
         if (not isinstance(relative, str) or relative.startswith("/")
                 or any(part in ("", ".", "..") for part in relative.split("/"))):
             return f"unsafe member path {relative!r}"

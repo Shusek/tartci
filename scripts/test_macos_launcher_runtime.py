@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -144,13 +145,15 @@ class LauncherRuntimeTests(unittest.TestCase):
 V2_TEAM = "AB12CD34EF"
 V2_STORE = "/Volumes/Example/VMs"
 V2_TEST_REQUIREMENT = 'identifier "com.danielraffel.tartci.launch-set"'
-V2_ENTRY = (
-    "#!/bin/sh\n"
+# The generation's `tartci`, reached through v2's real entrypoint (which first
+# verifies the cohort through the interpreter shim).
+V2_TARTCI = (
+    "#!/bin/bash\n"
     "case \"$TARTCI_TEST_MODE\" in\n"
     "  exit-zero) exit 0 ;;\n"
     "  exit-one) exit 1 ;;\n"
-    "  env) echo \"${PYTHONDONTWRITEBYTECODE-unset}:${PYTHONNOUSERSITE-unset}\" > \"$HOME/env.out\"; exit 0 ;;\n"
-    "  python) for py in $TARTCI_TEST_PYTHONS; do \"$py\" -c pass || exit 98; done; exit 0 ;;\n"
+    "  env) echo \"${PYTHONDONTWRITEBYTECODE-unset}:${PYTHONNOUSERSITE-unset}:$TARTCI_PYTHON:$(command -v python3)\" > \"$HOME/env.out\"; exit 0 ;;\n"
+    "  python) \"$TARTCI_PYTHON\" -c pass && python3 -c pass || exit 98; exit 0 ;;\n"
     "  *) exit 99 ;;\n"
     "esac\n"
 )
@@ -171,11 +174,24 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         import test_launch_set
         cls.ls, cls.fixture = launch_set, test_launch_set
         cls.temp = tempfile.TemporaryDirectory()
-        cls.base = Path(cls.temp.name)
+        cls.base = Path(os.path.realpath(cls.temp.name))
         cls.launcher = cls.base / "TartCILauncher.app/Contents/MacOS/tartci-launcher"
         cls.launcher.parent.mkdir(parents=True)
         subprocess.run(["xcrun", "swiftc", "-O", "-D", "TARTCI_TESTING", "-framework", "Security",
                         str(SOURCE), "-o", str(cls.launcher)], check=True)
+        cls.make_venv()
+
+    @classmethod
+    def make_venv(cls) -> None:
+        """A scratch venv: the pinned interpreter, and the stand-in for a
+        user-owned global site-packages (nothing is planted in /opt/homebrew)."""
+        import sys
+        cls.venv = cls.base / "venv"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(cls.venv)], check=True)
+        cls.pin = str(cls.venv / "bin/python3")
+        cls.venv_site = Path(subprocess.run(
+            [cls.pin, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            capture_output=True, text=True, check=True).stdout.strip())
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -196,14 +212,11 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         self.pointer = self.home / ".config/tartci/launcher-generation.json"
         self.floor = self.home / ".config/tartci/launcher-floor.json"
         self.write_policy(self.root)
-        self.generation = self.fixture.make_generation(self.root)
-        (self.generation / self.ls.ENTRYPOINT).write_text(V2_ENTRY)
+        self.generation = self.fixture.make_generation(self.root, pin=self.pin, tartci=V2_TARTCI)
         self.lanes = {mode: {"environment": {"HOME": str(work), "PATH": "/usr/bin:/bin",
-                                             "TART_HOME": V2_STORE, "TARTCI_TEST_MODE": mode}}
+                                             "TART_HOME": V2_STORE, "TARTCI_TEST_MODE": mode,
+                                             "TARTCI_PYTHON": self.pin}}
                       for mode in ("exit-zero", "exit-one", "env", "python")}
-        self.pythons = [p for p in ("/usr/bin/python3", "/opt/homebrew/bin/python3.11")
-                        if os.access(p, os.X_OK)]
-        self.lanes["python"]["environment"]["TARTCI_TEST_PYTHONS"] = " ".join(self.pythons)
         self.seal()
 
     def write_policy(self, root) -> None:
@@ -227,7 +240,7 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         for name in (self.ls.SET_NAME, self.ls.SIG_NAME):
             (self.generation / name).unlink(missing_ok=True)
         self.ls.write(self.generation, value or self.ls.build(self.generation, self.lanes,
-                                                              tart_home=V2_STORE, sequence=sequence))
+                                                              tart_home=V2_STORE, python=self.pin, sequence=sequence))
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", identifier,
                         "--detached", str(self.generation / self.ls.SIG_NAME),
                         str(self.generation / self.ls.SET_NAME)], check=True, capture_output=True)
@@ -323,7 +336,7 @@ class LauncherV2RuntimeTests(unittest.TestCase):
                 self.assertRefused("pointer names no generation")
 
     def test_a_signed_lane_on_another_store_is_refused(self) -> None:
-        value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, sequence=1)
+        value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, python=self.pin, sequence=1)
         value["lanes"]["exit-zero"]["environment"]["TART_HOME"] = "/Volumes/Example2/VMs"
         self.seal(value=value)
         self.assertRefused("wrong Tart store")
@@ -354,36 +367,97 @@ class LauncherV2RuntimeTests(unittest.TestCase):
         self.plant("planted.py")
         self.assertRefused("planted.py is not in the signed manifest")
 
-    def test_python_writes_no_bytecode_and_skips_the_user_site(self) -> None:
+    def test_lanes_get_the_shim_and_no_bytecode_or_user_site(self) -> None:
         self.assertEqual(0, self.run_lane("env").returncode, self.run_lane("env").stderr)
-        self.assertEqual("1:1\n", (self.work / "env.out").read_text())
+        shim = f"{self.generation}/bin/python3"
+        self.assertEqual(f"1:1:{shim}:{shim}\n", (self.work / "env.out").read_text())
 
-    def test_a_planted_user_site_pth_does_not_run(self) -> None:
-        # The lane's HOME is the scratch work dir: plant a .pth in each
-        # interpreter's user site-packages there.
+    def repin(self, pin: str) -> None:
+        """Rewrite the shim and entrypoint for another pinned interpreter and re-seal."""
+        for dirpath, _dirs, _files in os.walk(self.generation):
+            os.chmod(dirpath, 0o755)
+        self.ls.write_runtime(self.generation, pin)
+        self.pin = pin
+        for row in self.lanes.values():
+            row["environment"]["TARTCI_PYTHON"] = pin
+        self.seal()
+
+    def plant_site(self, site: Path, marker: Path) -> None:
+        site.mkdir(parents=True, exist_ok=True)
+        touch = f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n"
+        (site / "tartci-plant.pth").write_text(touch)
+        for name in ("sitecustomize.py", "usercustomize.py"):
+            (site / name).write_text(touch.replace("planted", name))
+
+    def assertPlantsDoNotRun(self, interpreter: str, site: Path) -> None:
         marker = self.work / "planted.ran"
-        for py in self.pythons:
-            site = subprocess.run([py, "-c", "import site; print(site.getusersitepackages())"],
-                                  env={"HOME": str(self.work), "PATH": "/usr/bin:/bin"},
-                                  capture_output=True, text=True, check=True).stdout.strip()
-            self.assertTrue(site.startswith(str(self.work)), site)
-            Path(site).mkdir(parents=True, exist_ok=True)
-            (Path(site) / "tartci-plant.pth").write_text(
-                f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n")
-        # Control: the plant runs when Python starts without the guard.
-        for py in self.pythons:
-            subprocess.run([py, "-c", "pass"], env={"HOME": str(self.work), "PATH": "/usr/bin:/bin"},
-                           check=True)
-            self.assertTrue(marker.exists(), py)
-            marker.unlink()
+        self.plant_site(site, marker)
+        # Control: started plainly, the plants run.
+        subprocess.run([interpreter, "-c", "pass"],
+                       env={"HOME": str(self.work), "PATH": "/usr/bin:/bin"}, check=True)
+        self.assertTrue(marker.exists(), "the plant must run without the shim")
+        marker.unlink()
         result = self.run_lane("python")
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertFalse(marker.exists(), "a user-site .pth ran under the launcher")
+        self.assertFalse(marker.exists(), "a planted .pth or sitecustomize ran under the launcher")
+
+    def test_a_planted_global_site_pth_or_sitecustomize_does_not_run(self) -> None:
+        self.assertPlantsDoNotRun(self.pin, self.venv_site)
+
+    def test_a_planted_user_site_pth_or_usercustomize_does_not_run(self) -> None:
+        brew = "/opt/homebrew/bin/python3.11"
+        if not os.access(brew, os.X_OK):
+            self.skipTest("no Homebrew python3.11 to pin")
+        self.repin(brew)
+        site = Path(subprocess.run([brew, "-c", "import site; print(site.getusersitepackages())"],
+                                   env={"HOME": str(self.work), "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, check=True).stdout.strip())
+        self.assertTrue(str(site).startswith(str(self.work)), site)
+        self.assertPlantsDoNotRun(brew, site)
+
+    def test_a_lane_interpreter_that_is_not_the_shim_is_refused(self) -> None:
+        for key in ("TARTCI_PYTHON", "SHIPYARD_GHAPP_PYTHON_BINARY"):
+            with self.subTest(key=key):
+                value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE,
+                                      python=self.pin, sequence=1)
+                value["lanes"]["exit-zero"]["environment"][key] = "/usr/bin/python3"
+                self.seal(value=value)
+                self.assertRefused(f"signed lane {key} is /usr/bin/python3")
+
+    def test_a_path_whose_first_python3_is_not_the_shim_is_refused(self) -> None:
+        # A shim that cannot be executed leaves PATH's first python3 elsewhere.
+        shim = self.generation / "bin/python3"
+        os.chmod(self.generation / "bin", 0o755)
+        os.chmod(shim, 0o444)
+        os.chmod(self.generation / "bin", 0o555)
+        self.assertRefused("the first python3 on the lane's PATH is not the interpreter shim")
+
+    def test_a_signed_entrypoint_that_is_not_v2s_is_refused(self) -> None:
+        # Hashed and signed, but not the entrypoint v2 builds for this
+        # generation (it would run Python without the shim).
+        value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, python=self.pin,
+                              sequence=1)
+        other = b'#!/bin/bash\nexec /bin/bash "$(dirname "$0")/tartci" "$@"\n'
+        entry = self.generation / self.ls.ENTRYPOINT
+        os.chmod(self.generation, 0o755)
+        os.chmod(entry, 0o755)
+        entry.write_bytes(other)
+        os.chmod(entry, 0o555)
+        value["entrypoint"]["sha256"] = hashlib.sha256(other).hexdigest()
+        self.seal(value=value)
+        self.assertRefused("entrypoint is not v2's for this generation")
+
+    def test_a_shim_that_does_not_exec_the_signed_pin_is_refused(self) -> None:
+        value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, python=self.pin,
+                              sequence=1)
+        value["python"]["pin"] = "/usr/bin/python3"
+        self.seal(value=value)
+        self.assertRefused("interpreter shim does not exec the signed pin")
 
     def test_a_python_start_up_variable_in_the_set_is_refused(self) -> None:
-        for name in ("PYTHONPATH", "PYTHONPYCACHEPREFIX", "PYTHONSTARTUP", "PYTHONHOME"):
+        for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONPYCACHEPREFIX"):
             with self.subTest(name=name):
-                value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, sequence=1)
+                value = self.ls.build(self.generation, self.lanes, tart_home=V2_STORE, python=self.pin, sequence=1)
                 value["lanes"]["exit-zero"]["environment"][name] = str(self.work)
                 self.seal(value=value)
                 self.assertRefused(f"signed lane sets {name}")
@@ -458,7 +532,7 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
         import test_launch_set
         cls.ls, cls.fixture = launch_set, test_launch_set
         cls.temp = tempfile.TemporaryDirectory()
-        cls.base = Path(cls.temp.name)
+        cls.base = Path(os.path.realpath(cls.temp.name))
         app = cls.base / "TartCILauncher.app"
         cls.launcher = app / "Contents/MacOS/tartci-launcher"
         cls.launcher.parent.mkdir(parents=True)
@@ -471,6 +545,7 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
             "<key>CFBundleIdentifier</key><string>com.example.tartci.launcher-test</string>"
             "<key>CFBundlePackageType</key><string>APPL</string></dict></plist>")
         cls.app = app
+        cls.make_venv()
 
     def setUp(self) -> None:
         super().setUp()
@@ -495,8 +570,13 @@ class LauncherV2ProductionTests(LauncherV2RuntimeTests):
     test_a_planted_bytecode_cache_is_refused = None
     test_a_planted_file_outside_the_manifest_is_refused = None
     test_an_empty_bytecode_cache_directory_is_refused = None
-    test_python_writes_no_bytecode_and_skips_the_user_site = None
-    test_a_planted_user_site_pth_does_not_run = None
+    test_lanes_get_the_shim_and_no_bytecode_or_user_site = None
+    test_a_planted_global_site_pth_or_sitecustomize_does_not_run = None
+    test_a_planted_user_site_pth_or_usercustomize_does_not_run = None
+    test_a_lane_interpreter_that_is_not_the_shim_is_refused = None
+    test_a_path_whose_first_python3_is_not_the_shim_is_refused = None
+    test_a_shim_that_does_not_exec_the_signed_pin_is_refused = None
+    test_a_signed_entrypoint_that_is_not_v2s_is_refused = None
     test_a_python_start_up_variable_in_the_set_is_refused = None
     test_a_corrupt_floor_is_refused = None
     test_a_fifo_in_the_generation_is_refused = None
