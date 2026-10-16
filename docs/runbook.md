@@ -2165,7 +2165,7 @@ running supervisor (one that crash-loops before its first heartbeat, or
 cannot write its state file) reads idle when the process tree and the lease
 store show no VM, so it never blocks `pool off` or a reload. Wait for the lane to go idle,
 or `tartci pool drain`; the explicit
-override that accepts killing the job is `--allow-mid-job`.
+override that accepts killing the job is `--force` (`--allow-mid-job` still works).
 
 `--dry-run` runs every precondition, including the mid-job probe, and prints
 the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) or
@@ -3398,8 +3398,32 @@ lanes change.
   orphan blocks rejoin, run `pool off`, then `pool repair-lock`, then `pool on`.
   `pool off` there refuses with exit 12 while an owned lane is mid-job (or its
   busy state is unreadable): wait for the job, or use `pool drain`, and re-run
-  it. Reach for `pool off --now` only when killing that job is intended;
-  `pool off --plan` names the lane and process first.
+  it. Reach for `pool off --force` (or `--now`) only when killing that job is
+  intended; `pool off --plan` names the lane and process first.
+- **Who changed the pool.** Every `tartci pool on|off|drain|undrain`, and
+  every `tartci launchd reload` except `--dry-run`, appends one JSON line to
+  `~/Library/Logs/tartci/manual-changes.log`. A refused attempt is recorded
+  too. Each line has:
+  - the action, its arguments, and the outcome (refused, proceeding, forced
+    or requested);
+  - how the caller got there: `launchd` with its job label, `ssh` with the
+    client address and tty, or `terminal`;
+  - up to eight parent processes with their command lines.
+
+  Credentials in those command lines are redacted before the write:
+  - the value of a variable or flag whose name ends in TOKEN, KEY, SECRET,
+    PASSWORD or CREDENTIAL(S), so `StrictHostKeyChecking=` and `--keychain`
+    survive;
+  - a URL's `user:pass@`;
+  - `security unlock-keychain -p` passwords;
+  - curl `-u`/`--user USER:PASS`;
+  - `Authorization:` and `Bearer` values;
+  - GitHub token shapes (`ghp_`, `gho_`, `ghs_`, `github_pat_`). The file is owner-only (0600), and a file
+  that already exists is tightened to 0600 on the next write.
+
+  On m5 at 05:19Z on 2026-10-16 an off/on over ssh killed two required jobs
+  and left no record of who ran it. To find the next one:
+  `tail ~/Library/Logs/tartci/manual-changes.log | python3 -m json.tool --json-lines`.
   Providers check for an already-present transition lock before allocating a
   port or VM lease and before cloning or booting. The existing serialized check
   immediately before JIT mint remains authoritative for a lock created after
