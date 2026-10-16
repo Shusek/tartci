@@ -1342,6 +1342,22 @@ def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -
                 f"({type(exc).__name__}: {exc})")
 
 
+def interpreter_grant_pass(now: float | None = None, probe=None, issue=None,
+                           close=None) -> str | None:
+    """About hourly, prove this host's current lane interpreters can still use
+    the VM store from launchd, and raise one issue when one cannot
+    (scripts/interpreter_grant_check.py). Never takes the host off; never raises."""
+    try:
+        import interpreter_grant_check as grant  # noqa: PLC0415 - sibling module
+        kwargs = {"issue": issue, "close": close}
+        if probe is not None:
+            kwargs["probe"] = probe
+        return grant.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter-grant check FAILED "
+                f"({type(exc).__name__}: {exc}); a revoked grant would not be reported")
+
+
 def tailnet_pass(now: float | None = None) -> str | None:
     """Tell someone when a fleet host is off the tailnet or a fallback route
     to it is broken (scripts/tailnet_peer_alert.py).
@@ -1706,6 +1722,9 @@ def main(argv: list[str] | None = None) -> int:
         interpreter_line = interpreter_refusal_pass()
         if interpreter_line:
             print(interpreter_line)
+        grant_line = interpreter_grant_pass()
+        if grant_line:
+            print(grant_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
