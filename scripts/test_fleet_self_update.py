@@ -81,6 +81,8 @@ class FakeSystem(su.System):
         self.remote_url = su.REPO_URL + "\n"
         self.api_repository = su.DEFAULT_REPOSITORY
         self.unreadable_repositories: set[str] = set()
+        # repository -> results to return, one per read, before answering normally
+        self.repository_failures: dict[str, list] = {}
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -160,6 +162,8 @@ class FakeSystem(su.System):
             return self.launchd_print or su.Result(1, "", "not configured")
         if a[0] == FAKE_GH:
             repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if self.repository_failures.get(repository):
+                return self.repository_failures[repository].pop(0)
             if repository in self.unreadable_repositories:
                 return su.Result(1, "", "not found")
             if "check-runs" in a[2]:
@@ -3010,6 +3014,45 @@ class RepositoryIdentityTests(Base):
         self.assertEqual(receipt["steps"][-1]["step"], "refused")
         self.assertEqual(json.loads((self.cfg.state_dir / "skew.json").read_text())["state"],
                          "unknown")
+
+    HUNG = "TimeoutExpired: Command '['ghapp', 'api', 'repos/x']' timed out after 60 seconds"
+
+    def reads(self) -> list[str]:
+        return [a[2] for a, _ in self.sys.calls if a and a[0] == FAKE_GH]
+
+    def test_a_read_that_timed_out_is_retried_once_and_then_succeeds(self):
+        # m1, 2026-10-16: one hung read refused the whole self-update.
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.repository_failures[su.LEGACY_REPOSITORY] = [su.Result(127, "", self.HUNG)]
+        before = self.sys.clock
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.configured_repository(self.cfg, self.sys), su.LEGACY_REPOSITORY)
+        self.assertEqual(self.reads(), [f"repos/{su.LEGACY_REPOSITORY}"] * 2)
+        self.assertEqual(self.sys.clock - before, su.REPOSITORY_READ_RETRY_SECONDS)
+
+    def test_reads_that_keep_hanging_refuse_naming_each_failure(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.repository_failures[repository] = [su.Result(127, "", self.HUNG)] * 2
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            with self.assertRaises(su.Refused) as caught:
+                su.configured_repository(self.cfg, self.sys)
+        message = str(caught.exception)
+        self.assertIn("no accepted TartCI repository is readable", message)
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.assertIn(f"{repository}: exit 127: TimeoutExpired", message)
+        self.assertEqual(message.count("(after one retry)"), 2)
+        self.assertEqual(len(self.reads()), 4)
+
+    def test_a_definite_answer_is_not_retried(self):
+        # Control: a 404 is an answer, not a transport failure.
+        self.sys.unreadable_repositories.update({su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY})
+        before = self.sys.clock
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            with self.assertRaises(su.Refused) as caught:
+                su.configured_repository(self.cfg, self.sys)
+        self.assertEqual(len(self.reads()), 2)
+        self.assertEqual(self.sys.clock, before)
+        self.assertIn(f"{su.LEGACY_REPOSITORY}: exit 1: not found", str(caught.exception))
 
     def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
         self.sys.api_repository = su.LEGACY_REPOSITORY
