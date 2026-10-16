@@ -65,6 +65,7 @@ class FakeSystem(su.System):
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
         self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
+        self.peer_paused: set[str] = set()   # peers whose self-update an operator paused
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
@@ -235,7 +236,9 @@ class FakeSystem(su.System):
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
                       + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
                       + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
-                         if pool_since is not None else ""))
+                         if pool_since is not None else "")
+                      + ("\n" + su.PAUSED_SEPARATOR + "\npaused\n"
+                         if peer in self.peer_paused else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -1021,13 +1024,57 @@ class PeerTurnReplayTests(Base):
                       peers_step["detail"])
 
     def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
-        # Control, same instrument: only the drain's age changed.
+        # Control, same instrument: only the drain's age changed. Inside the
+        # grace a self-update's marker may have been written between the reads.
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
-        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.sys.peer_pool_since["m5"] = NOW - 600
         self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
-        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 10 min",
                       su.waiting_ticket(self.cfg)["reason"])
+
+    def test_an_operator_drain_past_the_grace_no_longer_holds_the_turn(self) -> None:
+        # No update marker at all: a self-update writes its marker before it
+        # drains, so this is an operator's drain (a containment drain).
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("an operator drain: no update marker", peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_paused_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60       # inside the grace
+        self.sys.peer_paused.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is paused by an operator", peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_peer_mid_update_still_holds_the_turn_even_paused(self) -> None:
+        # Control: a live update marker wins over the drain's age and the pause.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_NEW, "ts": NOW - 1800}
+        self.sys.peer_pool_since["m5"] = NOW - 2 * 3600
+        self.sys.peer_paused.add("m5")
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is self-updating", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_the_capacity_floor_still_gates_a_turn_past_an_operator_drain(self) -> None:
+        # Control: m5 no longer holds the turn, but this host is the last
+        # server of a required label, so it still may not drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"label": "pulp-build-pr-head", "verdict": "last_serving_host"}]}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        receipt = json.loads(receipts[-1].read_text())
+        self.assertIn("last server of pulp-build-pr-head", json.dumps(receipt))
+        self.assertIn("counted as serving nothing by the capacity floor: m5", json.dumps(receipt))
 
     def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
         # No pool-state time (an old peer, or stat failed): fail closed.
