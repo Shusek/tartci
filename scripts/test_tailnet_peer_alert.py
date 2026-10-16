@@ -119,6 +119,35 @@ class Base(unittest.TestCase):
 
 
 class OfflinePeerTests(Base):
+    def test_configured_advertised_supply_is_used_without_checkout(self) -> None:
+        supply = self.dir / "advertised-labels.json"
+        supply.write_text(json.dumps({
+            "schema": "tartci.advertised-labels/v1",
+            "registrations": [],
+            "hosts": [{"host_id": host} for host in HOSTS],
+        }) + "\n")
+        profile = self.dir / "macos-fleet-profile.toml"
+        profile.write_text('[host]\nid = "m5"\nssh = "m5"\n')
+        with (
+            mock.patch.dict("os.environ", {
+                "TARTCI_ADVERTISED_LABELS": str(supply),
+                "TARTCI_FLEET_PROFILE": str(profile),
+            }, clear=False),
+            mock.patch.object(tna.pathlib.Path, "home", return_value=self.dir),
+        ):
+            out = tna.alert_pass(
+                now=OFFLINE_SINCE + 3600,
+                directory=self.dir / "configured",
+                hosts=None,
+                me=None,
+                run=Net(),
+                issue=self.issues.open,
+                close=self.issues.close,
+                table_text=TABLE,
+            )
+        self.assertFalse(out["skipped"])
+        self.assertEqual(set(HOSTS), set(out["hosts"]).intersection(HOSTS))
+
     def test_a_peer_offline_ten_minutes_is_reported_once(self) -> None:
         now = OFFLINE_SINCE + 11 * 60
         out = self.tick(Net("status-m1-offline.json", down={"203.0.113.10"}), now)

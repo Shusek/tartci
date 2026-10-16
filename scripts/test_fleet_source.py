@@ -77,6 +77,37 @@ class FleetSourceTests(unittest.TestCase):
             self.assertRegex(source.tree_sha256, r"^[0-9a-f]{64}$")
             self.assertRegex(source.published_supply_sha256, r"^[0-9a-f]{64}$")
 
+    def test_explicit_source_rejects_repository_or_commit_provenance_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "profiles").mkdir()
+            (root / "profiles" / "canary-macos-fleet.toml").write_text("schema = 1\n")
+            (root / "fleet").mkdir()
+            supply = root / "fleet" / "advertised-labels.json"
+            profile_digest = fleet_source.FleetSource(
+                root, root / "profiles", supply, True
+            ).profiles_sha256
+            supply.write_text(json.dumps({
+                "schema": "tartci.advertised-labels/v1",
+                "generated_from": {
+                    "repo": "ORG/private-fleet-authority",
+                    "commit": "a" * 40,
+                    "profiles": ["profiles/canary-macos-fleet.toml"],
+                    "profiles_sha256": profile_digest,
+                },
+                "registrations": [],
+            }) + "\n")
+            os.environ["TARTCI_FLEET_SOURCE_ROOT"] = str(root)
+            os.environ["TARTCI_FLEET_SOURCE_COMMIT"] = "b" * 40
+            os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "ORG/private-fleet-authority"
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                fleet_source.resolve(Path("/public"))
+
+            os.environ["TARTCI_FLEET_SOURCE_COMMIT"] = "a" * 40
+            os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"] = "ORG/other-fleet-authority"
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                fleet_source.resolve(Path("/public"))
+
 
 if __name__ == "__main__":
     unittest.main()
