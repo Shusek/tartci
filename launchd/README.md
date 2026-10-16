@@ -1120,6 +1120,33 @@ no-ops. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
 
+### Superseded merge-group runs
+
+Each tick also runs `shipyard rescue --superseded-merge-group --repo <repo>
+--json` for every repository in `SHIPYARD_QUEUE_REAP_REPOS` (default
+`Generous-Corp/pulp`). A `merge_group` run whose `gh-readonly-queue/*` ref no
+longer exists validates a batch the queue already dropped, and holds a gate VM
+until it ends. Shipyard decides which runs those are: it trusts only a ref
+listing that includes `HEAD`, keeps any run whose ref is live, and skips runs
+that hold no runner. The tick only runs it.
+
+- It cancels only while `~/.config/tartci/reap-superseded-merge-groups.enabled`
+  exists (`SHIPYARD_QUEUE_REAP_OPT_IN` names another path). Without the file
+  it only reports. Remove the file to roll back.
+- Each cancelled run (or, when reporting, each run it would cancel) is one
+  tab-separated line in `~/Library/Logs/tartci/superseded-merge-groups.log`:
+  time, host, repository, run id, ref, status and reason.
+- It never fails the tick. A Shipyard error, unreadable output or a run past
+  `SHIPYARD_QUEUE_REAP_TIMEOUT_SECS` (default 60) is one line in the tick log,
+  and the rest of the tick goes on. A held merge queue skips it with the rest
+  of the tick.
+
+Enable it on the host whose queue tick runs (m3):
+
+```sh
+touch ~/.config/tartci/reap-superseded-merge-groups.enabled
+```
+
 ## Retire Orchard on upgrades
 
 Deleting the old templates from a checkout does not stop an already-loaded
