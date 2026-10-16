@@ -62,6 +62,7 @@ except ModuleNotFoundError:  # Python < 3.11 (/usr/bin/python3 on macOS is 3.9)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import host_off  # noqa: E402
+from python_child import child_python  # noqa: E402
 
 THRESHOLD_S = 1.0
 PROBE_TIMEOUT_S = 10.0
@@ -171,7 +172,7 @@ def probe_command(path: str) -> List[str]:
                 and all(isinstance(part, str) for part in command)):
             raise ValueError("TARTCI_DISK_PROBE_COMMAND must be a JSON list of strings")
     else:
-        command = [sys.executable, "-c", PROBE]
+        command = [child_python(), "-c", PROBE]
     return [*command, PROBE_MARKER, path]
 
 

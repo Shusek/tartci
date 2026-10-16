@@ -113,11 +113,12 @@ class LauncherBuildTests(unittest.TestCase):
         self.profile = source / "profiles/m3-macos-fleet.toml"
         self.identity = "Developer ID Application: Daniel Raffel (95CX6P84C4)"
 
-    def run_builder(self, output: Path, approval: Path, *, python: Path | None = None):
+    def run_builder(self, output: Path, approval: Path, *, python: Path | None = None,
+                    extra: tuple[str, ...] = (), identity: str | None = None):
         args = [str(HERE / "build_macos_launcher.sh"),
                 "--output", str(output), "--approval-output", str(approval),
-                "--identity", self.identity, "--support-root", str(self.support_root),
-                "--profile", str(self.profile)]
+                "--identity", identity or self.identity, "--support-root", str(self.support_root),
+                "--profile", str(self.profile), *extra]
         if python is not None:
             args += ["--python", str(python)]
         return subprocess.run(
@@ -162,6 +163,47 @@ class LauncherBuildTests(unittest.TestCase):
         result = self.run_builder(root / "bad.app", root / "bad.sha256", python=wrapper)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("lane helper interpreter is not pinned", result.stderr)
+
+
+class LauncherV2BuildTests(LauncherBuildTests):
+    """--layout v2: the stable app carries no support tree, lanes or commit."""
+
+    def test_real_render_without_pin_pins_every_lane(self) -> None:
+        pass      # a v1 property; covered by LauncherBuildTests
+
+    def test_builder_refuses_a_render_that_drops_the_pin(self) -> None:
+        pass      # a v1 property; covered by LauncherBuildTests
+
+    def test_v2_bundle_is_the_executable_info_plist_and_policy_only(self) -> None:
+        root = Path(self.temp.name)
+        output, approval = root / "v2.app", root / "v2.sha256"
+        # A Developer ID from the environment when the host has one, else ad hoc.
+        identity = os.environ.get("TARTCI_TEST_SIGNING_IDENTITY", "-")
+        result = self.run_builder(output, approval, extra=("--layout", "v2"), identity=identity)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = sorted(p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file())
+        self.assertEqual(["Contents/Info.plist", "Contents/MacOS/tartci-launcher",
+                          "Contents/Resources/policy.json",
+                          "Contents/_CodeSignature/CodeResources"], files)
+        policy = json.loads((output / "Contents/Resources/policy.json").read_text())
+        import tomllib
+        profile = tomllib.loads(self.profile.read_text())
+        home = profile["host"]["home"].rstrip("/")
+        self.assertEqual({
+            "schema": 2, "identifier": profile["launch_helper"]["identifier"],
+            "team_id": profile["launch_helper"]["team_id"],
+            "tart_home": profile["host"]["tart_home"],
+            "generations_root": f"{home}/.local/share/tartci-generations",
+            "home": home,
+            "pointer": f"{home}/.config/tartci/launcher-generation.json",
+            "floor": f"{home}/.config/tartci/launcher-floor.json"}, policy)
+        self.assertRegex(approval.read_text(), r"^[0-9a-f]{64}\n$")
+
+    def test_an_unknown_layout_is_refused(self) -> None:
+        root = Path(self.temp.name)
+        result = self.run_builder(root / "x.app", root / "x.sha256", extra=("--layout", "v3"))
+        self.assertEqual(64, result.returncode)
+        self.assertFalse((root / "x.app").exists())
 
 
 class GuardTests(Host):

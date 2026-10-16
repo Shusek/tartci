@@ -140,7 +140,9 @@ import subprocess
 import sys
 
 root, key = sys.argv[1], sys.argv[2]
-profile = json.loads(subprocess.check_output([sys.executable, f"{root}/scripts/host_profile.py", "--json"], text=True))
+sys.path.insert(0, f"{root}/scripts")
+from python_child import child_python
+profile = json.loads(subprocess.check_output([child_python(), f"{root}/scripts/host_profile.py", "--json"], text=True))
 print(profile[key])
 PY
 }
