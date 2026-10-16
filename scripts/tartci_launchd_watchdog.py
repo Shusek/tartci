@@ -67,10 +67,13 @@ import os
 import plistlib
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from typing import Any, NamedTuple
+
+import macos_runner_identity
 
 try:
     import tomllib
@@ -471,16 +474,13 @@ def _runner_state_from_plist(plist_path: str) -> tuple[str, str] | None:
             data = plistlib.load(fh)
     except Exception:
         return None
-    env = data.get("EnvironmentVariables")
-    if not isinstance(env, dict):
+    try:
+        identity = macos_runner_identity.resolve_plist_identity(
+            data, hostname=socket.gethostname()
+        )
+    except (ValueError, TypeError, AttributeError):
         return None
-    state_dir = env.get("TARTCI_STATE_DIR")
-    runner = env.get("TARTCI_RUNNER_NAME")
-    if not isinstance(state_dir, str) or not state_dir.strip():
-        return None
-    if not isinstance(runner, str) or not runner.strip():
-        return None
-    return os.path.expanduser(state_dir), runner
+    return identity.state_dir, identity.runner_name
 
 
 def probe_stale_boot(

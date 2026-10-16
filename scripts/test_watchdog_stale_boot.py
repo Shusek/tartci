@@ -46,6 +46,23 @@ class StaleBootTests(unittest.TestCase):
         probe = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
         self.assertTrue(probe.stale, probe.reason)
 
+    def test_rendered_fleet_prefix_and_slot_identity_is_supported(self) -> None:
+        rendered = self.root / "rendered.plist"
+        rendered.write_bytes(plistlib.dumps({
+            "Label": "com.danielraffel.tartci.tart-runner-macos-fleet.m1.lane",
+            "EnvironmentVariables": {
+                "TARTCI_STATE_DIR": str(self.state),
+                "TARTCI_RUNNER_NAME_PREFIX": "m1-lane",
+                "TARTCI_RUNNER_SLOT": "1",
+            },
+        }))
+        (self.state / "m1-lane-01.state.json").write_text(json.dumps({
+            "ts": "1970-01-01T00:16:40Z", "phase": "booting",
+            "supervisor_pid": "42",
+        }))
+        probe = wd.probe_stale_boot(str(rendered), 42, now=2_000.0)
+        self.assertTrue(probe.stale, probe.reason)
+
     def test_active_job_and_fresh_heartbeat_are_safe(self) -> None:
         self.write_state(run_id="run-1")
         active = wd.probe_stale_boot(str(self.plist), 42, now=2_000.0)
