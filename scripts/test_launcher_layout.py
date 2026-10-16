@@ -82,6 +82,38 @@ class LauncherLayoutTests(unittest.TestCase):
         # The explicit downgrade is the way back.
         self.assertEqual("v1", ll.decide(self.home, V2, "v1"))
 
+    def test_a_lost_receipt_does_not_read_as_nothing_installed(self) -> None:
+        pointer = self.home / ".config/tartci/launcher-generation.json"
+        pointer.write_text("{}")
+        for receipt in (None, {"support": {}}):
+            with self.subTest(receipt=receipt):
+                self.assertEqual("v2", ll.installed(receipt, self.home))
+                with self.assertRaises(ll.LayoutError) as caught:
+                    ll.decide(self.home, receipt)
+                self.assertIn("install receipt is missing but the launcher v2 pointer",
+                              str(caught.exception))
+                self.assertIn("--launcher-layout v1", str(caught.exception))
+        self.assertEqual("v1", ll.decide(self.home, None, "v1"), "the explicit downgrade")
+        self.opt()
+        self.assertEqual("v2", ll.decide(self.home, None))
+        # A recorded v1 receipt is not overruled by a leftover pointer.
+        self.opt_in.unlink()
+        self.assertEqual("v1", ll.decide(self.home, V1))
+
+    def test_a_v2_app_on_disk_is_evidence_too(self) -> None:
+        app = self.home / "TartCILauncher.app"
+        (app / "Contents/Resources").mkdir(parents=True)
+        self.assertIsNone(ll.installed(None, self.home, app), "control: no evidence")
+        self.assertEqual("v1", ll.decide(self.home, None, app=app))
+        (app / "Contents/Resources/policy.json").write_text(json.dumps({"schema": 2}))
+        self.assertEqual("v2", ll.installed(None, self.home, app))
+        with self.assertRaisesRegex(ll.LayoutError, "a launcher v2 app at"):
+            ll.decide(self.home, None, app=app)
+        (app / "Contents/Resources/policy.json").write_text(json.dumps({"schema": 1}))
+        self.assertEqual("v1", ll.decide(self.home, None, app=app))
+        status = ll.status(self.home, None, app)
+        self.assertIsNone(status["layout"])
+
     def test_explicit_v2_needs_the_opt_in(self) -> None:
         with self.assertRaisesRegex(ll.LayoutError, "needs the per-host opt-in"):
             ll.decide(self.home, V1, "v2")

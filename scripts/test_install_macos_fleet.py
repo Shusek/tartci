@@ -8,6 +8,7 @@ import os
 import pty
 import select
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1954,6 +1955,68 @@ class InstallMacosFleetTests(unittest.TestCase):
             generation.chmod(0o555)
             with self.assertRaisesRegex(ValueError, "launch set does not verify"):
                 verify()
+
+    def rollback_after(self, *, touched: bool, backup: bool) -> tuple[Path, Path]:
+        """Run the installer's own rollback() with only the pointer touched."""
+        text = (ROOT / "scripts/install_macos_fleet.sh").read_text()
+        start = text.index("rollback() {")
+        function = text[start:text.index("\n}\n", start) + 3]
+        pointer = self.home / ".config/tartci/launcher-generation.json"
+        pointer.write_text('{"generation": "new"}\n')
+        saved = self.root / "launcher-generation.json.previous"
+        if backup:
+            saved.write_text('{"generation": "old"}\n')
+        script = (function + f"pointer_file={shlex.quote(str(pointer))}\n"
+                  f"pointer_backup={shlex.quote(str(saved)) if backup else ''}\n"
+                  f"pointer_touched={1 if touched else 0}\nrollback\n")
+        result = subprocess.run(["/bin/bash", "-c", script], text=True, capture_output=True,
+                                check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        return pointer, saved
+
+    def test_rollback_puts_the_previous_pointer_back_atomically(self) -> None:
+        pointer, saved = self.rollback_after(touched=True, backup=True)
+        self.assertEqual('{"generation": "old"}\n', pointer.read_text())
+        self.assertFalse(saved.exists(), "restored by one rename, not a copy")
+        source = (ROOT / "scripts/install_macos_fleet.sh").read_text()
+        restore = source[source.index('if [ "$pointer_touched" = 1 ]'):]
+        restore = restore[:restore.index("\n  fi\n")]
+        self.assertLess(restore.index('mv -f "$pointer_backup" "$pointer_file"'),
+                        restore.index('rm -f "$pointer_file"'),
+                        "the pointer is never removed before its backup replaces it")
+
+    def test_rollback_without_a_previous_pointer_removes_the_new_one(self) -> None:
+        pointer, _ = self.rollback_after(touched=True, backup=False)
+        self.assertFalse(pointer.exists())
+
+    def test_rollback_leaves_a_pointer_this_install_never_touched(self) -> None:
+        # Control: same run, the pointer step never reached.
+        pointer, _ = self.rollback_after(touched=False, backup=True)
+        self.assertEqual('{"generation": "new"}\n', pointer.read_text())
+
+    def test_a_v2_host_whose_receipt_is_gone_does_not_flip_to_v1(self) -> None:
+        # The receipt was deleted: the pointer on disk still says v2, so the
+        # install refuses instead of silently installing v1 without the opt-in.
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        (self.home / ".config/tartci/macos-fleet-install.json").unlink()
+        pointer = self.home / ".config/tartci/launcher-generation.json"
+        pointer.write_text(json.dumps({"schema": 1, "generation": "/x"}))
+        result = self.run_installer()
+        self.assertEqual(3, result.returncode, result.stdout)
+        self.assertIn("install receipt is missing but the launcher v2 pointer", result.stderr)
+        self.assertIn("--launcher-layout v1", result.stderr)
+        # Control: without the pointer, a receipt-less sealed host plans v1.
+        pointer.unlink()
+        result = self.run_installer()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("launcher_layout=v1 installed=none", result.stdout)
+        # A v2 app at the profile's launch helper path is evidence too.
+        policy = self.home / ".local/libexec/TartCILauncher.app/Contents/Resources/policy.json"
+        policy.write_text(json.dumps({"schema": 2}))
+        result = self.run_installer()
+        self.assertEqual(3, result.returncode, result.stdout)
+        self.assertIn("a launcher v2 app at", result.stderr)
 
 
 if __name__ == "__main__":

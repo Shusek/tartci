@@ -578,22 +578,16 @@ def launcher_pointer_path(cfg: Config) -> Path:
     return cfg.home / ".config" / "tartci" / "launcher-generation.json"
 
 
+def _helper_app(cfg: Config) -> Path | None:
+    helper = launch_helper(cfg)
+    return Path(helper["path"]) if helper is not None and helper.get("path") else None
+
+
 def installed_layout(cfg: Config) -> str | None:
-    """The launcher layout the install receipt records: "v1", "v2", or None."""
+    """The launcher layout this host runs: "v1", "v2", or None. The receipt
+    decides; without a launch helper record, v2 evidence on disk does."""
     import launcher_layout  # noqa: PLC0415 - sibling module; owns the layout rules
-    return launcher_layout.installed(_read_json(cfg.install_receipt))
-
-
-def launcher_layout_refusal(cfg: Config) -> str | None:
-    """Why this host's launcher layout cannot be decided (an untrusted opt-in
-    file, or a v2 host whose opt-in is gone), or None. Checked before any drain,
-    with the same rules the installer applies."""
-    import launcher_layout  # noqa: PLC0415
-    try:
-        launcher_layout.decide(cfg.home, launcher_layout.read_receipt(cfg.install_receipt))
-    except launcher_layout.LayoutError as exc:
-        return f"launcher layout: {exc}"
-    return None
+    return launcher_layout.installed(_read_json(cfg.install_receipt), cfg.home, _helper_app(cfg))
 
 
 def installed_commit(cfg: Config) -> tuple[str, str]:
@@ -1625,7 +1619,8 @@ def planned_layout(cfg: Config) -> str | None:
     import launcher_layout  # noqa: PLC0415 - sibling module; owns the layout rules
     try:
         return launcher_layout.decide(cfg.home,
-                                      launcher_layout.read_receipt(cfg.install_receipt))
+                                      launcher_layout.read_receipt(cfg.install_receipt),
+                                      app=_helper_app(cfg))
     except launcher_layout.LayoutError as exc:
         raise Refused(f"launcher layout: {exc}") from exc
 

@@ -322,14 +322,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
 import macos_fleet_lanes as fleet
-print("yes" if fleet.load(Path(sys.argv[1])).get("launch_helper") is not None else "no")
+helper = fleet.load(Path(sys.argv[1])).get("launch_helper")
+print(helper["path"] if helper is not None else "")
 PY
 )" || exit 2
-if [ "$plan_has_helper" = yes ]; then
-  layout_args=(--home "$HOME" --receipt "$RECEIPT")
+if [ -n "$plan_has_helper" ]; then
+  layout_args=(--home "$HOME" --receipt "$RECEIPT" --app "$plan_has_helper")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
   plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
-  plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT")" || exit 3
+  plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT" --home "$HOME" --app "$plan_has_helper")" || exit 3
 elif [ -n "$LAUNCHER_LAYOUT" ]; then
   echo "--launcher-layout is invalid for a profile without launch_helper" >&2
   exit 2
@@ -495,10 +496,12 @@ retired_backups=()
 rollback() {
   local i target backup
   if [ "$pointer_touched" = 1 ]; then
-    # Lanes go back to the generation the pointer named before this install.
-    rm -f "$pointer_file"
+    # Lanes go back to the generation the pointer named before this install:
+    # one rename over the new pointer, so no moment has no pointer at all.
     if [ -n "$pointer_backup" ] && [ -e "$pointer_backup" ]; then
       mv -f "$pointer_backup" "$pointer_file" || true
+    else
+      rm -f "$pointer_file"
     fi
   fi
   if [ "$launcher_touched" = 1 ]; then
@@ -709,7 +712,8 @@ verify_launcher() {  # PATH [SOURCE_COMMIT]: the launcher identity record, or re
   fi
 }
 if [ "$launch_helper_json" != "null" ]; then
-  layout_args=(--home "$HOME" --receipt "$RECEIPT")
+  layout_args=(--home "$HOME" --receipt "$RECEIPT"
+               --app "$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
   launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
   [ "$launcher_layout" = "$plan_launcher_layout" ] || {
