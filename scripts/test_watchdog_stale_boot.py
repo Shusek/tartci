@@ -134,6 +134,42 @@ class StaleBootTests(unittest.TestCase):
         )
         self.assertEqual(health.verdict, "wedged", health.reason)
 
+    def test_gather_health_defers_when_any_tart_vm_is_running(self) -> None:
+        self.write_state()
+        original = wd._run
+        wd._run = lambda cmd: (0, "state = running\npid = 42\nlast exit code = 0\n", "")
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m1.lane",
+            str(self.plist), stale_log_s=4_500, vm_running=True,
+            pool_participating=True,
+        )
+        self.assertNotEqual(health.verdict, "wedged", health.reason)
+
+    def test_gather_health_defers_when_tart_inventory_is_unknown(self) -> None:
+        self.write_state()
+        original = wd._run
+        wd._run = lambda cmd: (0, "state = running\npid = 42\nlast exit code = 0\n", "")
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m1.lane",
+            str(self.plist), stale_log_s=4_500, vm_running=None,
+            pool_participating=True,
+        )
+        self.assertNotEqual(health.verdict, "wedged", health.reason)
+
+    def test_gather_health_fails_closed_on_corrupt_lane_state(self) -> None:
+        (self.state / "lane.state.json").write_text("not json")
+        original = wd._run
+        wd._run = lambda cmd: (0, "state = running\npid = 42\nlast exit code = 0\n", "")
+        self.addCleanup(setattr, wd, "_run", original)
+        health = wd.gather_health(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m1.lane",
+            str(self.plist), stale_log_s=4_500, vm_running=False,
+            pool_participating=True,
+        )
+        self.assertEqual(health.verdict, "unknown", health.reason)
+
 
 if __name__ == "__main__":
     unittest.main()
