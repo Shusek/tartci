@@ -131,6 +131,36 @@ class Enforce(Base):
         self.assertIn("lv2repro-pulpimpl", self.tart.vms)
 
 
+class Filter(Base):
+    def test_a_record_for_a_non_scratch_vm_is_never_deleted(self) -> None:
+        # A hand-written or corrupted record naming a lane or an agent's VM.
+        self.tart.vms.update({"lv2repro-pulpimpl", "pulp-build-runner:latest"})
+        for name in ("lv2repro-pulpimpl", "pulp-build-runner:latest"):
+            sv.records_dir().mkdir(parents=True, exist_ok=True)
+            (sv.records_dir() / f"scratch-{len(name)}.json").write_text(sv.json.dumps(
+                {"name": name, "owner": "x", "store": str(self.store),
+                 "expires_at": NOW - 10, "warned_at": None}))
+        self.assertEqual(sv.enforce(NOW, tart=self.tart), [])
+        self.assertEqual([c for c in self.tart.calls if c[0][0] in ("stop", "delete")], [])
+        self.assertEqual(self.tart.vms, {"lv2repro-pulpimpl", "pulp-build-runner:latest"})
+
+
+class DryRun(Base):
+    def test_enforce_dry_run_names_what_it_would_do_and_changes_nothing(self) -> None:
+        late = self.make(ttl=1)
+        soon = self.make(ttl=1.5, name="scratch-soon")
+        lines = sv.enforce(NOW + 3600 + 1, tart=self.tart, dry_run=True)
+        self.assertEqual(len(lines), 2)
+        self.assertIn(f"would stop and delete scratch VM {late}", lines[0] + lines[1])
+        self.assertIn("would warn: scratch VM scratch-soon", lines[0] + lines[1])
+        self.assertEqual([c for c in self.tart.calls if c[0][0] in ("stop", "delete")], [])
+        self.assertIsNone(sv.read(soon)["warned_at"])
+
+    def test_the_default_image_is_pinned_by_digest(self) -> None:
+        self.assertIn("@sha256:", sv.DEFAULT_IMAGE)
+        self.assertNotIn(":latest", sv.DEFAULT_IMAGE)
+
+
 class Wiring(unittest.TestCase):
     def test_the_heal_pass_and_the_dispatcher_run_it(self) -> None:
         here = Path(sv.__file__).parent

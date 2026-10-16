@@ -572,9 +572,10 @@ RETIRED_LANE_MIN_AGE_SECS = 24 * 3600
 
 
 class TartciNames:
-    """Whether the fleet profile, a tartci state or config file, or a
-    LaunchAgent names a VM: tart_image_prune's ownership rule, read once and
-    only when a retired-lane candidate needs it. Unreadable reads as named."""
+    """Whether the fleet profile, a tartci config file or a LaunchAgent names a
+    VM (a golden, a rollback image): tart_image_prune's ownership rule, read
+    once and only when a retired-lane candidate needs it. Unreadable reads as
+    named."""
 
     def __init__(self) -> None:
         self._text: str | None = None
@@ -589,11 +590,43 @@ class TartciNames:
                     "TARTCI_FLEET_PROFILE", str(home / ".config/tartci/macos-fleet-profile.toml"))))
             except (OSError, ValueError, RuntimeError):
                 self._values = None
-            self._text = prune.reference_text([home / ".config/tartci", home / ".tartci/state",
+            # The state dir is left out: the retired lane's own state record
+            # names its clone, and that record is the proof required below.
+            self._text = prune.reference_text([home / ".config/tartci",
                                                home / "Library/LaunchAgents"])
         if self._values is None:
             return True
         return name in self._values or prune.named_in(name, self._text)
+
+
+def retired_lane_record(state_root: pathlib.Path, name: str, runner: str, pid: str) -> bool:
+    """Whether a lane's own state file (`<state_root>/<lane>/*.state.json`)
+    records exactly this VM, from a Tart provider, for this runner and
+    supervisor pid. A clone's name alone is no proof: an agent can name a
+    VM `pulp-m1-repro-20261016-1`."""
+    try:
+        paths = sorted(state_root.glob("*/*.state.json"))
+    except OSError:
+        return False
+    for path in paths:
+        if path.is_symlink():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(data, dict) and data.get("vm") == name
+                and str(data.get("provider") or "").startswith("tart-")
+                and data.get("runner") == runner and str(data.get("supervisor_pid")) == pid):
+            return True
+    return False
+
+
+def retired_clones_enabled() -> bool:
+    """Per-host opt-in for deleting retired lanes' clones; off reports only."""
+    flag = os.environ.get("TARTCI_REAP_RETIRED_ENABLE_FILE") or str(
+        pathlib.Path.home() / ".config" / "tartci" / "reap-retired-clones.enabled")
+    return pathlib.Path(flag).is_file()
 
 
 def retired_lane_runner(runner: str, host_id: str | None, prefixes: list[str]) -> bool:
@@ -615,6 +648,8 @@ def orphan_verdict(
     host_id: str | None = None,
     prefixes: list[str] | None = None,
     named: Any = None,
+    record: Any = None,
+    retired_enabled: bool = False,
 ) -> tuple[bool, str]:
     """(delete?, why) for a VM no state file owns. Every doubt keeps it.
 
@@ -637,6 +672,8 @@ def orphan_verdict(
         # profile or a LaunchAgent names (a golden, a rollback image) is kept.
         if named is None or named(name):
             return False, "named_by_tartci"
+        if record is None or not record(name, match.group("runner"), match.group("pid")):
+            return False, "no_retired_lane_record"
         retired = True
         min_age_secs = max(min_age_secs, RETIRED_LANE_MIN_AGE_SECS)
     if running:
@@ -655,6 +692,9 @@ def orphan_verdict(
         return False, "vm_bundle_unreadable"
     if age < min_age_secs:
         return False, "recent"
+    if retired and not retired_enabled:
+        return False, (f"retired_clone_reap_off: would delete (retired lane, supervisor "
+                       f"{match.group('pid')} gone, stopped {int(age)}s)")
     lane = "retired lane " if retired else ""
     return True, f"{lane}supervisor {match.group('pid')} gone, stopped {int(age)}s"
 
@@ -947,7 +987,10 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     orphaned, orphan_reason = orphan_verdict(
                         name, running, lane_runners, states_by_vm, leases_seen,
                         tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs,
-                        host_id=host_id, prefixes=prefixes, named=tartci_names)
+                        host_id=host_id, prefixes=prefixes, named=tartci_names,
+                        record=lambda vm, runner, pid: retired_lane_record(
+                            pathlib.Path(args.state_root).expanduser(), vm, runner, pid),
+                        retired_enabled=retired_clones_enabled())
                     if orphaned:
                         stale = True
                         action = "delete_orphaned_stopped_vm"
@@ -1280,6 +1323,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "kept": {v["name"]: v["orphan"] for v in vms
                      if v.get("orphan") and v.get("orphan") != "not_a_lane_vm"
                      and v.get("action") != "delete_orphaned_stopped_vm"},
+            "retired_would_delete": sorted(
+                v["name"] for v in vms
+                if str(v.get("orphan") or "").startswith("retired_clone_reap_off")),
         },
         "supervisor_coverage": supervisor_coverage.as_dict(),
         "supervisors": [
@@ -1347,6 +1393,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Report or safely reap tartci CI VM residue")
     parser.add_argument("--json", action="store_true", help="emit JSON digest")
     parser.add_argument("--fix", action="store_true", help="perform safe fixes")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="change nothing (overrides --fix); print the VMs a fix would delete")
     parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "Generous-Corp/pulp"))
     parser.add_argument(
         "--state-dir",
@@ -1419,7 +1467,18 @@ def ensure_tart_home() -> dict[str, Any]:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.dry_run:
+        args.fix = False
     digest, rc = build_digest(args)
+    if args.dry_run and not args.json:
+        orphans = digest.get("orphans") or {}
+        for row in digest.get("vms") or []:
+            if row.get("action") and row.get("stale"):
+                print(f"would {row['action']}: {row['name']}"
+                      + (f" ({row['orphan']})" if row.get("orphan") else ""))
+        for name in orphans.get("retired_would_delete", []):
+            print(f"would delete once ~/.config/tartci/reap-retired-clones.enabled exists: "
+                  f"{name} ({orphans.get('kept', {}).get(name, '')})")
     if args.json:
         print(json.dumps(digest, indent=2, sort_keys=True))
     else:

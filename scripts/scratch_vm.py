@@ -35,7 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 MAX_TTL_HOURS = 72.0
 WARN_BEFORE_SECONDS = 30 * 60
-DEFAULT_IMAGE = "ghcr.io/cirruslabs/ubuntu:latest"
+# Pinned by digest: a moving tag would make two scratch VMs made a day apart
+# differ, and pull whatever was pushed last.
+DEFAULT_IMAGE = ("ghcr.io/cirruslabs/ubuntu@sha256:"
+                 "cb46e37675838d0fbbd4c483654446b450b72d42e90864979e7a78e69428bd57")
 OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$")
 NAME_RE = re.compile(r"^scratch-[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
 
@@ -142,11 +145,20 @@ def remove(record: dict, tart: Runner = run_tart) -> tuple[bool, str]:
     return True, f"deleted scratch VM {record['name']} (owner {record['owner']})"
 
 
-def enforce(now: float, tart: Runner = run_tart) -> list[str]:
-    """Warn at TTL-30m, then stop and delete at the TTL. One line per action."""
+def enforce(now: float, tart: Runner = run_tart, dry_run: bool = False) -> list[str]:
+    """Warn at TTL-30m, then stop and delete at the TTL. One line per action.
+    `dry_run` prints what it would do and changes nothing."""
     lines = []
     for record in records():
         expires = float(record.get("expires_at") or 0)
+        if dry_run:
+            if now >= expires:
+                lines.append(f"would stop and delete scratch VM {record['name']} "
+                             f"(owner {record['owner']}, TTL ended {_iso(expires)})")
+            elif now >= expires - WARN_BEFORE_SECONDS:
+                lines.append(f"would warn: scratch VM {record['name']} (owner "
+                             f"{record['owner']}) is deleted at {_iso(expires)}")
+            continue
         if now >= expires:
             ok, text = remove(record, tart)
             lines.append(f"{_iso(now)} launchd-watchdog: {'' if ok else 'WARN '}scratch-vm: "
@@ -175,7 +187,8 @@ def main(argv: Optional[list] = None) -> int:
     e.add_argument("--ttl", required=True, type=_ttl)
     d = sub.add_parser("delete")
     d.add_argument("name")
-    sub.add_parser("enforce")
+    en = sub.add_parser("enforce")
+    en.add_argument("--dry-run", action="store_true", help="print what it would do")
     args = parser.parse_args(argv)
     now = time.time()
     if args.command == "create":
@@ -200,7 +213,7 @@ def main(argv: Optional[list] = None) -> int:
                   f"\t({left:.0f} min left)\tstore={row['store']}")
         return 0
     else:
-        for line in enforce(now):
+        for line in enforce(now, dry_run=args.dry_run):
             print(line)
         return 0
     print(text, file=sys.stderr if rc else sys.stdout)
