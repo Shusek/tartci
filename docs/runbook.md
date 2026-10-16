@@ -3577,12 +3577,14 @@ on 2026-10-16 they reached 246 GB and took the host down to 150 GB free. About
 hourly, the watchdog (`scripts/agent_cargo_reap.py`) names every target dir
 that meets all of these:
 
-- Cargo made it: it holds `CACHEDIR.TAG` with Cargo's signature.
+- Cargo made it: its `CACHEDIR.TAG` has the cache-dir signature and says it was
+  created by cargo (pytest and ccache write the same signature).
 - It is at most three levels under `~/agent-scratch`, reached without
   following a symlink.
 - It is not under `~/agent-scratch/rcg`.
-- Its newest fingerprint (`debug/.fingerprint`, `release/.fingerprint`) is at
-  least 2 days old.
+- Its newest build activity is at least 2 days old: the newest mtime across
+  `debug/`, `release/`, their `deps/`, and every `.fingerprint` entry.
+  `.fingerprint` itself keeps its first-build mtime.
 - No process has its cwd or an open file inside it, per lsof. If lsof cannot
   be read, nothing is deleted.
 

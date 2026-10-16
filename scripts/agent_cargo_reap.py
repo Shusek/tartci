@@ -10,9 +10,11 @@ A directory is a candidate only when all of these hold:
   * it is under the agent scratch root (~/agent-scratch), at most
     MAX_DEPTH levels down, reached without following a symlink, and not
     under a kept subtree (KEEP: `rcg`, an agent's live checkouts);
-  * Cargo made it: it holds CACHEDIR.TAG with Cargo's signature;
-  * it is stale: its newest build fingerprint (debug/.fingerprint,
-    release/.fingerprint, else the directory) is at least STALE_DAYS old;
+  * Cargo made it: its CACHEDIR.TAG has the cache-dir signature AND says it
+    was created by cargo (pytest and ccache write the same signature);
+  * it is stale: its newest build activity (debug/, release/, their deps/,
+    and every .fingerprint entry, since .fingerprint itself keeps its
+    first-build mtime) is at least STALE_DAYS old;
   * no process has it open: no cwd and no open file inside it (lsof). If
     the open-file list cannot be read, nothing is deleted.
 
@@ -59,10 +61,14 @@ def enabled(user_home: Path) -> bool:
 
 
 def is_cargo_target(path: Path) -> bool:
+    """CACHEDIR.TAG's signature is the generic cache-dir standard, which pytest
+    and ccache also write (m1's only matches on 2026-10-16 were two
+    .pytest_cache dirs); Cargo's own tag also says it was created by cargo."""
     try:
-        return CARGO_SIGNATURE in (path / "CACHEDIR.TAG").read_text(errors="replace")[:200]
+        tag = (path / "CACHEDIR.TAG").read_text(errors="replace")[:400]
     except OSError:
         return False
+    return CARGO_SIGNATURE in tag and "created by cargo" in tag
 
 
 def cargo_targets(root: Path) -> list[Path]:
@@ -90,14 +96,25 @@ def cargo_targets(root: Path) -> list[Path]:
 
 
 def last_built(target: Path) -> float:
-    stamps = []
-    for sub in ("debug/.fingerprint", "release/.fingerprint"):
+    """The newest build activity: a profile dir, its deps, or any fingerprint
+    entry. debug/.fingerprint itself keeps its first-build mtime, so a rebuild
+    an hour ago shows only in the entries and in deps."""
+    stamps = [target.stat().st_mtime]
+    for profile in ("debug", "release"):
+        for sub in (profile, f"{profile}/deps", f"{profile}/.fingerprint"):
+            try:
+                stamps.append((target / sub).stat().st_mtime)
+            except OSError:
+                continue
         try:
-            stamps.append((target / sub).stat().st_mtime)
+            with os.scandir(target / profile / ".fingerprint") as entries:
+                for entry in entries:
+                    try:
+                        stamps.append(entry.stat(follow_symlinks=False).st_mtime)
+                    except OSError:
+                        continue
         except OSError:
             continue
-    if not stamps:
-        stamps.append(target.stat().st_mtime)
     return max(stamps)
 
 

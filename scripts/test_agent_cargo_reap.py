@@ -39,7 +39,7 @@ class Base(unittest.TestCase):
         if cargo:
             (path / "CACHEDIR.TAG").write_text(acr.CARGO_SIGNATURE + "\n# created by cargo.\n")
         stamp = NOW - built_days_ago * DAY
-        for p in (path / "debug" / ".fingerprint", path):
+        for p in (path / "debug" / ".fingerprint", path / "debug", path):
             os.utime(p, (stamp, stamp))
         return path
 
@@ -75,6 +75,42 @@ class Plan(Base):
         self.assertEqual(rows[str(busy)]["reason"], "in use")
         self.assertNotIn(str(rcg), rows)
         self.assertNotIn(str(plain), rows)
+
+    def test_a_pytest_cache_with_the_same_signature_is_kept(self) -> None:
+        # m1, 2026-10-16: the only matches were two .pytest_cache dirs.
+        self.flag.write_text("")
+        cache = self.scratch / "runner-heal-tartci" / ".pytest_cache"
+        (cache / "debug").mkdir(parents=True)
+        (cache / "CACHEDIR.TAG").write_text(
+            acr.CARGO_SIGNATURE + "\n# This file is a cache directory tag created by pytest.\n")
+        os.utime(cache, (NOW - 30 * DAY, NOW - 30 * DAY))
+        self.run_pass()
+        self.assertEqual(self.removed, [])
+        self.assertEqual(acr.cargo_targets(self.scratch), [])
+
+    def test_a_rebuild_an_hour_ago_keeps_an_old_target(self) -> None:
+        # .fingerprint keeps its first-build mtime; a rebuild shows in its
+        # entries, or in deps/. Either alone must keep the target.
+        self.flag.write_text("")
+        for recent in ("fingerprint entry", "deps"):
+            with self.subTest(recent=recent):
+                target = self.target(f"sy-{recent[:4]}/target", 30)
+                entry = target / "debug" / ".fingerprint" / "tartci-1234"
+                entry.mkdir()
+                (target / "debug" / "deps").mkdir()
+                old = NOW - 30 * DAY
+                for path in (entry, target / "debug" / "deps", target / "debug" / ".fingerprint",
+                             target / "debug", target):
+                    os.utime(path, (old, old))
+                fresh = entry if recent == "fingerprint entry" else target / "debug" / "deps"
+                os.utime(fresh, (NOW - 3600, NOW - 3600))
+                self.assertGreater(acr.last_built(target), NOW - 2 * 3600)
+                # Control, same target with everything old: stale.
+                os.utime(fresh, (old, old))
+                self.assertEqual(acr.last_built(target), old)
+                os.utime(fresh, (NOW - 3600, NOW - 3600))
+        self.run_pass()
+        self.assertEqual(self.removed, [])
 
     def test_a_cwd_inside_the_target_keeps_it(self) -> None:
         self.flag.write_text("")
