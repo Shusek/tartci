@@ -3365,7 +3365,7 @@ class Run:
                 self.sys.sleep(self.POOL_ON_BACKOFF[attempt - 1])
         return False
 
-    def _reinstall_previous(self) -> None:
+    def _reinstall_previous(self, *, failed_source_env: dict[str, str | None] | None = None) -> None:
         """Reinstall the snapshot generation from its own commit (pin + bundle)."""
         cfg, sys_ = self.cfg, self.sys
         current_env = fleet_source_env_snapshot()
@@ -3389,7 +3389,7 @@ class Run:
             # The failed target may still be live. Keep its source selected so
             # recovery helpers cannot reinstall the old code with the new
             # generation's profile source.
-            restore_fleet_source_env(current_env)
+            restore_fleet_source_env(failed_source_env or current_env)
             raise
 
     def _restore_previous_python(self) -> str | None:
@@ -3420,7 +3420,8 @@ class Run:
             return "unknown"
 
     def _ensure_on(self, *, allow_reinstall: bool = True,
-                   restore_receipt: bool = False) -> str:
+                   restore_receipt: bool = False,
+                   failed_previous_source_env: dict[str, str | None] | None = None) -> str:
         """Put the host back in service, whatever else failed. Returns the
         resulting pool state: "on", "undrained", or what the host is left in.
 
@@ -3454,7 +3455,7 @@ class Run:
             if running == self.previous and self.snapshot is not None:
                 self.receipt.step("reinstall-for-pool-on",
                                   f"pool on refused; reinstalling {self.previous[:12]}")
-                self._reinstall_previous()
+                self._reinstall_previous(failed_source_env=failed_previous_source_env)
             else:
                 self.receipt.step(
                     "reinstall-for-pool-on",
@@ -3497,6 +3498,8 @@ class Run:
             on = False
             try:
                 self._repin_to_live()
+                if self._running() == self.previous:
+                    self._restore_previous_source_env()
                 on = self._pool_on()
             except BaseException:  # noqa: BLE001
                 pass
@@ -3521,6 +3524,14 @@ class Run:
             self._write_pin(self.approval.read_text())
         elif running == self.previous:
             self._write_pin((self.snapshot / "approved.sha256").read_text())
+
+    def _restore_previous_source_env(self) -> None:
+        """Make recovery helpers use the source recorded for the live rollback."""
+        restore_fleet_source_env({
+            name: fleet_source_env(self.previous_fleet_source).get(name)
+            for name in FLEET_SOURCE_ENV
+        })
+        self.receipt.step("source-restore", "previous installed source selected for recovery")
 
     def _running(self) -> str | None:
         try:
@@ -3567,10 +3578,13 @@ class Run:
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
             # back), so putting the host back is: pin, then pool on.
+            failed_previous_source_env = fleet_source_env_snapshot()
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            state = self._ensure_on(restore_receipt=True)
+            self._restore_previous_source_env()
+            state = self._ensure_on(restore_receipt=True,
+                                    failed_previous_source_env=failed_previous_source_env)
             if state not in ("on", "undrained"):
                 return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
                                       f"failed (generation {self.previous[:12]} is installed)",

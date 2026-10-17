@@ -3840,6 +3840,34 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
         self.assertIsNone(self.verified())
 
+    def test_failed_install_restores_previous_source_before_pool_on(self) -> None:
+        """An installer self-rollback must not serve old code with new profiles."""
+        self.sys.log_lines = ""
+        self.sys.install_rcs = [1]
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(step["step"] == "source-restore" for step in receipt["steps"]))
+
+    def test_failed_install_restores_previous_private_source_before_pool_on(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual(self.OLDER, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+
     def test_rollback_restores_the_previous_private_source(self) -> None:
         previous_root = self.cfg.fleet_source_store / self.OLDER
         previous_root.mkdir(parents=True)
