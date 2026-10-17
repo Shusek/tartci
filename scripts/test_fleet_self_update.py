@@ -3919,16 +3919,24 @@ class ReinstallCurrentTests(FleetSourceFixture):
         self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
         self.assertEqual("succeeded", self.last()["status"])
 
-    def configured_source(self, recorded: str) -> None:
+    def configured_source(self, recorded: str, repository: str | None = None) -> None:
         """[fleet_source] configured (this host is its canary); the receipt
         records `recorded` as the installed private-source commit."""
         self.cfg.fleet_source_repository = self.fixture.PRIVATE
         receipt = self.home / ".config/tartci/macos-fleet-install.json"
         value = json.loads(receipt.read_text())
-        value["fleet_source"] = {"configured": True, "repository": self.fixture.PRIVATE,
+        value["fleet_source"] = {"configured": True,
+                                 "repository": repository or self.fixture.PRIVATE,
                                  "commit": recorded,
                                  "root": str(self.cfg.fleet_source_store / recorded)}
         receipt.write_text(json.dumps(value))
+
+    def test_the_same_commit_from_another_repository_is_a_new_source(self) -> None:
+        self.configured_source(self.fixture.COMMIT, repository="ORG/another-fleet-authority")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("installed from ORG/another-fleet-authority@", out.getvalue())
 
     def test_it_never_installs_a_new_private_source(self) -> None:
         # The canary would select main's head, newer than the installed source:
@@ -3938,7 +3946,7 @@ class ReinstallCurrentTests(FleetSourceFixture):
             self.assertEqual(su.EXIT_REFUSED, self.reinstall())
         self.assertEqual([], self.sys.mutations())
         self.assertIn("--reinstall-current refused: it would install private source "
-                      + self.fixture.COMMIT[:12], out.getvalue())
+                      f"{self.fixture.PRIVATE}@{self.fixture.COMMIT[:12]}", out.getvalue())
         self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
 
     def test_it_reinstalls_on_the_installed_private_source(self) -> None:

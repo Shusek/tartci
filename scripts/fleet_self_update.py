@@ -3017,11 +3017,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # with the current settings (a removed [fleet_source], say), through the
         # same drain, install, pool-on and verify path as any update. It never
         # takes a NEW private source: that waits for the canary and its soak.
-        recorded = installed_fleet_source_commit(cfg)
-        if selected_source and selected_source.get("commit") != recorded:
+        recorded = installed_fleet_source_record(cfg) or {}
+        if selected_source and ((selected_source.get("repository"), selected_source.get("commit"))
+                                != (recorded.get("repository"), recorded.get("commit"))):
             reason = (f"--reinstall-current refused: it would install private source "
-                      f"{str(selected_source.get('commit'))[:12]} (installed from "
-                      f"{_source_name(recorded)}), which only a canary-gated update may do. "
+                      f"{selected_source.get('repository')}@{str(selected_source.get('commit'))[:12]} "
+                      f"(installed from "
+                      + (f"{recorded['repository']}@{recorded['commit'][:12]}" if recorded
+                         else "the public profiles")
+                      + "), which only a canary-gated update may do. "
                       "It reinstalls on the installed source, or moves to the public profiles "
                       "when [fleet_source] is removed. Fix: wait for the normal update, or "
                       "remove [fleet_source] to go public")
