@@ -2510,8 +2510,11 @@ def _same_fleet_source(first: Any, second: Any) -> bool:
         return True
     if not isinstance(first, dict) or not isinstance(second, dict):
         return False
-    return (first.get("repository"), first.get("commit")) == (
-        second.get("repository"), second.get("commit"))
+    # A new commit on the same private authority is still the same source
+    # class.  The source move itself gets a fresh window when crossing the
+    # public/private boundary, but a busy private authority must not make the
+    # canary drain once per commit.
+    return bool(first) == bool(second)
 
 
 def recent_attempt(cfg: Config, target: str, now: float,
