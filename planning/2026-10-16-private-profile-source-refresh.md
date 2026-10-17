@@ -140,6 +140,10 @@ The current branch is not installed on any fleet host. M1 remains on the
 previously validated generation while the merged branch receives a fresh exact
 head review and green CI.
 
+The follow-up also carries the source commit from the receipt into the
+published-supply status verdict, so a private source does not lose its commit
+provenance merely because verification runs without the installer environment.
+
 ## Stop conditions
 
 Stop and retain the public default if the private authority remains redacted,
