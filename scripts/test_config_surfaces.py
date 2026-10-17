@@ -70,7 +70,7 @@ class ReadinessCarriesConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
             "TARTCI_FLEET_SOURCE_ROOT": "/does/not/exist",
             "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
-            "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+            "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
         }):
             value = self._readiness(M3.read_text())["config"]
         self.assertEqual(value["profile_drift"]["state"], "unknown")
