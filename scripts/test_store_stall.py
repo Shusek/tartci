@@ -150,6 +150,27 @@ class ProbeTests(Base):
         self.assertEqual("ok", value["state"])
         self.assertFalse(marker.exists())
 
+    def test_a_live_unrelated_process_with_the_marker_pid_does_not_hold_a_probe(self) -> None:
+        # The same as the reuse after a reboot, with a real process: alive,
+        # but not started when the marker says, so it is not the probe.
+        other = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        self.assertIsNotNone(ss.pid_identity(other.pid), "ps reports a live process's start")
+        marker = ss.marker_path(self.state, "/Volumes/Example")
+        marker.parent.mkdir(parents=True)
+        marker.write_text(json.dumps({"since": NOW - 86400, "pids": [other.pid],
+                                      "identities": {str(other.pid): "Mon Jan  1 00:00:00 2001"}}))
+        calls = []
+
+        def counting(argv, timeout, env, started):
+            calls.append(argv)
+            return 0.01
+        value = self.probe([item("/Volumes/Example", ["x"])], timeout=1, runner=counting)
+        self.assertEqual([["x"]], calls, "the volume is probed again")
+        self.assertEqual("ok", value["state"])
+        self.assertFalse(marker.exists())
+
     def test_since_is_kept_across_probes_until_the_volume_answers(self) -> None:
         self.probe([item("/Volumes/Example", ["x"])], timeout=1, runner=hangs, now=NOW)
         value = self.probe([item("/Volumes/Example", ["x"])], timeout=1, runner=hangs,
@@ -221,6 +242,27 @@ class CacheTests(Base):
         line = ss.describe(value)
         self.assertIn("store: STALLED since 2027-01-15T08:00:00Z (as of 2027-01-15T08:00:00Z)", line)
         refuse.assert_not_called()
+
+    def test_a_two_day_old_ok_reads_unprobed_naming_its_age_and_producer(self) -> None:
+        home = Path(self.td.name) / "home"
+        with mock.patch.dict(os.environ, {"TARTCI_HOME": str(home / ".tartci")}):
+            ss._write(ss.state_dir(home) / "status.json",
+                      {"state": "ok", "detail": "2 store probe(s) answered within 20s",
+                       "stalled": [], "probed_at": NOW, "since": {}})
+            # Control: within one missed watchdog run it is still the answer.
+            self.assertEqual("ok", ss.cached(home, now=NOW + ss.STALE_AFTER_S - 1)["state"])
+            old = ss.cached(home, now=NOW + 2 * 86400)
+            self.assertEqual("unprobed", old["state"])
+            self.assertEqual(("ok", 2 * 86400), (old["stale_state"], old["age_s"]))
+            self.assertIn("last probe 48.0 h ago", old["detail"])
+            self.assertIn("the launchd watchdog is not probing", old["detail"])
+            self.assertIn("tartci doctor fleet", old["detail"])
+            self.assertTrue(ss.describe(old).startswith("store: not probed (last probe 48.0 h"))
+            with mock.patch.object(ss.time, "time", return_value=NOW + 2 * 86400), \
+                    mock.patch("sys.stdout") as out:
+                ss.main(["--cached", "--json"])
+            printed = json.loads("".join(call.args[0] for call in out.write.call_args_list))
+            self.assertEqual("unprobed", printed["state"])
 
     def test_an_old_ok_cache_is_unprobed(self) -> None:
         home = Path(self.td.name) / "home"
@@ -295,6 +337,17 @@ class DoctorTests(Base):
         callers = sorted(str(path.relative_to(ROOT)) for path in ROOT.glob("providers/**/*.sh")
                          if re.search(r"^[^#\n]*\bpool\s+status\b", path.read_text(), re.M))
         self.assertEqual([], callers)
+        # Nor does any provider run a probe itself: neither the probe mode
+        # nor `doctor fleet`, which probes. Quoted text is a message that may
+        # point an operator at doctor; only code outside quotes runs it.
+        def runs_a_probe(line: str) -> bool:
+            code = re.sub(r'"[^"]*"|\'[^\']*\'', "", line.split("#", 1)[0])
+            return bool(re.search(r"store_stall\.py\s+--probe|\bdoctor\s+fleet\b", code))
+        self.assertTrue(runs_a_probe('tartci doctor fleet --json'))
+        self.assertFalse(runs_a_probe('note "see tartci doctor fleet"'))
+        probers = sorted(str(path.relative_to(ROOT)) for path in ROOT.glob("providers/**/*.sh")
+                         if any(runs_a_probe(line) for line in path.read_text().splitlines()))
+        self.assertEqual([], probers)
 
 
 if __name__ == "__main__":

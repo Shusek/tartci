@@ -348,17 +348,28 @@ def status(home: Optional[pathlib.Path] = None, **kwargs: Any) -> dict:
     return probe(targets(profile), **kwargs)
 
 
-def cached(home: Optional[pathlib.Path] = None) -> dict:
-    """The last probe's result, read only: what pool status shows. Spawns nothing."""
+# Past this age the cached result says nothing about now: the watchdog probes
+# every PROBE_INTERVAL_S, so one missed run is allowed and a second is not.
+STALE_AFTER_S = 2 * PROBE_INTERVAL_S
+
+
+def cached(home: Optional[pathlib.Path] = None, now: Optional[float] = None) -> dict:
+    """The last probe's result, read only: what pool status shows. Spawns nothing.
+
+    A result older than STALE_AFTER_S reads as unprobed, naming its age, the
+    state it last had, and what should have refreshed it, so a watchdog that
+    stopped probing never leaves an old "ok" standing in for now."""
     value = _read(state_dir(home) / "status.json")
     if value is None or not isinstance(value.get("probed_at"), (int, float)):
         return {"state": "unprobed", "detail": "no probe result yet (doctor or the watchdog "
                 "writes one)", "stalled": []}
-    age = time.time() - float(value["probed_at"])
-    if age > 2 * PROBE_INTERVAL_S:
-        return {"state": "unprobed",
-                "detail": f"last probe {_age(age)} ago; the launchd watchdog may not be probing",
-                "stalled": [], "probed_at": value["probed_at"]}
+    age = (time.time() if now is None else now) - float(value["probed_at"])
+    if age > STALE_AFTER_S:
+        return {"state": "unprobed", "stalled": [], "probed_at": value["probed_at"],
+                "stale_state": value.get("state"), "age_s": round(age),
+                "detail": (f"last probe {_age(age)} ago, older than {_age(STALE_AFTER_S)}; "
+                           "the launchd watchdog is not probing "
+                           "(`tartci doctor fleet` probes now)")}
     return value
 
 
