@@ -1284,22 +1284,9 @@ EOF
       lock_health_json="$(tartci_pool_lock_health_json)" \
         || lock_health_json='{"state":"unobservable","present":null}'
       local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
-      local launcher_app=""
-      if [ -f "$fleet_receipt" ]; then
-        launcher_app="$($status_python - "$fleet_receipt" <<'PY2'
-import json, sys
-try:
-    value = json.load(open(sys.argv[1]))
-    helper = value.get("launch_helper")
-    if isinstance(helper, dict) and isinstance(helper.get("path"), str):
-        print(helper["path"])
-except (OSError, ValueError):
-    pass
-PY2
-        )"
-      fi
+      # launcher_layout.py reads the helper app from the installed profile
+      # (else the receipt), so a receipt-less v2 host still reports v2.
       local launcher_args=(--home "$HOME")
-      [ -n "$launcher_app" ] && launcher_args+=(--app "$launcher_app")
       local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[]}'
       local managed_plists=""
       managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
