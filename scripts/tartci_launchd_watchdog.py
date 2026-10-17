@@ -1549,6 +1549,18 @@ def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
     return "\n".join(lines) or None
 
 
+def store_stall_pass(now: float | None = None, **kwargs) -> str | None:
+    """At most every 15 min, probe the store volumes the profile names and cache
+    the result for pool status (scripts/store_stall.py). A volume whose earlier
+    probe is still hanging gets no new one. Never raises."""
+    try:
+        import store_stall  # noqa: PLC0415 - sibling module
+        return store_stall.watchdog_pass(now=now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN store-stall check FAILED "
+                f"({type(exc).__name__}: {exc}); a stalled store would not be reported")
+
+
 def agent_cargo_pass(now: float | None = None, **kwargs) -> str | None:
     """About hourly, name agents' stale Cargo target dirs, and delete them on a
     host that opted in (scripts/agent_cargo_reap.py). Never raises."""
@@ -1955,6 +1967,9 @@ def main(argv: list[str] | None = None) -> int:
         cargo_line = agent_cargo_pass()
         if cargo_line:
             print(cargo_line)
+        store_line = store_stall_pass()
+        if store_line:
+            print(store_line)
         git_line = git_maintenance_pass()
         if git_line:
             print(git_line)
