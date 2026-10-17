@@ -3018,6 +3018,23 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   pass's `scratch_dirs` field shows what the scratch reaper removed and why it
   kept the rest.
 
+  A reclaim pass that goes STALE because its own `git` hung is often a store
+  stall, not a reclaim problem. `tartci doctor fleet` and the launchd
+  watchdog (at most every 15 min) probe each store volume the installed
+  profile names (the Tart store listing and `tart list`, and `git rev-parse` on
+  the `[reclaim]` repository and a listing of its worktrees root) with a 15 s
+  bound, and cache the result in `~/.tartci/state/store-stall/status.json`.
+  `pool status` only reads that cache (`store: STALLED since <time> (as of
+  <time>)`): it runs every few minutes from agents and peers, and a probe there
+  would pile stuck children up on a stalled host. A probe that does not finish
+  is killed and never waited on again; its PID stays in the volume's
+  `<volume>.pids` marker, and while that PID is alive no new probe of the
+  volume starts (`an earlier probe ... is still hanging`). A stall names the
+  volume, since when, how long the oldest `git` or `tart` on it has been
+  hanging, the likely cause (a system-wide sandbox or TCC stall, which does not
+  clear on its own) and the step: drain, let running jobs finish, reboot.
+  Nothing on a lane's path runs it.
+
   With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
   default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs
   `ccache -d $TARTCI_CI_CACHE/ccache --evict-older-than <N>d` on the gate ccache
@@ -3864,6 +3881,17 @@ to mise-provided tools is a separate, flagged step, and a new tool binary goes
 through the same launchd preflight as a new interpreter first (macOS grants
 belong to the binary). Rollout is one host at a time: m1's profile carries the
 table first; m5, m5s and m3 follow only after m1's step.
+
+Moving the pin to a new mise release keeps that order per host: put the new
+binary at its versioned path and confirm its sha256 first, then merge the
+table change. The reverse order makes that host's next install refuse until
+the binary arrives. Leave the previous binary installed: rolling back is
+restoring the table's previous three values, with nothing to copy back.
+While no lane runs mise, a pin move starts no launchd job, so there is nothing
+to preflight. Once a lane runs mise or its tools, a new mise path is a new
+binary to macOS: run it once as a launchd job, the way the lane will, before
+the table moves, and keep the old pin if it does not finish within 60 s
+(`scripts/interpreter_preflight.py` does this for lane Pythons only).
 
 A pinned toolchain never queries for updates. `mise_pin.py` asks the binary
 its version with `MISE_DISABLE_UPDATE_WARNING=1`, because `mise --version`
