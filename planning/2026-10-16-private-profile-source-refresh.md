@@ -122,3 +122,8 @@ The current private planning `main` is
 `7f4dabcbb0d97b1e05f4fe4a00e9ed613b567ced`. Its profile and advertised-label
 files have the same SHA-256 values as the installed M1 source, so the newer
 private commits contain no profile drift.
+
+The authority check was rerun on fresh detached checkouts on 2026-10-17. It
+passed against Pulp `921a981ee7c9c7de21b1b0d04b08c59df7920025` and TartCI
+`9447d728128c07f72c5e8ed0c5e85f27d07efa82`. The result was
+`local macOS fleet projection: OK`.
