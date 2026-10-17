@@ -2498,11 +2498,29 @@ def _ts(text: str | None) -> float:
         return 0.0
 
 
-def recent_attempt(cfg: Config, target: str, now: float) -> str | None:
+def _same_fleet_source(first: Any, second: Any) -> bool:
+    """Whether two attempts selected the same profile source.
+
+    The target commit alone is not enough for a same-generation reinstall:
+    moving from the public profiles to a private source deliberately keeps the
+    TartCI generation unchanged.  Older receipts have no source field, which
+    is the public-source value and remains comparable to ``None``.
+    """
+    if not first and not second:
+        return True
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    return (first.get("repository"), first.get("commit")) == (
+        second.get("repository"), second.get("commit"))
+
+
+def recent_attempt(cfg: Config, target: str, now: float,
+                   fleet_source: dict[str, Any] | None = None) -> str | None:
     for path, value in _attempts(cfg.state_dir):
         # A refusal changed nothing, so it does not spend the attempt.
         if (value.get("mode") != "apply" or value.get("target") != target
-                or value.get("status") not in TERMINAL_STATUSES):
+                or value.get("status") not in TERMINAL_STATUSES
+                or not _same_fleet_source(value.get("fleet_source"), fleet_source)):
             continue
         if now - _ts(value.get("started_at")) < cfg.rate_hours * 3600:
             return f"{path.name} ({value.get('status')})"
@@ -2846,7 +2864,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
-            prior = recent_attempt(cfg, target, now)
+            prior = recent_attempt(cfg, target, now, selected_source)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
         consent = launcher_change_refusal(cfg, target, installed, bool(refresh))
