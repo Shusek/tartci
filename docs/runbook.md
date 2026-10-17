@@ -2521,6 +2521,17 @@ fleet`), and check GitHub's job history against it with
   6 h. After 3 consecutive failed or rolled-back attempts automatic attempts
   stop until `self-update --clear-halt`. Refusal receipts older than 7 days are
   pruned.
+- **Applying a settings change now: `--reinstall-current`.** A change to
+  `self-update.toml` (removing `[fleet_source]`, say) reaches the installed
+  generation only with the next install, and on a current host self-update
+  reports `nothing to do`, so the receipt keeps the old setting and `pool
+  status` reads `fleet ready: NO` (`receipt_mismatch`).
+  `tartci fleet-macos self-update --apply --reinstall-current` reinstalls the
+  generation the host runs with the current settings, through the same drain,
+  install, pool-on and verify path (and rollback) as any update; `--plan
+  --reinstall-current` shows it first. The attempt rate does not hold an
+  operator's reinstall back; the pause, halt, peer and capacity gates still
+  apply. It takes no `--target` and is never `--scheduled`.
 - **Always visible.** `pool status`, `doctor fleet` (`self_update`) and the
   watchdog show the skew line, `STALE` after 24 h, a failed or rolled-back last
   attempt, and a halt.

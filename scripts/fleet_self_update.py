@@ -2722,7 +2722,8 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
 
 
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
-                  explicit: bool = False, scheduled: bool = False) -> int:
+                  explicit: bool = False, scheduled: bool = False,
+                  reinstall: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
@@ -2793,7 +2794,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_UNKNOWN
     target = skew.get("target")
     refresh = None
-    if not target:
+    if reinstall:
+        # The operator's own request: reinstall the generation this host runs,
+        # with the current settings (a removed [fleet_source], say), through the
+        # same drain, install, pool-on and verify path as any update.
+        target = installed
+        refresh = ("operator requested --reinstall-current: reinstall the installed "
+                   "generation with the current settings")
+        print(f"self-update: same-generation reinstall requested: {installed[:12]}")
+    elif not target:
         refresh = refresh_reason(cfg, sys_)
         # A private-source change is a same-generation install. It must not
         # wait for an unrelated TartCI commit to finish its soak: the running
@@ -2846,7 +2855,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
-            prior = recent_attempt(cfg, target, now)
+            # An operator's --reinstall-current is not a retry of an automatic
+            # attempt, so the attempt rate does not hold it back.
+            prior = None if reinstall else recent_attempt(cfg, target, now)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
         consent = launcher_change_refusal(cfg, target, installed, bool(refresh))
@@ -3891,6 +3902,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="print each published peer and the SSH target it resolves to")
     mode.add_argument("--refresh-skew", action="store_true",
                       help="fetch main and record skew only (no other checks)")
+    parser.add_argument("--reinstall-current", action="store_true",
+                        help="with --plan or --apply: reinstall the installed generation with the "
+                        "current settings (to apply a settings change, such as a removed "
+                        "[fleet_source], without waiting for a new commit)")
     parser.add_argument("--scheduled", action="store_true",
                         help="apply after this host's stagger offset (the periodic agent)")
     parser.add_argument("--if-older", type=int, default=0,
@@ -3969,9 +3984,13 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(cfg.state_dir / "skew.json", skew)
         print(render_skew(skew))
         return 0
+    if args.reinstall_current and (args.target or args.scheduled):
+        parser.error("--reinstall-current reinstalls the installed generation; it takes no "
+                     "--target and is never --scheduled")
     target_ref = args.target or "origin/main"
     return plan_or_apply(cfg, sys_, apply=args.apply, target_ref=target_ref,
-                         explicit=args.target is not None, scheduled=args.scheduled)
+                         explicit=args.target is not None, scheduled=args.scheduled,
+                         reinstall=args.reinstall_current)
 
 
 if __name__ == "__main__":
