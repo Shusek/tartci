@@ -3448,6 +3448,13 @@ class OsInterpreterRefreshTests(Base):
         self.assertEqual(self.apply(), su.EXIT_NOTHING)
         self.assertEqual(self.sys.mutations(), [])
 
+    def test_os_interpreter_refresh_does_not_bypass_code_soak(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        self.sys.status_problems = [{"code": "interpreter_changed_by_os_update",
+                                     "detail": "macOS build changed"}]
+        self.assertEqual(self.apply(), su.EXIT_NOTHING)
+        self.assertEqual(self.sys.mutations(), [])
+
 
 class PrivateSourceSystem(FakeSystem):
     """FakeSystem plus GitHub API reads of one private fleet repository."""
@@ -3851,6 +3858,15 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         self.assertEqual(self.OLDER, restored["commit"])
         self.assertEqual(self.fixture.PRIVATE, restored["repository"])
         self.assertEqual(str(previous_root), restored["root"])
+
+    def test_failed_previous_reinstall_keeps_the_target_source_selected(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1
+        self.sys.rollback_install_rc = 1
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual(self.fixture.COMMIT, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
 
     def test_a_run_that_did_not_install_the_selected_commit_publishes_nothing(self) -> None:
         self.sys.log_lines = ""

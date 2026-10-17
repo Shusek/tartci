@@ -42,7 +42,7 @@ private paths or host data are added to this repository.
 - Run the focused source and self-update tests in a fresh worktree.
 - Run the related macOS lane/source tests and `./scripts/lint.sh` on the
   canary host.
-- Ask Ultra for adversarial review of the authority decision and changes.
+- Obtain an independent adversarial review of the authority decision and changes.
 - Confirm the public-path audit finds no private addresses, paths, tokens, or
   redacted snapshot data.
 - Do not configure or roll out an external source until a real unredacted
@@ -56,8 +56,9 @@ the current TartCI and Pulp sources. The canary installed the validated export
 and its receipt records the repository, commit, profile digest,
 published-supply digest, and complete-tree digest. The update drained and
 restored the pool with all required labels covered, then passed verification
-with every expected supervisor serving. A persistent `[fleet_source]` setting
-keeps scheduled updates on the same selected source.
+with every expected supervisor serving. The source setting was later removed
+from the fleet while the rollout was paused; the installed canary receipt
+continues to identify the private source until its next install.
 
 The canary passed the required 30-minute soak. Wider rollout remains blocked
 until the sequencing fix is reviewed and merged, then receives its own
@@ -109,8 +110,9 @@ regression coverage.
 
 The Python floor, self-update, and lint checks pass on the current candidate.
 The required signed review is still pending, so the wider rollout remains
-stopped. The canary remains healthy on the private source, and sealed launcher
-hosts remain on the public source until they support this selection.
+stopped. The canary reports a receipt mismatch until the corresponding
+readiness fix lands; sealed launcher hosts remain on the public source until
+they support this selection.
 
 The authority check was rerun on fresh detached checkouts on 2026-10-17 and
 passed with `local macOS fleet projection: OK`.
