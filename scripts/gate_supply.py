@@ -452,17 +452,27 @@ def fetch_peer(host_id: str, target: str, repo: str, class_label: str, *,
         result = subprocess.run(command, text=True, capture_output=True, check=False,
                                 timeout=timeout, stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        return {"verdict": "unknown", "reason": f"ssh {target}: {type(exc).__name__}", "host": host_id}
+        return {"schema": SCHEMA, "verdict": "unknown", "reason": f"ssh {target}: {type(exc).__name__}",
+                "host": host_id, "repo": repo, "class": class_label, "fetched_at": int(started)}
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError:
         tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
-        return {"verdict": "unknown", "host": host_id,
+        return {"schema": SCHEMA, "verdict": "unknown", "host": host_id, "repo": repo,
+                "class": class_label, "fetched_at": int(started),
                 "reason": f"ssh {target} exit {result.returncode}: {tail[0][:160]}"}
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
-        return {"verdict": "unknown", "host": host_id, "reason": "report schema mismatch"}
+        return {"schema": SCHEMA, "verdict": "unknown", "host": host_id, "repo": repo,
+                "class": class_label, "fetched_at": int(started), "reason": "report schema mismatch"}
     value["fetched_at"] = int(started)
     return value
+
+
+def error_report(repo: str, class_label: str, reason: str, host: str | None = None) -> dict[str, Any]:
+    """Typed unknown envelope shared by report and fallback-local failures."""
+    return {"schema": SCHEMA, "verdict": "unknown", "reason": reason,
+            "host": host or os.uname().nodename.split(".")[0], "repo": repo,
+            "class": class_label, "fetched_at": int(time.time())}
 
 
 def decide(demand: int, peers: list[dict[str, Any]], local: dict[str, Any] | None, *,
@@ -525,9 +535,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         try:
             report = host_report(args.repo, args.class_label)
+            report.setdefault("fetched_at", int(time.time()))
         except Exception as exc:  # noqa: BLE001 - report blindness, never crash the caller
-            report = {"schema": SCHEMA, "verdict": "unknown", "reason": f"report failed: {exc}",
-                      "repo": args.repo, "class": args.class_label, "free": 0, "in_flight": 0}
+            report = error_report(args.repo, args.class_label, f"report failed: {exc}")
+            report.update({"free": 0, "in_flight": 0})
         if args.json:
             print(json.dumps(report, sort_keys=True))
         else:
@@ -551,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             local = host_report(args.repo, args.class_label, lanes_only=True)
         except Exception as exc:  # noqa: BLE001
-            local = {"verdict": "unknown", "reason": f"local report failed: {exc}"}
+            local = error_report(args.repo, args.class_label, f"local report failed: {exc}")
     verdict, detail = decide(
         args.demand, reports, local, own_slot=args.slot, own_state_dir=args.state_dir,
         repo=args.repo, class_label=args.class_label,
