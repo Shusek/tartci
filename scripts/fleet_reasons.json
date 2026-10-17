@@ -548,6 +548,24 @@
       "why": "The launchd watchdog re-measures it every 30 minutes on a managed host; until then the answer is unknown, not current.",
       "remedy": "Run `tartci fleet-macos self-update --plan` (read-only)."
     },
+    "store_ok": {
+      "summary": "Every store volume the profile names answered its probe in time.",
+      "why": "A directory listing, tart list and git rev-parse on the VM store and repository volumes each finished within the probe timeout.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read ok as fast: the probe proves the volume answers, not that it is quick."
+    },
+    "store_stalled": {
+      "summary": "A store volume did not answer: a listing, tart list or git on it hung past the probe timeout.",
+      "why": "Usually a system-wide sandbox or TCC stall (a wedged sandboxd or tccd): every process touching the volume hangs, lanes stay loaded, and the reclaim agent only reads STALE hours later. It does not clear on its own.",
+      "remedy": "Drain the host (`tartci pool drain`), let running jobs finish, then reboot it; a reboot clears it. Verify with `tartci doctor fleet` (store_ok).",
+      "do_not": "Do not kill the hung processes one by one and call it fixed: new ones hang the same way until the reboot."
+    },
+    "store_unprobed": {
+      "summary": "The store volumes were not probed.",
+      "why": "No installed fleet profile, no TOML parser in this interpreter, or the probe itself failed to start.",
+      "remedy": "Run `tartci doctor fleet` with the pinned interpreter on a managed host.",
+      "do_not": "Do not read unprobed as healthy."
+    },
     "supply_match": {
       "summary": "Every registration this host's installed profile mints matches the published declared supply.",
       "why": "The published fleet/advertised-labels.json is what other projects read to learn which labels this fleet serves; it is generated from git, so only a comparison with the installed profile says the machine serves what git publishes."

@@ -2681,11 +2681,32 @@ def _ts(text: str | None) -> float:
         return 0.0
 
 
-def recent_attempt(cfg: Config, target: str, now: float) -> str | None:
+def _same_fleet_source(first: Any, second: Any) -> bool:
+    """Whether two attempts selected the same profile source.
+
+    The target commit alone is not enough for a same-generation reinstall:
+    moving from the public profiles to a private source deliberately keeps the
+    TartCI generation unchanged.  Older receipts have no source field, which
+    is the public-source value and remains comparable to ``None``.
+    """
+    if not first and not second:
+        return True
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    # A new commit on the same private authority is still the same source
+    # class.  The source move itself gets a fresh window when crossing the
+    # public/private boundary, but a busy private authority must not make the
+    # canary drain once per commit.
+    return bool(first) == bool(second)
+
+
+def recent_attempt(cfg: Config, target: str, now: float,
+                   fleet_source: dict[str, Any] | None = None) -> str | None:
     for path, value in _attempts(cfg.state_dir):
         # A refusal changed nothing, so it does not spend the attempt.
         if (value.get("mode") != "apply" or value.get("target") != target
-                or value.get("status") not in TERMINAL_STATUSES):
+                or value.get("status") not in TERMINAL_STATUSES
+                or not _same_fleet_source(value.get("fleet_source"), fleet_source)):
             continue
         if now - _ts(value.get("started_at")) < cfg.rate_hours * 3600:
             return f"{path.name} ({value.get('status')})"
@@ -3043,7 +3064,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
-            prior = recent_attempt(cfg, target, now)
+            prior = recent_attempt(cfg, target, now, selected_source)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
         layout = planned_layout(cfg)

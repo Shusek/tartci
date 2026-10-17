@@ -1904,6 +1904,23 @@ class InstallFailureTests(Base):
         self.sys.install_rcs = [0]
         self.assertUpdated(self.apply())
 
+    def test_source_move_has_a_separate_rate_limit_from_public_attempt(self) -> None:
+        """A source move must not wait six hours after a public install."""
+        attempts = self.cfg.state_dir / "attempts"
+        su._write_json(attempts / "public.json", {
+            "mode": "apply", "target": INSTALLED, "status": "succeeded",
+            "started_at": su._iso(NOW - 60), "fleet_source": None,
+        })
+        private = {"repository": "ORG/private-fleet-authority", "commit": "c" * 40}
+        self.assertIsNone(su.recent_attempt(self.cfg, INSTALLED, NOW, private))
+        su._write_json(attempts / "private.json", {
+            "mode": "apply", "target": INSTALLED, "status": "succeeded",
+            "started_at": su._iso(NOW - 60), "fleet_source": private,
+        })
+        self.assertIsNotNone(su.recent_attempt(self.cfg, INSTALLED, NOW, private))
+        newer_private = {"repository": private["repository"], "commit": "d" * 40}
+        self.assertIsNotNone(su.recent_attempt(self.cfg, INSTALLED, NOW, newer_private))
+
     def test_refusal_does_not_spend_the_attempt(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
