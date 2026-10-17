@@ -3448,6 +3448,13 @@ class OsInterpreterRefreshTests(Base):
         self.assertEqual(self.apply(), su.EXIT_NOTHING)
         self.assertEqual(self.sys.mutations(), [])
 
+    def test_os_interpreter_refresh_does_not_bypass_code_soak(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        self.sys.status_problems = [{"code": "interpreter_changed_by_os_update",
+                                     "detail": "macOS build changed"}]
+        self.assertEqual(self.apply(), su.EXIT_NOTHING)
+        self.assertEqual(self.sys.mutations(), [])
+
 
 class PrivateSourceSystem(FakeSystem):
     """FakeSystem plus GitHub API reads of one private fleet repository."""
@@ -3471,7 +3478,12 @@ class PrivateSourceSystem(FakeSystem):
         self.installed_sources = getattr(self, "installed_sources", []) + [selected]
         receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
         receipt = json.loads(receipt_path.read_text())
-        receipt["fleet_source"] = {"configured": bool(selected), "commit": selected}
+        receipt["fleet_source"] = {
+            "configured": bool(selected),
+            "commit": selected,
+            "repository": os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY") if selected else None,
+            "root": os.environ.get("TARTCI_FLEET_SOURCE_ROOT") if selected else None,
+        }
         receipt_path.write_text(json.dumps(receipt))
 
 
@@ -3664,7 +3676,11 @@ class FleetSourceCanaryTests(FleetSourceFixture):
 
     def installed_from(self, commit: str | None) -> None:
         receipt = json.loads(self.cfg.install_receipt.read_text())
-        receipt["fleet_source"] = {"configured": commit is not None, "commit": commit}
+        receipt["fleet_source"] = {
+            "configured": commit is not None, "commit": commit,
+            "repository": self.fixture.PRIVATE if commit else None,
+            "root": str(self.cfg.fleet_source_store / commit) if commit else None,
+        }
         self.cfg.install_receipt.write_text(json.dumps(receipt))
 
     def canary(self, record: dict | None):
@@ -3712,6 +3728,58 @@ class FleetSourceCanaryTests(FleetSourceFixture):
             selected = su.sync_fleet_source(self.cfg, self.sys)
         self.assertEqual(self.fixture.COMMIT, selected["commit"])
         self.assertIn("fleet source moved to cccccccccccc", su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_malformed_installed_source_receipt_refuses_before_source_sync(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": True, "commit": self.OLDER}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.repo.calls)
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(self.cfg.fleet_source_store.exists())
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+        self.assertIn("lacks the source root and repository",
+                      json.loads((self.cfg.state_dir / "skew.json").read_text())["reason"])
+
+    def test_a_non_boolean_configured_marker_also_refuses_before_source_sync(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": "true", "commit": self.OLDER,
+                                    "repository": self.fixture.PRIVATE,
+                                    "root": str(self.cfg.fleet_source_store / self.OLDER)}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.repo.calls)
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(self.cfg.fleet_source_store.exists())
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_adopted_source_reinstalls_while_tartci_commit_is_still_soaking(self) -> None:
+        """A source move must not wait for unrelated TartCI code to soak."""
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        with self.canary(soaked):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def _assert_adopted_source_reinstalls_for_skew_state(self, state: str) -> None:
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = ""
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        skew = {"state": state, "target": None, "explicit": False}
+        with self.canary(soaked), mock.patch.object(su, "measure_skew", return_value=skew):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def test_adopted_source_reinstalls_while_tartci_is_behind(self) -> None:
+        self._assert_adopted_source_reinstalls_for_skew_state("behind")
+
+    def test_adopted_source_reinstalls_while_tartci_is_unverified(self) -> None:
+        self._assert_adopted_source_reinstalls_for_skew_state("unverified")
 
     def test_a_record_for_another_repository_is_not_adopted(self) -> None:
         self.installed_from(self.OLDER)
@@ -3767,8 +3835,66 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         self.sys.log_lines = ""
         self.sys.on_rc = 1               # pool on keeps refusing
         self.assertNotEqual(su.EXIT_OK, self.apply())
-        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+        # The failed source move rolled back to the public source the host was
+        # running before the attempt.
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
         self.assertIsNone(self.verified())
+
+    def test_failed_install_restores_previous_source_before_pool_on(self) -> None:
+        """An installer self-rollback must not serve old code with new profiles."""
+        self.sys.log_lines = ""
+        self.sys.install_rcs = [1]
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(step["step"] == "source-restore" for step in receipt["steps"]))
+
+    def test_failed_install_restores_previous_private_source_before_pool_on(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual(self.OLDER, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+
+    def test_rollback_restores_the_previous_private_source(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1               # target pool-on fails; rollback must run
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual([self.fixture.COMMIT, self.OLDER], self.sys.installed_sources)
+        restored = json.loads(receipt_path.read_text())["fleet_source"]
+        self.assertEqual(self.OLDER, restored["commit"])
+        self.assertEqual(self.fixture.PRIVATE, restored["repository"])
+        self.assertEqual(str(previous_root), restored["root"])
+
+    def test_failed_previous_reinstall_keeps_the_target_source_selected(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1
+        self.sys.rollback_install_rc = 1
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual(self.fixture.COMMIT, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
 
     def test_a_run_that_did_not_install_the_selected_commit_publishes_nothing(self) -> None:
         self.sys.log_lines = ""
