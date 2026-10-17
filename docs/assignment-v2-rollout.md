@@ -622,8 +622,8 @@ age an idle lane's heartbeat past 120 s, and on m3 7 of 20 supply samples read
 heartbeat and exits within one interval of the supervisor dying, so a dead
 lane still goes stale. A
 Tart inventory that cannot be read (after the same retry the supervisor uses)
-is treated as the host's own slot claim treats it: the reservation files are
-the occupancy (`"inventory": "reservations"` in the report).
+blocks new clones on that host. Its supply report has `"inventory":
+"unavailable"` and `free: 0`, so fallback hosts do not count it as capacity.
 
 The fail-safe is structural: `unknown` and `hold` both fall through to the age
 rule, so the fallback lane never boots later than it does today, and never

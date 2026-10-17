@@ -84,6 +84,38 @@ PROFILES = {"canary-macos-fleet.toml": "schema = 1\nname = \"canary\"\n",
             "other-macos-fleet.toml": "schema = 1\nname = \"other\"\n"}
 
 
+class ExportWithoutTomllibTests(unittest.TestCase):
+    """Runs on every interpreter, the hosts' Python 3.9 included: without
+    tomllib the export refuses and publishes nothing. On 3.11+ tomllib is taken
+    away for the test; on 3.9 it is already absent, and the test says so."""
+
+    def setUp(self) -> None:
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.store = Path(self.td.name) / "fleet-sources"
+        self.repo = FakeRepository(source_files(PROFILES))
+
+    def test_an_interpreter_without_tomllib_refuses_and_publishes_nothing(self) -> None:
+        from unittest import mock  # noqa: PLC0415
+        native = fleet_source.tomllib is None
+        if sys.version_info < (3, 11):
+            self.assertTrue(native, "a 3.9 interpreter has no tomllib")
+        with mock.patch.object(fleet_source, "tomllib", None):
+            commit, tree = sync.head(self.repo, PRIVATE)
+            with self.assertRaisesRegex(sync.SyncError, "requires Python 3.11"):
+                sync.export(self.repo, PRIVATE, commit, tree, self.store)
+        self.assertFalse((self.store / COMMIT).exists(), "no export published")
+        self.assertEqual([], [p.name for p in self.store.iterdir()], "no staging left behind")
+
+    def test_the_same_export_succeeds_where_tomllib_is_present(self) -> None:
+        # Control, same fixture: the refusal above is the missing parser.
+        if fleet_source.tomllib is None:
+            self.skipTest("3.11-only control: this interpreter has no tomllib")
+        commit, tree = sync.head(self.repo, PRIVATE)
+        self.assertEqual(self.store / COMMIT,
+                         sync.export(self.repo, PRIVATE, commit, tree, self.store))
+
+
 @unittest.skipUnless(fleet_source.tomllib is not None,
                      "source export requires the pinned Python 3.11+ TOML parser")
 class ExportTests(unittest.TestCase):

@@ -679,6 +679,31 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertIsNone(value["verified_running_supervisors"])
             self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
 
+            recorded_receipt = {
+                **receipt,
+                "fleet_source": {
+                    "root": str(root / "source"),
+                    "configured": True,
+                    "commit": "a" * 40,
+                    "repository": "ORG/private-fleet-authority",
+                    "tree_sha256": "b" * 64,
+                    "published_supply_sha256": "c" * 64,
+                    "profiles_dir": str(root / "source" / "profiles"),
+                    "published_supply": str(root / "source" / "fleet" / "advertised-labels.json"),
+                },
+            }
+            with mock.patch.object(fleet, "verify_receipt", return_value=recorded_receipt), \
+                 mock.patch.object(
+                     fleet.fleet_source,
+                     "resolve_recorded",
+                     side_effect=ValueError("source disappeared"),
+                 ):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertFalse(value["fleet_ready"])
+            self.assertIsNone(value["verified_running_supervisors"])
+            self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
+            self.assertIn("source disappeared", value["problems"][0]["detail"])
+
     def test_heartbeat_identity_spans_wrapper_and_direct_topologies(self) -> None:
         """A lane on an external volume runs through a signed launch_helper, so
         launchd's job pid is the helper and the heartbeat is written by its
@@ -3699,6 +3724,119 @@ class PublishedSupplyIsAFileTests(unittest.TestCase):
         self.assertFalse(hasattr(fleet, "PUBLISHED_SUPPLY_URL"))
         published = fleet.read_published(fleet.PUBLISHED_SUPPLY)
         self.assertEqual("tartci.advertised-labels/v1", published["schema"])
+
+
+class VerifyReceiptFleetSourceTests(unittest.TestCase):
+    """verify_receipt takes its fleet source from the receipt, never the
+    process environment. Standalone self-update verification on m1 ran with no
+    source environment and failed every configured receipt (receipt_mismatch)."""
+
+    ENV = ("TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+           "TARTCI_FLEET_SOURCE_REPOSITORY")
+
+    def setUp(self) -> None:
+        import test_fleet_source  # noqa: PLC0415 - shared valid-source builder
+        self.configured_source = test_fleet_source.configured_source
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.root = Path(self.td.name).resolve()
+        saved = {name: os.environ.pop(name, None) for name in self.ENV}
+        self.addCleanup(lambda: [os.environ.pop(n, None) for n in self.ENV]
+                        + [os.environ.__setitem__(n, v) for n, v in saved.items() if v is not None])
+        self.config = self.root / "fleet.toml"
+        shutil.copy(CONFIG, self.config)
+        self.agents = self.root / "agents"
+        self.agents.mkdir()
+        # A public support generation carries the checkout's profiles and
+        # published supply, which a public source's digests are taken from.
+        self.support = self.root / "support"
+        shutil.copytree(ROOT / "profiles", self.support / "profiles")
+        (self.support / "fleet").mkdir()
+        shutil.copy(ROOT / "fleet" / "advertised-labels.json",
+                    self.support / "fleet" / "advertised-labels.json")
+        data = fleet.load(self.config)
+        self.schema = (4 if data["host"].get("persistent_runner_labels")
+                       else 3 if data.get("launch_helper") is not None else 2)
+
+    @staticmethod
+    def recorded(source: "fleet.fleet_source.FleetSource") -> dict:
+        return {
+            "root": str(source.root), "configured": source.configured,
+            "commit": source.source_commit, "repository": source.repository,
+            "tree_sha256": source.tree_sha256,
+            "published_supply_sha256": source.published_supply_sha256,
+            "profiles_dir": str(source.profiles_dir),
+            "published_supply": str(source.published_supply),
+        }
+
+    def private_source(self, name: str) -> tuple[dict, dict]:
+        """A valid configured source and its receipt record, built with its env."""
+        env = self.configured_source(self.root / name)
+        # The commit and repository are read while the source environment is
+        # set, as the installer does when it writes the receipt.
+        with mock.patch.dict(os.environ, env):
+            source = fleet.fleet_source.resolve(fleet.TARTCI_ROOT)
+            record = self.recorded(source)
+        self.assertTrue(source.configured)
+        self.assertEqual(record["commit"], env["TARTCI_FLEET_SOURCE_COMMIT"])
+        return env, record
+
+    def verify(self, fleet_source_record: dict | None) -> tuple[str, list]:
+        """Run verify_receipt; return the error and every root resolve() returned.
+
+        The receipt names nothing past the fleet source, so a source that
+        verifies stops at the support cohort check."""
+        receipt = {"schema": self.schema, "config_path": str(self.config),
+                   "agents_dir": str(self.agents)}
+        if fleet_source_record is not None:
+            receipt["fleet_source"] = fleet_source_record
+        path = self.root / "receipt.json"
+        path.write_text(json.dumps(receipt))
+        roots = []
+        real_resolve = fleet.fleet_source.resolve
+
+        def spy(*args, **kwargs):
+            source = real_resolve(*args, **kwargs)
+            roots.append(source.root)
+            return source
+        with mock.patch.object(fleet.fleet_source, "resolve", side_effect=spy):
+            with self.assertRaises(ValueError) as caught:
+                fleet.verify_receipt(path, self.config, self.agents, self.support)
+        return str(caught.exception), roots
+
+    def assert_source_verified(self, error: str) -> None:
+        self.assertNotIn("fleet source", error)
+        self.assertIn("support cohort is missing or malformed", error)
+
+    def test_a_configured_receipt_verifies_with_no_source_environment(self) -> None:
+        _, record = self.private_source("private")
+        for name in self.ENV:
+            self.assertNotIn(name, os.environ)
+        error, _ = self.verify(record)
+        self.assert_source_verified(error)
+
+    def test_a_configured_receipt_verifies_against_its_own_source_not_the_environment(
+        self,
+    ) -> None:
+        _, record = self.private_source("private")
+        other_env, other_record = self.private_source("other")
+        self.assertNotEqual(record["root"], other_record["root"])
+        with mock.patch.dict(os.environ, other_env):
+            error, _ = self.verify(record)
+        self.assert_source_verified(error)
+
+    def test_public_and_legacy_receipts_verify_against_the_support_root(self) -> None:
+        env, _ = self.private_source("private")
+        public = self.recorded(
+            fleet.fleet_source.resolve(self.support, allow_environment=False))
+        self.assertFalse(public["configured"])
+        with mock.patch.dict(os.environ, env):
+            for label, record in (("public", public), ("legacy", None)):
+                with self.subTest(receipt=label):
+                    error, roots = self.verify(record)
+                    self.assert_source_verified(error)
+                    self.assertTrue(roots, "verify_receipt resolved no source")
+                    self.assertEqual(roots[-1], self.support.resolve())
 
 
 if __name__ == "__main__":

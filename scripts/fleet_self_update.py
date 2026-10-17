@@ -147,6 +147,9 @@ STARVED_AFTER_SECONDS = PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600
 # old is an operator drain or an update that died after draining. The bound is
 # the marker's own TTL: a dead update's marker stops counting at the same age.
 PEER_DRAIN_STALE_SECONDS = ACTIVE_MARKER_TTL
+# A draining peer with NO update marker at all is an operator drain once its
+# pool state has been unchanged this long (see read_peer).
+PEER_DRAIN_GRACE_SECONDS = 15 * 60
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
@@ -646,6 +649,45 @@ def installed_fleet_source_commit(cfg: Config) -> str | None:
     return None
 
 
+def installed_fleet_source_record(cfg: Config) -> dict[str, Any] | None:
+    """The complete private-source record for the installed generation."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    if isinstance(recorded, dict) and recorded.get("configured") is True:
+        if all(isinstance(recorded.get(key), str) and recorded[key].strip()
+               for key in ("repository", "commit", "root")):
+            return {key: recorded[key] for key in ("repository", "commit", "root")}
+    return None
+
+
+def fleet_source_receipt_is_configured(cfg: Config) -> bool:
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    return (isinstance(recorded, dict) and "configured" in recorded
+            and recorded.get("configured") is not False)
+
+
+def fleet_source_env(record: dict[str, Any] | None) -> dict[str, str]:
+    """Return the source environment represented by an install receipt."""
+    if record is None:
+        return {}
+    return {
+        "TARTCI_FLEET_SOURCE_ROOT": record["root"],
+        "TARTCI_FLEET_SOURCE_COMMIT": record["commit"],
+        "TARTCI_FLEET_SOURCE_REPOSITORY": record["repository"],
+    }
+
+
+def fleet_source_env_snapshot() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in FLEET_SOURCE_ENV}
+
+
+def restore_fleet_source_env(snapshot: dict[str, str | None]) -> None:
+    for name, value in snapshot.items():
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+
+
 def _source_name(commit: str | None) -> str:
     return commit[:12] if commit else "the public profiles"
 
@@ -1058,6 +1100,28 @@ def self_host_id(cfg: Config) -> str:
 WAITING_SEPARATOR = "--- waiting ---"
 UNREADABLE_SEPARATOR = "--- unreadable ---"
 POOL_SINCE_SEPARATOR = "--- pool-state-since ---"
+PAUSED_SEPARATOR = "--- self-update-paused ---"
+# halt_reason, run by the PEER's own /usr/bin/python3 (any 3.x, no imports
+# from tartci) so a peer of any version reports whether its self-update is
+# halted. test_fleet_self_update checks it agrees with halt_reason.
+_PEER_HALTED = (
+    "import json, os, glob, datetime as d\n"
+    "s = (os.environ.get(\"TARTCI_HOME\") or os.path.expanduser(\"~/.tartci\")) + \"/state/self-update\"\n"
+    "def t(x):\n"
+    "    try: return d.datetime.strptime(str(x), \"%Y-%m-%dT%H:%M:%SZ\").replace(tzinfo=d.timezone.utc).timestamp()\n"
+    "    except ValueError: return 0.0\n"
+    "def r(p):\n"
+    "    try: v = json.load(open(p))\n"
+    "    except Exception: return None\n"
+    "    return v if isinstance(v, dict) else None\n"
+    "c = t((r(s + \"/halt-cleared.json\") or {}).get(\"at\")); n = 0\n"
+    "for p in sorted(glob.glob(s + \"/attempts/*.json\")):\n"
+    "    v = r(p)\n"
+    f"    if not v or v.get(\"mode\") != \"apply\" or v.get(\"status\") not in {json.dumps(list(TERMINAL_STATUSES))}:\n"
+    "        continue\n"
+    "    if t(v.get(\"started_at\")) < c: continue\n"
+    "    n = 0 if v.get(\"status\") == \"succeeded\" else n + 1\n"
+    f"print(\"halted\" if n >= {MAX_CONSECUTIVE_FAILURES} else \"\")\n")
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
@@ -1065,7 +1129,9 @@ _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/' + PEER_UNREADABLE_NAME
                 + '" 2>/dev/null || true; echo; echo "' + POOL_SINCE_SEPARATOR + '"; '
                 'stat -f %m "${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}" '
-                '2>/dev/null || true')
+                '2>/dev/null || true; echo; echo "' + PAUSED_SEPARATOR + '"; '
+                'test -s "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/scheduled-pause.json" '
+                '&& echo paused || true; /usr/bin/python3 -c \'' + _PEER_HALTED + '\' 2>/dev/null || true')
 
 
 def _ssh_failure_kind(result: Result) -> str:
@@ -1099,8 +1165,11 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     service on purpose (m5studio, off for a store move on 2026-10-01, blocked
     every other host's update for 11 h). It is marked `off`, and whether this
     host may still go out is the capacity floor's call, which counts an off
-    host as serving nothing. Draining, unreadable or updating peers still
-    refuse.
+    host as serving nothing. So is a DRAINING peer with no live update marker
+    whose self-update is paused or halted, or whose markerless drain is older
+    than PEER_DRAIN_GRACE_SECONDS (an operator drain: a containment drain on
+    2026-10-16, held every other host's turn for 3 h). Updating, unreadable
+    and freshly draining peers still refuse.
     """
     out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
                            "off": False, "readable": False, "clock": None, "unreadable": None}
@@ -1124,6 +1193,8 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
     out["clock"] = clock
     rest, _, pool_since_text = rest.partition(POOL_SINCE_SEPARATOR)
+    pool_since_text, _, paused_text = pool_since_text.partition(PAUSED_SEPARATOR)
+    held = set(paused_text.split())   # "paused" and/or "halted"
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
     waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
     pool_since = (int(pool_since_text.strip())
@@ -1175,6 +1246,25 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
                    evidence=(f"peer {host_id} has been draining for "
                              f"{(clock - pool_since) / 3600:.1f} h with no update marker "
                              "(left to the capacity floor)"))
+        return out
+    # An operator's drain: no update marker at all, so no self-update is in
+    # it. A self-update writes its marker BEFORE it drains, and a dead one's
+    # marker keeps it busy above until the marker's TTL; the grace only
+    # covers a marker written between this read's marker and pool reads.
+    # A peer whose own self-update the operator paused cannot be in an
+    # update without a live marker either. Both are left to the capacity
+    # floor, like an off peer.
+    operator_drain = (active is None and pool_since is not None
+                      and clock - pool_since >= PEER_DRAIN_GRACE_SECONDS)
+    stopped = sorted(held & {"paused", "halted"})
+    if value.get("state") == "draining" and (stopped or operator_drain):
+        why = (f"its self-update is {' and '.join(stopped)}, so no update is in this drain"
+               if stopped else
+               f"an operator drain: no update marker for more than "
+               f"{PEER_DRAIN_GRACE_SECONDS // 60} min")
+        age = (f" for {int((clock - pool_since) // 60)} min" if pool_since is not None else "")
+        out.update(busy=False, off=True,
+                   evidence=f"peer {host_id} is draining{age}, {why} (left to the capacity floor)")
         return out
     if not is_off and not serving:
         since = (f", pool state unchanged for {int((clock - pool_since) // 60)} min"
@@ -2651,6 +2741,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         finish_pending_fixes(cfg)
     try:
         installed, source = installed_commit(cfg)
+        previous_fleet_source = installed_fleet_source_record(cfg)
+        if fleet_source_receipt_is_configured(cfg) and previous_fleet_source is None:
+            raise Refused("installed private-source receipt lacks the source root and repository; "
+                          "refusing a source move until the host is reinstalled from a complete "
+                          "source receipt")
         refresh_checkout(cfg, sys_)
         selected_source = sync_fleet_source(cfg, sys_, write=apply)
     except NotManaged as exc:
@@ -2698,10 +2793,16 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_UNKNOWN
     target = skew.get("target")
     refresh = None
-    if not target and skew["state"] == "current":
+    if not target:
         refresh = refresh_reason(cfg, sys_)
-        if refresh:
-            # Same generation, reinstalled only to rewrite its receipt.
+        # A private-source change is a same-generation install. It must not
+        # wait for an unrelated TartCI commit to finish its soak: the running
+        # code is unchanged, while the selected profile bytes still need to
+        # reach the installed generation. The ordinary TartCI target remains
+        # gated by its own skew state below.
+        source_moved = bool(refresh and refresh.startswith("fleet source moved to "))
+        if refresh and (source_moved and skew["state"] in ("current", "soaking", "behind", "unverified")
+                        or not source_moved and skew["state"] == "current"):
             target = installed
             print(f"self-update: same-generation reinstall needed: {refresh}")
     if not target:
@@ -2858,7 +2959,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
-                  helper=helper, approval=approval, excluded=survey.excluded)
+                  helper=helper, approval=approval, excluded=survey.excluded,
+                  previous_fleet_source=previous_fleet_source)
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
@@ -2935,13 +3037,15 @@ class Run:
                  previous: str, profile: Path, install_args: list[str], allow: bool,
                  helper: dict | None, approval: Path | None,
                  repository: str | None = None,
-                 excluded: list[str] | None = None) -> None:
+                 excluded: list[str] | None = None,
+                 previous_fleet_source: dict[str, Any] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
         self.repository = repository
+        self.previous_fleet_source = previous_fleet_source
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
@@ -3261,21 +3365,32 @@ class Run:
                 self.sys.sleep(self.POOL_ON_BACKOFF[attempt - 1])
         return False
 
-    def _reinstall_previous(self) -> None:
+    def _reinstall_previous(self, *, failed_source_env: dict[str, str | None] | None = None) -> None:
         """Reinstall the snapshot generation from its own commit (pin + bundle)."""
         cfg, sys_ = self.cfg, self.sys
-        _checkout(cfg, sys_, self.previous)
-        result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
-                        "--output", ".tartci-support-manifest.json")
-        if result.rc != 0:
-            raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
-        args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
-                "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
-        if self.helper is not None:
-            self._write_pin((self.snapshot / "approved.sha256").read_text())
-            self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
-        self._install(args, python=self._restore_previous_python())
+        current_env = fleet_source_env_snapshot()
+        try:
+            restore_fleet_source_env(current_env |
+                                     {name: fleet_source_env(self.previous_fleet_source).get(name)
+                                      for name in FLEET_SOURCE_ENV})
+            _checkout(cfg, sys_, self.previous)
+            result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
+                            "--output", ".tartci-support-manifest.json")
+            if result.rc != 0:
+                raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
+            args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
+                    "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
+            if self.helper is not None:
+                self._write_pin((self.snapshot / "approved.sha256").read_text())
+                self.receipt.step("pin-restore", "previous approval restored from the snapshot")
+                args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
+            self._install(args, python=self._restore_previous_python())
+        except BaseException:
+            # The failed target may still be live. Keep its source selected so
+            # recovery helpers cannot reinstall the old code with the new
+            # generation's profile source.
+            restore_fleet_source_env(failed_source_env or current_env)
+            raise
 
     def _restore_previous_python(self) -> str | None:
         """Pin the interpreter the previous generation's lanes ran (else its
@@ -3305,7 +3420,8 @@ class Run:
             return "unknown"
 
     def _ensure_on(self, *, allow_reinstall: bool = True,
-                   restore_receipt: bool = False) -> str:
+                   restore_receipt: bool = False,
+                   failed_previous_source_env: dict[str, str | None] | None = None) -> str:
         """Put the host back in service, whatever else failed. Returns the
         resulting pool state: "on", "undrained", or what the host is left in.
 
@@ -3339,7 +3455,7 @@ class Run:
             if running == self.previous and self.snapshot is not None:
                 self.receipt.step("reinstall-for-pool-on",
                                   f"pool on refused; reinstalling {self.previous[:12]}")
-                self._reinstall_previous()
+                self._reinstall_previous(failed_source_env=failed_previous_source_env)
             else:
                 self.receipt.step(
                     "reinstall-for-pool-on",
@@ -3382,6 +3498,8 @@ class Run:
             on = False
             try:
                 self._repin_to_live()
+                if self._running() == self.previous:
+                    self._restore_previous_source_env()
                 on = self._pool_on()
             except BaseException:  # noqa: BLE001
                 pass
@@ -3406,6 +3524,14 @@ class Run:
             self._write_pin(self.approval.read_text())
         elif running == self.previous:
             self._write_pin((self.snapshot / "approved.sha256").read_text())
+
+    def _restore_previous_source_env(self) -> None:
+        """Make recovery helpers use the source recorded for the live rollback."""
+        restore_fleet_source_env({
+            name: fleet_source_env(self.previous_fleet_source).get(name)
+            for name in FLEET_SOURCE_ENV
+        })
+        self.receipt.step("source-restore", "previous installed source selected for recovery")
 
     def _running(self) -> str | None:
         try:
@@ -3452,10 +3578,13 @@ class Run:
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
             # back), so putting the host back is: pin, then pool on.
+            failed_previous_source_env = fleet_source_env_snapshot()
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            state = self._ensure_on(restore_receipt=True)
+            self._restore_previous_source_env()
+            state = self._ensure_on(restore_receipt=True,
+                                    failed_previous_source_env=failed_previous_source_env)
             if state not in ("on", "undrained"):
                 return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
                                       f"failed (generation {self.previous[:12]} is installed)",
