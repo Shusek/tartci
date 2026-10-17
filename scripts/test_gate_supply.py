@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import testing_support  # noqa: E402
 import argparse
+import contextlib
 import datetime as dt
 import json
+import io
 import re
 import os
 import plistlib
@@ -280,6 +282,58 @@ class DecideTests(unittest.TestCase):
     def test_unreadable_siblings_are_unknown(self) -> None:
         verdict, _ = self._decide(1, [self._peer("studio", 0)], {"verdict": "unknown", "reason": "x"})
         self.assertEqual(verdict, "unknown")
+
+
+class ErrorEnvelopeTests(unittest.TestCase):
+    def test_peer_transport_error_is_typed_and_decide_remains_unknown(self) -> None:
+        with mock.patch.object(
+            gate_supply.subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 1)
+        ):
+            report = gate_supply.fetch_peer("m5", "m5", REPO, MERGE, ssh="ssh", timeout=2)
+        self.assertEqual(report["schema"], gate_supply.SCHEMA)
+        self.assertEqual((report["host"], report["repo"], report["class"]), ("m5", REPO, MERGE))
+        self.assertIn("fetched_at", report)
+        verdict, _ = gate_supply.decide(
+            1, [report], {"verdict": "ok", "lanes": []}, own_slot=1,
+            own_state_dir="", repo=REPO, class_label=MERGE, max_age=60, now=time.time()
+        )
+        self.assertEqual(verdict, "unknown")
+        local_verdict, _ = gate_supply.decide(
+            1, [], report, own_slot=1, own_state_dir="", repo=REPO,
+            class_label=MERGE, max_age=60, now=time.time()
+        )
+        self.assertEqual(local_verdict, "unknown")
+
+    def test_local_report_error_is_typed_and_decide_remains_unknown(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(gate_supply, "host_report", side_effect=RuntimeError("launchd")), \
+                contextlib.redirect_stdout(output):
+            rc = gate_supply.main(["report", "--repo", REPO, "--class", MERGE, "--json"])
+        self.assertEqual(rc, 2)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["schema"], gate_supply.SCHEMA)
+        self.assertEqual((report["repo"], report["class"]), (REPO, MERGE))
+        self.assertTrue(report["host"])
+        self.assertIn("fetched_at", report)
+        verdict, _ = gate_supply.decide(
+            1, [report], {"verdict": "ok", "lanes": []}, own_slot=1,
+            own_state_dir="", repo=REPO, class_label=MERGE, max_age=60, now=time.time()
+        )
+        self.assertEqual(verdict, "unknown")
+
+    def test_decide_cli_local_report_error_uses_typed_unknown_envelope(self) -> None:
+        peer = {"schema": gate_supply.SCHEMA, "host": "m5", "verdict": "ok",
+                "repo": REPO, "class": MERGE, "free": 0, "in_flight": 0,
+                "fetched_at": int(time.time())}
+        output = io.StringIO()
+        with mock.patch.object(gate_supply, "fetch_peer", return_value=peer), \
+                mock.patch.object(gate_supply, "host_report",
+                                  side_effect=RuntimeError("launchd")), \
+                contextlib.redirect_stdout(output):
+            rc = gate_supply.main(["decide", "--repo", REPO, "--class", MERGE,
+                                   "--demand", "1", "--peers", "m5=m5"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(output.getvalue(), "unknown local siblings: local report failed: launchd\n")
 
 
 class HostReportCliTests(unittest.TestCase):
