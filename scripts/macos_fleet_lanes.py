@@ -2231,10 +2231,30 @@ def fleet_readiness(
         }
 
     recorded_source = receipt.get("fleet_source")
-    if isinstance(recorded_source, dict):
-        active_source = fleet_source.resolve_recorded(recorded_source, support_root)
-    else:
-        active_source = fleet_source.resolve(support_root, allow_environment=False)
+    try:
+        if isinstance(recorded_source, dict):
+            active_source = fleet_source.resolve_recorded(recorded_source, support_root)
+        else:
+            active_source = fleet_source.resolve(support_root, allow_environment=False)
+    except (OSError, ValueError) as exc:
+        # The source can disappear or change between receipt verification and
+        # this second resolution. Keep readiness fail-closed and observable;
+        # do not let a transient source race escape as an operator traceback.
+        return {
+            "managed": True,
+            "fleet_ready": False,
+            "verified_running_supervisors": None,
+            "expected_supervisors": None,
+            "serving": {
+                "blocked": None,
+                "blocked_lanes": [],
+                "unmeasurable_lanes": [],
+                "streak_threshold": blocked_serving_streak,
+                "blocked_seconds_threshold": blocked_serving_seconds,
+            },
+            "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
+            "config": config_verdicts(config, support_root),
+        }
 
     labels = sorted(name.removesuffix(".plist") for name in receipt["plists"])
     persistent_labels = sorted(

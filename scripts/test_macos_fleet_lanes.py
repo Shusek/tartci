@@ -679,6 +679,31 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertIsNone(value["verified_running_supervisors"])
             self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
 
+            recorded_receipt = {
+                **receipt,
+                "fleet_source": {
+                    "root": str(root / "source"),
+                    "configured": True,
+                    "commit": "a" * 40,
+                    "repository": "danielraffel/pulp-planning",
+                    "tree_sha256": "b" * 64,
+                    "published_supply_sha256": "c" * 64,
+                    "profiles_dir": str(root / "source" / "profiles"),
+                    "published_supply": str(root / "source" / "fleet" / "advertised-labels.json"),
+                },
+            }
+            with mock.patch.object(fleet, "verify_receipt", return_value=recorded_receipt), \
+                 mock.patch.object(
+                     fleet.fleet_source,
+                     "resolve_recorded",
+                     side_effect=ValueError("source disappeared"),
+                 ):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertFalse(value["fleet_ready"])
+            self.assertIsNone(value["verified_running_supervisors"])
+            self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
+            self.assertIn("source disappeared", value["problems"][0]["detail"])
+
     def test_heartbeat_identity_spans_wrapper_and_direct_topologies(self) -> None:
         """A lane on an external volume runs through a signed launch_helper, so
         launchd's job pid is the helper and the heartbeat is written by its
