@@ -2797,7 +2797,18 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     if reinstall:
         # The operator's own request: reinstall the generation this host runs,
         # with the current settings (a removed [fleet_source], say), through the
-        # same drain, install, pool-on and verify path as any update.
+        # same drain, install, pool-on and verify path as any update. It never
+        # takes a NEW private source: that waits for the canary and its soak.
+        recorded = installed_fleet_source_commit(cfg)
+        if selected_source and selected_source.get("commit") != recorded:
+            reason = (f"--reinstall-current refused: it would install private source "
+                      f"{str(selected_source.get('commit'))[:12]} (installed from "
+                      f"{_source_name(recorded)}), which only a canary-gated update may do. "
+                      "It reinstalls on the installed source, or moves to the public profiles "
+                      "when [fleet_source] is removed. Fix: wait for the normal update, or "
+                      "remove [fleet_source] to go public")
+            print(f"self-update: REFUSED {reason}")
+            return EXIT_REFUSED
         target = installed
         refresh = ("operator requested --reinstall-current: reinstall the installed "
                    "generation with the current settings")

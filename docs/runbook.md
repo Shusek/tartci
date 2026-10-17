@@ -2531,7 +2531,11 @@ fleet`), and check GitHub's job history against it with
   install, pool-on and verify path (and rollback) as any update; `--plan
   --reinstall-current` shows it first. The attempt rate does not hold an
   operator's reinstall back; the pause, halt, peer and capacity gates still
-  apply. It takes no `--target` and is never `--scheduled`.
+  apply. It takes no `--target` and is never `--scheduled`. It never installs a
+  NEW private source: when `[fleet_source]` selects a commit other than the
+  one the receipt records it refuses, since only the canary-gated update may
+  move the source. It reinstalls on the installed source, or moves to the
+  public profiles when `[fleet_source]` is removed.
 - **Always visible.** `pool status`, `doctor fleet` (`self_update`) and the
   watchdog show the skew line, `STALE` after 24 h, a failed or rolled-back last
   attempt, and a halt.

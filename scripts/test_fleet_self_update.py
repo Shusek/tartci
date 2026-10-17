@@ -3865,6 +3865,44 @@ class ReinstallCurrentTests(FleetSourceFixture):
         self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
         self.assertEqual("succeeded", self.last()["status"])
 
+    def configured_source(self, recorded: str) -> None:
+        """[fleet_source] configured (this host is its canary); the receipt
+        records `recorded` as the installed private-source commit."""
+        self.cfg.fleet_source_repository = self.fixture.PRIVATE
+        receipt = self.home / ".config/tartci/macos-fleet-install.json"
+        value = json.loads(receipt.read_text())
+        value["fleet_source"] = {"configured": True, "repository": self.fixture.PRIVATE,
+                                 "commit": recorded,
+                                 "root": str(self.cfg.fleet_source_store / recorded)}
+        receipt.write_text(json.dumps(value))
+
+    def test_it_never_installs_a_new_private_source(self) -> None:
+        # The canary would select main's head, newer than the installed source:
+        # only the canary-gated update path may take it.
+        self.configured_source(self.OLDER)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("--reinstall-current refused: it would install private source "
+                      + self.fixture.COMMIT[:12], out.getvalue())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_it_reinstalls_on_the_installed_private_source(self) -> None:
+        # Control: the selected source is the one already installed.
+        self.configured_source(self.fixture.COMMIT)
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_halt_still_holds_an_operator_reinstall(self) -> None:
+        for n in range(su.MAX_CONSECUTIVE_FAILURES):
+            su._write_json(self.cfg.state_dir / "attempts" / f"2027010{n}T000000Z-x.json",
+                           {"mode": "apply", "status": "failed", "target": INSTALLED,
+                            "started_at": f"2027-01-0{n + 1}T00:00:00Z"})
+        self.assertTrue(su.halt_reason(self.cfg.state_dir))
+        self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+
     def test_a_pause_still_holds_an_operator_reinstall(self) -> None:
         su._write_json(self.cfg.state_dir / "scheduled-pause.json",
                        {"at": su._iso(self.sys.now()), "reason": "held"})
