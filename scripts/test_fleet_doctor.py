@@ -304,6 +304,21 @@ class LauncherLayoutTests(unittest.TestCase):
             value = launcher_layout.status(home, launcher_layout.read_receipt(receipt))
             finding = fd.check_launcher_layout(value)
         self.assertEqual(finding.code, "launcher_opt_in_missing")
+
+    def test_receiptless_v2_app_is_reported_without_the_opt_in(self):
+        """Doctor must inspect the recorded launch-helper app when the receipt is gone."""
+        import launcher_layout
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            app = home / "TartCILauncher.app"
+            resources = app / "Contents" / "Resources"
+            resources.mkdir(parents=True)
+            (resources / "policy.json").write_text(json.dumps({"schema": 2}))
+            value = launcher_layout.status(home, None, app=app)
+            finding = fd.check_launcher_layout(value)
+        self.assertEqual(value["layout"], "v2")
+        self.assertEqual(finding.code, "launcher_opt_in_missing")
+        self.assertIn("launcher v2 app", finding.detail)
         self.assertIn("--launcher-layout v1", finding.detail)
 
     def test_a_receiptless_host_with_a_v2_app_in_its_profile_reads_as_v2(self):
