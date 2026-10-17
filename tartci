@@ -1284,6 +1284,22 @@ EOF
       lock_health_json="$(tartci_pool_lock_health_json)" \
         || lock_health_json='{"state":"unobservable","present":null}'
       local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
+      local launcher_app=""
+      if [ -f "$fleet_receipt" ]; then
+        launcher_app="$($status_python - "$fleet_receipt" <<'PY2'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1]))
+    helper = value.get("launch_helper")
+    if isinstance(helper, dict) and isinstance(helper.get("path"), str):
+        print(helper["path"])
+except (OSError, ValueError):
+    pass
+PY2
+        )"
+      fi
+      local launcher_args=(--home "$HOME")
+      [ -n "$launcher_app" ] && launcher_args+=(--app "$launcher_app")
       local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[]}'
       local managed_plists=""
       managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
@@ -1354,7 +1370,7 @@ PY
       [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
       # Which launcher layout this host runs (v1 or v2) and its v2 opt-in file.
       local launcher_json
-      launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status --receipt "$fleet_receipt" 2>/dev/null)" \
+      launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status "${launcher_args[@]}" --receipt "$fleet_receipt" 2>/dev/null)" \
         || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
       [ -n "$launcher_json" ] || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
       if [ "$status_json" = 1 ]; then
@@ -1384,7 +1400,7 @@ EOF
         "$status_python" "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
         "$status_python" "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
           || echo "launchd timers: UNREADABLE"
-        "$status_python" "$HERE/scripts/launcher_layout.py" --status-text --receipt "$fleet_receipt" 2>/dev/null \
+        "$status_python" "$HERE/scripts/launcher_layout.py" --status-text "${launcher_args[@]}" --receipt "$fleet_receipt" 2>/dev/null \
           || echo "launcher: UNREADABLE"
         "$status_python" "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
           || echo "signing prompts: UNREADABLE"

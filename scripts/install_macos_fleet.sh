@@ -499,7 +499,8 @@ rollback() {
     # Lanes go back to the generation the pointer named before this install:
     # one rename over the new pointer, so no moment has no pointer at all.
     if [ -n "$pointer_backup" ] && [ -e "$pointer_backup" ]; then
-      mv -f "$pointer_backup" "$pointer_file" || true
+      mv -f "$pointer_backup" "$pointer_file" || echo \
+        "rollback: could not restore the launcher pointer from $pointer_backup; lanes may still run the failed generation" >&2
     else
       rm -f "$pointer_file"
     fi

@@ -4044,6 +4044,17 @@ class LauncherV2SelfUpdateTests(Base):
         self.assertEqual([], self.sys.mutations())
         self.assertIn("--launcher-layout v1", self.latest()["error"])
 
+    def test_a_receiptless_v2_app_is_seen_by_the_plan_before_any_drain(self) -> None:
+        (self.home / ".config/tartci/macos-fleet-install.json").unlink()
+        (self.home / ".config/tartci/launcher-generation.json").unlink()
+        (self.home / ".config/tartci/launcher-v2.enabled").unlink()
+        policy = self.home / "libexec/TartCILauncher.app/Contents/Resources/policy.json"
+        policy.write_text(json.dumps({"schema": 2}))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(su.EXIT_REFUSED, self.plan())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("install receipt is missing but a launcher v2 app", output.getvalue())
+
     def test_without_the_dedicated_keychain_v2_refuses_before_any_drain(self) -> None:
         (self.home / ".config/pulp/secrets/keychain.env").unlink()
         self.assertEqual(su.EXIT_REFUSED, self.apply())

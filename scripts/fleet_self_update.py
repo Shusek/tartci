@@ -2832,6 +2832,20 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     if apply:
         recover_left_off(cfg, sys_)
         finish_pending_fixes(cfg)
+    # Resolve launcher layout before reading the installed generation or any
+    # selected source. A missing receipt must still refuse when the helper app
+    # on disk proves that this host runs v2.
+    try:
+        planned_layout(cfg)
+    except Refused as exc:
+        reason = f"launcher layout: {exc}" if not str(exc).startswith("launcher layout:") else str(exc)
+        if apply:
+            receipt = Receipt(cfg, sys_, None, "apply")
+            receipt.step("refused", reason, ok=False)
+            receipt.finish("refused", reason)
+        else:
+            print(f"self-update: REFUSED {reason}")
+        return EXIT_REFUSED
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)

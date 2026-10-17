@@ -1984,6 +1984,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertLess(restore.index('mv -f "$pointer_backup" "$pointer_file"'),
                         restore.index('rm -f "$pointer_file"'),
                         "the pointer is never removed before its backup replaces it")
+        self.assertIn("could not restore the launcher pointer", restore)
 
     def test_rollback_without_a_previous_pointer_removes_the_new_one(self) -> None:
         pointer, _ = self.rollback_after(touched=True, backup=False)
