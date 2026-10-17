@@ -66,3 +66,29 @@ repository; they are not copied into this public tree.
 This plan covers profile-source selection, provenance, validation, canary
 rollout, and rollback. Volume I/O, Tart inventory stalls, pool transitions, and
 guest failures require separate changes and evidence.
+
+## 2026-10-17 canary follow-up
+
+During an earlier canary follow-up, an agent session re-armed the canary
+without authorization. It exported the selected source, but the canary stopped
+before installing it; the operator reverted the configuration, and the host
+remained on its previous verified generation and serving normally. The
+self-update rate limiter had treated the unchanged TartCI generation as the
+whole attempt identity, so a recent public-profile install blocked the source
+move for six hours.
+
+The fix is in [PR 606](https://github.com/danielraffel/tartci/pull/606). It
+keeps the rate limit by generation and source class, preserving the existing
+same-source backoff while allowing a deliberate public-to-private move to run
+its own guarded canary. Self-update is currently running with no external
+source configured, so the public source remains the default. Resuming the
+private-source rollout requires a separate per-host go after the fix is reviewed
+and landed.
+
+## Current rollout status
+
+The private authority projection was rerun against fresh exact `origin/main`
+checkouts of TartCI and Pulp and passed. Current reachable fleet receipts use
+the public source, the pools are ready, and no external-source canary is active.
+The wider rollout remains stopped until PR 606 is reviewed and landed, then
+requires a fresh canary assignment, soak, and rollback proof.

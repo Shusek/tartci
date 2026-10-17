@@ -577,6 +577,22 @@ def launch_helper(cfg: Config) -> dict | None:
     return helper if isinstance(helper, dict) else None
 
 
+def launcher_pointer_path(cfg: Config) -> Path:
+    return cfg.home / ".config" / "tartci" / "launcher-generation.json"
+
+
+def _helper_app(cfg: Config) -> Path | None:
+    helper = launch_helper(cfg)
+    return Path(helper["path"]) if helper is not None and helper.get("path") else None
+
+
+def installed_layout(cfg: Config) -> str | None:
+    """The launcher layout this host runs: "v1", "v2", or None. The receipt
+    decides; without a launch helper record, v2 evidence on disk does."""
+    import launcher_layout  # noqa: PLC0415 - sibling module; owns the layout rules
+    return launcher_layout.installed(_read_json(cfg.install_receipt), cfg.home, _helper_app(cfg))
+
+
 def installed_commit(cfg: Config) -> tuple[str, str]:
     """(commit, source) of the cohort this host EXECUTES. Raises Refused.
 
@@ -589,7 +605,16 @@ def installed_commit(cfg: Config) -> tuple[str, str]:
     helper = launch_helper(cfg)
     if helper is None and not cfg.install_receipt.is_file():
         raise NotManaged(f"no install receipt at {cfg.install_receipt}")
-    if helper is not None:
+    if helper is not None and installed_layout(cfg) == "v2":
+        # A v2 app holds no commit: lanes run the generation its pointer names.
+        pointer = launcher_pointer_path(cfg)
+        generation = (_read_json(pointer) or {}).get("generation")
+        commit = None
+        if isinstance(generation, str) and generation:
+            manifest = Path(generation) / ".tartci-support-manifest.json"
+            commit = (_read_json(manifest) or {}).get("source_commit")
+        source = f"launcher v2 pointer {pointer}"
+    elif helper is not None:
         path = Path(helper["path"]) / "Contents" / "Resources" / "bundle.json"
         value = _read_json(path)
         commit = (value or {}).get("source_commit")
@@ -1675,6 +1700,143 @@ def launcher_change_refusal(cfg: Config, target: str, installed: str,
             f"with: echo {target} > {launcher_ack_path(cfg)}")
 
 
+def planned_layout(cfg: Config) -> str | None:
+    """The launcher layout the installer will write ("v1"/"v2"), None on a host
+    without a launch helper. Refuses with the installer's own finding (an
+    untrusted opt-in file, a v2 host whose opt-in is gone) before any drain."""
+    if launch_helper(cfg) is None:
+        return None
+    import launcher_layout  # noqa: PLC0415 - sibling module; owns the layout rules
+    try:
+        return launcher_layout.decide(cfg.home,
+                                      launcher_layout.read_receipt(cfg.install_receipt),
+                                      app=_helper_app(cfg))
+    except launcher_layout.LayoutError as exc:
+        raise Refused(f"launcher layout: {exc}") from exc
+
+
+@dataclasses.dataclass
+class LauncherChange:
+    """Whether a v2 turn replaces the stable app, and why (B1).
+
+    The app is keyed on what it is made of (the inputs digest of main.swift,
+    Info.plist and policy.json), who signs it and for which team. A turn that
+    leaves all three equal installs no new app, so its Removable Volumes grant
+    stands; any difference, or a move from v1, is a launcher change.
+    """
+    live_layout: str | None
+    live_inputs: str | None
+    target_inputs: str
+    live_identity: str
+    identity: str
+    live_team: str | None
+    team: str
+
+    @property
+    def differs(self) -> list[str]:
+        out = []
+        if self.live_layout != "v2":
+            out.append(f"layout {self.live_layout or 'none'} -> v2")
+        if self.live_inputs != self.target_inputs:
+            out.append(f"inputs {str(self.live_inputs)[:12]} -> {self.target_inputs[:12]}")
+        if self.live_identity != self.identity:
+            out.append(f"identity {self.live_identity[:12]} -> {self.identity[:12]}")
+        if self.live_team != self.team:
+            out.append(f"team {self.live_team} -> {self.team}")
+        return out
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.differs)
+
+    @property
+    def ack(self) -> str:
+        return f"v2 inputs={self.target_inputs} identity={self.identity} team={self.team}"
+
+    def describe(self) -> str:
+        if not self.changed:
+            return ("launcher v2: no launcher change (inputs, signing identity and team equal "
+                    "the live app's); the app stays in place")
+        return "launcher v2: launcher change (" + "; ".join(self.differs) + ")"
+
+
+def choose_signer(sys_: System, home: Path, live_identity: str) -> str:
+    """The identity a v2 turn signs with: the live app's own certificate while
+    the dedicated keychain still holds it, else the keychain's one Developer ID
+    Application identity (a rotated certificate, so a launcher change)."""
+    keychain = signing_keychain(home)
+    result = sys_.run(["security", "find-identity", "-v", "-p", "codesigning",
+                       *([keychain] if keychain else [])])
+    found = re.findall(r'\b([0-9A-F]{40})\b "Developer ID Application', result.out or "")
+    if live_identity in found:
+        return live_identity
+    if len(set(found)) == 1:
+        return found[0]
+    raise Refused(f"the dedicated signing keychain holds {len(set(found))} Developer ID "
+                  f"Application identities and not the live launcher's {live_identity}; "
+                  "keep exactly one there (`pulp ship doctor`)")
+
+
+def certificate_team(sys_: System, home: Path, identity: str) -> str | None:
+    """The Team ID in the dedicated keychain's Developer ID Application
+    certificate `identity` ("Developer ID Application: Name (TEAMID)")."""
+    keychain = signing_keychain(home)
+    result = sys_.run(["security", "find-identity", "-v", "-p", "codesigning",
+                       *([keychain] if keychain else [])])
+    match = re.search(rf'\b{re.escape(identity)}\b "Developer ID Application: [^"]*\(([A-Z0-9]{{10}})\)"',
+                      result.out or "")
+    return match.group(1) if match else None
+
+
+def v2_launcher_change(cfg: Config, sys_: System, helper: dict, profile: Path,
+                       identity: str, live_identity: str) -> LauncherChange:
+    """Measure, before any drain, whether this v2 turn needs a new app."""
+    resources = Path(helper["path"]) / "Contents" / "Resources"
+    digest = sys_.run(["python3", "-c",
+                       "import sys, tomllib; sys.path.insert(0, 'scripts'); "
+                       "import macos_launcher_identity as m; "
+                       "print(m.source_inputs_digest('.', tomllib.loads(open(sys.argv[1]).read())))",
+                       str(profile)], cwd=str(cfg.checkout))
+    target_inputs = digest.out.strip()
+    if digest.rc != 0 or not re.fullmatch(r"[0-9a-f]{64}", target_inputs):
+        raise Refused(f"cannot measure the target's launcher inputs: {digest.text[:300]}")
+    detail = sys_.run(["codesign", "-d", "--verbose=2", helper["path"]])
+    team = re.search(r"^TeamIdentifier=(\S+)$", detail.text or "", re.MULTILINE)
+    return LauncherChange(
+        live_layout=installed_layout(cfg),
+        live_inputs=(_read_json(resources / "inputs.json") or {}).get("sha256"),
+        target_inputs=target_inputs, live_identity=live_identity, identity=identity,
+        live_team=team.group(1) if team else None,
+        team=signing_team(sys_, cfg.home, identity, str(helper.get("team_id"))))
+
+
+def signing_team(sys_: System, home: Path, identity: str, profile_team: str) -> str:
+    """The team the new app would carry: the signing certificate's own Team
+    ID, which must be the profile's launch_helper.team_id (the policy pins it)."""
+    team = certificate_team(sys_, home, identity)
+    if team != profile_team:
+        raise Refused(f"the signing certificate {identity} is for team {team or 'unknown'}, not "
+                      f"the profile's launch_helper.team_id {profile_team}; a launcher signed by it "
+                      "would fail its own policy. Fix the keychain (`pulp ship doctor`) or the profile")
+    return team
+
+
+def v2_ack_refusal(cfg: Config, change: LauncherChange) -> str | None:
+    """Why a v2 launcher change may not go ahead yet, or None: the operator
+    acknowledges exactly this inputs digest, signing identity and team."""
+    if not change.changed:
+        return None
+    try:
+        acknowledged = launcher_ack_path(cfg).read_text().strip()
+    except OSError:
+        acknowledged = ""
+    if acknowledged == change.ack:
+        return None
+    return (f"launcher change needs consent ({'; '.join(change.differs)}): a new TartCI "
+            "Launcher can reset its Removable Volumes consent; acknowledge with: "
+            f"echo '{change.ack}' > {launcher_ack_path(cfg)}")
+
+
 def launcher_consent_alert(cfg: Config, me: str, target: str, installed: str,
                            refusal: str | None, now: float) -> None:
     """One issue while a launcher change waits for consent; it closes once the
@@ -2354,9 +2516,10 @@ def launch_python(profile: Path) -> str:
 
 
 def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, target: str,
-                   out_dir: Path) -> tuple[Path, Path]:
+                   out_dir: Path, *, layout: str = "v1", identity: str | None = None,
+                   expected_inputs: str | None = None) -> tuple[Path, Path]:
     live = Path(helper["path"])
-    identity = extract_signing_identity(sys_, live, out_dir)
+    identity = identity or extract_signing_identity(sys_, live, out_dir)
     pinned = keychain_args(cfg.home)
     signing_probe(sys_, identity, out_dir, pinned)
     bundle = out_dir / "TartCILauncher.app"
@@ -2368,7 +2531,8 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
                            "--support-root", ".", "--profile", str(profile),
-                           "--python", launcher_python, *pinned],
+                           "--python", launcher_python, *pinned,
+                           *(["--layout", "v2"] if layout == "v2" else [])],
                           cwd=str(cfg.checkout),
                           env={"TARTCI_RENDER_PYTHON": launcher_python,
                                "TARTCI_PYTHON": launcher_python},
@@ -2380,8 +2544,23 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     if not bundle.is_dir() or not approval.is_file():
         raise Refused(f"launcher build produced no bundle (exit {result.rc}): "
                       + "\n".join(l for l in result.text.splitlines() if not l.startswith("rm:")))
-    verify_bundle(cfg, sys_, bundle, profile, target)
+    if layout == "v2":
+        verify_bundle_v2(sys_, bundle, expected_inputs)
+    else:
+        verify_bundle(cfg, sys_, bundle, profile, target)
     return bundle, approval
+
+
+def verify_bundle_v2(sys_: System, bundle: Path, expected_inputs: str | None) -> None:
+    """A new v2 app: built from exactly the inputs this turn measured, and signed."""
+    inputs = (_read_json(bundle / "Contents" / "Resources" / "inputs.json") or {}).get("sha256")
+    if not expected_inputs or inputs != expected_inputs:
+        raise Refused(f"new launcher v2 inputs {inputs} != the target's {expected_inputs}")
+    if (bundle / "Contents" / "Resources" / "bundle.json").exists():
+        raise Refused("new launcher v2 carries a v1 bundle.json")
+    check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
+    if check.rc != 0:
+        raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
 
 
 def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target: str) -> None:
@@ -2415,9 +2594,13 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
     if check.rc != 0:
         raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
-    # Every support agent the profile declares must render from the target
-    # checkout, checked here so a missing or broken template refuses the update
-    # before any drain rather than after the lanes are back.
+    check_support_agent_templates(cfg, sys_, profile, target)
+
+
+def check_support_agent_templates(cfg: Config, sys_: System, profile: Path, target: str) -> None:
+    """Every support agent the profile declares must render from the target
+    checkout, checked before any drain so a missing or broken template refuses
+    the update rather than surfacing after the lanes are back."""
     agents = sys_.run(["python3", "scripts/support_agents.py", "check-templates",
                        "--profile-file", str(profile)], cwd=str(cfg.checkout))
     if agents.rc != 0:
@@ -2498,11 +2681,32 @@ def _ts(text: str | None) -> float:
         return 0.0
 
 
-def recent_attempt(cfg: Config, target: str, now: float) -> str | None:
+def _same_fleet_source(first: Any, second: Any) -> bool:
+    """Whether two attempts selected the same profile source.
+
+    The target commit alone is not enough for a same-generation reinstall:
+    moving from the public profiles to a private source deliberately keeps the
+    TartCI generation unchanged.  Older receipts have no source field, which
+    is the public-source value and remains comparable to ``None``.
+    """
+    if not first and not second:
+        return True
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    # A new commit on the same private authority is still the same source
+    # class.  The source move itself gets a fresh window when crossing the
+    # public/private boundary, but a busy private authority must not make the
+    # canary drain once per commit.
+    return bool(first) == bool(second)
+
+
+def recent_attempt(cfg: Config, target: str, now: float,
+                   fleet_source: dict[str, Any] | None = None) -> str | None:
     for path, value in _attempts(cfg.state_dir):
         # A refusal changed nothing, so it does not spend the attempt.
         if (value.get("mode") != "apply" or value.get("target") != target
-                or value.get("status") not in TERMINAL_STATUSES):
+                or value.get("status") not in TERMINAL_STATUSES
+                or not _same_fleet_source(value.get("fleet_source"), fleet_source)):
             continue
         if now - _ts(value.get("started_at")) < cfg.rate_hours * 3600:
             return f"{path.name} ({value.get('status')})"
@@ -2740,6 +2944,20 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     if apply:
         recover_left_off(cfg, sys_)
         finish_pending_fixes(cfg)
+    # Resolve launcher layout before reading the installed generation or any
+    # selected source. A missing receipt must still refuse when the helper app
+    # on disk proves that this host runs v2.
+    try:
+        planned_layout(cfg)
+    except Refused as exc:
+        reason = f"launcher layout: {exc}" if not str(exc).startswith("launcher layout:") else str(exc)
+        if apply:
+            receipt = Receipt(cfg, sys_, None, "apply")
+            receipt.step("refused", reason, ok=False)
+            receipt.finish("refused", reason)
+        else:
+            print(f"self-update: REFUSED {reason}")
+        return EXIT_REFUSED
     try:
         installed, source = installed_commit(cfg)
         previous_fleet_source = installed_fleet_source_record(cfg)
@@ -2868,10 +3086,12 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 raise Refused(halted)
             # An operator's --reinstall-current is not a retry of an automatic
             # attempt, so the attempt rate does not hold it back.
-            prior = None if reinstall else recent_attempt(cfg, target, now)
+            prior = None if reinstall else recent_attempt(cfg, target, now, selected_source)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
-        consent = launcher_change_refusal(cfg, target, installed, bool(refresh))
+        layout = planned_layout(cfg)
+        consent = (launcher_change_refusal(cfg, target, installed, bool(refresh))
+                   if layout != "v2" else None)
         if apply:
             launcher_consent_alert(cfg, me, target, installed, consent, now)
         if consent is not None:
@@ -2891,16 +3111,37 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step(name)
         helper = launch_helper(cfg)
         bundle = approval = None
-        if helper is not None and not refresh:
+        identity = None
+        change = None
+        if helper is not None and (not refresh or layout == "v2"):
             with tempfile.TemporaryDirectory() as scratch:
-                identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
+                live_identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
                 receipt.step("signing-keychain", unlock_signing_keychain(sys_, cfg.home))
+                identity = (choose_signer(sys_, cfg.home, live_identity) if layout == "v2"
+                            else live_identity)
                 signing_probe(sys_, identity, Path(scratch), keychain_args(cfg.home))
-            receipt.step("signing", f"{'would build' if not apply else 'will build'} a sealed "
-                         f"launcher signed by {identity} (extracted from the live bundle's leaf "
-                         "certificate; a timestamped signing probe with it succeeded)")
+            if layout == "v2":
+                change = v2_launcher_change(cfg, sys_, helper, profile, identity, live_identity)
+                receipt.step("launcher", change.describe())
+                ack = v2_ack_refusal(cfg, change)
+                if apply:
+                    launcher_consent_alert(cfg, me, target, installed, ack, now)
+                if ack is not None:
+                    raise Refused(ack)
+            receipt.step("signing", f"{'would sign' if not apply else 'will sign'} "
+                         + ("a sealed launcher" if layout != "v2" else
+                            "the launch set" + (" and a new launcher" if change.changed else ""))
+                         + f" with {identity} (a timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
+        if helper is not None and layout == "v2":
+            keychain = signing_keychain(cfg.home)
+            if not keychain:
+                raise Refused("launcher v2 signs every launch set through the dedicated signing "
+                              "keychain, and keychain.env names none; run `pulp ship doctor`")
+            install_args += ["--launch-set-identity", str(identity),
+                             "--launch-set-keychain", keychain]
+            check_support_agent_templates(cfg, sys_, profile, target)
         repository = configured_repository(cfg, sys_)
         print(f"self-update: repository={repository}")
         if helper is None:
@@ -2956,7 +3197,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step("capacity-floor", str(exc), ok=False)
         if refusals:
             raise Refused(" | ".join(refusals))
-        if helper is not None and apply and not refresh:
+        if (helper is not None and apply and not refresh
+                and (layout != "v2" or change.changed)):
             # Built only once every cheap gate passed: a refused run must not
             # have spent a signing build, and a rebuild must always be possible.
             builds = cfg.state_dir / "builds"
@@ -2964,7 +3206,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             clear_dir(out_dir)
             out_dir.mkdir(parents=True)
             try:
-                bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+                bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir,
+                                                  layout=layout, identity=identity,
+                                                  expected_inputs=change.target_inputs
+                                                  if change else None)
             except Refused as exc:
                 raise HostFault(str(exc)) from exc
             prune_dirs(builds, KEEP_BUILDS)
@@ -3076,6 +3321,15 @@ class Run:
         receipt.value.update(approval=str(approval) if approval else None,
                              pin_path=str(self.pin_path) if self.pin_path else None)
 
+    def launch_set_args(self) -> list[str]:
+        """The forward install's launch-set signing options, for a v2 rollback."""
+        args = self.install_args
+        try:
+            return ["--launch-set-identity", args[args.index("--launch-set-identity") + 1],
+                    "--launch-set-keychain", args[args.index("--launch-set-keychain") + 1]]
+        except (ValueError, IndexError) as exc:
+            raise Failed("a launcher v2 rollback has no launch-set signing options") from exc
+
     # ── entry ───────────────────────────────────────────────────────────
     def _record_skew_after_apply(self) -> None:
         """Rewrite skew.json for the generation this run just verified.
@@ -3159,7 +3413,8 @@ class Run:
         previous_pin = pin.read_text().strip() if pin.is_file() else None
         _write_json(snap / "snapshot.json", {
             "previous": self.previous, "at": _iso(self.sys.now()),
-            "python": installed_lane_python(self.cfg.home), "python_pin": previous_pin})
+            "python": installed_lane_python(self.cfg.home), "python_pin": previous_pin,
+            "launcher_layout": installed_layout(self.cfg) if self.helper is not None else None})
         self.snapshot = snap
         self.receipt.value["snapshot"] = str(snap)
         self.receipt.step("snapshot", f"{snap} (previous generation {self.previous[:12]})")
@@ -3172,12 +3427,20 @@ class Run:
                                "print(m.profile_policy_digest(sys.argv[1]))",
                                str(snap / "profile.toml")], cwd=str(self.cfg.checkout))
         pin = (snap / "approved.sha256").read_text().strip()
-        check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify",
-                              str(snap / "TartCILauncher.app"),
-                              "--identifier", str(self.helper.get("identifier", "")),
-                              "--team-id", str(self.helper.get("team_id", "")),
-                              "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
-                             cwd=str(self.cfg.checkout))
+        if installed_layout(self.cfg) == "v2":
+            check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify-v2",
+                                  str(snap / "TartCILauncher.app"),
+                                  "--identifier", str(self.helper.get("identifier", "")),
+                                  "--team-id", str(self.helper.get("team_id", "")),
+                                  "--sha256", pin, "--profile", str(snap / "profile.toml")],
+                                 cwd=str(self.cfg.checkout))
+        else:
+            check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify",
+                                  str(snap / "TartCILauncher.app"),
+                                  "--identifier", str(self.helper.get("identifier", "")),
+                                  "--team-id", str(self.helper.get("team_id", "")),
+                                  "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
+                                 cwd=str(self.cfg.checkout))
         if policy.rc != 0 or check.rc != 0:
             raise Refused("the snapshot of the live launcher does not verify against the current "
                           f"approval pin, so it could not be rolled back to: "
@@ -3406,6 +3669,17 @@ class Run:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
                 args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
+                # The layout the snapshot ran, explicitly: a v1 -> v2 move rolls
+                # back to v1 with the opt-in still present. A v2 rollback names
+                # the signing keychain, which the installer uses only when the
+                # previous generation's signed set cannot simply be pointed at
+                # again.
+                snap = _read_json(self.snapshot / "snapshot.json") or {}
+                layout = (snap.get("launcher_layout")
+                          if snap.get("launcher_layout") in ("v1", "v2") else "v1")
+                args += ["--launcher-layout", layout]
+                if layout == "v2":
+                    args += self.launch_set_args()
             self._install(args, python=self._restore_previous_python())
         except BaseException:
             # The failed target may still be live. Keep its source selected so

@@ -156,6 +156,9 @@ CODES: tuple[str, ...] = (
     "signing_prompts_ok",
     "signing_prompts_risk",
     "signing_prompts_unknown",
+    "store_ok",
+    "store_stalled",
+    "store_unprobed",
     "supply_match",
     "supply_mismatch",
     "supply_unknown",
@@ -1141,6 +1144,20 @@ def check_launchd_timers(value: dict | None) -> Finding:
     return Finding("launchd_timers", OK, "launchd_timers_ok", detail, facts)
 
 
+def check_store_stall(value: dict | None) -> Finding:
+    """Whether the VM store or repository volume answers at all (store_stall.py)."""
+    import store_stall
+
+    value = value or {"state": "unprobed", "detail": "no probe result", "stalled": []}
+    facts = {"store": value}
+    detail = store_stall.describe(value)
+    if value.get("state") == "stalled":
+        return Finding("store_stall", PROBLEM, "store_stalled", detail, facts)
+    if value.get("state") == "ok":
+        return Finding("store_stall", OK, "store_ok", detail, facts)
+    return Finding("store_stall", UNKNOWN, "store_unprobed", detail, facts)
+
+
 def check_reclaim(value: dict | None) -> Finding:
     """The disk reclaimer's last pass, from its receipt (scripts/reclaim_status.py)."""
     import reclaim_status
@@ -1614,6 +1631,16 @@ def collect_census(repo: str, gh_cli: str | None) -> tuple[Any, str | None, str]
         return None, "census_incomplete", f"{type(exc).__name__}: {exc}"
 
 
+def read_launcher_layout(home: Path, receipt_path: Path, profile_path: Path) -> dict:
+    """The launcher layout report. The installed profile names the helper app
+    even when the install receipt is gone, so a receipt-less v2 host still
+    reads as v2 rather than as nothing installed."""
+    import launcher_layout
+    receipt = launcher_layout.read_receipt(receipt_path)
+    app = launcher_layout.profile_app(profile_path) or launcher_layout.receipt_app(receipt)
+    return launcher_layout.status(home, receipt, app=app)
+
+
 def collect(*, home: Path, agents_dir: Path | None = None,
             config_dir: Path | None = None, support_root: Path = ROOT,
             repos: Sequence[str] | None = None, gh_cli: str | None = None,
@@ -1626,6 +1653,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
+            store_value: dict | None = None,
             launchd_timers_value: dict | None = None,
             vm_dhcp_value: dict | None = None,
             lane_python_value: dict | None = None,
@@ -1745,7 +1773,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         managed=config.is_file()))
     try:
         import launcher_layout
-        launcher_value = launcher_layout.status(home, launcher_layout.read_receipt(receipt_path))
+        launcher_value = read_launcher_layout(home, receipt_path, config)
     except Exception:  # noqa: BLE001 - reported as unreadable
         launcher_value = None
     findings.append(check_launcher_layout(launcher_value))
@@ -1761,6 +1789,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             reclaim_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_reclaim(reclaim_value))
+    if store_value is None:
+        try:
+            import store_stall
+            store_value = store_stall.status(home)
+        except Exception as exc:  # noqa: BLE001 - reported as not probed
+            store_value = {"state": "unprobed", "detail": f"probe failed: {exc}", "stalled": []}
+    findings.append(check_store_stall(store_value))
     if launchd_timers_value is None:
         try:
             import launchd_interval_guard

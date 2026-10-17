@@ -3033,6 +3033,23 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   pass's `scratch_dirs` field shows what the scratch reaper removed and why it
   kept the rest.
 
+  A reclaim pass that goes STALE because its own `git` hung is often a store
+  stall, not a reclaim problem. `tartci doctor fleet` and the launchd
+  watchdog (at most every 15 min) probe each store volume the installed
+  profile names (the Tart store listing and `tart list`, and `git rev-parse` on
+  the `[reclaim]` repository and a listing of its worktrees root) with a 15 s
+  bound, and cache the result in `~/.tartci/state/store-stall/status.json`.
+  `pool status` only reads that cache (`store: STALLED since <time> (as of
+  <time>)`): it runs every few minutes from agents and peers, and a probe there
+  would pile stuck children up on a stalled host. A probe that does not finish
+  is killed and never waited on again; its PID stays in the volume's
+  `<volume>.pids` marker, and while that PID is alive no new probe of the
+  volume starts (`an earlier probe ... is still hanging`). A stall names the
+  volume, since when, how long the oldest `git` or `tart` on it has been
+  hanging, the likely cause (a system-wide sandbox or TCC stall, which does not
+  clear on its own) and the step: drain, let running jobs finish, reboot.
+  Nothing on a lane's path runs it.
+
   With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
   default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs
   `ccache -d $TARTCI_CI_CACHE/ccache --evict-older-than <N>d` on the gate ccache
@@ -3821,6 +3838,34 @@ the app, and replacing the app can reset it. Without it the helper blocks in
 
   The key is the commit, not the bundle digest, because each build is re-signed
   with a new timestamp. The issue closes once the change is acknowledged.
+- On a **launcher v2** host (opt-in, `docs/macos-dynamic-fleet-worker.md`) the
+  app is stable, so most updates need no acknowledgement. Before any drain
+  self-update compares what the target would build against the live app:
+  the inputs digest (`main.swift`, `Info.plist`, `policy.json`), the signing
+  identity (the live app's certificate while the dedicated keychain holds it,
+  else the keychain's one Developer ID identity) and the team (the signing
+  certificate's own Team ID, which must be the profile's `launch_helper.team_id`;
+  a certificate for another team refuses before any drain). All three equal:
+  no build, the app stays, and the update only writes and signs the new
+  generation's launch set and moves the pointer. Any difference, or the move
+  from v1, is a launcher change; the receipt's `launcher` step (and the plan)
+  says which of the three differed, and the acknowledgement is one exact line
+  printed by the refusal:
+
+  ```sh
+  echo 'v2 inputs=<sha256> identity=<cert sha1> team=<TEAM>' > ~/.config/tartci/launcher-change-ack
+  ```
+
+  An acknowledgement for any other inputs, identity or team, or a v1 commit
+  line, does not cover it.
+- A v2 rollback points the launcher back at the previous generation when its
+  signed launch set still verifies with the same lanes, without signing
+  anything. Otherwise it signs that set forward, which needs the dedicated
+  keychain unlocked and a passing signing probe; if neither is possible it
+  installs nothing unsigned and stops with the host off and the reason. A
+  failed volume probe after a v2 update that did not change the app rolls back
+  normally; stopping with the host off instead of rolling back applies only
+  after a launcher change.
 - When the launch-helper volume probe times out, it times the same small write
   from its own (parent) process as a control. A fast control is reported as
   `helper blocked in open(); same-dir write from parent took N ms` with the

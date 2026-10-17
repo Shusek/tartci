@@ -161,6 +161,11 @@ A host moves to v2 only when it opts in:
 `tartci pool status` and `tartci doctor fleet` report the layout and whether
 the opt-in file is present.
 
+A failed v2 install puts the previous pointer back. If that rename itself
+fails, the install exits 6 with `FINDING launcher_pointer_restore_failed`
+(what, cause, fix, verify) and the host stays off: `tartci pool on` refuses
+while the pointer does not name the receipt's generation.
+
 Before a future stacked-image canary on any host, validate only metadata and
 authorization without displaying credential values:
 
