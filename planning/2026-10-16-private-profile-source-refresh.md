@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation merged; canary verification fix pending; rollout gated
+Status: implementation and verification repair merged; canary cleared; rollout gated
 
 ## Goal
 
@@ -20,26 +20,30 @@ TartCI continues to use its checked-in profiles.
 
 ## Canary status
 
-A single canary host was configured with a validated private export. The
+An earlier canary was configured with a validated private export. The
 transaction completed its admission, readiness, DHCP, and source checks, but
 standalone verification reported a false `receipt_mismatch`: the apply process
 selected the private source while the later verifier fell back to the public
-support root. The canary remains on that generation and rollout is paused. No
-additional host is configured.
+support root. That configuration was cleared after the failed verification.
+Current host receipts report the public source and no host is configured as an
+external-source canary.
 
 The verification repair is in
-https://github.com/danielraffel/tartci/pull/602. It reconstructs the selected
+https://github.com/danielraffel/tartci/pull/605. It reconstructs the selected
 source from the installed receipt, validates the marker and bytes, and restores
 the process environment after resolution. It also keeps public and legacy
 receipts on the immutable public support root even when private-source
-variables are present. The repair must be reviewed, installed on the canary,
-and verified before rollout resumes.
+variables are present. It must be installed on the canary and verified before
+rollout resumes.
 
 ## Rollout gates
 
-1. Review and land the verification repair.
-2. Install it on the canary and run standalone verification.
-3. Confirm pool readiness, source provenance, and rendered LaunchAgents.
+1. Install the current main generation, including the verification repair, on
+   the selected canary.
+2. Export the private authority at one immutable commit and configure only the
+   canary to use it.
+3. Run standalone verification and confirm pool readiness, source provenance,
+   and rendered LaunchAgents.
 4. Soak the canary and prove rollback to the checked-in source.
 5. Obtain a separate go for each additional host and repeat the checks.
 
@@ -51,9 +55,11 @@ default.
 ## Validation record
 
 The focused source, source-sync, self-update, published-supply, lane, and
-Python 3.9 compatibility tests pass on current main. Public-path checks must
-remain clean. The private fleet record and desired-state projection stay in a
-private authority repository; they are not copied into this public tree.
+Python 3.9 compatibility tests pass on current main. The private authority's
+semantic projection check also passes against fresh exact `origin/main`
+checkouts of TartCI and Pulp. Public-path checks must remain clean. The
+private fleet record and desired-state projection stay in a private authority
+repository; they are not copied into this public tree.
 
 ## Scope
 
