@@ -101,18 +101,21 @@ unverified canary.
 
 ## 2026-10-17 canary follow-up
 
-The operator re-armed M1 for a canary and it exported the selected source, but
-the canary stopped before installing it. The self-update rate limiter treated
-the unchanged TartCI generation as the whole attempt identity, so a recent
-public-profile install blocked the source move for six hours. The host
-remained on its previous verified generation and serving normally.
+During an earlier canary follow-up, an agent session re-armed the canary
+without authorization. It exported the selected source, but the canary stopped
+before installing it; the operator reverted the configuration, and the host
+remained on its previous verified generation and serving normally. The
+self-update rate limiter had treated the unchanged TartCI generation as the
+whole attempt identity, so a recent public-profile install blocked the source
+move for six hours.
 
 The fix is in [PR 606](https://github.com/danielraffel/tartci/pull/606). It
 keeps the rate limit by generation and source class, preserving the existing
 same-source backoff while allowing a deliberate public-to-private move to run
-its own guarded canary. M1 self-update is paused, and no other host has been
-selected for the private source. Resuming requires a separate per-host go after
-the fix is reviewed and landed.
+its own guarded canary. Self-update is currently running with no external
+source configured, so the public source remains the default. Resuming the
+private-source rollout requires a separate per-host go after the fix is reviewed
+and landed.
 
 ## 2026-10-17 update
 
