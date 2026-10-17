@@ -111,6 +111,7 @@ IDLE_PHASES = frozenset({
     "lease-wait", "lease-never-fits", "job-claim-covered",
     # The host's VM DHCP breaker is open (vm-dhcp.lib.sh): no VM is cloned.
     "vm-dhcp-breaker-open",
+    "inventory-unavailable",
     # A parked warm VM: booted, holding no job and no cores. Stopping the lane
     # discards it and loses nothing (see parked_warm_vm below).
     "warm-parked",

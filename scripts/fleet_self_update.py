@@ -649,6 +649,45 @@ def installed_fleet_source_commit(cfg: Config) -> str | None:
     return None
 
 
+def installed_fleet_source_record(cfg: Config) -> dict[str, Any] | None:
+    """The complete private-source record for the installed generation."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    if isinstance(recorded, dict) and recorded.get("configured") is True:
+        if all(isinstance(recorded.get(key), str) and recorded[key].strip()
+               for key in ("repository", "commit", "root")):
+            return {key: recorded[key] for key in ("repository", "commit", "root")}
+    return None
+
+
+def fleet_source_receipt_is_configured(cfg: Config) -> bool:
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    return (isinstance(recorded, dict) and "configured" in recorded
+            and recorded.get("configured") is not False)
+
+
+def fleet_source_env(record: dict[str, Any] | None) -> dict[str, str]:
+    """Return the source environment represented by an install receipt."""
+    if record is None:
+        return {}
+    return {
+        "TARTCI_FLEET_SOURCE_ROOT": record["root"],
+        "TARTCI_FLEET_SOURCE_COMMIT": record["commit"],
+        "TARTCI_FLEET_SOURCE_REPOSITORY": record["repository"],
+    }
+
+
+def fleet_source_env_snapshot() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in FLEET_SOURCE_ENV}
+
+
+def restore_fleet_source_env(snapshot: dict[str, str | None]) -> None:
+    for name, value in snapshot.items():
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+
+
 def _source_name(commit: str | None) -> str:
     return commit[:12] if commit else "the public profiles"
 
@@ -2702,6 +2741,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         finish_pending_fixes(cfg)
     try:
         installed, source = installed_commit(cfg)
+        previous_fleet_source = installed_fleet_source_record(cfg)
+        if fleet_source_receipt_is_configured(cfg) and previous_fleet_source is None:
+            raise Refused("installed private-source receipt lacks the source root and repository; "
+                          "refusing a source move until the host is reinstalled from a complete "
+                          "source receipt")
         refresh_checkout(cfg, sys_)
         selected_source = sync_fleet_source(cfg, sys_, write=apply)
     except NotManaged as exc:
@@ -2749,10 +2793,16 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_UNKNOWN
     target = skew.get("target")
     refresh = None
-    if not target and skew["state"] == "current":
+    if not target:
         refresh = refresh_reason(cfg, sys_)
-        if refresh:
-            # Same generation, reinstalled only to rewrite its receipt.
+        # A private-source change is a same-generation install. It must not
+        # wait for an unrelated TartCI commit to finish its soak: the running
+        # code is unchanged, while the selected profile bytes still need to
+        # reach the installed generation. The ordinary TartCI target remains
+        # gated by its own skew state below.
+        source_moved = bool(refresh and refresh.startswith("fleet source moved to "))
+        if refresh and (source_moved and skew["state"] in ("current", "soaking", "behind", "unverified")
+                        or not source_moved and skew["state"] == "current"):
             target = installed
             print(f"self-update: same-generation reinstall needed: {refresh}")
     if not target:
@@ -2909,7 +2959,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
-                  helper=helper, approval=approval, excluded=survey.excluded)
+                  helper=helper, approval=approval, excluded=survey.excluded,
+                  previous_fleet_source=previous_fleet_source)
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
@@ -2986,13 +3037,15 @@ class Run:
                  previous: str, profile: Path, install_args: list[str], allow: bool,
                  helper: dict | None, approval: Path | None,
                  repository: str | None = None,
-                 excluded: list[str] | None = None) -> None:
+                 excluded: list[str] | None = None,
+                 previous_fleet_source: dict[str, Any] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
         self.repository = repository
+        self.previous_fleet_source = previous_fleet_source
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
@@ -3312,21 +3365,32 @@ class Run:
                 self.sys.sleep(self.POOL_ON_BACKOFF[attempt - 1])
         return False
 
-    def _reinstall_previous(self) -> None:
+    def _reinstall_previous(self, *, failed_source_env: dict[str, str | None] | None = None) -> None:
         """Reinstall the snapshot generation from its own commit (pin + bundle)."""
         cfg, sys_ = self.cfg, self.sys
-        _checkout(cfg, sys_, self.previous)
-        result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
-                        "--output", ".tartci-support-manifest.json")
-        if result.rc != 0:
-            raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
-        args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
-                "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
-        if self.helper is not None:
-            self._write_pin((self.snapshot / "approved.sha256").read_text())
-            self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
-        self._install(args, python=self._restore_previous_python())
+        current_env = fleet_source_env_snapshot()
+        try:
+            restore_fleet_source_env(current_env |
+                                     {name: fleet_source_env(self.previous_fleet_source).get(name)
+                                      for name in FLEET_SOURCE_ENV})
+            _checkout(cfg, sys_, self.previous)
+            result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
+                            "--output", ".tartci-support-manifest.json")
+            if result.rc != 0:
+                raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
+            args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
+                    "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
+            if self.helper is not None:
+                self._write_pin((self.snapshot / "approved.sha256").read_text())
+                self.receipt.step("pin-restore", "previous approval restored from the snapshot")
+                args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
+            self._install(args, python=self._restore_previous_python())
+        except BaseException:
+            # The failed target may still be live. Keep its source selected so
+            # recovery helpers cannot reinstall the old code with the new
+            # generation's profile source.
+            restore_fleet_source_env(failed_source_env or current_env)
+            raise
 
     def _restore_previous_python(self) -> str | None:
         """Pin the interpreter the previous generation's lanes ran (else its
@@ -3356,7 +3420,8 @@ class Run:
             return "unknown"
 
     def _ensure_on(self, *, allow_reinstall: bool = True,
-                   restore_receipt: bool = False) -> str:
+                   restore_receipt: bool = False,
+                   failed_previous_source_env: dict[str, str | None] | None = None) -> str:
         """Put the host back in service, whatever else failed. Returns the
         resulting pool state: "on", "undrained", or what the host is left in.
 
@@ -3390,7 +3455,7 @@ class Run:
             if running == self.previous and self.snapshot is not None:
                 self.receipt.step("reinstall-for-pool-on",
                                   f"pool on refused; reinstalling {self.previous[:12]}")
-                self._reinstall_previous()
+                self._reinstall_previous(failed_source_env=failed_previous_source_env)
             else:
                 self.receipt.step(
                     "reinstall-for-pool-on",
@@ -3433,6 +3498,8 @@ class Run:
             on = False
             try:
                 self._repin_to_live()
+                if self._running() == self.previous:
+                    self._restore_previous_source_env()
                 on = self._pool_on()
             except BaseException:  # noqa: BLE001
                 pass
@@ -3457,6 +3524,14 @@ class Run:
             self._write_pin(self.approval.read_text())
         elif running == self.previous:
             self._write_pin((self.snapshot / "approved.sha256").read_text())
+
+    def _restore_previous_source_env(self) -> None:
+        """Make recovery helpers use the source recorded for the live rollback."""
+        restore_fleet_source_env({
+            name: fleet_source_env(self.previous_fleet_source).get(name)
+            for name in FLEET_SOURCE_ENV
+        })
+        self.receipt.step("source-restore", "previous installed source selected for recovery")
 
     def _running(self) -> str | None:
         try:
@@ -3503,10 +3578,13 @@ class Run:
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
             # back), so putting the host back is: pin, then pool on.
+            failed_previous_source_env = fleet_source_env_snapshot()
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            state = self._ensure_on(restore_receipt=True)
+            self._restore_previous_source_env()
+            state = self._ensure_on(restore_receipt=True,
+                                    failed_previous_source_env=failed_previous_source_env)
             if state not in ("on", "undrained"):
                 return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
                                       f"failed (generation {self.previous[:12]} is installed)",
