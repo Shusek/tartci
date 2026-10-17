@@ -3870,6 +3870,121 @@ class FleetSourceCanaryTests(FleetSourceFixture):
         self.assertEqual([], self.sys.mutations())
 
 
+class ReinstallCurrentTests(FleetSourceFixture):
+    """--reinstall-current: apply a settings change (here a removed
+    [fleet_source]) to the generation already installed, in one command."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        receipt = self.home / ".config/tartci/macos-fleet-install.json"
+        value = json.loads(receipt.read_text())
+        value["fleet_source"] = {"configured": True, "repository": self.fixture.PRIVATE,
+                                 "commit": self.OLDER,
+                                 "root": str(self.cfg.fleet_source_store / self.OLDER)}
+        receipt.write_text(json.dumps(value))
+        self.cfg.fleet_source_repository = None      # the operator removed it
+        self.sys.log_lines = ""                      # the installed commit is current
+
+    def reinstall(self, apply: bool = True) -> int:
+        return su.plan_or_apply(self.cfg, self.sys, apply=apply, target_ref="origin/main",
+                                reinstall=True)
+
+    def test_without_it_a_removed_source_waits_for_a_new_commit(self) -> None:
+        # The gap: nothing to do, and the receipt keeps the stale source.
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_it_reinstalls_the_running_generation_and_clears_the_stale_source(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+        receipt = json.loads((self.home / ".config/tartci/macos-fleet-install.json").read_text())
+        self.assertIs(False, receipt["fleet_source"]["configured"])
+        joined = [" ".join(m) if isinstance(m, list) else m for m in self.sys.mutations()]
+        self.assertTrue(any("pool drain" in m for m in joined), "the normal drain path")
+        self.assertTrue(any("pool on" in m for m in joined))
+        attempt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertIn("--reinstall-current", attempt["refresh"])
+
+    def test_a_plan_changes_nothing(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.reinstall(apply=False))
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_recent_install_of_the_same_commit_does_not_hold_it_back(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.sys.clock += 600
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+
+    def configured_source(self, recorded: str, repository: str | None = None) -> None:
+        """[fleet_source] configured (this host is its canary); the receipt
+        records `recorded` as the installed private-source commit."""
+        self.cfg.fleet_source_repository = self.fixture.PRIVATE
+        receipt = self.home / ".config/tartci/macos-fleet-install.json"
+        value = json.loads(receipt.read_text())
+        value["fleet_source"] = {"configured": True,
+                                 "repository": repository or self.fixture.PRIVATE,
+                                 "commit": recorded,
+                                 "root": str(self.cfg.fleet_source_store / recorded)}
+        receipt.write_text(json.dumps(value))
+
+    def test_the_same_commit_from_another_repository_is_a_new_source(self) -> None:
+        self.configured_source(self.fixture.COMMIT, repository="ORG/another-fleet-authority")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("installed from ORG/another-fleet-authority@", out.getvalue())
+
+    def test_it_never_installs_a_new_private_source(self) -> None:
+        # The canary would select main's head, newer than the installed source:
+        # only the canary-gated update path may take it.
+        self.configured_source(self.OLDER)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("--reinstall-current refused: it would install private source "
+                      f"{self.fixture.PRIVATE}@{self.fixture.COMMIT[:12]}", out.getvalue())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_it_reinstalls_on_the_installed_private_source(self) -> None:
+        # Control: the selected source is the one already installed.
+        self.configured_source(self.fixture.COMMIT)
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_halt_still_holds_an_operator_reinstall(self) -> None:
+        for n in range(su.MAX_CONSECUTIVE_FAILURES):
+            su._write_json(self.cfg.state_dir / "attempts" / f"2027010{n}T000000Z-x.json",
+                           {"mode": "apply", "status": "failed", "target": INSTALLED,
+                            "started_at": f"2027-01-0{n + 1}T00:00:00Z"})
+        self.assertTrue(su.halt_reason(self.cfg.state_dir))
+        self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_pause_still_holds_an_operator_reinstall(self) -> None:
+        su._write_json(self.cfg.state_dir / "scheduled-pause.json",
+                       {"at": su._iso(self.sys.now()), "reason": "held"})
+        self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+
+    # Base's pause test needs an update to refuse; on this current host there is
+    # none without the flag. The test above covers the pause for a reinstall.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
+
+    def test_the_command_takes_no_target_and_is_never_scheduled(self) -> None:
+        for extra in (["--target", T_OLD], ["--scheduled"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SystemExit) as caught, \
+                        mock.patch("sys.stderr", new=io.StringIO()):
+                    su.main(["--apply", "--reinstall-current", "--home", str(self.home),
+                             *extra])
+                self.assertEqual(2, caught.exception.code)
+
+
 class FleetSourceCanaryHostTests(FleetSourceFixture):
     """On the canary itself (this host is m1)."""
 
