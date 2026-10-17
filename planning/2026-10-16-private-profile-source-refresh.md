@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation complete locally; review pending; external-source rollout intentionally gated
+Status: implementation is on main; M1 canary succeeded; M1 soak is in progress
 
 ## Goal
 
@@ -19,9 +19,10 @@ paths, while TartCI's external-source contract requires a validated export with
 marker. A redacted snapshot must therefore never be selected as a live source.
 
 The private authority was compared with the current TartCI profile contract.
-It does not yet contain a complete validated export, so no private snapshot is
-being copied into this repository or activated on a host as part of this
-change.
+Its current `main` at `55a2617d4705f1becf48ee41b96cc26697607db0` contains the
+four fleet profiles and published supply document required by the source
+contract. The export is selected by commit and carries a generated marker; no
+private paths or host data were added to this public repository.
 
 ## Implementation
 
@@ -50,9 +51,21 @@ change.
 
 ## Rollout status
 
-No fleet mutation has been performed. Current installed hosts report the
-ordinary checked-in profile path and no configured external source. The canary
-and rollback steps remain gated on a validated private export.
+The private projection reconciles cleanly against exact current source heads:
+Pulp `8d2463527a1dfd51635ef3d4189e00e50c2ed82e` and TartCI
+`5df49763eeef6d1aa9657b1c8a5a12cd21275749`.
+
+M1 is the canary. It installed TartCI `eef056df977a9bf1e74a66266ec15f950a9948fd`
+with private source `danielraffel/pulp-planning@55a2617d4705f1becf48ee41b96cc26697607db0`.
+The install receipt records the repository, commit, profile digest,
+published-supply digest, and complete-tree digest. The update drained and
+restored the pool with all required labels covered, then passed verification
+with five of five supervisors serving. A persistent `[fleet_source]` setting
+is installed on M1 so scheduled updates keep the same source selection.
+
+M1 remains in the required 30-minute soak. Wider rollout is blocked until the
+soak, a fresh readiness check, a live canary assignment and teardown, and a
+public-source rollback proof all pass.
 
 ## Scope boundary
 
@@ -71,13 +84,9 @@ source, source-sync, self-update, published-supply, lane, and installer tests
 pass. The exact published head was checked out in an isolated M1 worktree;
 M1 lint and the source, source-sync, and self-update suites passed there.
 
-The branch is published for review at
-`feat/private-profile-source-refresh-20261016`. It has not been merged or
-installed on a fleet host.
-
-The private authority still lacks a complete export with the required profile
-set and published supply document. A partial export would omit routing and
-capacity authority, so it is not being created or rolled out.
+The source resolver and provenance changes are on TartCI `main`. The private
+authority remains the desired-state and backup authority; the public checkout
+continues to be the default when no source is configured.
 
 The first Python 3.9 run exposed a compatibility gap: stock Python 3.9 has no
 `tomllib`, so valid configured sources were rejected. Export now performs full
@@ -88,7 +97,8 @@ locally after this fix.
 
 ## Stop conditions
 
-Stop and retain the public default if the private authority remains redacted,
+Stop and retain the public default if the private authority becomes redacted,
 if its generated export cannot be authenticated, if profile validation or
 provenance disagrees, if M1 validation fails, or if the canary cannot prove
-pool readiness and rollback.
+pool readiness and rollback. Do not widen the rollout from a failed or
+unverified canary.
