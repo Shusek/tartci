@@ -56,16 +56,16 @@ Pulp `8d2463527a1dfd51635ef3d4189e00e50c2ed82e` and TartCI
 `5df49763eeef6d1aa9657b1c8a5a12cd21275749`.
 
 M1 is the canary. It installed TartCI `eef056df977a9bf1e74a66266ec15f950a9948fd`
-with private source `danielraffel/pulp-planning@55a2617d4705f1becf48ee41b96cc26697607db0`.
+with private source `danielraffel/pulp-planning@65c2aec0a6f6d17ce2ab671bff09fb55c4692142`.
 The install receipt records the repository, commit, profile digest,
 published-supply digest, and complete-tree digest. The update drained and
 restored the pool with all required labels covered, then passed verification
 with five of five supervisors serving. A persistent `[fleet_source]` setting
 is installed on M1 so scheduled updates keep the same source selection.
 
-M1 remains in the required 30-minute soak. Wider rollout is blocked until the
-soak, a fresh readiness check, a live canary assignment and teardown, and a
-public-source rollback proof all pass.
+M1 passed the required 30-minute soak. Wider rollout remains blocked until the
+M5 sequencing fix is reviewed and merged, then receives its own readiness,
+live canary assignment and teardown, and rollback proof.
 
 ## Scope boundary
 
@@ -117,3 +117,8 @@ The Python 3.9, Python floor, and lint checks pass. The required signed
 Its private-source setting is staged but has not been activated. M1 remains
 healthy on the private source. M3 and m5studio remain on the public source
 until their sealed launcher profiles support this source selection.
+
+The current private planning `main` is
+`7f4dabcbb0d97b1e05f4fe4a00e9ed613b567ced`. Its profile and advertised-label
+files have the same SHA-256 values as the installed M1 source, so the newer
+private commits contain no profile drift.
