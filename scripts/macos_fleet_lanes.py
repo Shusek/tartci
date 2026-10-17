@@ -37,6 +37,7 @@ import debug_hold
 import reuse_canary
 import power_status
 import fleet_source
+import launch_set
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -1359,6 +1360,11 @@ def assert_executed_generation(
                 f"install_ineffective: launcher execs {program} which is not the "
                 f"installed generation {launch_entrypoint} ({name})"
             )
+        v2_policy = _launcher_v2_policy(bundle)
+        if v2_policy is not None:
+            records[name] = _launch_set_execution(
+                v2_policy, name, launch_entrypoint, source_commit, manifest_sha256)
+            continue
         sealed_launch = bundle / SEALED_SUPPORT / support_manifest.LAUNCH_NAME
         if sealed_launch.is_symlink() or not sealed_launch.is_file():
             fail(
@@ -1400,6 +1406,90 @@ def assert_executed_generation(
     return records
 
 
+def _launcher_v2_policy(bundle: Path) -> dict | None:
+    """A v2 app's policy.json (schema 2), or None for any other bundle."""
+    try:
+        value = json.loads((bundle / "Contents/Resources/policy.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) and value.get("schema") == 2 else None
+
+
+def _launch_set_execution(
+    policy: dict, name: str, launch_entrypoint: Path, source_commit: str, manifest_sha256: str,
+) -> dict:
+    """What a v2 lane executes: the pointer's generation, which must be this install's."""
+    pointer = launch_set.read_pointer(Path(str(policy.get("pointer", ""))))
+    generation = Path((pointer or {}).get("generation") or "")
+    if not pointer or generation.resolve() != launch_entrypoint.parent:
+        fail(
+            f"install_ineffective: launcher v2 points at {generation or '<no pointer>'}, "
+            f"not the installed generation {launch_entrypoint.parent} ({name})"
+        )
+    try:
+        value = json.loads((generation / launch_set.SET_NAME).read_text())
+    except (OSError, ValueError) as exc:
+        fail(f"install_ineffective: launcher v2 launch set is unreadable: {exc} ({name})")
+    if (not isinstance(value, dict) or value.get("source_commit") != source_commit
+            or value.get("manifest_sha256") != manifest_sha256):
+        fail(
+            f"install_ineffective: launcher v2 launch set in {generation} is not the "
+            f"installed cohort {source_commit}/{manifest_sha256} ({name})"
+        )
+    return {"kind": "launch-set", "executes": str(generation / launch_set.ENTRYPOINT)}
+
+
+def launch_helper_record(
+    helper: dict, config: Path, data: dict, support_root: Path, source_commit: str,
+    layout: str = "v1",
+) -> dict:
+    """The installed launch helper, verified for its layout.
+
+    v1: the sealed app, bound to the support commit. v2: the stable app, built
+    from this support tree's launcher inputs, plus the signed launch set of
+    the generation the pointer names, which must be this support root.
+    """
+    if layout == "v2":
+        record = macos_launcher_identity.verify_v2(
+            Path(helper["path"]), identifier=helper["identifier"],
+            team_id=helper["team_id"], profile=tomllib.loads(config.read_text()),
+            support_root=support_root,
+        )
+        record["launch_set"] = launch_set_record(Path(data["host"]["home"]), support_root)
+        return record
+    return macos_launcher_identity.verify(
+        Path(helper["path"]), identifier=helper["identifier"],
+        team_id=helper["team_id"],
+        profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
+        source_commit=source_commit,
+        tart_home=data["host"]["tart_home"],
+    )
+
+
+def launch_set_record(home: Path, support_root: Path) -> dict:
+    """The pointer and launch set a v2 host runs, checked as the launcher does
+    (the signature is the launcher's to check on every lane start)."""
+    pointer = home / ".config/tartci/launcher-generation.json"
+    value = launch_set.read_pointer(pointer)
+    generation = Path((value or {}).get("generation") or "")
+    if not value or generation.resolve() != support_root.resolve():
+        fail(f"launcher v2 pointer {pointer} does not name the installed generation {support_root}")
+    root = (home / ".local/share/tartci-generations").resolve()
+    problem = launch_set.verify_contents(support_root.resolve(), root)
+    if problem:
+        fail(f"launcher v2 launch set does not verify: {problem}")
+    set_path = support_root / launch_set.SET_NAME
+    set_bytes = set_path.read_bytes()
+    return {
+        "pointer": str(pointer),
+        "generation": str(support_root),
+        "sequence": json.loads(set_bytes)["sequence"],
+        "set_sha256": hashlib.sha256(set_bytes).hexdigest(),
+        "signature_sha256": hashlib.sha256(
+            (support_root / launch_set.SIG_NAME).read_bytes()).hexdigest(),
+    }
+
+
 def write_receipt(
     config: Path,
     agents_dir: Path,
@@ -1410,6 +1500,7 @@ def write_receipt(
     entrypoint_source: Path,
     launch_entrypoint: Path,
     source_authority_commit: str,
+    launcher_layout: str = "v1",
 ) -> None:
     data = load(config)
     support_root = support_root.resolve()
@@ -1479,13 +1570,8 @@ def write_receipt(
     helper = data.get("launch_helper")
     helper_record = None
     if helper is not None:
-        helper_record = macos_launcher_identity.verify(
-            Path(helper["path"]), identifier=helper["identifier"],
-            team_id=helper["team_id"],
-            profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
-            source_commit=source_authority_commit,
-            tart_home=data["host"]["tart_home"],
-        )
+        helper_record = launch_helper_record(
+            helper, config, data, support_root, source_authority_commit, launcher_layout)
     persistent_records = persistent_plist_records(data, agents_dir)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     fleet_source_state = fleet_source.resolve(TARTCI_ROOT)
@@ -1636,13 +1722,10 @@ def verify_receipt(
         if receipt.get("launch_helper") is not None:
             fail("install receipt unexpectedly records a launch helper")
     else:
-        helper_record = macos_launcher_identity.verify(
-            Path(helper["path"]), identifier=helper["identifier"],
-            team_id=helper["team_id"],
-            profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
-            source_commit=verified_support["source_commit"],
-            tart_home=data["host"]["tart_home"],
-        )
+        # The receipt names the layout; each layout's checks refuse the other's app.
+        layout = "v2" if (receipt.get("launch_helper") or {}).get("layout") == "v2" else "v1"
+        helper_record = launch_helper_record(
+            helper, config, data, support_root, verified_support["source_commit"], layout)
         if helper_record != receipt.get("launch_helper"):
             fail("installed launch helper does not match its receipt")
     expected_entrypoint = Path(data["host"]["home"]) / ".local/bin/tartci"
@@ -3690,6 +3773,7 @@ def main(argv: list[str] | None = None) -> int:
     receipt.add_argument("--entrypoint-source", required=True, type=Path)
     receipt.add_argument("--launch-entrypoint", required=True, type=Path)
     receipt.add_argument("--source-authority-commit", required=True)
+    receipt.add_argument("--launcher-layout", choices=("v1", "v2"), default="v1")
     verify = sub.add_parser("verify-installed")
     verify.add_argument("receipt", type=Path)
     verify.add_argument("--config", required=True, type=Path)
@@ -3867,6 +3951,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.entrypoint_source,
                 args.launch_entrypoint,
                 args.source_authority_commit,
+                args.launcher_layout,
             )
             print(args.output)
             return 0

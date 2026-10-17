@@ -125,6 +125,42 @@ that boundary. After the first explicit Removable Volumes grant, canary a real
 JIT job and then replace the launcher once with the same identifier/Team ID to
 prove the consent identity is durable.
 
+### Launcher v2 (opt-in, one host at a time)
+
+A v1 launcher seals the support tree and lanes into the app, so every TartCI
+update is a new app, and a new app can lose its Removable Volumes grant. A v2
+launcher is a stable app (executable, `Info.plist`, `policy.json` and an
+`inputs.json` digest of those three) that runs the signed launch set of the
+support generation named by `~/.config/tartci/launcher-generation.json`.
+
+A host moves to v2 only when it opts in:
+
+- `~/.config/tartci/launcher-v2.enabled` must be a regular file owned by the
+  fleet user and not group- or world-writable (`touch` it, `chmod 600`).
+  Anything else refuses the install loudly.
+- Review the install dry run first: it prints `launcher_layout=v2` and, on a
+  v1 host, `launcher_change=v1->v2`. The move installs a new app, so it needs
+  that app's approval digest and the Removable Volumes grant, exactly like any
+  other launcher change. The opt-in never bypasses either.
+- A v2 install signs the launch set through the dedicated signing keychain
+  only, and refuses without it:
+
+```sh
+./tartci fleet-macos install PROFILE.toml \
+  --support-source . --support-manifest .tartci-support-manifest.json \
+  --launch-helper-source /absolute/staging/TartCILauncher.app \
+  --launch-set-identity IDENTITY --launch-set-keychain /absolute/signing.keychain-db --apply
+```
+
+  Build the stable app with `scripts/build_macos_launcher.sh --layout v2`.
+- Removing the opt-in file from a v2 host does not fall back to v1: the next
+  install refuses and names the two ways forward. Restore the file to keep v2,
+  or install with `--launcher-layout v1` to go back deliberately (a launcher
+  change, with its approval and grant).
+
+`tartci pool status` and `tartci doctor fleet` report the layout and whether
+the opt-in file is present.
+
 Before a future stacked-image canary on any host, validate only metadata and
 authorization without displaying credential values:
 

@@ -183,10 +183,16 @@ class LauncherV2BuildTests(LauncherBuildTests):
         self.assertEqual(result.returncode, 0, result.stderr)
         files = sorted(p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file())
         self.assertEqual(["Contents/Info.plist", "Contents/MacOS/tartci-launcher",
-                          "Contents/Resources/policy.json",
+                          "Contents/Resources/inputs.json", "Contents/Resources/policy.json",
                           "Contents/_CodeSignature/CodeResources"], files)
-        policy = json.loads((output / "Contents/Resources/policy.json").read_text())
+        import macos_launcher_identity
         import tomllib
+        inputs = json.loads((output / "Contents/Resources/inputs.json").read_text())
+        self.assertEqual(macos_launcher_identity.source_inputs_digest(
+            self.support_root, tomllib.loads(self.profile.read_text())), inputs["sha256"])
+        self.assertEqual((self.support_root / "native/macos/tartci-launcher/Info.plist").read_bytes(),
+                         (output / "Contents/Info.plist").read_bytes())
+        policy = json.loads((output / "Contents/Resources/policy.json").read_text())
         profile = tomllib.loads(self.profile.read_text())
         home = profile["host"]["home"].rstrip("/")
         self.assertEqual({
