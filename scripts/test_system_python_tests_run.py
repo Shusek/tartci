@@ -67,6 +67,10 @@ ALLOWED = {
      "FleetSourceTests.test_a_profile_that_is_not_toml_is_refused"):
         ("3.11-only: source resolution parses profile TOML when the interpreter provides "
          "tomllib; Python 3.9 trusts the immutable export marker after sync validation"),
+    ("test_fleet_source_sync.py",
+     "ExportWithoutTomllibTests.test_the_same_export_succeeds_where_tomllib_is_present"):
+        ("3.11-only: the success control for the 3.9 refusal; exporting needs tomllib to "
+         "validate profile TOML, which is exactly what the refusal test proves 3.9 lacks"),
     ("test_fleet_source_sync.py", "ExportTests"):
         ("3.11-only: source export validates profile TOML before publishing the immutable "
          "export; Python 3.9 cannot perform the export"),
