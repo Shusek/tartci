@@ -52,19 +52,18 @@ private paths or host data are added to this repository.
 ## Rollout status
 
 The private projection reconciles cleanly against fresh detached checkouts of
-the current TartCI and Pulp sources. The canary installed the validated export
-and its receipt records the repository, commit, profile digest,
-published-supply digest, and complete-tree digest. The update drained and
-restored the pool with all required labels covered, then passed verification
-with every expected supervisor serving. The source setting was later removed
-from the fleet while the rollout was paused; the installed canary receipt
-continues to identify the private source until its next install.
+the current TartCI and Pulp sources. An earlier canary installed the validated
+export, recorded its repository, commit, profile digest, published-supply
+digest, and complete-tree digest, and passed verification with every expected
+supervisor serving. That canary was later cleared after standalone verification
+reported a false receipt mismatch. Current receipts use the public source, no
+external-source canary is active, and the fleet is ready.
 
-The canary passed the required 30-minute soak. Wider rollout remains blocked
-until the sequencing fix is reviewed and merged, then receives its own
-readiness, live canary assignment and teardown, and rollback proof. Sealed
-launcher hosts remain on the public source until their launcher profiles
-support this source selection.
+The earlier canary passed the required 30-minute soak. Wider rollout remains
+blocked while the source-move sequencing fix is reviewed and until each host
+receives its own readiness, live canary assignment and teardown, and rollback
+proof. Sealed launcher hosts remain on the public source until their launcher
+profiles support this source selection.
 
 ## Scope boundary
 
@@ -124,10 +123,12 @@ then treated as a no-op, so the new source was not installed. PR
 regression coverage.
 
 The Python floor, self-update, and lint checks pass on the current candidate.
-The required signed review is still pending, so the wider rollout remains
-stopped. The canary reports a receipt mismatch until the corresponding
-readiness fix lands; sealed launcher hosts remain on the public source until
-they support this selection.
+The verification repair is merged in [PR 605](https://github.com/danielraffel/tartci/pull/605),
+and the cleared canary currently reports a ready pool with no receipt mismatch.
+The wider rollout remains stopped pending signed review of [PR
+606](https://github.com/danielraffel/tartci/pull/606) and a separate go for each
+host. Sealed launcher hosts remain on the public source until they support this
+selection.
 
 The authority check was rerun on fresh detached checkouts on 2026-10-17 and
 passed with `local macOS fleet projection: OK`.
