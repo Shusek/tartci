@@ -3356,7 +3356,20 @@ def config_verdicts(config: Path, support_root: Path,
     Reported, never enforced: a status or admission path that refused on
     these would turn configuration drift into a capacity outage.
     """
-    source = source or fleet_source.resolve(support_root)
+    if source is None:
+        try:
+            source = fleet_source.resolve(support_root)
+        except Exception as exc:  # noqa: BLE001 - a broken check reads as unknown
+            reason = f"{type(exc).__name__}: {exc}"
+            return {
+                "profile_drift": {"state": "unknown", "reason": reason},
+                "supply": {"state": "unknown", "reason": reason},
+                "self_update": self_update_summary(),
+                "gate_reserve": {"lines": ["gate reserve: unknown (source unavailable)"],
+                                 "problem": "source_unavailable"},
+                "tool_freshness": tool_freshness_summary(),
+                "host_vitals": host_vitals_summary(),
+            }
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
@@ -3383,7 +3396,8 @@ def config_verdicts(config: Path, support_root: Path,
         except Exception as exc:  # noqa: BLE001
             published, error = None, f"{source_path}: {exc}"
         supply = verify_supply(config, published, error,
-                               published_from=published_commit(source_path),
+                               published_from=(source.source_commit
+                                               or published_commit(source_path)),
                                host_commit=host_tartci_commit(receipt))
         value["supply"] = {
             "state": supply["state"], "reason": supply["reason"],

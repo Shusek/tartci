@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -64,6 +65,17 @@ class ReadinessCarriesConfigTests(unittest.TestCase):
         self.assertEqual(fleet.render_config_verdicts(None).splitlines()[:2],
                          ["profile drift: UNKNOWN (not checked from here)",
                           "supply: UNKNOWN (not checked from here)"])
+
+    def test_unavailable_source_is_unknown_instead_of_raising(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "TARTCI_FLEET_SOURCE_ROOT": "/does/not/exist",
+            "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+            "TARTCI_FLEET_SOURCE_REPOSITORY": "danielraffel/pulp-planning",
+        }):
+            value = self._readiness(M3.read_text())["config"]
+        self.assertEqual(value["profile_drift"]["state"], "unknown")
+        self.assertEqual(value["supply"]["state"], "unknown")
+        self.assertEqual(value["gate_reserve"]["problem"], "source_unavailable")
 
 
 class PoolStatusTests(unittest.TestCase):
