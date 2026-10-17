@@ -2749,10 +2749,14 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_UNKNOWN
     target = skew.get("target")
     refresh = None
-    if not target and skew["state"] == "current":
+    if not target:
         refresh = refresh_reason(cfg, sys_)
-        if refresh:
-            # Same generation, reinstalled only to rewrite its receipt.
+        # A private-source change is a same-generation install. It must not
+        # wait for an unrelated TartCI commit to finish its soak: the running
+        # code is unchanged, while the selected profile bytes still need to
+        # reach the installed generation. The ordinary TartCI target remains
+        # gated by its own skew state below.
+        if refresh and skew["state"] in ("current", "soaking", "behind", "unverified"):
             target = installed
             print(f"self-update: same-generation reinstall needed: {refresh}")
     if not target:

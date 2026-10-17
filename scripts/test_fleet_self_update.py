@@ -3713,6 +3713,17 @@ class FleetSourceCanaryTests(FleetSourceFixture):
         self.assertEqual(self.fixture.COMMIT, selected["commit"])
         self.assertIn("fleet source moved to cccccccccccc", su.refresh_reason(self.cfg, self.sys))
 
+    def test_adopted_source_reinstalls_while_tartci_commit_is_still_soaking(self) -> None:
+        """A source move must not wait for unrelated TartCI code to soak."""
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        with self.canary(soaked):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
     def test_a_record_for_another_repository_is_not_adopted(self) -> None:
         self.installed_from(self.OLDER)
         other = {"repository": "ORG/other", "commit": self.fixture.COMMIT, "age": 99999}
