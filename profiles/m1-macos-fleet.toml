@@ -30,15 +30,17 @@ job_claim_max_age_seconds = 1800
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
 # The pinned mise binary (runbook: Pinned mise). Built from source at mise
-# v2026.10.8 and copied between hosts by digest; the same sha256 is on m1, m3,
-# m5 and m5s. The install refuses a missing or different binary and records
+# v2026.10.11 and copied between hosts by digest. The previous pin
+# (2026.10.8) stays installed beside it as the rollback: restore this table's
+# three values to it. The install refuses a missing or different binary and records
 # ~/.config/tartci/mise.pin. It changes no PATH and no lane: lanes keep their
 # tools until one is moved to the pinned toolchain on purpose. m1 first; the
-# other hosts get this table after m1's rollout step. Rollback: delete it.
+# other hosts get this table after m1's rollout step. Deleting the table
+# unpins mise entirely.
 [mise]
-version = "2026.10.8"
-path = "/Users/danielraffel/.local/opt/mise-2026.10.8/bin/mise"
-sha256 = "87c18142dd67f5848b0236738eb9338976329266937ecd79b11121de64dd2d47"
+version = "2026.10.11"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.11/bin/mise"
+sha256 = "25e38f796fff67fc5f4c44f6963d4b8ed15be82a5d9244f693cc55d40a245ee3"
 
 # The host's rustup never checks for or installs its own updates (runbook:
 # Pinned mise). Rollback: delete this table and run
