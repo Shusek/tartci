@@ -463,7 +463,7 @@ class LaunchSetInstallTests(unittest.TestCase):
 
     def test_a_keychain_that_is_not_ready_writes_nothing(self) -> None:
         codesign = FakeCodesign()
-        with self.assertRaisesRegex(ls.LaunchSetError, "not ready, pointer unchanged"):
+        with self.assertRaisesRegex(ls.LaunchSetError, "not ready to sign it forward"):
             self.install(self.generation, codesign, ready=lambda: "locked")
         self.assertFalse(self.pointer.exists())
         self.assertFalse((self.generation / ls.SET_NAME).exists())
@@ -475,6 +475,80 @@ class LaunchSetInstallTests(unittest.TestCase):
             self.install(self.generation, FakeCodesign(sign_rc=1))
         self.assertFalse(self.pointer.exists())
         self.assertEqual(0o555, self.generation.stat().st_mode & 0o777)
+
+    # Rollback: switch back to `previous`, else sign forward, else stop.
+
+    def rolled_forward(self) -> Path:
+        """Install A then B; the pointer names B with A as previous."""
+        self.install(self.generation)
+        newer = self.staged("b" * 40 + "-1")
+        self.install(newer)
+        self.assertEqual(str(self.generation), ls.read_pointer(self.pointer)["previous"])
+        return newer
+
+    def test_a_rollback_switches_the_pointer_back_without_a_signature(self) -> None:
+        newer = self.rolled_forward()
+        codesign = FakeCodesign()
+        value = self.install(self.generation, codesign, ready=lambda: "keychain locked")
+        self.assertTrue(value["rolled_back"])
+        self.assertEqual({"schema": 1, "generation": str(self.generation), "previous": str(newer)},
+                         ls.read_pointer(self.pointer))
+        self.assertEqual(0, self.signed(codesign))
+        self.assertEqual(1, json.loads((self.generation / ls.SET_NAME).read_text())["sequence"])
+
+    def test_a_rollback_whose_lanes_changed_signs_forward_when_signing_is_ready(self) -> None:
+        newer = self.rolled_forward()
+        self.write_plist("studio-forge-gate")
+        codesign = FakeCodesign()
+        value = self.install(self.generation, codesign)
+        self.assertNotIn("rolled_back", value)
+        self.assertEqual(1, self.signed(codesign))
+        self.assertEqual(3, json.loads((self.generation / ls.SET_NAME).read_text())["sequence"])
+        self.assertEqual(str(newer), ls.read_pointer(self.pointer)["previous"])
+
+    def test_a_rollback_that_can_neither_switch_nor_sign_stops_with_the_operator_step(self) -> None:
+        newer = self.rolled_forward()
+        # The previous set no longer verifies: one byte of a member changed.
+        member = self.generation / "scripts/x.py"
+        os.chmod(member.parent, 0o755)
+        os.chmod(member, 0o644)
+        member.write_text("print(2)\n")
+        ls.freeze(self.generation)
+        before = self.pointer.read_bytes()
+        codesign = FakeCodesign()
+        with self.assertRaises(ls.LaunchSetError) as caught:
+            self.install(self.generation, codesign, ready=lambda: "keychain locked")
+        message = str(caught.exception)
+        self.assertIn("cannot be reused (scripts/x.py does not match its digest)", message)
+        self.assertIn("keychain locked", message)
+        self.assertIn("Operator step", message)
+        self.assertEqual(before, self.pointer.read_bytes())
+        self.assertEqual(0, self.signed(codesign))
+        self.assertEqual(str(newer), ls.read_pointer(self.pointer)["generation"])
+
+    def test_a_generation_two_back_is_never_pointed_at_without_signing(self) -> None:
+        # A, B, C installed in turn: A's signed set still verifies, but it is
+        # two back, so the launcher's floor would refuse it; it is signed
+        # forward or not at all.
+        newer = self.rolled_forward()
+        newest = self.staged("c" * 40 + "-1")
+        self.install(newest)
+        self.assertEqual(str(newer), ls.read_pointer(self.pointer)["previous"])
+        before = self.pointer.read_bytes()
+        with self.assertRaisesRegex(ls.LaunchSetError, "not the pointer's previous generation"):
+            self.install(self.generation, ready=lambda: "keychain locked")
+        self.assertEqual(before, self.pointer.read_bytes())
+        codesign = FakeCodesign()
+        value = self.install(self.generation, codesign)
+        self.assertNotIn("rolled_back", value)
+        self.assertEqual(1, self.signed(codesign))
+        self.assertEqual(4, json.loads((self.generation / ls.SET_NAME).read_text())["sequence"])
+
+    def test_only_the_previous_generation_is_switched_back_to(self) -> None:
+        self.rolled_forward()
+        older = self.staged("c" * 40 + "-1")
+        with self.assertRaisesRegex(ls.LaunchSetError, "not the pointer's previous generation"):
+            self.install(older, ready=lambda: "keychain locked")
 
     def test_rendered_lanes_must_be_unique_and_present(self) -> None:
         import plistlib  # noqa: PLC0415
@@ -493,6 +567,25 @@ class LaunchSetInstallTests(unittest.TestCase):
         keychain = self.render / "signing.keychain-db"
         keychain.write_text("")
         self.assertIsNone(ls.keychain_problem(str(keychain)))
+
+    def test_signing_is_ready_only_when_a_probe_signature_succeeds(self) -> None:
+        keychain = self.render / "signing.keychain-db"
+        keychain.write_text("")
+        calls = []
+
+        def probe(rc=0, raises=False):
+            def run(argv, **kwargs):
+                calls.append(list(argv))
+                if raises:
+                    raise subprocess.TimeoutExpired(argv, 60)
+                return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else "locked")
+            return run
+        self.assertIsNone(ls.signing_problem("ID", str(keychain), probe()))
+        self.assertEqual(["--keychain", str(keychain)], calls[0][3:5])
+        self.assertIn("--timestamp", calls[0])
+        self.assertIn("probe failed: locked", ls.signing_problem("ID", str(keychain), probe(1)))
+        self.assertIn("timed out", ls.signing_problem("ID", str(keychain), probe(raises=True)))
+        self.assertIn("not a keychain", ls.signing_problem("ID", str(self.render / "x"), probe()))
 
     def test_the_command_refuses_without_a_keychain_file(self) -> None:
         result = subprocess.run(

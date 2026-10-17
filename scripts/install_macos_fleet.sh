@@ -322,14 +322,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
 import macos_fleet_lanes as fleet
-print("yes" if fleet.load(Path(sys.argv[1])).get("launch_helper") is not None else "no")
+helper = fleet.load(Path(sys.argv[1])).get("launch_helper")
+print(helper["path"] if helper is not None else "")
 PY
 )" || exit 2
-if [ "$plan_has_helper" = yes ]; then
-  layout_args=(--home "$HOME" --receipt "$RECEIPT")
+if [ -n "$plan_has_helper" ]; then
+  layout_args=(--home "$HOME" --receipt "$RECEIPT" --app "$plan_has_helper")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
   plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
-  plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT")" || exit 3
+  plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT" --home "$HOME" --app "$plan_has_helper")" || exit 3
 elif [ -n "$LAUNCHER_LAYOUT" ]; then
   echo "--launcher-layout is invalid for a profile without launch_helper" >&2
   exit 2
@@ -483,6 +484,7 @@ launcher_source_commit=""
 pointer_file="$HOME/.config/tartci/launcher-generation.json"
 pointer_backup=""
 pointer_touched=0
+pointer_restore_failed=0
 support_root=""
 installed_support_manifest=""
 launch_entrypoint=""
@@ -495,10 +497,24 @@ retired_backups=()
 rollback() {
   local i target backup
   if [ "$pointer_touched" = 1 ]; then
-    # Lanes go back to the generation the pointer named before this install.
-    rm -f "$pointer_file"
+    # Lanes go back to the generation the pointer named before this install:
+    # one rename over the new pointer, so no moment has no pointer at all.
     if [ -n "$pointer_backup" ] && [ -e "$pointer_backup" ]; then
-      mv -f "$pointer_backup" "$pointer_file" || true
+      if ! mv -f "$pointer_backup" "$pointer_file"; then
+        # The lanes would start the generation this install just failed on.
+        # The pool is off for the whole install and stays off: `pool on`
+        # refuses while the pointer does not name the receipt's generation.
+        pointer_restore_failed=1
+        echo "FINDING launcher_pointer_restore_failed: rollback could not put the launcher pointer back." >&2
+        echo "  what: $pointer_file still names the generation this failed install published" >&2
+        echo "  cause: renaming $pointer_backup over it failed (see the mv error above)" >&2
+        echo "  host: left OFF; tartci pool on refuses until the pointer matches the install receipt" >&2
+        echo "  fix: mv -f '$pointer_backup' '$pointer_file' (or reinstall), then tartci pool on" >&2
+        echo "  verify: tartci doctor fleet reports launcher_layout_v2 and executed_generation ok" >&2
+      fi
+    elif ! rm -f "$pointer_file"; then
+      pointer_restore_failed=1
+      echo "FINDING launcher_pointer_restore_failed: rollback could not remove the new launcher pointer $pointer_file; host left OFF" >&2
     fi
   fi
   if [ "$launcher_touched" = 1 ]; then
@@ -546,7 +562,12 @@ rollback() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -ne 0 ]; then rollback; fi
+  if [ "$rc" -ne 0 ]; then
+    rollback
+    # A failed pointer restore is its own failure: never the install's
+    # ordinary exit code, so no caller mistakes it for a clean rollback.
+    [ "$pointer_restore_failed" != 1 ] || rc=6
+  fi
   [ -n "$stage_dir" ] && rm -rf "$stage_dir"
   [ -n "$receipt_tmp" ] && rm -f "$receipt_tmp"
   [ -z "$wrapper_candidate" ] || rm -f "$wrapper_candidate"
@@ -709,7 +730,8 @@ verify_launcher() {  # PATH [SOURCE_COMMIT]: the launcher identity record, or re
   fi
 }
 if [ "$launch_helper_json" != "null" ]; then
-  layout_args=(--home "$HOME" --receipt "$RECEIPT")
+  layout_args=(--home "$HOME" --receipt "$RECEIPT"
+               --app "$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
   launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
   [ "$launcher_layout" = "$plan_launcher_layout" ] || {

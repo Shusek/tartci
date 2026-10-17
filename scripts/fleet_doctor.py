@@ -1631,6 +1631,16 @@ def collect_census(repo: str, gh_cli: str | None) -> tuple[Any, str | None, str]
         return None, "census_incomplete", f"{type(exc).__name__}: {exc}"
 
 
+def read_launcher_layout(home: Path, receipt_path: Path, profile_path: Path) -> dict:
+    """The launcher layout report. The installed profile names the helper app
+    even when the install receipt is gone, so a receipt-less v2 host still
+    reads as v2 rather than as nothing installed."""
+    import launcher_layout
+    receipt = launcher_layout.read_receipt(receipt_path)
+    app = launcher_layout.profile_app(profile_path) or launcher_layout.receipt_app(receipt)
+    return launcher_layout.status(home, receipt, app=app)
+
+
 def collect(*, home: Path, agents_dir: Path | None = None,
             config_dir: Path | None = None, support_root: Path = ROOT,
             repos: Sequence[str] | None = None, gh_cli: str | None = None,
@@ -1763,7 +1773,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         managed=config.is_file()))
     try:
         import launcher_layout
-        launcher_value = launcher_layout.status(home, launcher_layout.read_receipt(receipt_path))
+        launcher_value = read_launcher_layout(home, receipt_path, config)
     except Exception:  # noqa: BLE001 - reported as unreadable
         launcher_value = None
     findings.append(check_launcher_layout(launcher_value))

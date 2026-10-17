@@ -82,6 +82,38 @@ class LauncherLayoutTests(unittest.TestCase):
         # The explicit downgrade is the way back.
         self.assertEqual("v1", ll.decide(self.home, V2, "v1"))
 
+    def test_a_lost_receipt_does_not_read_as_nothing_installed(self) -> None:
+        pointer = self.home / ".config/tartci/launcher-generation.json"
+        pointer.write_text("{}")
+        for receipt in (None, {"support": {}}):
+            with self.subTest(receipt=receipt):
+                self.assertEqual("v2", ll.installed(receipt, self.home))
+                with self.assertRaises(ll.LayoutError) as caught:
+                    ll.decide(self.home, receipt)
+                self.assertIn("install receipt is missing but the launcher v2 pointer",
+                              str(caught.exception))
+                self.assertIn("--launcher-layout v1", str(caught.exception))
+        self.assertEqual("v1", ll.decide(self.home, None, "v1"), "the explicit downgrade")
+        self.opt()
+        self.assertEqual("v2", ll.decide(self.home, None))
+        # A recorded v1 receipt is not overruled by a leftover pointer.
+        self.opt_in.unlink()
+        self.assertEqual("v1", ll.decide(self.home, V1))
+
+    def test_a_v2_app_on_disk_is_evidence_too(self) -> None:
+        app = self.home / "TartCILauncher.app"
+        (app / "Contents/Resources").mkdir(parents=True)
+        self.assertIsNone(ll.installed(None, self.home, app), "control: no evidence")
+        self.assertEqual("v1", ll.decide(self.home, None, app=app))
+        (app / "Contents/Resources/policy.json").write_text(json.dumps({"schema": 2}))
+        self.assertEqual("v2", ll.installed(None, self.home, app))
+        with self.assertRaisesRegex(ll.LayoutError, "a launcher v2 app at"):
+            ll.decide(self.home, None, app=app)
+        (app / "Contents/Resources/policy.json").write_text(json.dumps({"schema": 1}))
+        self.assertEqual("v1", ll.decide(self.home, None, app=app))
+        status = ll.status(self.home, None, app)
+        self.assertIsNone(status["layout"])
+
     def test_explicit_v2_needs_the_opt_in(self) -> None:
         with self.assertRaisesRegex(ll.LayoutError, "needs the per-host opt-in"):
             ll.decide(self.home, V1, "v2")
@@ -124,6 +156,67 @@ class LauncherLayoutTests(unittest.TestCase):
         self.assertIn("unreadable", result.stderr)
         status = json.loads(self.cli("--status").stdout)
         self.assertEqual("absent", status["opt_in"])
+
+    def v2_app(self) -> Path:
+        app = self.home / "libexec/TartCILauncher.app"
+        (app / "Contents/Resources").mkdir(parents=True)
+        (app / "Contents/Resources/policy.json").write_text(json.dumps({"schema": 2}))
+        return app
+
+    def test_the_profile_names_the_helper_app_with_or_without_tomllib(self) -> None:
+        profile = self.home / ll.PROFILE
+        self.assertIsNone(ll.profile_app(profile), "control: no profile")
+        profile.write_text('[host]\nid = "m1"\n# a comment\n\n[launch_helper]\n'
+                           'layout = "v2"\npath = "/Users/me/libexec/TartCILauncher.app"\n'
+                           '\n[lanes]\npath = "/not/this/one"\n')
+        expected = Path("/Users/me/libexec/TartCILauncher.app")
+        self.assertEqual(expected, ll.profile_app(profile))
+        import builtins  # noqa: PLC0415
+        real_import = builtins.__import__
+
+        def without_tomllib(name, *args, **kwargs):
+            if name == "tomllib":
+                raise ImportError("no tomllib on Python 3.9")
+            return real_import(name, *args, **kwargs)
+        from unittest import mock  # noqa: PLC0415
+        with mock.patch.object(builtins, "__import__", without_tomllib):
+            self.assertEqual(expected, ll.profile_app(profile))
+        self.assertEqual("/a/b.app", ll._profile_helper_path("[launch_helper]\npath = '/a/b.app'\n"))
+        self.assertIsNone(ll._profile_helper_path('[lanes]\npath = "/x"\n'))
+        profile.write_text('[launch_helper]\nlayout = "v2"\n')
+        self.assertIsNone(ll.profile_app(profile))
+
+    def test_the_profile_app_wins_over_the_receipts(self) -> None:
+        app = self.v2_app()
+        (self.home / ll.PROFILE).write_text(f'[launch_helper]\npath = "{app}"\n')
+        receipt = {"launch_helper": {"layout": "v1", "path": "/elsewhere/TartCILauncher.app"}}
+        self.assertEqual(app, ll.helper_app(self.home, receipt))
+        (self.home / ll.PROFILE).unlink()
+        self.assertEqual(Path("/elsewhere/TartCILauncher.app"), ll.helper_app(self.home, receipt))
+        self.assertIsNone(ll.helper_app(self.home, None))
+
+    def test_status_command_finds_a_receiptless_v2_app_through_the_profile(self) -> None:
+        app = self.v2_app()
+        absent = self.home / "no-receipt.json"
+        self.assertIsNone(json.loads(self.cli("--status", "--receipt", str(absent)).stdout)["layout"],
+                          "control: no profile names the app")
+        (self.home / ll.PROFILE).write_text(f'[launch_helper]\npath = "{app}"\n')
+        status = json.loads(self.cli("--status", "--receipt", str(absent)).stdout)
+        self.assertEqual("v2", status["layout"])
+        self.assertIn(f"a launcher v2 app at {app}", status["problem"])
+        text = self.cli("--status-text", "--receipt", str(absent)).stdout
+        self.assertIn("layout v2", text)
+
+    def test_pool_status_passes_this_home_to_both_layout_reads(self) -> None:
+        # The app now comes from the profile under --home, so both pool status
+        # reads must name the home they report on.
+        source = (HERE.parent / "tartci").read_text()
+        self.assertIn('local launcher_args=(--home "$HOME")', source)
+        for mode in ("--status ", "--status-text "):
+            calls = [line for line in source.splitlines()
+                     if "scripts/launcher_layout.py" in line and mode in line]
+            self.assertEqual(1, len(calls), mode)
+            self.assertIn('"${launcher_args[@]}"', calls[0])
 
 
 if __name__ == "__main__":
