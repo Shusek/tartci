@@ -1956,7 +1956,8 @@ class InstallMacosFleetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "launch set does not verify"):
                 verify()
 
-    def rollback_after(self, *, touched: bool, backup: bool) -> tuple[Path, Path]:
+    def rollback_after(self, *, touched: bool, backup: bool,
+                       backup_failure: bool = False) -> tuple[Path, Path, subprocess.CompletedProcess]:
         """Run the installer's own rollback() with only the pointer touched."""
         text = (ROOT / "scripts/install_macos_fleet.sh").read_text()
         start = text.index("rollback() {")
@@ -1965,17 +1966,21 @@ class InstallMacosFleetTests(unittest.TestCase):
         pointer.write_text('{"generation": "new"}\n')
         saved = self.root / "launcher-generation.json.previous"
         if backup:
-            saved.write_text('{"generation": "old"}\n')
+            if backup_failure:
+                saved.mkdir()
+                (saved / "cannot-move-a-directory-as-a-file").write_text("x")
+            else:
+                saved.write_text('{"generation": "old"}\n')
         script = (function + f"pointer_file={shlex.quote(str(pointer))}\n"
                   f"pointer_backup={shlex.quote(str(saved)) if backup else ''}\n"
                   f"pointer_touched={1 if touched else 0}\nrollback\n")
         result = subprocess.run(["/bin/bash", "-c", script], text=True, capture_output=True,
                                 check=False)
         self.assertEqual(0, result.returncode, result.stderr)
-        return pointer, saved
+        return pointer, saved, result
 
     def test_rollback_puts_the_previous_pointer_back_atomically(self) -> None:
-        pointer, saved = self.rollback_after(touched=True, backup=True)
+        pointer, saved, _ = self.rollback_after(touched=True, backup=True)
         self.assertEqual('{"generation": "old"}\n', pointer.read_text())
         self.assertFalse(saved.exists(), "restored by one rename, not a copy")
         source = (ROOT / "scripts/install_macos_fleet.sh").read_text()
@@ -1987,13 +1992,20 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("could not restore the launcher pointer", restore)
 
     def test_rollback_without_a_previous_pointer_removes_the_new_one(self) -> None:
-        pointer, _ = self.rollback_after(touched=True, backup=False)
+        pointer, _, _ = self.rollback_after(touched=True, backup=False)
         self.assertFalse(pointer.exists())
 
     def test_rollback_leaves_a_pointer_this_install_never_touched(self) -> None:
         # Control: same run, the pointer step never reached.
-        pointer, _ = self.rollback_after(touched=False, backup=True)
+        pointer, _, _ = self.rollback_after(touched=False, backup=True)
         self.assertEqual('{"generation": "new"}\n', pointer.read_text())
+
+    def test_rollback_reports_a_failed_pointer_restore(self) -> None:
+        pointer, saved, result = self.rollback_after(touched=True, backup=True,
+                                                      backup_failure=True)
+        self.assertEqual('{"generation": "new"}\n', pointer.read_text())
+        self.assertTrue(saved.is_dir())
+        self.assertIn("could not restore the launcher pointer", result.stderr)
 
     def test_a_v2_host_whose_receipt_is_gone_does_not_flip_to_v1(self) -> None:
         # The receipt was deleted: the pointer on disk still says v2, so the
