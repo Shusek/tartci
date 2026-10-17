@@ -1239,7 +1239,8 @@ def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
 
 
 def rendered_plists(
-    data: dict, *, launch_entrypoint: Path | None = None
+    data: dict, *, launch_entrypoint: Path | None = None,
+    source: fleet_source.FleetSource | None = None,
 ) -> dict[str, bytes]:
     host_id = data["host"]["id"]
     result: dict[str, bytes] = {}
@@ -1252,7 +1253,8 @@ def rendered_plists(
             )
             result[name] = plistlib.dumps(
                 lane_plist(
-                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint
+                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint,
+                    source=source,
                 ),
                 sort_keys=False,
             )
@@ -1651,20 +1653,27 @@ def verify_receipt(
         fail("install receipt paths do not match the canonical installed paths")
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
-    active_source = fleet_source.resolve(TARTCI_ROOT)
-    if not active_source.configured:
-        # Public installs execute from the immutable support generation. Use
-        # that same root while verifying the receipt, including during the
-        # install transaction before the staged wrapper becomes active.
-        active_source = fleet_source.resolve(support_root, allow_environment=False)
     recorded_source = receipt.get("fleet_source")
     source_keys = {
         "root", "configured", "commit", "repository", "tree_sha256",
         "published_supply_sha256", "profiles_dir", "published_supply",
     }
-    if active_source.configured:
-        if not isinstance(recorded_source, dict) or set(recorded_source) != source_keys:
-            fail("install receipt fleet source is missing or malformed")
+    if recorded_source is None:
+        # Older public receipts predate source provenance. They always verify
+        # against the immutable support cohort, never ambient environment.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
+    elif not isinstance(recorded_source, dict) or set(recorded_source) != source_keys:
+        fail("install receipt fleet source is missing or malformed")
+    elif recorded_source.get("configured") is True:
+        # Standalone self-update verification does not inherit the environment
+        # used by the installer. Reconstruct the selected source from the
+        # receipt so it does not falsely compare against public profiles.
+        active_source = fleet_source.resolve_recorded(recorded_source, TARTCI_ROOT)
+    else:
+        # Public installs execute from the immutable support generation. Use
+        # that same root while verifying the receipt, including during the
+        # install transaction before the staged wrapper becomes active.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
     if isinstance(recorded_source, dict):
         expected_source = {
             "root": str(active_source.root),
@@ -1781,7 +1790,9 @@ def verify_receipt(
                 os.environ["TARTCI_RENDER_PYTHON"] = pinned
                 break
     try:
-        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+        expected = rendered_plists(
+            data, launch_entrypoint=launch_entrypoint, source=active_source
+        )
     finally:
         if previous_render_python is None:
             os.environ.pop("TARTCI_RENDER_PYTHON", None)
@@ -2302,6 +2313,32 @@ def fleet_readiness(
             "config": config_verdicts(config, support_root),
         }
 
+    recorded_source = receipt.get("fleet_source")
+    try:
+        if isinstance(recorded_source, dict):
+            active_source = fleet_source.resolve_recorded(recorded_source, support_root)
+        else:
+            active_source = fleet_source.resolve(support_root, allow_environment=False)
+    except (OSError, ValueError) as exc:
+        # The source can disappear or change between receipt verification and
+        # this second resolution. Keep readiness fail-closed and observable;
+        # do not let a transient source race escape as an operator traceback.
+        return {
+            "managed": True,
+            "fleet_ready": False,
+            "verified_running_supervisors": None,
+            "expected_supervisors": None,
+            "serving": {
+                "blocked": None,
+                "blocked_lanes": [],
+                "unmeasurable_lanes": [],
+                "streak_threshold": blocked_serving_streak,
+                "blocked_seconds_threshold": blocked_serving_seconds,
+            },
+            "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
+            "config": config_verdicts(config, support_root),
+        }
+
     labels = sorted(name.removesuffix(".plist") for name in receipt["plists"])
     persistent_labels = sorted(
         name.removesuffix(".plist")
@@ -2675,7 +2712,7 @@ def fleet_readiness(
         "disk": disks,
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.
-        "config": config_verdicts(config, support_root),
+        "config": config_verdicts(config, support_root, source=active_source),
     }
 
 
@@ -2718,6 +2755,7 @@ def lane_plist(
     *,
     slot: int = 1,
     launch_entrypoint: Path | None = None,
+    source: fleet_source.FleetSource | None = None,
 ) -> dict:
     host = data["host"]
     lane_id = lane["id"]
@@ -2761,8 +2799,9 @@ def lane_plist(
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
     configured_source = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
-    if configured_source:
+    if source is None and configured_source:
         source = fleet_source.resolve(TARTCI_ROOT)
+    if source is not None and source.configured:
         env.update({
             "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
             "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
@@ -3310,13 +3349,27 @@ def verify_supply(installed: Path, published: dict | None,
 
 
 def config_verdicts(config: Path, support_root: Path,
-                    receipt: Path = DEFAULT_INSTALL_RECEIPT) -> dict:
+                    receipt: Path = DEFAULT_INSTALL_RECEIPT,
+                    source: fleet_source.FleetSource | None = None) -> dict:
     """Profile drift and supply verdicts for status surfaces. Never raises.
 
     Reported, never enforced: a status or admission path that refused on
     these would turn configuration drift into a capacity outage.
     """
-    source = fleet_source.resolve(support_root)
+    if source is None:
+        try:
+            source = fleet_source.resolve(support_root)
+        except Exception as exc:  # noqa: BLE001 - a broken check reads as unknown
+            reason = f"{type(exc).__name__}: {exc}"
+            return {
+                "profile_drift": {"state": "unknown", "reason": reason},
+                "supply": {"state": "unknown", "reason": reason},
+                "self_update": self_update_summary(),
+                "gate_reserve": {"lines": ["gate reserve: unknown (source unavailable)"],
+                                 "problem": "source_unavailable"},
+                "tool_freshness": tool_freshness_summary(),
+                "host_vitals": host_vitals_summary(),
+            }
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
@@ -3343,7 +3396,8 @@ def config_verdicts(config: Path, support_root: Path,
         except Exception as exc:  # noqa: BLE001
             published, error = None, f"{source_path}: {exc}"
         supply = verify_supply(config, published, error,
-                               published_from=published_commit(source_path),
+                               published_from=(source.source_commit
+                                               or published_commit(source_path)),
                                host_commit=host_tartci_commit(receipt))
         value["supply"] = {
             "state": supply["state"], "reason": supply["reason"],
