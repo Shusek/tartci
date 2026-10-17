@@ -3870,6 +3870,11 @@ binary at its versioned path and confirm its sha256 first, then merge the
 table change. The reverse order makes that host's next install refuse until
 the binary arrives. Leave the previous binary installed: rolling back is
 restoring the table's previous three values, with nothing to copy back.
+While no lane runs mise, a pin move starts no launchd job, so there is nothing
+to preflight. Once a lane runs mise or its tools, a new mise path is a new
+binary to macOS: run it once as a launchd job, the way the lane will, before
+the table moves, and keep the old pin if it does not finish within 60 s
+(`scripts/interpreter_preflight.py` does this for lane Pythons only).
 
 A pinned toolchain never queries for updates. `mise_pin.py` asks the binary
 its version with `MISE_DISABLE_UPDATE_WARNING=1`, because `mise --version`
