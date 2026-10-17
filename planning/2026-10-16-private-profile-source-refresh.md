@@ -144,6 +144,11 @@ The follow-up also carries the source commit from the receipt into the
 published-supply status verdict, so a private source does not lose its commit
 provenance merely because verification runs without the installer environment.
 
+The live M1 canary is still on generation `5176f47`, before this verifier fix.
+An independent `self-update --verify` therefore reproduces the original false
+`receipt_mismatch`; the receipt itself still records the expected private
+source. No live mutation was made while confirming this baseline.
+
 ## Stop conditions
 
 Stop and retain the public default if the private authority remains redacted,
