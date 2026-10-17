@@ -90,7 +90,7 @@ class ProbeTests(Base):
     def test_a_hanging_probe_leaves_its_pid_in_the_volume_marker(self) -> None:
         self.probe([item("/Volumes/Example", ["x"])], timeout=1, runner=hangs)
         marker = json.loads(ss.marker_path(self.state, "/Volumes/Example").read_text())
-        self.assertEqual({"since": NOW, "pids": [424242]}, marker)
+        self.assertEqual({"since": NOW, "pids": [424242], "identities": {"424242": None}}, marker)
 
     def test_while_an_earlier_probe_is_alive_no_new_child_is_spawned(self) -> None:
         # The earlier probe's child is a real live process.
@@ -99,7 +99,8 @@ class ProbeTests(Base):
         self.addCleanup(child.kill)
         marker = ss.marker_path(self.state, "/Volumes/Example")
         marker.parent.mkdir(parents=True)
-        marker.write_text(json.dumps({"since": NOW - 7200, "pids": [child.pid]}))
+        marker.write_text(json.dumps({"since": NOW - 7200, "pids": [child.pid],
+                                      "identities": {str(child.pid): ss.pid_identity(child.pid)}}))
         calls = []
 
         def counting(argv, timeout, env, started):
@@ -119,7 +120,8 @@ class ProbeTests(Base):
         # Control: same marker, its PID gone, so the volume is probed again.
         marker = ss.marker_path(self.state, "/Volumes/Example")
         marker.parent.mkdir(parents=True)
-        marker.write_text(json.dumps({"since": NOW - 7200, "pids": [424242]}))
+        marker.write_text(json.dumps({"since": NOW - 7200, "pids": [424242],
+                                      "identities": {"424242": "gone"}}))
         calls = []
 
         def counting(argv, timeout, env, started):
@@ -127,6 +129,23 @@ class ProbeTests(Base):
             return 0.01
         value = self.probe([item("/Volumes/Example", ["x"])], timeout=1, runner=counting,
                            alive=lambda pid: False)
+        self.assertEqual([["x"]], calls)
+        self.assertEqual("ok", value["state"])
+        self.assertFalse(marker.exists())
+
+    def test_a_reused_pid_does_not_block_the_next_probe(self) -> None:
+        marker = ss.marker_path(self.state, "/Volumes/Example")
+        marker.parent.mkdir(parents=True)
+        marker.write_text(json.dumps({"since": NOW - 7200, "pids": [424242],
+                                      "identities": {"424242": "old-start"}}))
+        calls = []
+
+        def counting(argv, timeout, env, started):
+            calls.append(argv)
+            return 0.01
+
+        value = self.probe([item("/Volumes/Example", ["x"])], timeout=1, runner=counting,
+                           alive=lambda pid: True, identity=lambda pid: "new-start")
         self.assertEqual([["x"]], calls)
         self.assertEqual("ok", value["state"])
         self.assertFalse(marker.exists())
@@ -202,6 +221,18 @@ class CacheTests(Base):
         line = ss.describe(value)
         self.assertIn("store: STALLED since 2027-01-15T08:00:00Z (as of 2027-01-15T08:00:00Z)", line)
         refuse.assert_not_called()
+
+    def test_an_old_ok_cache_is_unprobed(self) -> None:
+        home = Path(self.td.name) / "home"
+        state = ss.state_dir(home)
+        state.mkdir(parents=True)
+        (state / "status.json").write_text(json.dumps({"state": "ok",
+                                                         "probed_at": NOW - 2 * ss.PROBE_INTERVAL_S - 1,
+                                                         "detail": "old", "stalled": []}))
+        with mock.patch.object(ss.time, "time", return_value=NOW):
+            value = ss.cached(home)
+        self.assertEqual("unprobed", value["state"])
+        self.assertIn("watchdog", value["detail"])
 
     def test_the_watchdog_probes_at_most_every_interval(self) -> None:
         home = Path(self.td.name) / "home"

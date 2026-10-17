@@ -219,23 +219,43 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def pid_identity(pid: int) -> Optional[str]:
+    """Return the process start identity used to reject PID reuse."""
+    try:
+        result = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                                capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
 def live_marker(state: pathlib.Path, volume: str,
-                alive: Callable[[int], bool] = pid_alive) -> Optional[dict]:
+                alive: Callable[[int], bool] = pid_alive,
+                identity: Callable[[int], Optional[str]] = pid_identity) -> Optional[dict]:
     """The volume's marker when an earlier probe of it is still alive, else None."""
     marker = _read(marker_path(state, volume))
     pids = [pid for pid in (marker or {}).get("pids") or [] if isinstance(pid, int)]
-    return marker if any(alive(pid) for pid in pids) else None
+    identities = marker.get("identities") if marker else None
+    if not isinstance(identities, dict):
+        return None
+    live = [pid for pid in pids if alive(pid)
+            and identities.get(str(pid))
+            and identities.get(str(pid)) == identity(pid)]
+    return marker if live else None
 
 
 def probe(probes: list, *, timeout: float = PROBE_TIMEOUT_S, runner: Runner = run_bounded,
           ps_output: Optional[str] = None, state: Optional[pathlib.Path] = None,
-          now: Optional[float] = None, alive: Callable[[int], bool] = pid_alive) -> dict:
+          now: Optional[float] = None, alive: Callable[[int], bool] = pid_alive,
+          identity: Callable[[int], Optional[str]] = pid_identity) -> dict:
     """Probe every volume whose earlier probe is not still alive, all at once
     (the caller waits at most about `timeout`), and cache the result."""
     state = state or state_dir()
     now = time.time() if now is None else now
     previous = (_read(state / "status.json") or {}).get("since") or {}
-    held = {item["volume"]: live_marker(state, item["volume"], alive) for item in probes}
+    held = {item["volume"]: live_marker(state, item["volume"], alive, identity)
+            for item in probes}
     held = {volume: marker for volume, marker in held.items() if marker}
     run = [item for item in probes if item["volume"] not in held]
     results: list = [None] * len(run)
@@ -252,7 +272,9 @@ def probe(probes: list, *, timeout: float = PROBE_TIMEOUT_S, runner: Runner = ru
                 spawned.setdefault(item["volume"], []).append(pid)
                 _write(marker_path(state, item["volume"]),
                        {"since": previous.get(item["volume"]) or now,
-                        "pids": spawned[item["volume"]]})
+                        "pids": spawned[item["volume"]],
+                        "identities": {str(value): identity(value)
+                                        for value in spawned[item["volume"]]}})
         results[index] = runner(item["argv"], timeout, item["env"], started)
 
     threads = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(len(run))]
@@ -332,6 +354,11 @@ def cached(home: Optional[pathlib.Path] = None) -> dict:
     if value is None or not isinstance(value.get("probed_at"), (int, float)):
         return {"state": "unprobed", "detail": "no probe result yet (doctor or the watchdog "
                 "writes one)", "stalled": []}
+    age = time.time() - float(value["probed_at"])
+    if age > 2 * PROBE_INTERVAL_S:
+        return {"state": "unprobed",
+                "detail": f"last probe {_age(age)} ago; the launchd watchdog may not be probing",
+                "stalled": [], "probed_at": value["probed_at"]}
     return value
 
 
