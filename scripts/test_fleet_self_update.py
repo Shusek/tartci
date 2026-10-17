@@ -65,6 +65,8 @@ class FakeSystem(su.System):
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
         self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
+        self.peer_paused: set[str] = set()   # peers whose self-update an operator paused
+        self.peer_halted: set[str] = set()   # peers whose self-update halted on failures
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
@@ -240,7 +242,11 @@ class FakeSystem(su.System):
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
                       + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
                       + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
-                         if pool_since is not None else ""))
+                         if pool_since is not None else "")
+                      + ("\n" + su.PAUSED_SEPARATOR + "\n"
+                         + ("paused\n" if peer in self.peer_paused else "")
+                         + ("halted\n" if peer in self.peer_halted else "")
+                         if peer in self.peer_paused | self.peer_halted else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -1058,13 +1064,111 @@ class PeerTurnReplayTests(Base):
                       peers_step["detail"])
 
     def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
-        # Control, same instrument: only the drain's age changed.
+        # Control, same instrument: only the drain's age changed. Inside the
+        # grace a self-update's marker may have been written between the reads.
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
-        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.sys.peer_pool_since["m5"] = NOW - 600
         self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
-        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 10 min",
                       su.waiting_ticket(self.cfg)["reason"])
+
+    def test_an_operator_drain_past_the_grace_no_longer_holds_the_turn(self) -> None:
+        # No update marker at all: a self-update writes its marker before it
+        # drains, so this is an operator's drain (a containment drain).
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("an operator drain: no update marker for more than 15 min",
+                      peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_paused_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60       # inside the grace
+        self.sys.peer_paused.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is paused, so no update is in this drain",
+                      peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_halted_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60
+        self.sys.peer_halted.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is halted, so no update is in this drain",
+                      peer["evidence"])
+
+    def test_the_evidence_names_the_rule_that_released_the_peer(self) -> None:
+        # The deferred host's log must say WHICH rule let it go, so an operator
+        # reading it knows whether to look for a pause, a halt or a drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        cases = (({"m5"}, set(), NOW - 60, "self-update is paused,"),
+                 (set(), {"m5"}, NOW - 60, "self-update is halted,"),
+                 ({"m5"}, {"m5"}, NOW - 60, "self-update is halted and paused,"),
+                 (set(), set(), NOW - su.PEER_DRAIN_GRACE_SECONDS - 60,
+                  "an operator drain: no update marker for more than 15 min"))
+        for paused, halted, since, rule in cases:
+            with self.subTest(rule=rule):
+                self.sys.peer_paused = {"m5"} if paused else set()
+                self.sys.peer_halted = set(halted)
+                self.sys.peer_pool_since["m5"] = since
+                evidence = su.read_peer(self.cfg, self.sys, "m5", "m5")["evidence"]
+                self.assertIn(rule, evidence)
+                self.assertIn("left to the capacity floor", evidence)
+
+    def test_the_peer_command_reports_a_pause_and_the_halt_rule_like_halt_reason(self) -> None:
+        # The real marker command, run in a shell against a fixture state dir:
+        # its halted verdict must agree with halt_reason on the same receipts.
+        import subprocess  # noqa: PLC0415
+        state = self.home / "peer" / ".tartci" / "state" / "self-update"
+        (state / "attempts").mkdir(parents=True)
+        env = {"HOME": str(self.home / "peer"), "TARTCI_HOME": str(self.home / "peer/.tartci"),
+               "PATH": "/usr/bin:/bin"}
+
+        def words() -> set[str]:
+            out = subprocess.run(["/bin/bash", "-c", su._PEER_MARKER], env=env,
+                                 capture_output=True, text=True, check=True).stdout
+            return set(out.partition(su.PAUSED_SEPARATOR)[2].split())
+        self.assertEqual(set(), words())
+        for n, status in enumerate(("failed", "rolled_back", "failed")):
+            (state / "attempts" / f"2027010{n}T000000Z.json").write_text(json.dumps(
+                {"mode": "apply", "status": status, "started_at": f"2027-01-0{n + 1}T00:00:00Z"}))
+        self.assertTrue(su.halt_reason(state))
+        self.assertEqual({"halted"}, words())
+        (state / "halt-cleared.json").write_text(json.dumps({"at": "2027-01-02T12:00:00Z"}))
+        self.assertIsNone(su.halt_reason(state))
+        self.assertEqual(set(), words())
+        (state / "scheduled-pause.json").write_text(json.dumps({"at": "x", "reason": "held"}))
+        self.assertEqual({"paused"}, words())
+
+    def test_a_peer_mid_update_still_holds_the_turn_even_paused(self) -> None:
+        # Control: a live update marker wins over the drain's age and the pause.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_NEW, "ts": NOW - 1800}
+        self.sys.peer_pool_since["m5"] = NOW - 2 * 3600
+        self.sys.peer_paused.add("m5")
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is self-updating", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_the_capacity_floor_still_gates_a_turn_past_an_operator_drain(self) -> None:
+        # Control: m5 no longer holds the turn, but this host is the last
+        # server of a required label, so it still may not drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"label": "pulp-build-pr-head", "verdict": "last_serving_host"}]}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        receipt = json.loads(receipts[-1].read_text())
+        self.assertIn("last server of pulp-build-pr-head", json.dumps(receipt))
+        self.assertIn("counted as serving nothing by the capacity floor: m5", json.dumps(receipt))
 
     def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
         # No pool-state time (an old peer, or stat failed): fail closed.
@@ -3381,6 +3485,13 @@ class OsInterpreterRefreshTests(Base):
         self.assertEqual(self.apply(), su.EXIT_NOTHING)
         self.assertEqual(self.sys.mutations(), [])
 
+    def test_os_interpreter_refresh_does_not_bypass_code_soak(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        self.sys.status_problems = [{"code": "interpreter_changed_by_os_update",
+                                     "detail": "macOS build changed"}]
+        self.assertEqual(self.apply(), su.EXIT_NOTHING)
+        self.assertEqual(self.sys.mutations(), [])
+
 
 class PrivateSourceSystem(FakeSystem):
     """FakeSystem plus GitHub API reads of one private fleet repository."""
@@ -3404,7 +3515,12 @@ class PrivateSourceSystem(FakeSystem):
         self.installed_sources = getattr(self, "installed_sources", []) + [selected]
         receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
         receipt = json.loads(receipt_path.read_text())
-        receipt["fleet_source"] = {"configured": bool(selected), "commit": selected}
+        receipt["fleet_source"] = {
+            "configured": bool(selected),
+            "commit": selected,
+            "repository": os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY") if selected else None,
+            "root": os.environ.get("TARTCI_FLEET_SOURCE_ROOT") if selected else None,
+        }
         receipt_path.write_text(json.dumps(receipt))
 
 
@@ -3597,7 +3713,11 @@ class FleetSourceCanaryTests(FleetSourceFixture):
 
     def installed_from(self, commit: str | None) -> None:
         receipt = json.loads(self.cfg.install_receipt.read_text())
-        receipt["fleet_source"] = {"configured": commit is not None, "commit": commit}
+        receipt["fleet_source"] = {
+            "configured": commit is not None, "commit": commit,
+            "repository": self.fixture.PRIVATE if commit else None,
+            "root": str(self.cfg.fleet_source_store / commit) if commit else None,
+        }
         self.cfg.install_receipt.write_text(json.dumps(receipt))
 
     def canary(self, record: dict | None):
@@ -3645,6 +3765,58 @@ class FleetSourceCanaryTests(FleetSourceFixture):
             selected = su.sync_fleet_source(self.cfg, self.sys)
         self.assertEqual(self.fixture.COMMIT, selected["commit"])
         self.assertIn("fleet source moved to cccccccccccc", su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_malformed_installed_source_receipt_refuses_before_source_sync(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": True, "commit": self.OLDER}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.repo.calls)
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(self.cfg.fleet_source_store.exists())
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+        self.assertIn("lacks the source root and repository",
+                      json.loads((self.cfg.state_dir / "skew.json").read_text())["reason"])
+
+    def test_a_non_boolean_configured_marker_also_refuses_before_source_sync(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": "true", "commit": self.OLDER,
+                                    "repository": self.fixture.PRIVATE,
+                                    "root": str(self.cfg.fleet_source_store / self.OLDER)}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.repo.calls)
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(self.cfg.fleet_source_store.exists())
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_adopted_source_reinstalls_while_tartci_commit_is_still_soaking(self) -> None:
+        """A source move must not wait for unrelated TartCI code to soak."""
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        with self.canary(soaked):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def _assert_adopted_source_reinstalls_for_skew_state(self, state: str) -> None:
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = ""
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        skew = {"state": state, "target": None, "explicit": False}
+        with self.canary(soaked), mock.patch.object(su, "measure_skew", return_value=skew):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def test_adopted_source_reinstalls_while_tartci_is_behind(self) -> None:
+        self._assert_adopted_source_reinstalls_for_skew_state("behind")
+
+    def test_adopted_source_reinstalls_while_tartci_is_unverified(self) -> None:
+        self._assert_adopted_source_reinstalls_for_skew_state("unverified")
 
     def test_a_record_for_another_repository_is_not_adopted(self) -> None:
         self.installed_from(self.OLDER)
@@ -3700,8 +3872,66 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         self.sys.log_lines = ""
         self.sys.on_rc = 1               # pool on keeps refusing
         self.assertNotEqual(su.EXIT_OK, self.apply())
-        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+        # The failed source move rolled back to the public source the host was
+        # running before the attempt.
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
         self.assertIsNone(self.verified())
+
+    def test_failed_install_restores_previous_source_before_pool_on(self) -> None:
+        """An installer self-rollback must not serve old code with new profiles."""
+        self.sys.log_lines = ""
+        self.sys.install_rcs = [1]
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(step["step"] == "source-restore" for step in receipt["steps"]))
+
+    def test_failed_install_restores_previous_private_source_before_pool_on(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual(self.OLDER, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+
+    def test_rollback_restores_the_previous_private_source(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1               # target pool-on fails; rollback must run
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual([self.fixture.COMMIT, self.OLDER], self.sys.installed_sources)
+        restored = json.loads(receipt_path.read_text())["fleet_source"]
+        self.assertEqual(self.OLDER, restored["commit"])
+        self.assertEqual(self.fixture.PRIVATE, restored["repository"])
+        self.assertEqual(str(previous_root), restored["root"])
+
+    def test_failed_previous_reinstall_keeps_the_target_source_selected(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1
+        self.sys.rollback_install_rc = 1
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual(self.fixture.COMMIT, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
 
     def test_a_run_that_did_not_install_the_selected_commit_publishes_nothing(self) -> None:
         self.sys.log_lines = ""

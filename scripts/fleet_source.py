@@ -39,11 +39,15 @@ class FleetSource:
     profiles_dir: Path
     published_supply: Path
     configured: bool
+    recorded_commit: str | None = None
+    recorded_repository: str | None = None
 
     @property
     def source_commit(self) -> str | None:
         if not self.configured:
             return None
+        if self.recorded_commit is not None:
+            return self.recorded_commit
         value = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
         return value or None
 
@@ -51,6 +55,8 @@ class FleetSource:
     def repository(self) -> str | None:
         if not self.configured:
             return None
+        if self.recorded_repository is not None:
+            return self.recorded_repository
         value = os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY", "").strip()
         return value or None
 
@@ -253,6 +259,42 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
         if problem:
             raise ValueError(f"configured fleet source provenance does not match environment: {problem}")
     return FleetSource(root, profiles_dir, published_supply, bool(configured_root))
+
+
+def resolve_recorded(recorded: object, default_root: Path) -> FleetSource:
+    """Resolve the source named by an installed receipt.
+
+    Standalone self-update verification does not inherit the source
+    environment used by the installer. Reconstruct the same validated source
+    without leaving process environment changes behind.
+    """
+    if not isinstance(recorded, dict):
+        raise ValueError("recorded fleet source must be an object")
+    if recorded.get("configured") is not True:
+        return resolve(default_root, allow_environment=False)
+    required = {"root", "configured", "commit", "repository", "tree_sha256",
+                "published_supply_sha256", "profiles_dir", "published_supply"}
+    if set(recorded) != required:
+        raise ValueError("recorded fleet source is missing or malformed")
+    root = recorded.get("root")
+    commit = recorded.get("commit")
+    repository = recorded.get("repository")
+    if not all(isinstance(value, str) and value for value in (root, commit, repository)):
+        raise ValueError("recorded fleet source identity is missing or malformed")
+    names = ("TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+             "TARTCI_FLEET_SOURCE_REPOSITORY")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(dict(zip(names, (root, commit, repository))))
+    try:
+        source = resolve(default_root)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return FleetSource(source.root, source.profiles_dir, source.published_supply,
+                       True, commit, repository)
 
 
 def selected_published_supply() -> Path | None:

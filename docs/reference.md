@@ -182,9 +182,11 @@ five-second budget so a wedged `tart list` or `tart get` cannot freeze every
 supervisor on a host; override it with `TARTCI_TART_INVENTORY_TIMEOUT_SECS`.
 A failed or timed-out listing gets one retry with a longer budget
 (`TARTCI_TART_INVENTORY_RETRY_TIMEOUT_SECS`, default 15) and then reads as
-`unknown`, never as a full host: the slot claim then counts occupancy from the
-macOS-slot reservation files, which every lane writes before it boots and keeps
-until its VM is proved deleted, and emits an `inventory_unknown` event.
+`unknown`, never as a full host. New macOS clones wait until inventory can be
+read again; existing VMs continue. The lane reports an `inventory-unavailable`
+heartbeat and an `inventory_unknown` event. Reservation files still account for
+clones and VMs already owned by a lane, but cannot prove Tart or storage is
+healthy enough to admit a new clone.
 
 A teardown whose guardian is terminal but whose `tart delete` was not proved
 (`teardown_incomplete reason=delete_unproved`) no longer restarts the
