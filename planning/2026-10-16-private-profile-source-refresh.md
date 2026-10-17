@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation is on main; M1 canary succeeded; M1 soak is in progress
+Status: implementation is on main; M1 canary and soak passed; the M5 rollout fix is awaiting signed review
 
 ## Goal
 
@@ -102,3 +102,18 @@ if its generated export cannot be authenticated, if profile validation or
 provenance disagrees, if M1 validation fails, or if the canary cannot prove
 pool readiness and rollback. Do not widen the rollout from a failed or
 unverified canary.
+
+## 2026-10-17 update
+
+The first M5 rollout check found a real sequencing bug. M5 had the current
+TartCI code while the next TartCI commit was still soaking. A private-source
+move was then treated as a no-op, so the new source was not installed. PR
+[604](https://github.com/danielraffel/tartci/pull/604) fixes that case and has
+the regression test. Its exact head is
+[5d11a384](https://github.com/danielraffel/tartci/commit/5d11a3841f2edb994c3f2dc906d29fe462affc97).
+
+The Python 3.9, Python floor, and lint checks pass. The required signed
+`infra-review2` approval is still pending, so M5 remains on the public source.
+Its private-source setting is staged but has not been activated. M1 remains
+healthy on the private source. M3 and m5studio remain on the public source
+until their sealed launcher profiles support this source selection.
