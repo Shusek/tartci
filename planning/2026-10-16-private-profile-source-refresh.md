@@ -124,6 +124,22 @@ tests pass 6 tests. Ultra approved the private projection at its current
 review head. External-source selection remains disabled while the complete
 export is still missing.
 
+After review, the feature branch was merged with current TartCI `main` before
+another review round. This was required because `main` now contains launcher-v2
+support. The merge preserves the v2 installer, receipt, layout, and launch-set
+paths; the profile-source change must not be landed from the older merge base.
+The readiness path also now fails closed with `receipt_mismatch` if the
+recorded source disappears between receipt verification and status rendering,
+and config status reports unknown instead of raising when its source is
+unavailable. The focused source, config-surface, and macOS lane suites pass
+(24, 16, 113 tests respectively); the self-update suite passes 321 tests.
+The installer suite was started but stopped after hanging in its signing
+fixture setup, so it remains a CI gate rather than a local pass claim.
+
+The current branch is not installed on any fleet host. M1 remains on the
+previously validated generation while the merged branch receives a fresh exact
+head review and green CI.
+
 ## Stop conditions
 
 Stop and retain the public default if the private authority remains redacted,
