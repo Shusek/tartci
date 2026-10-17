@@ -484,6 +484,7 @@ launcher_source_commit=""
 pointer_file="$HOME/.config/tartci/launcher-generation.json"
 pointer_backup=""
 pointer_touched=0
+pointer_restore_failed=0
 support_root=""
 installed_support_manifest=""
 launch_entrypoint=""
@@ -499,10 +500,21 @@ rollback() {
     # Lanes go back to the generation the pointer named before this install:
     # one rename over the new pointer, so no moment has no pointer at all.
     if [ -n "$pointer_backup" ] && [ -e "$pointer_backup" ]; then
-      mv -f "$pointer_backup" "$pointer_file" || echo \
-        "rollback: could not restore the launcher pointer from $pointer_backup; lanes may still run the failed generation" >&2
-    else
-      rm -f "$pointer_file"
+      if ! mv -f "$pointer_backup" "$pointer_file"; then
+        # The lanes would start the generation this install just failed on.
+        # The pool is off for the whole install and stays off: `pool on`
+        # refuses while the pointer does not name the receipt's generation.
+        pointer_restore_failed=1
+        echo "FINDING launcher_pointer_restore_failed: rollback could not put the launcher pointer back." >&2
+        echo "  what: $pointer_file still names the generation this failed install published" >&2
+        echo "  cause: renaming $pointer_backup over it failed (see the mv error above)" >&2
+        echo "  host: left OFF; tartci pool on refuses until the pointer matches the install receipt" >&2
+        echo "  fix: mv -f '$pointer_backup' '$pointer_file' (or reinstall), then tartci pool on" >&2
+        echo "  verify: tartci doctor fleet reports launcher_layout_v2 and executed_generation ok" >&2
+      fi
+    elif ! rm -f "$pointer_file"; then
+      pointer_restore_failed=1
+      echo "FINDING launcher_pointer_restore_failed: rollback could not remove the new launcher pointer $pointer_file; host left OFF" >&2
     fi
   fi
   if [ "$launcher_touched" = 1 ]; then
@@ -550,7 +562,12 @@ rollback() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -ne 0 ]; then rollback; fi
+  if [ "$rc" -ne 0 ]; then
+    rollback
+    # A failed pointer restore is its own failure: never the install's
+    # ordinary exit code, so no caller mistakes it for a clean rollback.
+    [ "$pointer_restore_failed" != 1 ] || rc=6
+  fi
   [ -n "$stage_dir" ] && rm -rf "$stage_dir"
   [ -n "$receipt_tmp" ] && rm -f "$receipt_tmp"
   [ -z "$wrapper_candidate" ] || rm -f "$wrapper_candidate"

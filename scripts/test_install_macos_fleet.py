@@ -1989,7 +1989,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertLess(restore.index('mv -f "$pointer_backup" "$pointer_file"'),
                         restore.index('rm -f "$pointer_file"'),
                         "the pointer is never removed before its backup replaces it")
-        self.assertIn("could not restore the launcher pointer", restore)
+        self.assertIn("launcher_pointer_restore_failed", restore)
 
     def test_rollback_without_a_previous_pointer_removes_the_new_one(self) -> None:
         pointer, _, _ = self.rollback_after(touched=True, backup=False)
@@ -2005,7 +2005,41 @@ class InstallMacosFleetTests(unittest.TestCase):
                                                       backup_failure=True)
         self.assertEqual('{"generation": "new"}\n', pointer.read_text())
         self.assertTrue(saved.is_dir())
-        self.assertIn("could not restore the launcher pointer", result.stderr)
+        self.assertIn("FINDING launcher_pointer_restore_failed", result.stderr)
+        for part in ("what:", "cause:", "host: left OFF", "fix: mv -f", "verify:"):
+            self.assertIn(part, result.stderr)
+
+    def cleanup_exit(self, *, backup_failure: bool) -> subprocess.CompletedProcess:
+        """The installer's own cleanup trap after a failed install (exit 1)."""
+        text = (ROOT / "scripts/install_macos_fleet.sh").read_text()
+        functions = ""
+        for name in ("rollback", "cleanup"):
+            start = text.index(f"{name}() {{")
+            functions += text[start:text.index("\n}\n", start) + 3]
+        pointer = self.home / ".config/tartci/launcher-generation.json"
+        pointer.write_text('{"generation": "new"}\n')
+        saved = self.root / "launcher-generation.json.previous"
+        if saved.is_dir():
+            shutil.rmtree(saved)
+        if backup_failure:
+            saved.mkdir()
+            (saved / "x").write_text("x")
+        else:
+            saved.write_text('{"generation": "old"}\n')
+        script = (functions + f"pointer_file={shlex.quote(str(pointer))}\n"
+                  f"pointer_backup={shlex.quote(str(saved))}\npointer_touched=1\n"
+                  "pointer_restore_failed=0\ntrap cleanup EXIT\nexit 1\n")
+        return subprocess.run(["/bin/bash", "-c", script], text=True, capture_output=True,
+                              check=False)
+
+    def test_a_failed_pointer_restore_fails_the_install_with_its_own_exit_code(self) -> None:
+        result = self.cleanup_exit(backup_failure=True)
+        self.assertEqual(6, result.returncode, result.stderr)
+        self.assertIn("FINDING launcher_pointer_restore_failed", result.stderr)
+        # Control: a restore that works keeps the install's own exit code.
+        result = self.cleanup_exit(backup_failure=False)
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertNotIn("launcher_pointer_restore_failed", result.stderr)
 
     def test_a_v2_host_whose_receipt_is_gone_does_not_flip_to_v1(self) -> None:
         # The receipt was deleted: the pointer on disk still says v2, so the
