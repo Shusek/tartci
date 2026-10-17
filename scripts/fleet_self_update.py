@@ -784,19 +784,26 @@ def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict 
     repository = cfg.fleet_source_repository
     if repository is None:
         return None
-    if launch_helper(cfg) is not None:
-        # A source move is a same-generation refresh, which keeps the live
-        # sealed launcher; the installer then verifies that launcher against
-        # the moved profile's policy digest, fails after the drain, and rolls
-        # back, every turn. Refuse before anything is read or drained.
+    if launch_helper(cfg) is not None and installed_layout(cfg) == "v2":
+        # Launcher v2: the app holds only host policy, so a source move is a
+        # refresh when the app's inputs are unchanged and an acknowledged
+        # launcher change when they are not (the turn measures both). The
+        # installer's layout rules still apply first.
+        planned_layout(cfg)
+    elif launch_helper(cfg) is not None:
+        # A v1 sealed launcher seals the profile: a source move is a
+        # same-generation refresh, which keeps the live launcher; the
+        # installer then verifies it against the moved profile's policy
+        # digest, fails after the drain, and rolls back, every turn. Refuse
+        # before anything is read or drained.
         raise Refused(
             "fleet source refused on a sealed-launcher host: a [fleet_source] move changes the "
             "profile the sealed TartCI Launcher's policy digest covers, and a source move does "
             "not rebuild the launcher, so the install would fail after the drain and roll back "
-            "every turn. Fix: remove [fleet_source] from self-update.toml on this host; a "
-            "sealed host takes a private source once a source move rebuilds the launcher "
-            "(launcher v2). Verify: `tartci fleet-macos self-update --plan` no longer reports "
-            "this refusal")
+            "every turn. Fix: remove [fleet_source] from self-update.toml on this host, or move "
+            "it to launcher v2 (~/.config/tartci/launcher-v2.enabled, then an acknowledged "
+            "install), where a source move rebuilds the launcher only when its inputs change. "
+            "Verify: `tartci fleet-macos self-update --plan` no longer reports this refusal")
     if cfg.fleet_source_canary is None:
         raise Refused("fleet source has no canary: set [fleet_source] canary to the host that "
                       "installs a new source commit first")
@@ -3175,7 +3182,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step("capacity-floor", str(exc), ok=False)
         if refusals:
             raise Refused(" | ".join(refusals))
-        if (helper is not None and apply and not refresh
+        # A v2 refresh (a [fleet_source] move) builds too when the app's
+        # inputs changed: the installer verifies the live app against the
+        # moved profile.
+        if (helper is not None and apply and (not refresh or layout == "v2")
                 and (layout != "v2" or change.changed)):
             # Built only once every cheap gate passed: a refused run must not
             # have spent a signing build, and a rebuild must always be possible.
