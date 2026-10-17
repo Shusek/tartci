@@ -302,11 +302,14 @@ class PinnedKeychainTests(Host):
                                  r'\$\{keychain_args\[@\]\+"\$\{keychain_args\[@\]\}"\} --sign')
         source = (HERE / "fleet_self_update.py").read_text()
         body = source[source.index("def build_launcher("):]
-        self.assertIn(
-            '"--profile", str(profile),\n'
-            '                           "--python", launcher_python, *pinned,',
-            body[:body.index("\ndef ")],
-        )
+        body = body[:body.index("\ndef ")]
+        call = body[body.index('sys_.run(["bash", "scripts/build_macos_launcher.sh"'):]
+        call = call[:call.index("cwd=")]
+        self.assertIn('"--profile", str(profile),\n'
+                      '                           "--python", launcher_python, *pinned,', call)
+        # The builder takes the LAST --keychain it is given, so nothing after
+        # the pinned one may name another.
+        self.assertNotIn("--keychain", call[call.index("*pinned"):])
 
     def test_launcher_builder_resolves_a_real_interpreter_without_a_pin(self) -> None:
         env = {**os.environ, "TARTCI_PYTHON": "", "TARTCI_RENDER_PYTHON": ""}

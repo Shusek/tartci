@@ -3798,7 +3798,9 @@ the app, and replacing the app can reset it. Without it the helper blocks in
   self-update compares what the target would build against the live app:
   the inputs digest (`main.swift`, `Info.plist`, `policy.json`), the signing
   identity (the live app's certificate while the dedicated keychain holds it,
-  else the keychain's one Developer ID identity) and the team. All three equal:
+  else the keychain's one Developer ID identity) and the team (the signing
+  certificate's own Team ID, which must be the profile's `launch_helper.team_id`;
+  a certificate for another team refuses before any drain). All three equal:
   no build, the app stays, and the update only writes and signs the new
   generation's launch set and moves the pointer. Any difference, or the move
   from v1, is a launcher change; the receipt's `launcher` step (and the plan)

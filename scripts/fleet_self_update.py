@@ -1687,6 +1687,17 @@ def choose_signer(sys_: System, home: Path, live_identity: str) -> str:
                   "keep exactly one there (`pulp ship doctor`)")
 
 
+def certificate_team(sys_: System, home: Path, identity: str) -> str | None:
+    """The Team ID in the dedicated keychain's Developer ID Application
+    certificate `identity` ("Developer ID Application: Name (TEAMID)")."""
+    keychain = signing_keychain(home)
+    result = sys_.run(["security", "find-identity", "-v", "-p", "codesigning",
+                       *([keychain] if keychain else [])])
+    match = re.search(rf'\b{re.escape(identity)}\b "Developer ID Application: [^"]*\(([A-Z0-9]{{10}})\)"',
+                      result.out or "")
+    return match.group(1) if match else None
+
+
 def v2_launcher_change(cfg: Config, sys_: System, helper: dict, profile: Path,
                        identity: str, live_identity: str) -> LauncherChange:
     """Measure, before any drain, whether this v2 turn needs a new app."""
@@ -1705,7 +1716,19 @@ def v2_launcher_change(cfg: Config, sys_: System, helper: dict, profile: Path,
         live_layout=installed_layout(cfg),
         live_inputs=(_read_json(resources / "inputs.json") or {}).get("sha256"),
         target_inputs=target_inputs, live_identity=live_identity, identity=identity,
-        live_team=team.group(1) if team else None, team=str(helper.get("team_id")))
+        live_team=team.group(1) if team else None,
+        team=signing_team(sys_, cfg.home, identity, str(helper.get("team_id"))))
+
+
+def signing_team(sys_: System, home: Path, identity: str, profile_team: str) -> str:
+    """The team the new app would carry: the signing certificate's own Team
+    ID, which must be the profile's launch_helper.team_id (the policy pins it)."""
+    team = certificate_team(sys_, home, identity)
+    if team != profile_team:
+        raise Refused(f"the signing certificate {identity} is for team {team or 'unknown'}, not "
+                      f"the profile's launch_helper.team_id {profile_team}; a launcher signed by it "
+                      "would fail its own policy. Fix the keychain (`pulp ship doctor`) or the profile")
+    return team
 
 
 def v2_ack_refusal(cfg: Config, change: LauncherChange) -> str | None:

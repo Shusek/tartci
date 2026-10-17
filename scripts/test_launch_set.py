@@ -526,6 +526,24 @@ class LaunchSetInstallTests(unittest.TestCase):
         self.assertEqual(0, self.signed(codesign))
         self.assertEqual(str(newer), ls.read_pointer(self.pointer)["generation"])
 
+    def test_a_generation_two_back_is_never_pointed_at_without_signing(self) -> None:
+        # A, B, C installed in turn: A's signed set still verifies, but it is
+        # two back, so the launcher's floor would refuse it; it is signed
+        # forward or not at all.
+        newer = self.rolled_forward()
+        newest = self.staged("c" * 40 + "-1")
+        self.install(newest)
+        self.assertEqual(str(newer), ls.read_pointer(self.pointer)["previous"])
+        before = self.pointer.read_bytes()
+        with self.assertRaisesRegex(ls.LaunchSetError, "not the pointer's previous generation"):
+            self.install(self.generation, ready=lambda: "keychain locked")
+        self.assertEqual(before, self.pointer.read_bytes())
+        codesign = FakeCodesign()
+        value = self.install(self.generation, codesign)
+        self.assertNotIn("rolled_back", value)
+        self.assertEqual(1, self.signed(codesign))
+        self.assertEqual(4, json.loads((self.generation / ls.SET_NAME).read_text())["sequence"])
+
     def test_only_the_previous_generation_is_switched_back_to(self) -> None:
         self.rolled_forward()
         older = self.staged("c" * 40 + "-1")

@@ -122,7 +122,9 @@ class FakeSystem(su.System):
         self.target_orchestrator_calls: list[list[str]] = []
         self.v2_generation: Path | None = None   # launcher v2: the pointer's generation
         self.live_team = "95CX6P84C4"            # the live app's TeamIdentifier
-        self.keychain_identities = [IDENTITY]    # Developer ID identities in the keychain
+        self.keychain_identities = [IDENTITY]    # Developer ID identities (or (id, team))
+        self.live_identity = None                # the live app's certificate (None: IDENTITY)
+        self.built_identity = None               # what the last launcher build signed with
 
     def now(self) -> float:
         return self.clock
@@ -260,10 +262,13 @@ class FakeSystem(su.System):
         if a[0] == "codesign" and "--verify" in a:
             return su.Result(self.codesign_verify_rc, "", "" if self.codesign_verify_rc == 0 else "invalid signature")
         if a[0] == "openssl":
-            return ok(f"SHA1 Fingerprint={FINGERPRINT}\n")
+            live = self.live_identity or IDENTITY
+            return ok("SHA1 Fingerprint=" + ":".join(live[i:i + 2] for i in range(0, 40, 2)) + "\n")
         if a[0] == "security":
-            return ok("".join(f'  {n}) {identity} "Developer ID Application: X (95CX6P84C4)"\n'
-                              for n, identity in enumerate(self.keychain_identities, 1)))
+            rows = [(item, "95CX6P84C4") if isinstance(item, str) else item
+                    for item in self.keychain_identities]
+            return ok("".join(f'  {n}) {identity} "Developer ID Application: X ({team})"\n'
+                              for n, (identity, team) in enumerate(rows, 1)))
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
             return self._build(a, env)
         if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
@@ -322,6 +327,9 @@ class FakeSystem(su.System):
             rc = self.install_rcs.pop(0) if len(self.install_rcs) > 1 else self.install_rcs[0]
             if rc == 0:
                 self._set_installed(self.installed_after or self.checked_out)
+                if "--launch-helper-source" in args and self.built_identity:
+                    # The installed app is the one just built, signed by it.
+                    self.live_identity = self.built_identity
             return su.Result(rc, "", "" if rc == 0 else "agents still unloading")
         if args[:2] == ["pool", "undrain"]:
             if self.pool_state != "draining":
@@ -424,6 +432,7 @@ class FakeSystem(su.System):
         return su.Result(proc.returncode, proc.stdout, proc.stderr)
 
     def _build(self, a, env=None):
+        self.built_identity = a[a.index("--identity") + 1]
         out = Path(a[a.index("--output") + 1])
         approval = Path(a[a.index("--approval-output") + 1])
         profile = Path(a[a.index("--profile") + 1])
@@ -3968,6 +3977,48 @@ class LauncherV2SelfUpdateTests(Base):
         error = self.latest()["error"]
         self.assertIn(f"identity {IDENTITY[:12]} -> {'B' * 12}", error)
         self.assertIn(self.expected_ack(identity="B" * 40), error)
+
+    def test_the_turn_after_an_acked_rotation_sees_no_change(self) -> None:
+        self.sys.keychain_identities = ["B" * 40]   # the live app's cert is gone
+        self.ack_path().write_text(self.expected_ack(identity="B" * 40) + "\n")
+        self.assertUpdated(self.apply())
+        self.assertEqual("B" * 40, self.sys.built_identity)
+        # The next turn reads the new live app's certificate: no re-detection.
+        helper = su.launch_helper(self.cfg)
+        with tempfile.TemporaryDirectory() as scratch:
+            live = su.extract_signing_identity(self.sys, Path(helper["path"]), Path(scratch))
+        signer = su.choose_signer(self.sys, self.home, live)
+        change = su.v2_launcher_change(self.cfg, self.sys, helper, su.checked_in_profile(self.cfg),
+                                       signer, live)
+        self.assertEqual([], change.differs)
+
+    def test_the_ack_team_is_the_certificates_and_must_be_the_profiles(self) -> None:
+        # The chosen certificate is for another team: refuse, before any drain,
+        # rather than build a launcher its own policy would reject.
+        self.sys.keychain_identities = [(IDENTITY, "ZZZZZZZZZZ")]
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("is for team ZZZZZZZZZZ, not the profile's launch_helper.team_id "
+                      "95CX6P84C4", self.latest()["error"])
+
+    def test_a_new_v2_app_must_carry_the_measured_inputs(self) -> None:
+        app = Path(self.td.name) / "new.app"
+        resources = app / "Contents" / "Resources"
+        resources.mkdir(parents=True)
+        (resources / "inputs.json").write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        with self.assertRaisesRegex(su.Refused, "inputs e+ != the target's f+"):
+            su.verify_bundle_v2(self.sys, app, "f" * 64)
+        with self.assertRaisesRegex(su.Refused, "!= the target's None"):
+            su.verify_bundle_v2(self.sys, app, None)
+        (resources / "inputs.json").write_text(json.dumps({"schema": 1, "sha256": "f" * 64}))
+        su.verify_bundle_v2(self.sys, app, "f" * 64)        # control: matching inputs pass
+        (resources / "bundle.json").write_text("{}")
+        with self.assertRaisesRegex(su.Refused, "v1 bundle.json"):
+            su.verify_bundle_v2(self.sys, app, "f" * 64)
+        (resources / "bundle.json").unlink()
+        self.sys.codesign_verify_rc = 1
+        with self.assertRaisesRegex(su.Refused, "codesign --verify"):
+            su.verify_bundle_v2(self.sys, app, "f" * 64)
 
     def test_a_different_team_is_a_launcher_change(self) -> None:
         self.sys.live_team = "ZZZZZZZZZZ"
