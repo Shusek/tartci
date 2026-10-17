@@ -100,6 +100,20 @@ provenance disagrees, if canary validation fails, or if the canary cannot prove
 pool readiness and rollback. Do not widen the rollout from a failed or
 unverified canary.
 
+## 2026-10-17 canary follow-up
+
+The M1 canary reached the source-move gate and stopped before installing the
+private source. The self-update rate limiter treated the unchanged TartCI
+generation as the whole attempt identity, so a recent public-profile install
+blocked the source move for six hours. The host remained on its previous
+verified generation and serving normally.
+
+The fix is in [PR 606](https://github.com/danielraffel/tartci/pull/606). It
+keys the rate limit by both generation and selected profile source, preserving
+the existing same-source backoff while allowing a deliberate source move to
+run its own guarded canary. M1 self-update is paused until that fix is reviewed
+and landed; no other host has been selected for the private source.
+
 ## 2026-10-17 update
 
 The first wider rollout check found a sequencing bug. A host had current TartCI
