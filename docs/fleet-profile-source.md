@@ -115,14 +115,22 @@ verified commit of the private source: enabling cleanup by any other route
 proof. The structural limits in `macos_fleet_lanes.worktree_cleanup_problem`
 bound what the setting can do; the canary bounds who gets it first.
 
-## Not on a sealed-launcher host
+## Sealed-launcher hosts
 
-A host with a sealed TartCI Launcher (`[launch_helper]` in its profile: the
-external-volume hosts) refuses `[fleet_source]` before reading the source or
-draining anything. The sealed launcher's policy digest covers the profile, and
+A host with a **v1** sealed TartCI Launcher (`[launch_helper]` in its profile:
+the external-volume hosts) refuses `[fleet_source]` before reading the source
+or draining anything. The v1 launcher's policy digest covers the profile, and
 a source move reinstalls the same generation without rebuilding the launcher,
 so the installer would refuse the live launcher after the drain and roll back
 on every turn. The refusal names the cause and the fix (remove
-`[fleet_source]` on that host). A sealed host takes a private source once a
-source move rebuilds the launcher, which launcher v2 makes unnecessary by
-taking the policy out of the app.
+`[fleet_source]` on that host, or move it to launcher v2). A v1 host whose
+launcher v2 opt-in file is present still refuses until it has installed v2.
+
+A **launcher v2** host takes `[fleet_source]`. Its stable app holds only host
+policy (`policy.json`), so a source move is measured like any update: when the
+app's inputs digest, signing identity and team are unchanged the move is a
+same-generation refresh that writes and signs a new launch set and keeps the
+app; when they change (the moved profile changed `host.home`, `host.tart_home`
+or the launch helper's team or identifier) it is a launcher change that waits
+for the exact `v2 inputs=... identity=... team=...` acknowledgement and then
+rebuilds the app.
