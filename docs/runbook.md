@@ -3019,15 +3019,21 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   kept the rest.
 
   A reclaim pass that goes STALE because its own `git` hung is often a store
-  stall, not a reclaim problem. `pool status` (`store:`) and `doctor fleet`
-  (`store_stalled`) probe each store volume the installed profile names (the
-  Tart store listing and `tart list`, and `git rev-parse` on the `[reclaim]`
-  repository and a listing of its worktrees root) with a 15 s bound, killing
-  and never re-waiting a probe that does not finish. A stall names the volume,
-  how long the oldest `git` or `tart` on it has been hanging, the likely cause
-  (a system-wide sandbox or TCC stall, which does not clear on its own) and the
-  step: drain, let running jobs finish, reboot. The probe runs only there,
-  never in a lane.
+  stall, not a reclaim problem. `tartci doctor fleet` and the launchd
+  watchdog (at most every 15 min) probe each store volume the installed
+  profile names (the Tart store listing and `tart list`, and `git rev-parse` on
+  the `[reclaim]` repository and a listing of its worktrees root) with a 15 s
+  bound, and cache the result in `~/.tartci/state/store-stall/status.json`.
+  `pool status` only reads that cache (`store: STALLED since <time> (as of
+  <time>)`): it runs every few minutes from agents and peers, and a probe there
+  would pile stuck children up on a stalled host. A probe that does not finish
+  is killed and never waited on again; its PID stays in the volume's
+  `<volume>.pids` marker, and while that PID is alive no new probe of the
+  volume starts (`an earlier probe ... is still hanging`). A stall names the
+  volume, since when, how long the oldest `git` or `tart` on it has been
+  hanging, the likely cause (a system-wide sandbox or TCC stall, which does not
+  clear on its own) and the step: drain, let running jobs finish, reboot.
+  Nothing on a lane's path runs it.
 
   With `gate_ccache_trim = true` (and optionally `gate_ccache_max_age_days`,
   default 14, and `gate_ccache_trim_interval_hours`, default 24) the pass runs

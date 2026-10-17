@@ -1357,10 +1357,12 @@ PY
       launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status --receipt "$fleet_receipt" 2>/dev/null)" \
         || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
       [ -n "$launcher_json" ] || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
-      # Whether the VM store and repository volumes answer at all: a bounded
-      # probe (scripts/store_stall.py), run here and by doctor, never by a lane.
+      # Whether the VM store and repository volumes answer at all: the last
+      # cached result of scripts/store_stall.py. Pool status runs from agents
+      # and peers every few minutes, so it never probes; doctor and the
+      # watchdog do.
       local store_json
-      store_json="$("$status_python" "$HERE/scripts/store_stall.py" --json 2>/dev/null)" \
+      store_json="$("$status_python" "$HERE/scripts/store_stall.py" --cached --json 2>/dev/null)" \
         || store_json='{"state":"unprobed","detail":"probe unavailable","stalled":[]}'
       [ -n "$store_json" ] || store_json='{"state":"unprobed","detail":"probe unavailable","stalled":[]}'
       if [ "$status_json" = 1 ]; then
