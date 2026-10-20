@@ -154,6 +154,9 @@ class RunOneHarness:
             f"source {str(PROOF_LIB)!r}\n"
             f"source {str(ROOT / 'providers/tart-macos/job-claim.lib.sh')!r}\n"
             f"source {str(ROOT / 'providers/tart-macos/lifecycle.lib.sh')!r}\n"
+            # Keep the extracted run_one body runnable when a fixture is
+            # intentionally testing only its admission ordering.
+            "tartci_lifecycle_reset(){ :; }\n"
             # The host VM-DHCP breaker reads host state; closed here.
             "tartci_vm_dhcp_check(){ return 0; }\n"
             "tartci_vm_dhcp_record(){ :; }\n"
@@ -183,11 +186,15 @@ class RunOneHarness:
             "tartci_vm_lease_cores(){ printf '4'; }\n"
             "tartci_vm_lease_mem_mb(){ printf '8192'; }\n"
             "tartci_vm_lease_priority(){ printf '0'; }\n"
-            f"tartci_job_claim_acquire(){{ printf 'claim\\n' >>{str(self.tmp / 'claims')!r}; return 0; }}\n"
             f"tartci_acquire_vm_lease(){{ printf 'lease\\n' >>{str(self.tmp / 'leases')!r}; return 0; }}\n"
             "tartci_release_vm_lease(){ :; }\n"
             f"tartci_vm_lease_waiter_register(){{ printf 'waiter\\n' >>{str(self.tmp / 'waiters')!r}; }}\n"
             "discard_current_vm(){ :; }\n"
+            # Assignment V2 is covered by its own end-to-end fixtures; this
+            # harness keeps the pre-clone branch disabled so it can exercise
+            # the admission/claim ordering control.
+            "tartci_assignment_v2_pre_clone_check_enabled(){ return 1; }\n"
+            "tartci_assignment_v2_pre_clone_skip(){ return 1; }\n"
             "runtime_emit_complete(){ :; }\n"
             f"note(){{ printf '%s\\n' \"$*\" >>{str(self.notes)!r}; }}\n"
             f"heartbeat(){{ printf '%s\\n' \"$1\" >>{str(self.heartbeats)!r}; }}\n"
@@ -235,6 +242,11 @@ class RunOneHarness:
                 # Isolate the inconclusive breaker's counter: a shared one would
                 # let an earlier test degrade a later test into an admit.
                 "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(self.tmp / "breaker"),
+                # Keep the real claim implementation hermetic. Integration
+                # callers can override this through their parent environment.
+                "TARTCI_JOB_CLAIM_DIR": os.environ.get(
+                    "TARTCI_JOB_CLAIM_DIR", str(self.tmp / "claims")
+                ),
                 # This harness stops at the clone; a parallel boundary proof
                 # started beside it would outlive the harness. The parallel
                 # path has its own tests in test_boundary_proof_parallel.py.

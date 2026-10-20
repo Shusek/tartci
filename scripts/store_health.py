@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from bounded_subprocess import ObservationError, require_success, run_bounded
+from python_child import child_python
 
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -57,7 +58,7 @@ def probe(root: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
         raise ValueError("timeout must be positive")
     try:
         completed = run_bounded(
-            [sys.executable, __file__, "--probe-child", root],
+            [child_python(), __file__, "--probe-child", root],
             timeout=timeout_s,
             operation="tart_store_probe",
         )
@@ -87,7 +88,7 @@ def profile_tart_home(profile_path: str, timeout_s: float = 2.0) -> str | None:
     """Read only the declared Tart path in a killable child process."""
     try:
         completed = run_bounded(
-            [sys.executable, "-c", _PROFILE_TART_HOME_CODE, profile_path],
+            [child_python(), "-c", _PROFILE_TART_HOME_CODE, profile_path],
             timeout=timeout_s,
             operation="tart_profile_read",
         )
