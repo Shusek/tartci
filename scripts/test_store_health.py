@@ -7,12 +7,18 @@ import os
 import sys
 import tempfile
 import subprocess
+import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import store_health  # noqa: E402
 import tartci_launchd_watchdog as watchdog  # noqa: E402
+
+
+class StoreHealthContractTests(unittest.TestCase):
+    def test_probe_and_state_contract(self) -> None:
+        main()
 
 
 def main() -> None:

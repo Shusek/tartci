@@ -641,14 +641,25 @@ def resolve_tart_home() -> tuple[str | None, str]:
 def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
     env = dict(os.environ)
     env["TART_HOME"] = tart_home
-    process = subprocess.run(
-        [tart_cli, "list", "--format", "json"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=30,
-    )
-    return process.returncode, process.stdout, process.stderr
+    try:
+        process = store_health.run_bounded(
+            [tart_cli, "list", "--format", "json"],
+            timeout=30, operation="tart_inventory", env=env)
+        return process.returncode, process.stdout, process.stderr
+    except store_health.ObservationError as exc:
+        return 124 if exc.kind == "timeout" else 127, "", str(exc)
+
+
+def probe_tart_vm_running_after_storage(
+    storage_health: dict[str, Any],
+) -> TartVMProbe:
+    """Skip Tart inventory whenever storage health is not proven healthy."""
+    if storage_health.get("state") != "healthy":
+        path = storage_health.get("path")
+        reason = storage_health.get("reason") or storage_health.get(
+            "last_result", {}).get("reason", "storage health is not healthy")
+        return TartVMProbe(None, f"Tart store health unavailable: {reason}", None, path)
+    return probe_tart_vm_running()
 
 
 def probe_tart_vm_running() -> TartVMProbe:
@@ -1935,11 +1946,6 @@ def main(argv: list[str] | None = None) -> int:
         print(vm_boot_line)
 
     agents = discover_agents(args.launch_agents_dir)
-    # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and
-    # deliberately imprecise in the safe direction: neither wedge signature fires
-    # while anything is building, so a busy host defers a heal to its next idle
-    # window rather than risking a bootout under someone else's live job.
-    vm_probe = probe_tart_vm_running()
     participating = pool_participating(args.participation_file)
     store_health_result = store_health_pass(
         participation_file=args.participation_file,
@@ -1948,6 +1954,10 @@ def main(argv: list[str] | None = None) -> int:
         timeout_s=args.store_health_timeout_seconds,
         failure_threshold=args.store_health_failure_threshold,
     )
+    # Compute the VM-running guard ONCE per pass, but only after storage health
+    # is proven. A Tart inventory call can itself block on a wedged external
+    # volume; never let it outrun the bounded storage gate.
+    vm_probe = probe_tart_vm_running_after_storage(store_health_result)
     disabled = disabled_services()
     health = [
         gather_health(lbl, p, args.stale_log_seconds, vm_probe.running, participating,

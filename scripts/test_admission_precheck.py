@@ -134,7 +134,7 @@ class RunOneHarness:
         )
 
     def run(self, *, source_override: str | None = None,
-            inventory: str = "0") -> subprocess.CompletedProcess:
+            inventory: str = "0", storage_health_rc: int = 0) -> subprocess.CompletedProcess:
         source = (
             MACOS_RUNNER.read_text(encoding="utf-8")
             if source_override is None
@@ -171,9 +171,9 @@ class RunOneHarness:
             # admitted verdict reaches the clone.
             "tartci_pool_admission_open(){ return 0; }\n"
             "tartci_pool_read_state(){ echo on; }\n"
-            # The storage gate is exercised by the dedicated store-health
-            # tests; keep this harness focused on admission-clean behavior.
-            "tartci_storage_health_check(){ return 0; }\n"
+            # The storage gate is exercised here with both healthy and blocked
+            # outcomes; the dedicated store-health tests cover its probe body.
+            f"tartci_storage_health_check(){{ STORAGE_HEALTH_STATE={'ok' if storage_health_rc == 0 else 'unknown'}; heartbeat {'loop' if storage_health_rc == 0 else 'yielded-storage-health'}; return {storage_health_rc}; }}\n"
             f"running_macos_vms(){{ echo {inventory!r}; }}\n"
             "tartci_check_macos_disk_floor_with_cleanup_once(){ return 0; }\n"
             "tartci_prepare_and_check_disk_root_observed(){ return 0; }\n"
@@ -183,9 +183,10 @@ class RunOneHarness:
             "tartci_vm_lease_cores(){ printf '4'; }\n"
             "tartci_vm_lease_mem_mb(){ printf '8192'; }\n"
             "tartci_vm_lease_priority(){ printf '0'; }\n"
-            "tartci_acquire_vm_lease(){ return 0; }\n"
+            f"tartci_job_claim_acquire(){{ printf 'claim\\n' >>{str(self.tmp / 'claims')!r}; return 0; }}\n"
+            f"tartci_acquire_vm_lease(){{ printf 'lease\\n' >>{str(self.tmp / 'leases')!r}; return 0; }}\n"
             "tartci_release_vm_lease(){ :; }\n"
-            "tartci_vm_lease_waiter_register(){ :; }\n"
+            f"tartci_vm_lease_waiter_register(){{ printf 'waiter\\n' >>{str(self.tmp / 'waiters')!r}; }}\n"
             "discard_current_vm(){ :; }\n"
             "runtime_emit_complete(){ :; }\n"
             f"note(){{ printf '%s\\n' \"$*\" >>{str(self.notes)!r}; }}\n"
@@ -312,6 +313,16 @@ class PrecheckSkipsTheCloneTests(unittest.TestCase):
                 f"an admitted verdict must still clone: {result.stderr}",
             )
             self.assertIn("clone_start", harness.event_names())
+
+    def test_storage_health_failure_blocks_claim_lease_and_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            harness = RunOneHarness(Path(raw))
+            result = harness.run(storage_health_rc=75)
+            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertIn("yielded-storage-health", harness.heartbeats.read_text())
+            self.assertNotIn("clone_start", harness.event_names())
+            for name in ("claims", "leases", "waiters"):
+                self.assertFalse((Path(raw) / name).exists(), name)
 
     def test_an_unreadable_tart_inventory_defers_before_the_clone(self) -> None:
         """The same real boot body, with `tart list` unreadable: deferred (75),

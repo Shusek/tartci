@@ -297,6 +297,18 @@ if testing_support.HAVE_TOMLLIB:
         check("non-object entry" in probe.reason,
               f"malformed inventory cause must survive the probe: {probe.reason}")
 
+# A failed storage gate must short-circuit Tart inventory entirely. This keeps
+# the watchdog bounded when Tart itself is blocked inside a wedged mount.
+with mock.patch.object(wd, "probe_tart_vm_running") as inventory:
+    probe = wd.probe_tart_vm_running_after_storage({
+        "state": "draining", "path": "/Volumes/Example/VMs",
+        "last_result": {"reason": "timeout after 10s"},
+    })
+check(probe.running is None, f"unhealthy storage must be unavailable: {probe}")
+check("timeout after 10s" in probe.reason,
+      f"storage reason must survive inventory short-circuit: {probe.reason}")
+check(not inventory.called, "unhealthy storage must not invoke Tart inventory")
+
 with tempfile.TemporaryDirectory() as td:
     fake_tart = Path(td) / "tart"
     fake_tart.write_text("#!/bin/sh\nexit 99\n")
@@ -346,12 +358,17 @@ with tempfile.TemporaryDirectory() as td:
 
 with tempfile.TemporaryDirectory() as td:
     with mock.patch.object(
-        wd.subprocess, "run",
-        return_value=subprocess.CompletedProcess(["tart", "list"], 0, "[]", ""),
+        wd.store_health,
+        "run_bounded",
+        return_value=subprocess.CompletedProcess(["tart", "list", "--format", "json"], 0, "[]", ""),
     ) as run:
         wd._run_tart_inventory("/bin/tart", td)
     check(run.call_args.kwargs.get("timeout") == 30,
           f"Tart inventory must enforce a 30s subprocess timeout: {run.call_args}")
+    check(run.call_args.kwargs.get("operation") == "tart_inventory",
+          f"Tart inventory must identify its bounded operation: {run.call_args}")
+    check(run.call_args.kwargs["env"]["TART_HOME"] == td,
+          f"Tart inventory must pass the resolved Tart home: {run.call_args}")
 
 with (
     mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
@@ -881,7 +898,10 @@ if sys.platform == "darwin":
         [sys.executable, str(ROOT / "scripts" / "tartci_launchd_watchdog.py"),
          "--status", "--json"], capture_output=True, text=True, check=False, timeout=30,
     )
-    check(proc.returncode == 0, f"watchdog status entrypoint failed: {proc.stderr}")
+    # ``--status`` is an attention report: a healthy process exits 0, while a
+    # real host condition intentionally exits 1 after still emitting JSON.
+    check(proc.returncode in (0, 1),
+          f"watchdog status entrypoint failed: {proc.stderr}")
     try:
         json.loads(proc.stdout)
     except ValueError as exc:
