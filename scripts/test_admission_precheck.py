@@ -171,6 +171,9 @@ class RunOneHarness:
             # admitted verdict reaches the clone.
             "tartci_pool_admission_open(){ return 0; }\n"
             "tartci_pool_read_state(){ echo on; }\n"
+            # The storage gate is exercised by the dedicated store-health
+            # tests; keep this harness focused on admission-clean behavior.
+            "tartci_storage_health_check(){ return 0; }\n"
             f"running_macos_vms(){{ echo {inventory!r}; }}\n"
             "tartci_check_macos_disk_floor_with_cleanup_once(){ return 0; }\n"
             "tartci_prepare_and_check_disk_root_observed(){ return 0; }\n"
