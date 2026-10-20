@@ -589,7 +589,7 @@ class RunOneTests(unittest.TestCase):
         env = {"TARTCI_JOB_CLAIM_DIR": str(claims), "GH_CLI": "false",
                "CURRENT_SELECTED_QUEUED": queued}
         with mock.patch.dict(os.environ, env):
-            return harness.run(), harness
+            return harness.run(claim_dir=str(claims)), harness
 
     def test_covered_demand_returns_before_admission_and_clone(self) -> None:
         result, harness = self.run_one("1", hold=True)

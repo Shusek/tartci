@@ -83,6 +83,10 @@ BLOCKED_PHASES = frozenset({
     "scan_blind_escalated", "jit-admission-denied", "vm-lease-denied",
     "vm-lease-infeasible", "admission-precheck-deferred",
     "admission-precheck-error", "teardown-pending",
+    # Tart store liveness is an independent admission axis.  A fresh
+    # heartbeat with this phase proves the supervisor is alive while it is
+    # deliberately refusing new VM work; it never counts as free capacity.
+    "yielded-storage-health", "yielded_storage_health",
     # lease-fit.lib.sh: this lane's VM lease cannot be granted now, or ever.
     "lease-wait", "lease-never-fits",
     # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.
@@ -246,6 +250,14 @@ def classify_lane(env: dict, heartbeat: dict | None, class_label: str, classes: 
         return "unknown", f"heartbeat without a readable timestamp (phase {phase})"
     if age > stale_after:
         return "unknown", f"stale heartbeat ({phase}, {int(age)}s > {stale_after}s)"
+    # New Tart macOS heartbeats carry an independent store-health receipt.  A
+    # missing, stale, or non-ok value must never advertise capacity; older
+    # Tart heartbeats are treated as unknown during the rollout.  Test and
+    # non-Tart providers do not carry this field and retain their existing
+    # phase policy.
+    if heartbeat.get("provider") == "tart-macos" \
+            and heartbeat.get("storage_health") != "ok":
+        return "unknown", f"storage health unavailable ({heartbeat.get('storage_health') or 'missing'})"
     if phase in FREE_PHASES:
         return "free", f"{phase} {int(age)}s ago"
     if phase in IN_FLIGHT_PHASES:

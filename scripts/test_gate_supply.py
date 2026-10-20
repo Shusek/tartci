@@ -60,7 +60,8 @@ class ClassifyAndFitTests(unittest.TestCase):
             "waiting": "free", "backoff": "free", "loop": "free",
             "booting": "in_flight", "minting-jit": "in_flight", "idle-wait": "in_flight",
             "job-running": "blocked", "vm-lease-denied": "blocked", "scan_blind": "blocked",
-            "draining": "blocked", "something-new": "unknown",
+            "draining": "blocked", "yielded-storage-health": "blocked",
+            "yielded_storage_health": "blocked", "something-new": "unknown",
         }
         for phase, expected in cases.items():
             with self.subTest(phase=phase):
@@ -93,6 +94,25 @@ class ClassifyAndFitTests(unittest.TestCase):
         control, _ = gate_supply.classify_lane(
             lane_env(), {"ts": stamp(10), "phase": "waiting"}, MERGE, [MERGE, PR], time.time())
         self.assertEqual(control, "free")
+
+    def test_tart_storage_health_is_required_for_capacity(self) -> None:
+        missing, detail = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "ts": stamp(5), "phase": "waiting"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(missing, "unknown")
+        self.assertIn("storage health", detail)
+        healthy, _ = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "storage_health": "ok",
+                         "ts": stamp(5), "phase": "waiting"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(healthy, "free")
+
+        unhealthy, detail = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "storage_health": "unknown",
+                         "ts": stamp(5), "phase": "yielded-storage-health"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(unhealthy, "unknown")
+        self.assertIn("storage health", detail)
 
     def test_a_lane_in_flight_for_the_other_class_does_not_cover_this_one(self) -> None:
         state, _ = gate_supply.classify_lane(

@@ -273,6 +273,21 @@ that command can fail solely because a stripped non-login shell omitted
 `/opt/homebrew/bin`. Probe the configured absolute binary and report
 `installed but unreachable from launch environment` separately from `absent`.
 
+The launchd watchdog also runs a bounded, read-only Tart-store probe each pass.
+It opens the configured `TART_HOME` directory with `O_DIRECTORY` and performs
+`fstat` in a killable child process, then records the result under the internal
+`TARTCI_HOME` state directory. One failed probe reports `suspect`; two consecutive failures
+report `drain_required` and leave the pool unchanged by default. A drained
+canary may explicitly set `TARTCI_STORE_HEALTH_DRAIN=1` to cooperatively run
+`tartci pool drain`, stopping new admission while allowing active jobs to
+finish. The watchdog never reboots or kills a process for this condition.
+`--store-health-timeout-seconds` and
+`--store-health-failure-threshold` tune the bounds for fixture testing.
+The macOS runner performs the same probe before a new job claim/clone and on
+each idle poll. An unknown or timed-out result emits `yielded_storage_health`,
+sets `storage_health=unknown` in the heartbeat, and makes `gate_supply` report
+the lane as blocked/unknown; active guests continue to finish.
+
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
 token — the `[github.auth]` `source = "command"` block (the

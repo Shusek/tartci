@@ -196,6 +196,14 @@ esac
 LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
+# Read-only Tart-store liveness probe.  The helper owns a process-group
+# deadline, so a wedged APFS/USB path cannot strand this supervisor.  A probe
+# failure yields before any new VM clone; active guests are left alone.
+STORAGE_HEALTH_TIMEOUT="${TARTCI_STORAGE_HEALTH_TIMEOUT_SECS:-5}"
+case "$STORAGE_HEALTH_TIMEOUT" in
+  ''|*[!0-9]*|0) STORAGE_HEALTH_TIMEOUT=5 ;;
+esac
+[ "$STORAGE_HEALTH_TIMEOUT" -le 30 ] || STORAGE_HEALTH_TIMEOUT=30
 JOB_TIMEOUT="${TARTCI_JOB_TIMEOUT_SECS:-7200}"
 TEARDOWN_STEP_TIMEOUT="${TARTCI_TEARDOWN_STEP_TIMEOUT_SECS:-5}"
 case "$TEARDOWN_STEP_TIMEOUT" in
@@ -306,6 +314,7 @@ PRE_CLONE_DEMAND_GONE=0
 # The queued count the loop selected with; the per-job claim reads it.
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
+STORAGE_HEALTH_STATE="unknown"
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -831,7 +840,7 @@ heartbeat(){
   find "$STATE_DIR" -type f -name "$RUNNER_NAME.state.json.tmp.*" -mtime +1 -delete 2>/dev/null || true
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","serving_blocked_cause":"$(json_sanitize "$SERVING_BLOCKED_CAUSE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","storage_health":"$(json_sanitize "$STORAGE_HEALTH_STATE")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","serving_blocked_cause":"$(json_sanitize "$SERVING_BLOCKED_CAUSE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -839,6 +848,24 @@ EOF
     rm -f "$tmp_file"
     return 1
   fi
+}
+
+tartci_storage_health_check(){
+  local result=""
+  if result="$(python3 "$TARTCI_ROOT/scripts/store_health.py" \
+      --path "$TART_HOME" --timeout-seconds "$STORAGE_HEALTH_TIMEOUT" --json \
+      2>/dev/null)"; then
+    STORAGE_HEALTH_STATE=ok
+    event storage_health "Tart store probe succeeded" \
+      "state=ok" "path=$TART_HOME"
+    return 0
+  fi
+  STORAGE_HEALTH_STATE=unknown
+  event yielded_storage_health "Tart store probe failed" \
+    "state=unknown" "path=$TART_HOME" "reason=probe_failed"
+  heartbeat yielded-storage-health
+  note "Tart store health is unknown — deferring new VM admission"
+  return 75
 }
 
 runtime_emit_complete(){
@@ -2075,6 +2102,10 @@ run_one(){
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
   fi
+  # Storage liveness is a separate admission axis.  A healthy SSH/control
+  # plane does not prove that Tart's store can answer open/fstat; unknown or
+  # timed-out storage yields before a job claim, clone, or VM lease is taken.
+  tartci_storage_health_check || return $?
   # The host's VM DHCP breaker comes first: while the host's DHCP server is
   # not answering no boot can succeed, so nothing else is worth doing, and a
   # lane that backs off here has taken no job claim. Order of the pre-boot
@@ -2592,6 +2623,15 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
       continue
     fi
+    # Refresh the independent storage receipt even while the queue is empty.
+    # This keeps gate_supply from treating an old pre-probe `waiting` heartbeat
+    # as free capacity, and it lets a recovered mount become routable without
+    # requiring demand to enter run_one first.
+    if ! tartci_storage_health_check; then
+      sleep "$POLL"
+      continue
+    fi
+    heartbeat loop
     # A lane whose VM lease cannot be granted right now (or ever) has nothing
     # to boot, so it neither scans the queue nor asks Shipyard. Local and
     # read-only; fails open. See providers/tart-macos/lease-fit.lib.sh.
