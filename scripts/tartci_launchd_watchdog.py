@@ -152,6 +152,7 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
 # Rate limit: at most this many heals per label inside the window.
 DEFAULT_MAX_HEALS = 3
 DEFAULT_HEAL_WINDOW_S = 3600  # 1 hour
+TART_INVENTORY_TIMEOUT_S = 15.0
 
 
 def utcnow() -> float:
@@ -346,8 +347,17 @@ def classify(
     )
 
 
-def _run(cmd: list[str]) -> tuple[int, str, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, str, str]:
+    """Run a control-plane probe without allowing a wedged store to hang us."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return 124, exc.stdout or "", (
+            f"command timed out after {timeout:.0f}s: {' '.join(cmd)}"
+            if timeout is not None else "command timed out"
+        )
+    except OSError as exc:
+        return 127, "", str(exc)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -514,12 +524,20 @@ def resolve_tart_home() -> tuple[str | None, str]:
 def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
     env = dict(os.environ)
     env["TART_HOME"] = tart_home
-    process = subprocess.run(
-        [tart_cli, "list", "--format", "json"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        process = subprocess.run(
+            [tart_cli, "list", "--format", "json"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=TART_INVENTORY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return 124, exc.stdout or "", (
+            f"tart list timed out after {TART_INVENTORY_TIMEOUT_S:.0f}s"
+        )
+    except OSError as exc:
+        return 127, "", str(exc)
     return process.returncode, process.stdout, process.stderr
 
 

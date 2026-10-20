@@ -112,6 +112,38 @@ DEFAULT_BOOT_FLOOR_GB = 30.0
 # silent is indistinguishable from one that is wedged, so emit a bounded
 # heartbeat instead of leaving the log frozen for the whole run.
 PROGRESS_INTERVAL_S = 300.0
+# Metadata and free-space calls can block in the kernel when an external APFS
+# volume is wedged. Keep root admission and the post-pass receipt bounded too.
+ROOT_PROBE_TIMEOUT_S = 15.0
+PASS_TIMEOUT_S = 900.0
+PASS_DEADLINE: float | None = None
+
+
+def bounded_fs_call(operation: Any, *, description: str,
+                    timeout: float = ROOT_PROBE_TIMEOUT_S) -> Any:
+    """Run one filesystem metadata call with a fail-closed deadline."""
+    result: dict[str, Any] = {}
+    error: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            result["value"] = operation()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
+            error.append(exc)
+
+    remaining = None if PASS_DEADLINE is None else PASS_DEADLINE - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise OSError(errno.ETIMEDOUT, f"reclaim pass deadline reached before {description}")
+    effective_timeout = timeout if remaining is None else min(timeout, remaining)
+    worker = threading.Thread(target=invoke, name=f"fs probe {description}", daemon=True)
+    worker.start()
+    worker.join(effective_timeout)
+    if worker.is_alive():
+        raise OSError(errno.ETIMEDOUT,
+                      f"{description} timed out after {effective_timeout:.0f}s")
+    if error:
+        raise error[0]
+    return result.get("value")
 
 
 class Progress:
@@ -305,6 +337,11 @@ def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry
         APP_CONTAINERS_SKIPPED.append(str(path))
         raise OSError(errno.EPERM, "another app's data container is never listed", str(path))
     limit = SCANDIR_TIMEOUT_S if timeout is None else timeout
+    if PASS_DEADLINE is not None:
+        remaining = PASS_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            raise OSError(errno.ETIMEDOUT, "reclaim pass deadline reached")
+        limit = min(limit, remaining)
     result: dict[str, Any] = {}
 
     def listing() -> None:
@@ -428,7 +465,8 @@ def free_bytes(path: pathlib.Path) -> int | None:
     traceback out of the janitor instead of an honest "unknown".
     """
     try:
-        return shutil.disk_usage(path).free
+        return bounded_fs_call(lambda: shutil.disk_usage(path).free,
+                               description=f"disk usage {path}")
     except OSError:
         return None
 
@@ -637,7 +675,8 @@ def device_id(path: pathlib.Path) -> int | None:
     measurement rather than take one.
     """
     try:
-        return os.stat(path).st_dev
+        return bounded_fs_call(lambda: os.stat(path).st_dev,
+                               description=f"stat {path}")
     except OSError:
         return None
 
@@ -690,7 +729,12 @@ def resolve_boot_volume(explicit: str | None) -> pathlib.Path:
     if explicit:
         return pathlib.Path(os.path.expanduser(explicit))
     data = pathlib.Path(DEFAULT_BOOT_VOLUME)
-    return data if data.is_dir() else pathlib.Path("/")
+    try:
+        return data if bounded_fs_call(data.is_dir, description=f"is_dir {data}") else pathlib.Path("/")
+    except OSError:
+        # Keep the authoritative path so its later free-space check remains
+        # unknown; never substitute another volume after a stall.
+        return data
 
 
 def boot_volume_report(path: pathlib.Path, before: dict[str, Any],
@@ -1081,6 +1125,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
+    global PASS_DEADLINE
+    PASS_DEADLINE = time.monotonic() + PASS_TIMEOUT_S
     # Every other knob widens or narrows what is examined. These two decide
     # whether anything is examined at all: a zero age gate deletes every
     # generated tree the scan reaches the moment it reaches it, and a
@@ -1113,10 +1159,17 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     for root in roots:
         if refused_root(root):
             unusable.append(f"{root} (refused: {refused_root(root)})")
-        elif not root.is_dir():
-            unusable.append(f"{root} (not a directory)")
-        elif not os.access(root, os.R_OK | os.X_OK):
-            unusable.append(f"{root} (not readable)")
+        else:
+            try:
+                if not bounded_fs_call(root.is_dir, description=f"is_dir {root}"):
+                    unusable.append(f"{root} (not a directory)")
+                elif not bounded_fs_call(
+                    lambda: os.access(root, os.R_OK | os.X_OK),
+                    description=f"access {root}",
+                ):
+                    unusable.append(f"{root} (not readable)")
+            except OSError as exc:
+                unusable.append(f"{root} (probe failed: {exc})")
     if unusable:
         print("disk_reclaim: unusable scan root(s): " + ", ".join(unusable),
               file=sys.stderr)

@@ -264,6 +264,25 @@ with tempfile.TemporaryDirectory() as td:
     check(probe.tart_home == str(tart_home),
           f"probe must report the exact Tart store it inspected: {probe}")
 
+# A wedged Tart store must become an unavailable probe, not hang the watchdog.
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nsleep 2\n")
+    fake_tart.chmod(0o755)
+    with mock.patch.dict(
+        os.environ,
+        {
+            "PATH": "/usr/bin:/bin",
+            "TARTCI_TART_CLI": str(fake_tart),
+            "TART_HOME": str(tart_home),
+        },
+    ), mock.patch.object(wd, "TART_INVENTORY_TIMEOUT_S", 0.01):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None, f"timed-out Tart inventory must be unavailable: {probe}")
+    check("timed out" in probe.reason, f"timeout cause must survive the probe: {probe.reason}")
+
 # The installed profile names a custom Tart store; reading it needs tomllib.
 if testing_support.HAVE_TOMLLIB:
     with tempfile.TemporaryDirectory() as td:
