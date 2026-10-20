@@ -71,7 +71,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import threading
 import time
 from typing import Any, NamedTuple
 
@@ -1831,17 +1830,10 @@ def store_health_pass(
         if failure_threshold < 1 or failure_threshold > 10:
             return {"state": "unknown", "reason": "invalid store health threshold",
                     "drain_required": False}
-        resolved: list[tuple[str | None, str]] = []
-        resolver = threading.Thread(
-            target=lambda: resolved.append(resolve_tart_home()),
-            name="tartci store path resolution", daemon=True)
-        resolver.start()
-        resolver.join(timeout_s)
-        if resolver.is_alive():
-            return {"state": "unknown",
-                    "reason": f"store path resolution timed out after {timeout_s:g}s",
-                    "drain_required": False}
-        tart_home, resolution = resolved[0]
+        # resolve_tart_home is lexical for TART_HOME; it deliberately does not
+        # call isdir/stat on the potentially wedged store.  The bounded child
+        # below is the only operation that touches that path.
+        tart_home, resolution = resolve_tart_home()
         if tart_home is None:
             return {"state": "unknown", "reason": resolution, "drain_required": False}
         state_path = os.path.join(os.environ.get(
@@ -1855,9 +1847,16 @@ def store_health_pass(
         state["updated_at"] = int(time.time())
         if not status_only and not dry_run:
             store_health.save(state_path, state)
+        # Production pool mutation is an explicit rollout decision.  Keep the
+        # default report-only for this read-only recovery change; a future
+        # drained canary may set TARTCI_STORE_HEALTH_DRAIN=1 after observing
+        # the typed health receipts.
+        drain_enabled = os.environ.get("TARTCI_STORE_HEALTH_DRAIN") == "1"
         if state.get("drain_required") and not status_only:
             state["action"] = "would-drain" if dry_run else "drain-required"
-            if not dry_run and pool_participating(participation_file):
+            if not drain_enabled:
+                state["action"] = "report-only"
+            elif not dry_run and pool_participating(participation_file):
                 tartci = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tartci")
                 try:
                     drained = subprocess.run(

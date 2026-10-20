@@ -54,7 +54,8 @@ def main() -> None:
         state_home = Path(td) / "state-home"
         participation = Path(td) / "participation"
         participation.write_text("1\n")
-        with mock.patch.dict(os.environ, {"TARTCI_HOME": str(state_home)}), \
+        with mock.patch.dict(os.environ, {"TARTCI_HOME": str(state_home),
+                                          "TARTCI_STORE_HEALTH_DRAIN": "1"}), \
                 mock.patch.object(watchdog, "resolve_tart_home", return_value=(td, "test")), \
                 mock.patch.object(watchdog.store_health, "probe", side_effect=[
                     {"ok": False, "reason": "timeout"},
