@@ -277,9 +277,11 @@ The launchd watchdog also runs a bounded, read-only Tart-store probe each pass.
 It opens the configured `TART_HOME` directory with `O_DIRECTORY` and performs
 `fstat` in a killable child process, then records the result under the internal
 `TARTCI_HOME` state directory. One failed probe reports `suspect`; two consecutive failures
-cooperatively run `tartci pool drain`, stopping new admission while allowing
-active jobs to finish. The watchdog never reboots or kills a process for this
-condition. `--store-health-timeout-seconds` and
+report `drain_required` and leave the pool unchanged by default. A drained
+canary may explicitly set `TARTCI_STORE_HEALTH_DRAIN=1` to cooperatively run
+`tartci pool drain`, stopping new admission while allowing active jobs to
+finish. The watchdog never reboots or kills a process for this condition.
+`--store-health-timeout-seconds` and
 `--store-health-failure-threshold` tune the bounds for fixture testing.
 
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
