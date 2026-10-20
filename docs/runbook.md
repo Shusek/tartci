@@ -283,6 +283,10 @@ canary may explicitly set `TARTCI_STORE_HEALTH_DRAIN=1` to cooperatively run
 finish. The watchdog never reboots or kills a process for this condition.
 `--store-health-timeout-seconds` and
 `--store-health-failure-threshold` tune the bounds for fixture testing.
+The macOS runner performs the same probe before a new job claim/clone and on
+each idle poll. An unknown or timed-out result emits `yielded_storage_health`,
+sets `storage_health=unknown` in the heartbeat, and makes `gate_supply` report
+the lane as blocked/unknown; active guests continue to finish.
 
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
