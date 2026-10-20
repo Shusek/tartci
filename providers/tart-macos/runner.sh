@@ -2621,6 +2621,15 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
       continue
     fi
+    # Refresh the independent storage receipt even while the queue is empty.
+    # This keeps gate_supply from treating an old pre-probe `waiting` heartbeat
+    # as free capacity, and it lets a recovered mount become routable without
+    # requiring demand to enter run_one first.
+    if ! tartci_storage_health_check; then
+      sleep "$POLL"
+      continue
+    fi
+    heartbeat loop
     # A lane whose VM lease cannot be granted right now (or ever) has nothing
     # to boot, so it neither scans the queue nor asks Shipyard. Local and
     # read-only; fails open. See providers/tart-macos/lease-fit.lib.sh.
