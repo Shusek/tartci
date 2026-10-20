@@ -71,10 +71,12 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, NamedTuple
 
 import macos_runner_identity
+import store_health
 
 try:
     import tomllib
@@ -1801,6 +1803,77 @@ def save_heal_log(path: str, data: dict[str, list[float]]) -> None:
     os.replace(tmp, path)
 
 
+def store_health_pass(
+    *,
+    participation_file: str,
+    status_only: bool,
+    dry_run: bool,
+    timeout_s: float = 10.0,
+    failure_threshold: int = 2,
+) -> dict[str, Any]:
+    """Probe the Tart store and fail closed after repeated I/O failures.
+
+    State is kept under TARTCI_HOME (normally the internal boot volume).  A
+    store timeout must not strand the watchdog, so the probe itself is always
+    bounded.  Draining is cooperative and leaves running jobs alone; rebooting
+    and process killing are deliberately outside this path.
+    """
+    try:
+        if timeout_s < 1 or timeout_s > 300:
+            return {"state": "unknown", "reason": "invalid store health timeout",
+                    "drain_required": False}
+        if failure_threshold < 1 or failure_threshold > 10:
+            return {"state": "unknown", "reason": "invalid store health threshold",
+                    "drain_required": False}
+        resolved: list[tuple[str | None, str]] = []
+        resolver = threading.Thread(
+            target=lambda: resolved.append(resolve_tart_home()),
+            name="tartci store path resolution", daemon=True)
+        resolver.start()
+        resolver.join(timeout_s)
+        if resolver.is_alive():
+            return {"state": "unknown",
+                    "reason": f"store path resolution timed out after {timeout_s:g}s",
+                    "drain_required": False}
+        tart_home, resolution = resolved[0]
+        if tart_home is None:
+            return {"state": "unknown", "reason": resolution, "drain_required": False}
+        state_path = os.path.join(os.environ.get(
+            "TARTCI_HOME", os.path.expanduser("~/.tartci")),
+            "state", "store-health.json")
+        previous = store_health.load(state_path)
+        result = store_health.probe(tart_home, timeout_s=timeout_s)
+        state = store_health.next_state(previous, result, failure_threshold)
+        state["path"] = tart_home
+        state["resolution"] = resolution
+        state["updated_at"] = int(time.time())
+        if not status_only and not dry_run:
+            store_health.save(state_path, state)
+        if state.get("drain_required") and not status_only:
+            state["action"] = "would-drain" if dry_run else "drain-required"
+            if not dry_run and pool_participating(participation_file):
+                tartci = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tartci")
+                try:
+                    drained = subprocess.run(
+                        [tartci, "pool", "drain"], text=True,
+                        capture_output=True, timeout=30, check=False,
+                    )
+                    state["drain_result"] = drained.returncode
+                    if drained.returncode == 0:
+                        state["action"] = "drained"
+                    else:
+                        state["action"] = "drain-failed"
+                        state["drain_error"] = (drained.stderr or drained.stdout)[-500:]
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    state["action"] = "drain-failed"
+                    state["drain_error"] = str(exc)
+                store_health.save(state_path, state)
+        return state
+    except Exception as exc:  # noqa: BLE001 - health must not stop the watchdog
+        return {"state": "unknown", "reason": f"store health unavailable: {exc}",
+                "drain_required": False}
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _iso(ts: float) -> str:
@@ -1846,6 +1919,8 @@ def main(argv: list[str] | None = None) -> int:
                     default=os.path.join(
                         os.environ.get("HOME", os.path.expanduser("~")),
                         ".config", "tartci", "native-build-participation"))
+    ap.add_argument("--store-health-timeout-seconds", type=float, default=10.0)
+    ap.add_argument("--store-health-failure-threshold", type=int, default=2)
     args = ap.parse_args(argv)
 
     if args.reload:
@@ -1870,6 +1945,13 @@ def main(argv: list[str] | None = None) -> int:
     # window rather than risking a bootout under someone else's live job.
     vm_probe = probe_tart_vm_running()
     participating = pool_participating(args.participation_file)
+    store_health_result = store_health_pass(
+        participation_file=args.participation_file,
+        status_only=args.status,
+        dry_run=args.dry_run,
+        timeout_s=args.store_health_timeout_seconds,
+        failure_threshold=args.store_health_failure_threshold,
+    )
     disabled = disabled_services()
     health = [
         gather_health(lbl, p, args.stale_log_seconds, vm_probe.running, participating,
@@ -2020,6 +2102,7 @@ def main(argv: list[str] | None = None) -> int:
                 "executable": vm_probe.executable,
                 "tart_home": vm_probe.tart_home,
             },
+            "store_health": store_health_result,
             "agents": results,
             "config": config,
             "build_disagreement": disagreement,
@@ -2028,6 +2111,12 @@ def main(argv: list[str] | None = None) -> int:
         if not results:
             print(f"{_iso(now)} launchd-watchdog: no managed runner "
                   f"LaunchAgents found")
+        if store_health_result.get("state") != "healthy":
+            last_result = store_health_result.get("last_result", {})
+            print(f"{_iso(now)} launchd-watchdog: store-health: "
+                  f"{store_health_result.get('state')}: "
+                  f"{last_result.get('reason', store_health_result.get('reason', ''))} "
+                  f"[{store_health_result.get('action', 'report-only')}]")
         for r in results:
             mark = {"healthy": "✓", "attention": "!", "wedged": "✗",
                     "broken": "✗", "unknown": "?"}.get(
