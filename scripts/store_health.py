@@ -62,6 +62,9 @@ def probe(root: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
             reason = f"{exc.kind}: {exc.detail}"
         return {"ok": False, "reason": reason, "path": root,
                 "kind": exc.kind}
+    except Exception as exc:  # noqa: BLE001 - unknown is fail-closed
+        return {"ok": False, "reason": f"probe unavailable: {exc}",
+                "path": root, "kind": "internal_error"}
     try:
         value = json.loads(completed.stdout)
     except (TypeError, ValueError) as exc:
