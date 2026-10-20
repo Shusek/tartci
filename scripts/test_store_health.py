@@ -19,12 +19,23 @@ def main() -> None:
         result = store_health.probe(td, timeout_s=1)
         assert result["ok"] is True, result
         assert result["device_id"]
-        assert not list(Path(td).glob(".tartci-store-health-*"))
+        assert not list(Path(td).iterdir()), "probe must not create files"
+
+    with mock.patch.object(
+        store_health,
+        "run_bounded",
+        side_effect=store_health.ObservationError(
+            "tart_store_probe", "timeout", "timed out after 0.01s"),
+    ):
+        result = store_health.probe("/wedged/Atelier", timeout_s=0.01)
+    assert result["ok"] is False
+    assert result["reason"] == "timeout after 0.01s"
 
     with tempfile.TemporaryDirectory() as td:
-        result = store_health.probe(td, timeout_s=0.01)
-        assert result["ok"] is False
-        assert "timed out" in result["reason"]
+        missing = Path(td) / "does-not-exist"
+        result = store_health.probe(str(missing), timeout_s=1)
+        assert result["ok"] is False, result
+        assert not missing.exists(), "probe must not create a missing store"
 
     healthy = store_health.next_state({}, {"ok": True})
     assert healthy["state"] == "healthy"

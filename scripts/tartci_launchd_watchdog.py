@@ -615,13 +615,19 @@ def _profile_tart_home(profile_path: str) -> str | None:
 
 
 def resolve_tart_home() -> tuple[str | None, str]:
-    """Resolve the declared Tart store; never silently inspect Tart's default store."""
+    """Resolve the declared Tart store without touching the store path.
+
+    Existence and mount health belong to :func:`store_health.probe`, which is
+    run in a bounded child.  Calling ``isdir`` here would perform an unbounded
+    APFS lookup before that deadline and can strand this watchdog on the exact
+    failure mode it is meant to report.
+    """
     configured = os.environ.get("TART_HOME", "").strip()
     if configured:
         expanded = os.path.abspath(os.path.expanduser(configured))
-        if os.path.isabs(configured) and os.path.isdir(expanded):
+        if os.path.isabs(configured):
             return expanded, f"resolved from TART_HOME={configured}"
-        return None, f"TART_HOME is not an existing absolute directory: {configured}"
+        return None, f"TART_HOME is not an absolute directory: {configured}"
 
     profile_path = os.environ.get(
         "TARTCI_MACOS_FLEET_PROFILE",
@@ -630,10 +636,10 @@ def resolve_tart_home() -> tuple[str | None, str]:
     profile_home = _profile_tart_home(profile_path)
     if profile_home:
         expanded = os.path.abspath(os.path.expanduser(profile_home))
-        if os.path.isabs(profile_home) and os.path.isdir(expanded):
+        if os.path.isabs(profile_home):
             return expanded, f"resolved from installed fleet profile: {profile_path}"
         return None, (
-            f"installed fleet profile declares unavailable Tart store: {profile_home} "
+            f"installed fleet profile declares a non-absolute Tart store: {profile_home} "
             f"({profile_path})"
         )
     return None, (

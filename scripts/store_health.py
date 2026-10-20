@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Bounded, read-only Tart store health probe and fail-closed state machine."""
+"""Bounded Tart store I/O health probe and fail-closed state machine."""
 
 from __future__ import annotations
 
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 from typing import Any
+
+from bounded_subprocess import ObservationError, require_success, run_bounded
 
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -17,9 +18,18 @@ DEFAULT_FAILURE_THRESHOLD = 2
 
 
 def _probe_body(root: str) -> dict[str, Any]:
+    """Inspect one directory without creating or removing anything.
+
+    This function runs in a private child process.  The parent kills that
+    process group when an APFS/USB bridge call stops completing, so a blocked
+    ``open`` cannot strand the watchdog.  Keep this operation deliberately
+    metadata-only: an admission probe must never write, fsync, unlink, or
+    recursively enumerate a potentially wedged external volume.
+    """
     path = pathlib.Path(root).expanduser()
     started = time.monotonic()
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(str(path), flags)
     try:
         stat = os.fstat(fd)
     finally:
@@ -33,28 +43,33 @@ def _probe_body(root: str) -> dict[str, Any]:
     }
 
 
-def probe(root: str, timeout_s: float = DEFAULT_TIMEOUT_S,
-          *, write: bool = True) -> dict[str, Any]:
-    """Run the read-only directory probe in a killable process group."""
+def probe(root: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
+    """Run the metadata probe behind a process-group deadline."""
     if timeout_s <= 0:
-        return {"ok": False, "reason": "invalid timeout", "path": root}
-    code = (
-        "import os,sys; p=sys.argv[1]; fd=os.open(p, os.O_RDONLY|getattr(os,'O_DIRECTORY',0)); "
-        "s=os.fstat(fd); os.close(fd); print(s.st_dev)"
-    )
+        raise ValueError("timeout must be positive")
     try:
-        from bounded_subprocess import run_bounded
-        completed = run_bounded([sys.executable, "-c", code, root],
-                                timeout=timeout_s, operation="store_probe")
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or f"exit {completed.returncode}"
-            return {"ok": False, "reason": detail, "path": root}
-        return {"ok": True, "path": root,
-                "device_id": completed.stdout.strip(),
-                "latency_ms": None, "checked_at": int(time.time()),
-                "read_only": True}
-    except Exception as exc:  # noqa: BLE001 - typed failure for watchdog
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "path": root}
+        completed = run_bounded(
+            [sys.executable, __file__, "--probe-child", root],
+            timeout=timeout_s,
+            operation="tart_store_probe",
+        )
+        require_success(completed, operation="tart_store_probe")
+    except ObservationError as exc:
+        if exc.kind == "timeout":
+            reason = f"timeout after {timeout_s:g}s"
+        else:
+            reason = f"{exc.kind}: {exc.detail}"
+        return {"ok": False, "reason": reason, "path": root,
+                "kind": exc.kind}
+    try:
+        value = json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "reason": f"invalid probe output: {exc}",
+                "path": root, "kind": "invalid_output"}
+    if not isinstance(value, dict) or value.get("ok") is not True:
+        return {"ok": False, "reason": "invalid probe result", "path": root,
+                "kind": "invalid_output"}
+    return value
 
 
 def next_state(previous: dict[str, Any], result: dict[str, Any],
@@ -100,3 +115,10 @@ def save(path: str, state: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, destination)
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--probe-child":
+    # This mode is intentionally tiny and side-effect free.  The parent
+    # process owns the deadline and terminates the complete process group if
+    # open/fstat/close blocks in a failing mount path.
+    print(json.dumps(_probe_body(sys.argv[2]), sort_keys=True))
