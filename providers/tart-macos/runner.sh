@@ -196,6 +196,14 @@ esac
 LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
+# Read-only Tart-store liveness probe.  The helper owns a process-group
+# deadline, so a wedged APFS/USB path cannot strand this supervisor.  A probe
+# failure yields before any new VM clone; active guests are left alone.
+STORAGE_HEALTH_TIMEOUT="${TARTCI_STORAGE_HEALTH_TIMEOUT_SECS:-5}"
+case "$STORAGE_HEALTH_TIMEOUT" in
+  ''|*[!0-9]*|0) STORAGE_HEALTH_TIMEOUT=5 ;;
+esac
+[ "$STORAGE_HEALTH_TIMEOUT" -le 30 ] || STORAGE_HEALTH_TIMEOUT=30
 JOB_TIMEOUT="${TARTCI_JOB_TIMEOUT_SECS:-7200}"
 TEARDOWN_STEP_TIMEOUT="${TARTCI_TEARDOWN_STEP_TIMEOUT_SECS:-5}"
 case "$TEARDOWN_STEP_TIMEOUT" in
@@ -839,6 +847,20 @@ EOF
     rm -f "$tmp_file"
     return 1
   fi
+}
+
+tartci_storage_health_check(){
+  local result=""
+  if result="$(python3 "$TARTCI_ROOT/scripts/store_health.py" \
+      --path "$TART_HOME" --timeout-seconds "$STORAGE_HEALTH_TIMEOUT" --json \
+      2>/dev/null)"; then
+    event storage_health "state=ok path=$TART_HOME"
+    return 0
+  fi
+  event yielded_storage_health "state=unknown path=$TART_HOME reason=probe_failed"
+  heartbeat yielded-storage-health
+  note "Tart store health is unknown — deferring new VM admission"
+  return 75
 }
 
 runtime_emit_complete(){
@@ -2075,6 +2097,10 @@ run_one(){
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
   fi
+  # Storage liveness is a separate admission axis.  A healthy SSH/control
+  # plane does not prove that Tart's store can answer open/fstat; unknown or
+  # timed-out storage yields before a job claim, clone, or VM lease is taken.
+  tartci_storage_health_check || return $?
   # The host's VM DHCP breaker comes first: while the host's DHCP server is
   # not answering no boot can succeed, so nothing else is worth doing, and a
   # lane that backs off here has taken no job claim. Order of the pre-boot

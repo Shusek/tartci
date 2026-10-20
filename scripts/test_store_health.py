@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,12 @@ def main() -> None:
         assert result["ok"] is True, result
         assert result["device_id"]
         assert not list(Path(td).iterdir()), "probe must not create files"
+        cli = subprocess.run(
+            [sys.executable, str(Path(store_health.__file__)), "--path", td, "--json"],
+            capture_output=True, text=True, check=False,
+        )
+        assert cli.returncode == 0, cli.stderr
+        assert '"ok": true' in cli.stdout
 
     with mock.patch.object(
         store_health,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import argparse
 import sys
 import time
 from typing import Any
@@ -117,8 +118,25 @@ def save(path: str, state: dict[str, Any]) -> None:
     os.replace(temporary, destination)
 
 
-if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--probe-child":
-    # This mode is intentionally tiny and side-effect free.  The parent
-    # process owns the deadline and terminates the complete process group if
-    # open/fstat/close blocks in a failing mount path.
-    print(json.dumps(_probe_body(sys.argv[2]), sort_keys=True))
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--probe-child", metavar="PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--path", help="declared Tart store directory")
+    parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument("--json", action="store_true", help="emit the result as JSON")
+    args = parser.parse_args(argv)
+    if args.probe_child is not None:
+        # This mode is intentionally tiny and side-effect free.  The parent
+        # process owns the deadline and terminates the complete process group if
+        # open/fstat/close blocks in a failing mount path.
+        print(json.dumps(_probe_body(args.probe_child), sort_keys=True))
+        return 0
+    if not args.path:
+        parser.error("--path is required")
+    result = probe(args.path, timeout_s=args.timeout_seconds)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("ok") else 75
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

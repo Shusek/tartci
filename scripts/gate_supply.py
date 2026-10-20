@@ -83,6 +83,10 @@ BLOCKED_PHASES = frozenset({
     "scan_blind_escalated", "jit-admission-denied", "vm-lease-denied",
     "vm-lease-infeasible", "admission-precheck-deferred",
     "admission-precheck-error", "teardown-pending",
+    # Tart store liveness is an independent admission axis.  A fresh
+    # heartbeat with this phase proves the supervisor is alive while it is
+    # deliberately refusing new VM work; it never counts as free capacity.
+    "yielded-storage-health", "yielded_storage_health",
     # lease-fit.lib.sh: this lane's VM lease cannot be granted now, or ever.
     "lease-wait", "lease-never-fits",
     # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.
