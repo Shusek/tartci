@@ -95,6 +95,18 @@ class ClassifyAndFitTests(unittest.TestCase):
             lane_env(), {"ts": stamp(10), "phase": "waiting"}, MERGE, [MERGE, PR], time.time())
         self.assertEqual(control, "free")
 
+    def test_tart_storage_health_is_required_for_capacity(self) -> None:
+        missing, detail = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "ts": stamp(5), "phase": "waiting"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(missing, "unknown")
+        self.assertIn("storage health", detail)
+        healthy, _ = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "storage_health": "ok",
+                         "ts": stamp(5), "phase": "waiting"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(healthy, "free")
+
     def test_a_lane_in_flight_for_the_other_class_does_not_cover_this_one(self) -> None:
         state, _ = gate_supply.classify_lane(
             lane_env(), {"ts": stamp(5), "phase": "booting", "labels": f"a,b,{PR}"},
