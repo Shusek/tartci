@@ -52,7 +52,7 @@ def main() -> None:
     assert second["state"] == "draining"
     assert second["drain_required"] is True
     recovered = store_health.next_state(
-        second, {"ok": True, "device_id": "same", "path": "/Volumes/Atelier/VMs"})
+        second, {"ok": True, "device_id": "same", "path": "/Volumes/Example/VMs"})
     assert recovered["state"] == "healthy"
     assert recovered["consecutive_failures"] == 0
     assert recovered["drain_required"] is False
