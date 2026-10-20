@@ -594,23 +594,14 @@ def resolve_tart_cli() -> tuple[str | None, str]:
 
 
 def _profile_tart_home(profile_path: str) -> str | None:
-    """Read the installed fleet profile without requiring interactive shell state."""
+    """Read the installed fleet profile behind a killable deadline."""
     # Do not implement a partial TOML parser on Apple's older system Python. A
     # launchd service already carries explicit TART_HOME; an interactive caller
     # without tomllib must supply it too. Partial parsing could accept a torn or
     # otherwise malformed profile and turn corruption into a false idle result.
     if tomllib is None:
         return None
-    try:
-        with open(profile_path, "rb") as fh:
-            parsed = tomllib.load(fh)
-            host = parsed.get("host")
-            if not isinstance(host, dict):
-                return None
-            value = host.get("tart_home")
-            return value.strip() if isinstance(value, str) and value.strip() else None
-    except (OSError, ValueError):
-        return None
+    return store_health.profile_tart_home(profile_path)
 
 
 def resolve_tart_home() -> tuple[str | None, str]:

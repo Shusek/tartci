@@ -17,6 +17,13 @@ from bounded_subprocess import ObservationError, require_success, run_bounded
 DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_FAILURE_THRESHOLD = 2
 
+_PROFILE_TART_HOME_CODE = (
+    "import sys,tomllib; "
+    "p=tomllib.load(open(sys.argv[1],'rb')); "
+    "h=p.get('host',{}); v=h.get('tart_home') if isinstance(h,dict) else None; "
+    "print(v.strip() if isinstance(v,str) and v.strip() else '')"
+)
+
 
 def _probe_body(root: str) -> dict[str, Any]:
     """Inspect one directory without creating or removing anything.
@@ -74,6 +81,21 @@ def probe(root: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
         return {"ok": False, "reason": "invalid probe result", "path": root,
                 "kind": "invalid_output"}
     return value
+
+
+def profile_tart_home(profile_path: str, timeout_s: float = 2.0) -> str | None:
+    """Read only the declared Tart path in a killable child process."""
+    try:
+        completed = run_bounded(
+            [sys.executable, "-c", _PROFILE_TART_HOME_CODE, profile_path],
+            timeout=timeout_s,
+            operation="tart_profile_read",
+        )
+        require_success(completed, operation="tart_profile_read")
+    except (ObservationError, OSError, ValueError):
+        return None
+    value = completed.stdout.strip()
+    return value or None
 
 
 def next_state(previous: dict[str, Any], result: dict[str, Any],
