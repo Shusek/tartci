@@ -856,11 +856,13 @@ tartci_storage_health_check(){
       --path "$TART_HOME" --timeout-seconds "$STORAGE_HEALTH_TIMEOUT" --json \
       2>/dev/null)"; then
     STORAGE_HEALTH_STATE=ok
-    event storage_health "state=ok path=$TART_HOME"
+    event storage_health "Tart store probe succeeded" \
+      "state=ok" "path=$TART_HOME"
     return 0
   fi
   STORAGE_HEALTH_STATE=unknown
-  event yielded_storage_health "state=unknown path=$TART_HOME reason=probe_failed"
+  event yielded_storage_health "Tart store probe failed" \
+    "state=unknown" "path=$TART_HOME" "reason=probe_failed"
   heartbeat yielded-storage-health
   note "Tart store health is unknown — deferring new VM admission"
   return 75
