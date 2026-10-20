@@ -107,6 +107,13 @@ class ClassifyAndFitTests(unittest.TestCase):
             MERGE, [MERGE, PR], time.time())
         self.assertEqual(healthy, "free")
 
+        unhealthy, detail = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "storage_health": "unknown",
+                         "ts": stamp(5), "phase": "yielded-storage-health"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(unhealthy, "unknown")
+        self.assertIn("storage health", detail)
+
     def test_a_lane_in_flight_for_the_other_class_does_not_cover_this_one(self) -> None:
         state, _ = gate_supply.classify_lane(
             lane_env(), {"ts": stamp(5), "phase": "booting", "labels": f"a,b,{PR}"},

@@ -51,6 +51,11 @@ def main() -> None:
     second = store_health.next_state(first, {"ok": False, "reason": "timeout"})
     assert second["state"] == "draining"
     assert second["drain_required"] is True
+    recovered = store_health.next_state(
+        second, {"ok": True, "device_id": "same", "path": "/Volumes/Atelier/VMs"})
+    assert recovered["state"] == "healthy"
+    assert recovered["consecutive_failures"] == 0
+    assert recovered["drain_required"] is False
     changed = store_health.next_state(
         {"last_result": {"ok": True, "device_id": "old"}},
         {"ok": True, "device_id": "new"}, threshold=1)
