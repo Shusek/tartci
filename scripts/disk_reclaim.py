@@ -1298,7 +1298,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # before the re-measure, so the floor below is judged on what both freed.
     # Their gates are theirs; nothing here narrows or widens them.
     progress.emit("pulp reapers: checking the fleet profile", force=True)
-    pulp = pulp_reapers.run(fix=args.fix, state_dir=state_dir(args), discovered_roots=roots)
+    pulp_skip = pulp_reapers.skip_reason_for_scan_timeouts(SCAN_TIMEOUTS)
+    pulp = pulp_reapers.run(
+        fix=args.fix, state_dir=state_dir(args), discovered_roots=roots,
+        deadline=PASS_DEADLINE, skip_reason=pulp_skip)
     receipt["pulp_reapers"] = pulp
     # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
     # gates). A live build naming one protects it, exactly as for build dirs;

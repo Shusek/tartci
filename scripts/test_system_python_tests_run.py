@@ -237,6 +237,9 @@ ALLOWED = {
      "DiskReclaimIntegration.test_the_reclaim_pass_hands_its_scan_roots_to_the_reapers"):
         reads_profile("pulp_reapers.run()"),
     ("test_pulp_reapers.py",
+     "DiskReclaimIntegration.test_scan_timeout_skips_pulp_reapers_and_is_recorded"):
+        "3.11-only: builds a temporary [reclaim] profile with tomllib to verify a timed-out root is skipped",
+    ("test_pulp_reapers.py",
      "EndToEnd.test_build_cov_runs_even_without_pressure_but_worktree_reaper_does_not"):
         reads_profile("pulp_reapers.run()"),
     ("test_pulp_reapers.py",
@@ -245,6 +248,15 @@ ALLOWED = {
     ("test_pulp_reapers.py",
      "EndToEnd.test_two_day_old_build_cov_idle_goes_active_stays"):
         reads_profile("pulp_reapers.run()"),
+    ("test_pulp_reapers.py",
+     "VolumeStallGuards.test_explicit_skip_does_not_materialize_or_invoke_a_reaper"):
+        "3.11-only: builds a temporary [reclaim] profile with tomllib to verify fail-closed skipping",
+    ("test_pulp_reapers.py",
+     "VolumeStallGuards.test_scan_timeout_overlapping_configured_root_returns_a_skip_reason"):
+        "3.11-only: builds a temporary [reclaim] profile with tomllib to verify path overlap evidence",
+    ("test_pulp_reapers.py",
+     "VolumeStallGuards.test_timeout_on_an_unrelated_root_does_not_skip_reapers"):
+        "3.11-only: builds a temporary [reclaim] profile with tomllib to verify unrelated roots remain eligible",
     ("test_pulp_reapers.py",
      "Materialize.test_origin_without_tools_ci_is_refused_and_nothing_runs"):
         reads_profile("pulp_reapers.run()"),
