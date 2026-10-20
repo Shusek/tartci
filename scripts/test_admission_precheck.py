@@ -134,7 +134,8 @@ class RunOneHarness:
         )
 
     def run(self, *, source_override: str | None = None,
-            inventory: str = "0", storage_health_rc: int = 0) -> subprocess.CompletedProcess:
+            inventory: str = "0", storage_health_rc: int = 0,
+            claim_dir: str | None = None) -> subprocess.CompletedProcess:
         source = (
             MACOS_RUNNER.read_text(encoding="utf-8")
             if source_override is None
@@ -243,10 +244,8 @@ class RunOneHarness:
                 # let an earlier test degrade a later test into an admit.
                 "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(self.tmp / "breaker"),
                 # Keep the real claim implementation hermetic. Integration
-                # callers can override this through their parent environment.
-                "TARTCI_JOB_CLAIM_DIR": os.environ.get(
-                    "TARTCI_JOB_CLAIM_DIR", str(self.tmp / "claims")
-                ),
+                # callers pass an explicit existing store when needed.
+                "TARTCI_JOB_CLAIM_DIR": claim_dir or str(self.tmp / "claims"),
                 # This harness stops at the clone; a parallel boundary proof
                 # started beside it would outlive the harness. The parallel
                 # path has its own tests in test_boundary_proof_parallel.py.
