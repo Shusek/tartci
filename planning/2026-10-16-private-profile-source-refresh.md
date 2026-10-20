@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation and verification repair merged; canary cleared; rollout gated
+Status: implementation and verification repair merged; canary passed; rollback and wider rollout remain gated
 
 ## Goal
 
@@ -33,13 +33,13 @@ https://github.com/danielraffel/tartci/pull/605. It reconstructs the selected
 source from the installed receipt, validates the marker and bytes, and restores
 the process environment after resolution. It also keeps public and legacy
 receipts on the immutable public support root even when private-source
-variables are present. It must be installed on the canary and verified before
-rollout resumes.
+variables are present. The related source-move rate-limit fix is in
+https://github.com/danielraffel/tartci/pull/606. Both are merged in current
+main.
 
 ## Rollout gates
 
-1. Install the current main generation, including the verification repair, on
-   the selected canary.
+1. Install the current main generation on the selected canary.
 2. Export the private authority at one immutable commit and configure only the
    canary to use it.
 3. Run standalone verification and confirm pool readiness, source provenance,
@@ -88,7 +88,19 @@ and landed.
 ## Current rollout status
 
 The private authority projection was rerun against fresh exact `origin/main`
-checkouts of TartCI and Pulp and passed. Current reachable fleet receipts use
-the public source, the pools are ready, and no external-source canary is active.
-The wider rollout remains stopped until PR 606 is reviewed and landed, then
-requires a fresh canary assignment, soak, and rollback proof.
+checkouts of TartCI and Pulp and passed. The selected canary now uses the
+immutable private source and passed standalone verification, source
+provenance, published-supply, rendered-launch, and readiness checks. The other
+reachable hosts remain on the public source.
+
+During the rollout gate, a completed update on another host left its pool
+services loaded but its participation state off. The supported `pool on` path
+restored all supervisors and `fleet_ready=yes`; no state files were edited by
+hand. The update status also retained a stale failed-attempt guard, so the
+host was deliberately left on the public generation until a later reviewed
+retry. This is evidence for a follow-up self-update recovery test, not a reason
+to bypass the capacity floor.
+
+The wider rollout remains stopped until the canary has a documented soak and
+rollback to the checked-in source. After that, each additional host needs its
+own reviewed, one-host-at-a-time rollout and the same verification record.
