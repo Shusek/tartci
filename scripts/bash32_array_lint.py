@@ -21,7 +21,9 @@ and pass. A line whose array is provably non-empty can say so instead:
 
     "${files[@]}"   # bash32-lint: nonempty <why it cannot be empty>
 
-The reason is required. Shell files are found the way scripts/lint.sh finds
+The reason is required. A sourced library (`*.lib.sh`) is checked even when
+it does not turn on nounset itself, since it runs under its caller's.
+Shell files are found the way scripts/lint.sh finds
 them: `*.sh` plus extensionless files with a bash shebang, except the
 verbatim copies of other repositories' scripts under tests/fixtures.
 
@@ -66,6 +68,12 @@ def uses_nounset(text: str) -> bool:
     return NOUNSET.search(text) is not None
 
 
+def is_sourced_library(path: Path) -> bool:
+    """A `*.lib.sh` file is sourced into its caller and runs under the
+    caller's `set -u`, so it is checked whether or not it sets nounset itself."""
+    return path.name.endswith(".lib.sh")
+
+
 def shell_files(root: Path) -> list[Path]:
     """`*.sh` plus extensionless files with a bash shebang, as lint.sh finds them."""
     out = []
@@ -100,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{path}: cannot read: {exc}", file=sys.stderr)
             total += 1
             continue
-        if not uses_nounset(text):
+        if not (uses_nounset(text) or is_sourced_library(path)):
             continue
         for number, name in findings_in(text):
             total += 1
