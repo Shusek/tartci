@@ -17,14 +17,23 @@ class StorageHealthTests(unittest.TestCase):
             args.extend([f"--{key.replace('_', '-')}", str(value)])
         return subprocess.run(args, text=True, capture_output=True, check=False, timeout=10)
 
-    def test_write_fsync_probe_is_healthy(self):
+    def test_metadata_probe_is_healthy_without_creating_files(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "volume"
             root.mkdir()
             state = Path(temp) / "state.json"
             result = self.run_probe(root, state)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["reason"], "write_fsync_unlink_ok")
+            self.assertEqual(json.loads(result.stdout)["reason"], "directory_metadata_ok")
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_missing_path_is_not_created(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "missing-volume"
+            state = Path(temp) / "state.json"
+            result = self.run_probe(root, state)
+            self.assertEqual(result.returncode, 10, result.stderr)
+            self.assertFalse(root.exists())
 
     def test_two_failures_quarantine_and_three_passes_recover(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -89,7 +98,7 @@ class StorageHealthTests(unittest.TestCase):
         self.assertLess(loop.index("tartci_storage_health_check"), loop.index("tartci_warm_tick"))
         self.assertIn("heartbeat yielded-storage-health", runner)
 
-    def test_runner_has_one_storage_gate_and_uses_write_probe(self):
+    def test_runner_has_one_storage_gate_and_uses_read_only_probe(self):
         """The #625 runner gate must not be shadowed by a sourced duplicate."""
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
         self.assertEqual(runner.count("tartci_storage_health_check(){"), 1)
@@ -99,6 +108,12 @@ class StorageHealthTests(unittest.TestCase):
         self.assertIn("scripts/storage_health.py", body)
         self.assertIn("--failure-threshold", body)
         self.assertIn("--recovery-threshold", body)
+        probe = (ROOT / "scripts" / "storage_health.py").read_text()
+        self.assertIn("O_RDONLY", probe)
+        self.assertIn("O_DIRECTORY", probe)
+        self.assertIn("os.fstat", probe)
+        self.assertNotIn("mkstemp(prefix=\".tartci-storage-probe-\"", probe)
+        self.assertNotIn("write_fsync_unlink_ok", probe)
 
     def test_storage_gate_does_not_change_capacity_or_active_vm_state(self):
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()

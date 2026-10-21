@@ -74,16 +74,28 @@ def save_state(path: Path, state: dict) -> None:
 
 
 def probe(path: Path) -> tuple[bool, str, float]:
+    """Inspect the store directory without changing its contents.
+
+    The storage admission check is deliberately metadata-only.  Creating a
+    temporary file, fsyncing it, or unlinking it would turn a diagnostic gate
+    into a write test against the potentially wedged external volume and
+    would violate the read-only recovery contract.  ``open``/``fstat`` still
+    exercise the APFS lookup path that can block, and the caller runs this
+    function in a bounded child process.
+    """
     started = time.monotonic()
+    fd = -1
     try:
-        fd, name = tempfile.mkstemp(prefix=".tartci-storage-probe-", dir=path)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(str(path), flags)
         try:
-            os.write(fd, b"tartci-storage-probe\n")
-            os.fsync(fd)
+            stat = os.fstat(fd)
         finally:
             os.close(fd)
-            os.unlink(name)
-        return True, "write_fsync_unlink_ok", time.monotonic() - started
+            fd = -1
+        if not stat:
+            raise OSError("directory metadata unavailable")
+        return True, "directory_metadata_ok", time.monotonic() - started
     except FileNotFoundError:
         return False, "path_missing", time.monotonic() - started
     except PermissionError:
@@ -92,6 +104,12 @@ def probe(path: Path) -> tuple[bool, str, float]:
         return False, "interrupted_system_call", time.monotonic() - started
     except OSError as exc:
         return False, f"os_error_{exc.errno or 'unknown'}", time.monotonic() - started
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _group_exists(pgid: int) -> bool:
