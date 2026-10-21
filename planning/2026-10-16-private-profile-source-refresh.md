@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation and verification repair merged; canary cleared; rollout gated
+Status: implementation and verification repair merged; standalone readiness evidence recorded; canary soak and rollback remain gated
 
 ## Goal
 
@@ -33,13 +33,13 @@ https://github.com/danielraffel/tartci/pull/605. It reconstructs the selected
 source from the installed receipt, validates the marker and bytes, and restores
 the process environment after resolution. It also keeps public and legacy
 receipts on the immutable public support root even when private-source
-variables are present. It must be installed on the canary and verified before
-rollout resumes.
+variables are present. The related source-move rate-limit fix is in
+https://github.com/danielraffel/tartci/pull/606. Both are merged in current
+main.
 
 ## Rollout gates
 
-1. Install the current main generation, including the verification repair, on
-   the selected canary.
+1. Install the current main generation on the selected canary.
 2. Export the private authority at one immutable commit and configure only the
    canary to use it.
 3. Run standalone verification and confirm pool readiness, source provenance,
@@ -88,7 +88,26 @@ and landed.
 ## Current rollout status
 
 The private authority projection was rerun against fresh exact `origin/main`
-checkouts of TartCI and Pulp and passed. Current reachable fleet receipts use
-the public source, the pools are ready, and no external-source canary is active.
-The wider rollout remains stopped until PR 606 is reviewed and landed, then
-requires a fresh canary assignment, soak, and rollback proof.
+checkouts of TartCI and Pulp and passed. The selected canary has standalone
+verification, source provenance, published-supply, rendered-launch, and
+readiness evidence. No per-host go was authorized: **m1 is explicitly
+NO-GO**, no soak was started, and rollback remains an operator-held action with
+no approval or execution receipt. This record does not claim a completed fleet
+canary. The other reachable hosts remain on the public source.
+
+During the rollout gate, a completed update on another host left its pool
+services loaded but its participation state off. The supported `pool on` path
+restored all supervisors and `fleet_ready=yes`; no state files were edited by
+hand. The update status also retained a stale failed-attempt guard, so the
+host was deliberately left on the public generation until a later reviewed
+retry. This is evidence for a follow-up self-update recovery test, not a reason
+to bypass the capacity floor.
+
+The wider rollout remains stopped until the canary has a named per-host go
+decision, a documented soak, and rollback to the checked-in source. No m5s
+sealed-launcher refusal or Tart-store-stall reboot/recovery was executed in
+this window; therefore there are no timestamps or receipts to claim, and m5s
+remains **NO-GO** on the public generation. The next canary packet must record
+those two actions with timestamps before any private-source read or
+participation change. After that, each additional host needs its own reviewed,
+one-host-at-a-time rollout and the same verification record.
