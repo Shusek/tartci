@@ -60,6 +60,7 @@ job finishes -> VM deleted, lease released
   images with `tartci goldens sync`; copy Tart images with `tartci tart-image-sync`.
 - **LaunchAgents** in `launchd/` keep the serving loops running across
   reboots.
+- **Storage health admission (macOS)** — before new VM admission, each supervisor runs a bounded write/fsync/unlink probe against `TART_HOME`; two failures quarantine admission and three successes reopen it. This gate never changes configured leases or VM capacity, so a healthy host retains its configured envelope. Active VMs are left running.
 - **`tartci pool drain` and `tartci pool on`** take a Mac out of the pool and
   bring it back. Drain lets the running job finish.
 
