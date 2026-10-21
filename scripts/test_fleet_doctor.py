@@ -61,7 +61,7 @@ def write_bundle(home: pathlib.Path, commit: str, manifest: str) -> str:
     (bundle / hp.SEALED_BUNDLE_MARKER).write_text(json.dumps({
         "schema": 1, "source_commit": commit,
         "support_manifest_sha256": manifest,
-        "profile_policy_sha256": "0" * 64, "tart_home": "/Volumes/Workshop/VMs"}))
+        "profile_policy_sha256": "0" * 64, "tart_home": "/Volumes/Example/VMs"}))
     program = bundle / "Contents" / "MacOS" / "tartci-launcher"
     program.write_text("#!/bin/sh\n")
     return str(program)
@@ -214,6 +214,133 @@ class GenerationDeliveryTests(unittest.TestCase):
             finding = fd.check_generation_delivery(delivery(home))
         self.assertEqual(finding.state, fd.UNKNOWN)
         self.assertIsNone(finding.facts["can_receive_generation"])
+
+
+# ── Launcher v2 lanes ──────────────────────────────────────────────────────
+
+
+def write_v2_bundle(home: pathlib.Path, generation_entrypoint: str) -> str:
+    """A v2 launcher whose pointer names the generation of `generation_entrypoint`."""
+    bundle = home / ".local" / "libexec" / "TartCILauncher.app"
+    (bundle / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+    (bundle / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
+    pointer = home / ".config" / "tartci" / "launcher-generation.json"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(json.dumps(
+        {"schema": 1, "generation": str(pathlib.Path(generation_entrypoint).parent)}))
+    (bundle / "Contents" / "Resources" / "policy.json").write_text(json.dumps(
+        {"schema": 2, "pointer": str(pointer)}))
+    program = bundle / "Contents" / "MacOS" / "tartci-launcher"
+    program.write_text("#!/bin/sh\n")
+    return str(program)
+
+
+def manifest_digest(entrypoint: str) -> str:
+    import hashlib
+    return hashlib.sha256(
+        (pathlib.Path(entrypoint).parent / hp.GENERATION_MANIFEST).read_bytes()).hexdigest()
+
+
+class LauncherV2DeliveryTests(unittest.TestCase):
+    def test_a_v2_lane_executes_the_generation_its_pointer_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            entry = write_generation(home, COMMIT_A, MANIFEST_A)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL,
+                        write_v2_bundle(home, entry))
+            report = delivery(home)
+            ok = fd.check_executed_generation(
+                report, installed(home, COMMIT_A, manifest_digest(entry)))
+            stale = fd.check_executed_generation(
+                report, installed(home, COMMIT_B, MANIFEST_B))
+            deliverable = fd.check_generation_delivery(report)
+        self.assertEqual(report["lanes"][0]["in_force"]["layout"], "v2")
+        self.assertEqual((ok.state, ok.code), (fd.OK, "effective_generation_matches"))
+        self.assertEqual((stale.state, stale.code),
+                         (fd.PROBLEM, "effective_generation_mismatch"))
+        # An install moves the pointer, so a v2 host is not a sealed v1 bundle.
+        self.assertEqual(deliverable.state, fd.OK)
+
+    def test_a_v2_lane_with_no_pointer_is_unknown_not_agreement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            entry = write_generation(home, COMMIT_A, MANIFEST_A)
+            program = write_v2_bundle(home, entry)
+            (home / ".config" / "tartci" / "launcher-generation.json").unlink()
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, program)
+            finding = fd.check_executed_generation(
+                delivery(home), installed(home, COMMIT_A, manifest_digest(entry)))
+        self.assertEqual(finding.state, fd.UNKNOWN)
+
+
+class LauncherLayoutTests(unittest.TestCase):
+    def test_each_state_has_its_code(self):
+        cases = [
+            (None, fd.UNKNOWN, "launcher_layout_unreadable"),
+            ({"layout": None, "opt_in": "absent"}, fd.NOT_APPLICABLE,
+             "launcher_layout_not_applicable"),
+            ({"layout": "v1", "opt_in": "absent"}, fd.OK, "launcher_layout_v1"),
+            ({"layout": "v2", "opt_in": "present"}, fd.OK, "launcher_layout_v2"),
+            ({"layout": "v1", "opt_in": "refused", "problem": "group-writable"}, fd.PROBLEM,
+             "launcher_opt_in_refused"),
+            ({"layout": "v2", "opt_in": "absent", "problem": "--launcher-layout v1"},
+             fd.PROBLEM, "launcher_opt_in_missing"),
+        ]
+        for value, state, code in cases:
+            with self.subTest(code=code):
+                finding = fd.check_launcher_layout(value)
+                self.assertEqual((finding.state, finding.code), (state, code))
+                self.assertIn(code, fd.CODES)
+        pending = fd.check_launcher_layout({"layout": "v1", "opt_in": "present"})
+        self.assertIn("next install moves this host to v2", pending.detail)
+
+    def test_the_doctor_reads_the_opt_in_and_the_receipt(self):
+        import launcher_layout
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            receipt = home / ".config" / "tartci" / "macos-fleet-install.json"
+            receipt.parent.mkdir(parents=True)
+            receipt.write_text(json.dumps({"launch_helper": {"layout": "v2"}}))
+            value = launcher_layout.status(home, launcher_layout.read_receipt(receipt))
+            finding = fd.check_launcher_layout(value)
+        self.assertEqual(finding.code, "launcher_opt_in_missing")
+
+    def test_receiptless_v2_app_is_reported_without_the_opt_in(self):
+        """Doctor must inspect the recorded launch-helper app when the receipt is gone."""
+        import launcher_layout
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            app = home / "TartCILauncher.app"
+            resources = app / "Contents" / "Resources"
+            resources.mkdir(parents=True)
+            (resources / "policy.json").write_text(json.dumps({"schema": 2}))
+            value = launcher_layout.status(home, None, app=app)
+            finding = fd.check_launcher_layout(value)
+        self.assertEqual(value["layout"], "v2")
+        self.assertEqual(finding.code, "launcher_opt_in_missing")
+        self.assertIn("launcher v2 app", finding.detail)
+        self.assertIn("--launcher-layout v1", finding.detail)
+
+    def test_a_receiptless_host_with_a_v2_app_in_its_profile_reads_as_v2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            config = home / ".config" / "tartci"
+            config.mkdir(parents=True)
+            receipt = config / "macos-fleet-install.json"
+            profile = config / "macos-fleet-profile.toml"
+            app = home / "libexec" / "TartCILauncher.app"
+            (app / "Contents" / "Resources").mkdir(parents=True)
+            (app / "Contents" / "Resources" / "policy.json").write_text(json.dumps({"schema": 2}))
+            # Control: no profile, so nothing names the app and no layout is seen.
+            value = fd.read_launcher_layout(home, receipt, profile)
+            self.assertIsNone(value["layout"])
+            self.assertEqual(fd.check_launcher_layout(value).code, "launcher_layout_not_applicable")
+            profile.write_text(f'[host]\nid = "m1"\n\n[launch_helper]\npath = "{app}"\n')
+            value = fd.read_launcher_layout(home, receipt, profile)
+            finding = fd.check_launcher_layout(value)
+        self.assertEqual(value["layout"], "v2")
+        self.assertEqual(finding.code, "launcher_opt_in_missing")
+        self.assertIn(f"a launcher v2 app at {app}", finding.detail)
 
 
 # ── 3. Can this host drain ─────────────────────────────────────────────────

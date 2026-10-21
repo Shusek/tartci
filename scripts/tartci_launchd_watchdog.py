@@ -63,13 +63,19 @@ import argparse
 import datetime as dt
 import glob
 import json
+import math
 import os
 import plistlib
+from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from typing import Any, NamedTuple
+
+import macos_runner_identity
+import store_health
 
 try:
     import tomllib
@@ -107,6 +113,11 @@ def default_stale_log_seconds() -> int:
 # If launchd does not respawn it, that explicit restart contract has failed; do
 # not make a known-idle lane wait for the generic 30-minute crash-loop bound.
 DEFAULT_RESTART_GRACE_S = 60
+DEFAULT_STALE_BOOT_S = 900  # 15 minutes: a boot/admission phase should make progress
+STALE_BOOT_PHASES = frozenset({
+    "booting", "admission-precheck", "cloning", "registering",
+    "ensuring-runner", "aqua-preflight", "chrome-preflight", "minting-jit",
+})
 # Exit codes with which a tartci agent reports APPLICATION state: the program
 # ran to completion and is reporting a condition a reload cannot fix. Treating
 # those as the crash-loop signature boots out a working agent every hour and
@@ -152,7 +163,6 @@ APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
 # Rate limit: at most this many heals per label inside the window.
 DEFAULT_MAX_HEALS = 3
 DEFAULT_HEAL_WINDOW_S = 3600  # 1 hour
-TART_INVENTORY_TIMEOUT_S = 15.0
 
 
 def utcnow() -> float:
@@ -178,6 +188,11 @@ class TartVMProbe(NamedTuple):
     reason: str
     executable: str | None
     tart_home: str | None
+
+
+class StaleBootProbe(NamedTuple):
+    stale: bool | None       # None means the lane evidence was unreadable
+    reason: str
 
 
 def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
@@ -206,6 +221,17 @@ def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
             match = re.match(r"-?\d+", val)
             last_exit = int(match.group()) if match else None
     return state, last_exit
+
+
+def parse_launchctl_pid(text: str) -> int | None:
+    """Extract the loaded job's top-level pid from ``launchctl print``."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("pid = "):
+            value = line[len("pid = "):].strip()
+            match = re.match(r"\d+", value)
+            return int(match.group()) if match else None
+    return None
 
 
 def parse_launchctl_exit_timeout(text: str) -> float | None:
@@ -347,17 +373,8 @@ def classify(
     )
 
 
-def _run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, str, str]:
-    """Run a control-plane probe without allowing a wedged store to hang us."""
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        return 124, exc.stdout or "", (
-            f"command timed out after {timeout:.0f}s: {' '.join(cmd)}"
-            if timeout is not None else "command timed out"
-        )
-    except OSError as exc:
-        return 127, "", str(exc)
+def _run(cmd: list[str]) -> tuple[int, str, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -452,6 +469,109 @@ def _program_path_from_plist(plist_path: str) -> str | None:
     return None
 
 
+def _runner_state_from_plist(plist_path: str) -> tuple[str, str] | None:
+    """Return (state directory, runner name) declared by a runner plist."""
+    try:
+        with open(plist_path, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return None
+    try:
+        identity = macos_runner_identity.resolve_plist_identity(
+            data, hostname=socket.gethostname()
+        )
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return identity.state_dir, identity.runner_name
+
+
+def _launchd_owns_pid(launchd_pid: int | None, supervisor_pid: int) -> bool:
+    """Accept the direct child used by the sealed launch-helper wrapper."""
+    if launchd_pid is None:
+        return False
+    if launchd_pid == supervisor_pid:
+        return True
+    rc, out, _ = _run(["ps", "-o", "ppid=", "-p", str(supervisor_pid)])
+    if rc != 0:
+        return False
+    try:
+        parents = [int(line.strip()) for line in out.splitlines() if line.strip()]
+    except ValueError:
+        return False
+    return launchd_pid in parents
+
+
+def _pid_start_matches(supervisor_pid: int, recorded: str) -> bool:
+    """Compare the runner's recorded ``ps lstart`` value with the live pid."""
+    rc, out, _ = _run(["ps", "-o", "lstart=", "-p", str(supervisor_pid)])
+    if rc != 0:
+        return False
+    live = " ".join(out.split())
+    return bool(live) and live == " ".join(recorded.split())
+
+
+def probe_stale_boot(
+    plist_path: str,
+    launchd_pid: int | None,
+    now: float | None = None,
+    stale_after_s: int = DEFAULT_STALE_BOOT_S,
+) -> StaleBootProbe:
+    """Detect a supervisor stuck before a VM or job exists.
+
+    This is deliberately narrower than the log watchdog. It needs a state file
+    written by this exact lane, the state heartbeat must be old, its supervisor
+    pid must match launchd's current pid, and the phase must name a boot or
+    admission operation with no run/job identity. Missing or malformed evidence
+    is unknown and callers must not heal on it.
+    """
+    declared = _runner_state_from_plist(plist_path)
+    if declared is None:
+        return StaleBootProbe(False, "lane does not declare a TartCI state file")
+    state_dir, runner = declared
+    path = os.path.join(state_dir, f"{runner}.state.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            raise ValueError("state is not an object")
+        phase = state.get("phase")
+        ts = state.get("ts")
+        supervisor_pid = state.get("supervisor_pid")
+        if not isinstance(phase, str) or isinstance(ts, bool) or not isinstance(ts, (int, float, str)):
+            raise ValueError("missing phase or timestamp")
+        if phase not in STALE_BOOT_PHASES:
+            return StaleBootProbe(False, f"phase={phase}")
+        if state.get("run_id") or state.get("job_id"):
+            return StaleBootProbe(False, "boot phase has an active run/job identity")
+        if not isinstance(supervisor_pid, str) or not supervisor_pid.isdigit():
+            raise ValueError("missing supervisor pid")
+        supervisor_pid_int = int(supervisor_pid)
+        if not _launchd_owns_pid(launchd_pid, supervisor_pid_int):
+            return StaleBootProbe(False, "state supervisor pid does not match launchd")
+        started_at = state.get("supervisor_pid_started_at")
+        if not isinstance(started_at, str) or not started_at.strip():
+            return StaleBootProbe(None, "lane state has no supervisor start identity")
+        if not _pid_start_matches(supervisor_pid_int, started_at):
+            return StaleBootProbe(False, "supervisor pid start time does not match state")
+        if isinstance(ts, str):
+            parsed_dt = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed_dt.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+            parsed_ts = parsed_dt.timestamp()
+        else:
+            parsed_ts = float(ts)
+        if not math.isfinite(parsed_ts):
+            raise ValueError("timestamp is not finite")
+        age = max(0.0, (time.time() if now is None else now) - parsed_ts)
+        if age <= stale_after_s:
+            return StaleBootProbe(False, f"phase={phase}, heartbeat age {int(age)}s")
+        return StaleBootProbe(True, f"phase={phase}, heartbeat stale {int(age)}s")
+    except FileNotFoundError:
+        return StaleBootProbe(False, f"lane state file not present at {path}")
+    except (OSError, OverflowError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return StaleBootProbe(None, f"lane state unavailable at {path}: {exc}")
+
+
 def resolve_tart_cli() -> tuple[str | None, str]:
     """Resolve Tart without assuming an interactive shell has Homebrew on PATH."""
     configured = os.environ.get("TARTCI_TART_CLI", "").strip()
@@ -474,33 +594,30 @@ def resolve_tart_cli() -> tuple[str | None, str]:
 
 
 def _profile_tart_home(profile_path: str) -> str | None:
-    """Read the installed fleet profile without requiring interactive shell state."""
+    """Read the installed fleet profile behind a killable deadline."""
     # Do not implement a partial TOML parser on Apple's older system Python. A
     # launchd service already carries explicit TART_HOME; an interactive caller
     # without tomllib must supply it too. Partial parsing could accept a torn or
     # otherwise malformed profile and turn corruption into a false idle result.
     if tomllib is None:
         return None
-    try:
-        with open(profile_path, "rb") as fh:
-            parsed = tomllib.load(fh)
-            host = parsed.get("host")
-            if not isinstance(host, dict):
-                return None
-            value = host.get("tart_home")
-            return value.strip() if isinstance(value, str) and value.strip() else None
-    except (OSError, ValueError):
-        return None
+    return store_health.profile_tart_home(profile_path)
 
 
 def resolve_tart_home() -> tuple[str | None, str]:
-    """Resolve the declared Tart store; never silently inspect Tart's default store."""
+    """Resolve the declared Tart store without touching the store path.
+
+    Existence and mount health belong to :func:`store_health.probe`, which is
+    run in a bounded child.  Calling ``isdir`` here would perform an unbounded
+    APFS lookup before that deadline and can strand this watchdog on the exact
+    failure mode it is meant to report.
+    """
     configured = os.environ.get("TART_HOME", "").strip()
     if configured:
         expanded = os.path.abspath(os.path.expanduser(configured))
-        if os.path.isabs(configured) and os.path.isdir(expanded):
+        if os.path.isabs(configured):
             return expanded, f"resolved from TART_HOME={configured}"
-        return None, f"TART_HOME is not an existing absolute directory: {configured}"
+        return None, f"TART_HOME is not an absolute directory: {configured}"
 
     profile_path = os.environ.get(
         "TARTCI_MACOS_FLEET_PROFILE",
@@ -509,10 +626,10 @@ def resolve_tart_home() -> tuple[str | None, str]:
     profile_home = _profile_tart_home(profile_path)
     if profile_home:
         expanded = os.path.abspath(os.path.expanduser(profile_home))
-        if os.path.isabs(profile_home) and os.path.isdir(expanded):
+        if os.path.isabs(profile_home):
             return expanded, f"resolved from installed fleet profile: {profile_path}"
         return None, (
-            f"installed fleet profile declares unavailable Tart store: {profile_home} "
+            f"installed fleet profile declares a non-absolute Tart store: {profile_home} "
             f"({profile_path})"
         )
     return None, (
@@ -525,20 +642,24 @@ def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
     env = dict(os.environ)
     env["TART_HOME"] = tart_home
     try:
-        process = subprocess.run(
+        process = store_health.run_bounded(
             [tart_cli, "list", "--format", "json"],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=TART_INVENTORY_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return 124, exc.stdout or "", (
-            f"tart list timed out after {TART_INVENTORY_TIMEOUT_S:.0f}s"
-        )
-    except OSError as exc:
-        return 127, "", str(exc)
-    return process.returncode, process.stdout, process.stderr
+            timeout=30, operation="tart_inventory", env=env)
+        return process.returncode, process.stdout, process.stderr
+    except store_health.ObservationError as exc:
+        return 124 if exc.kind == "timeout" else 127, "", str(exc)
+
+
+def probe_tart_vm_running_after_storage(
+    storage_health: dict[str, Any],
+) -> TartVMProbe:
+    """Skip Tart inventory whenever storage health is not proven healthy."""
+    if storage_health.get("state") != "healthy":
+        path = storage_health.get("path")
+        reason = storage_health.get("reason") or storage_health.get(
+            "last_result", {}).get("reason", "storage health is not healthy")
+        return TartVMProbe(None, f"Tart store health unavailable: {reason}", None, path)
+    return probe_tart_vm_running()
 
 
 def probe_tart_vm_running() -> TartVMProbe:
@@ -585,7 +706,7 @@ def probe_tart_vm_running() -> TartVMProbe:
             tart_cli,
             tart_home,
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         return TartVMProbe(
             None,
             f"Tart VM inventory unavailable via {tart_cli} in {tart_home}: {exc}",
@@ -607,6 +728,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
                   vm_probe_reason: str = "Tart VM inventory unavailable") -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
+    launchd_pid = parse_launchctl_pid(out) if rc == 0 else None
     log_path = _log_path_from_plist(plist_path)
     log_age: float | None = None
     if log_path and os.path.exists(log_path):
@@ -704,8 +826,29 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
             "only repeat it — read its log",
         )
     expected_loaded = pool_participating and pool_runner
+    # A Tart child can wedge before it ever appears in `tart list`, leaving a
+    # fresh supervisor and a misleadingly healthy launchd job. The lane-local
+    # heartbeat catches that case, but only an idle, readable Tart inventory may
+    # authorize recovery.
+    if expected_loaded and ".tart-runner-macos" in label and vm_running is False:
+        boot_probe = probe_stale_boot(plist_path, launchd_pid)
+        if boot_probe.stale:
+            return AgentHealth(
+                label, plist_path, log_path, state, last_exit, log_age, "wedged",
+                f"{boot_probe.reason}; no Tart VM is running",
+            )
+        if boot_probe.stale is None:
+            return AgentHealth(
+                label, plist_path, log_path, state, last_exit, log_age, "unknown",
+                f"{boot_probe.reason}; refusing stale boot recovery",
+            )
+    # The inventory probe is Tart-specific. Never let an idle Tart store
+    # authorize recovery of a QEMU lane, whose guest state is independent.
+    classify_vm_running = (
+        None if ".qemu-runner" in label or ".tart-runner-linux" in label else vm_running
+    )
     verdict, reason = classify(
-        state, last_exit, log_age, effective_stale_s, vm_running, expected_loaded,
+        state, last_exit, log_age, effective_stale_s, classify_vm_running, expected_loaded,
         restart_grace_s, vm_probe_reason
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
@@ -866,15 +1009,30 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
         print(f"launchd-watchdog: REFUSE: no plist for {label} at {plist}",
               file=sys.stderr)
         return RELOAD_REFUSED if dry_run else RELOAD_FAILED
-    if not allow_mid_job:
+    def log(outcome: str) -> None:
+        # Who reloaded which lane (scripts/manual_change_log.py); never fails.
+        if dry_run:
+            return
+        try:
+            import manual_change_log  # noqa: PLC0415 - sibling module
+            manual_change_log.record("launchd reload", outcome,
+                                     [label] + (["--force"] if allow_mid_job else []))
+        except Exception:  # noqa: BLE001 - the record never blocks the reload
+            pass
+
+    if allow_mid_job:
+        log("forced: mid-job check skipped")
+    else:
         refusal = mid_job_refusal(label, launch_agents_dir)
         if refusal is not None:
+            log(f"refused: {refusal}")
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "
                   "tartci pool drain so it finishes its job and stops.\n"
                   "  Override (kills the job): tartci launchd reload "
-                  f"{label} --allow-mid-job", file=sys.stderr)
+                  f"{label} --force (or --allow-mid-job)", file=sys.stderr)
             return RELOAD_REFUSED
+        log("proceeding: lane idle")
     plan = plan_reload(label, plist)
     if not plan.proceed:
         print(f"launchd-watchdog: REFUSE: {plan.reason}", file=sys.stderr)
@@ -1347,6 +1505,142 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
+    """Raise one issue while a tartci LaunchAgent on this host refuses to run
+    an unpinned interpreter (scripts/interpreter_alert.py). Never raises."""
+    try:
+        import interpreter_alert  # noqa: PLC0415 - sibling module
+        return interpreter_alert.alert_pass(utcnow() if now is None else now,
+                                            issue=issue, close=close)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter check FAILED "
+                f"({type(exc).__name__}: {exc})")
+
+
+def interpreter_grant_pass(now: float | None = None, probe=None, issue=None,
+                           close=None) -> str | None:
+    """About hourly, prove this host's current lane interpreters can still use
+    the VM store from launchd, and raise one issue when one cannot
+    (scripts/interpreter_grant_check.py). Never takes the host off; never raises."""
+    try:
+        import interpreter_grant_check as grant  # noqa: PLC0415 - sibling module
+        kwargs = {"issue": issue, "close": close}
+        if probe is not None:
+            kwargs["probe"] = probe
+        return grant.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN interpreter-grant check FAILED "
+                f"({type(exc).__name__}: {exc}); a revoked grant would not be reported")
+
+
+def scratch_vm_pass(now: float | None = None, tart=None) -> str | None:
+    """Warn 30 min before a scratch VM's TTL, then stop and delete it
+    (scripts/scratch_vm_ttl.py). Acts only on VMs that command recorded. Never raises."""
+    try:
+        import scratch_vm_ttl  # noqa: PLC0415 - sibling module; standard library only
+        kwargs = {} if tart is None else {"tart": tart}
+        lines = scratch_vm_ttl.enforce(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN scratch-vm check FAILED "
+                f"({type(exc).__name__}: {exc}); no scratch VM was stopped")
+    return "\n".join(lines) or None
+
+
+def host_hygiene_pass(now: float | None = None, **kwargs) -> str | None:
+    """Disk floor and foreign VMs on this host, report-only
+    (scripts/host_hygiene.py). Off unless the host opts in. Never raises."""
+    try:
+        import host_hygiene  # noqa: PLC0415 - sibling module
+        lines = host_hygiene.alert_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-hygiene check FAILED "
+                f"({type(exc).__name__}: {exc}); a full disk or a stray VM would not be reported")
+    return "\n".join(lines) or None
+
+
+def store_stall_pass(now: float | None = None, **kwargs) -> str | None:
+    """At most every 15 min, probe the store volumes the profile names and cache
+    the result for pool status (scripts/store_stall.py). A volume whose earlier
+    probe is still hanging gets no new one. Never raises."""
+    try:
+        import store_stall  # noqa: PLC0415 - sibling module
+        return store_stall.watchdog_pass(now=now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN store-stall check FAILED "
+                f"({type(exc).__name__}: {exc}); a stalled store would not be reported")
+
+
+def agent_cargo_pass(now: float | None = None, **kwargs) -> str | None:
+    """About hourly, name agents' stale Cargo target dirs, and delete them on a
+    host that opted in (scripts/agent_cargo_reap.py). Never raises."""
+    try:
+        import agent_cargo_reap  # noqa: PLC0415 - sibling module
+        lines = agent_cargo_reap.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN agent-cargo check FAILED "
+                f"({type(exc).__name__}: {exc}); stale build caches would not be reported")
+    return "\n".join(lines) or None
+
+
+def git_maintenance_pass(now: float | None = None, **kwargs) -> str | None:
+    """WARN on a git maintenance stampede; run the opted-in nightly pass
+    (scripts/git_maintenance_guard.py). Never raises."""
+    try:
+        import git_maintenance_guard  # noqa: PLC0415 - sibling module
+        lines = git_maintenance_guard.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN git-maintenance check FAILED "
+                f"({type(exc).__name__}: {exc}); a maintenance stampede would not be reported")
+    return "\n".join(lines) or None
+
+
+def tailnet_pass(now: float | None = None) -> str | None:
+    """Tell someone when a fleet host is off the tailnet or a fallback route
+    to it is broken (scripts/tailnet_peer_alert.py).
+
+    Read-only: one local `tailscale status --json` and one ssh-keyscan per
+    route per tick. A host offline, or online in control with its tailnet
+    route down, for 10 min; this host's own tailscaled down; or a `-lan` /
+    `-wifi` route the fleet-ssh table lists that is dead or reaches another
+    machine, raises an issue through the peer-alert path. Prints a WARN for
+    each. Never raises.
+    """
+    try:
+        import tailnet_peer_alert  # noqa: PLC0415 - sibling module
+        out = tailnet_peer_alert.alert_pass(now=utcnow() if now is None else now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tailnet check FAILED "
+                f"({type(exc).__name__}: {exc}); a host off the tailnet would not be reported")
+    if out.get("skipped"):
+        return None
+    parts = []
+    for host, v in sorted((out.get("hosts") or {}).items()):
+        if v.get("state") in ("local", "local_route_down") and v.get("active"):
+            parts.append(f"this host ({host}) is off the tailnet: {v.get('detail')} "
+                         f"since {v.get('since')}")
+        elif v.get("state") == "offline" and v.get("active"):
+            parts.append(f"{host} offline since {v.get('since')} ({v.get('minutes')} min)")
+        elif v.get("state") == "route_down" and v.get("active"):
+            parts.append(f"{host} online in control but its tailnet route is down since "
+                         f"{v.get('since')} ({v.get('minutes')} min)")
+        elif v.get("state") == "unmapped":
+            parts.append(f"{host} has no tailnet node ({v.get('detail')})")
+        if (v.get("lan_blind") or {}).get("active"):
+            parts.append(f"this host ({host}) cannot reach the LAN since "
+                         f"{v['lan_blind'].get('since')}; fallback routes unchecked "
+                         "(several hosts at once: suspect the router or switch)")
+        for kind, route in sorted((v.get("routes") or {}).items()):
+            if route.get("active"):
+                parts.append(f"{route.get('alias') or host + '-' + kind} ({route.get('addr')}) "
+                             f"{route.get('status')} since {route.get('since')}")
+    if out.get("table"):
+        parts.append(str(out["table"]))
+    if not parts:
+        return None
+    return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN tailnet: "
+            + "; ".join(parts))
+
+
 def resolver_health_pass(now: float | None = None) -> str | None:
     """Publish one resolver/TCP probe for peers to read.
 
@@ -1398,6 +1692,90 @@ def host_off_pass(status_only: bool = False, now: float | None = None) -> str | 
     return None
 
 
+def _serving_truth_host_id() -> str | None:
+    """This host's advertised host_id: TARTCI_HOST_ID, else the installed
+    fleet profile's host.id. None when neither says (never a guess)."""
+    explicit = os.environ.get("TARTCI_HOST_ID", "").strip()
+    if explicit:
+        return explicit
+    if tomllib is None:
+        return None
+    profile = os.environ.get("TARTCI_MACOS_FLEET_PROFILE",
+                             os.path.expanduser("~/.config/tartci/macos-fleet-profile.toml"))
+    try:
+        with open(profile, "rb") as fh:
+            host = tomllib.load(fh).get("host")
+    except (OSError, ValueError):
+        return None
+    value = host.get("id") if isinstance(host, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def serving_truth_pass(now: float | None = None) -> str | None:
+    """Run the rules-only serving monitor for THIS host once per watchdog tick.
+
+    The host judges only itself: its own lane event logs (read back
+    LOOKBACK_SECONDS, not whole) and the queued gate jobs its own published
+    registrations serve. It is shadow unless TARTCI_SERVING_TRUTH_ALARM=on
+    (then it opens one issue per episode); =0 disables the pass. Fail-open
+    for the watchdog: a failure is reported, never turned into a host action.
+    """
+    mode = os.environ.get("TARTCI_SERVING_TRUTH_ALARM", "shadow").lower()
+    if mode == "0":
+        return None
+    stamp = _iso(utcnow() if now is None else now)
+    try:
+        import gate_job_demand  # noqa: PLC0415 - sibling module
+        import host_off  # noqa: PLC0415
+        import serving_truth_alarm  # noqa: PLC0415
+        state = Path(os.environ.get("TARTCI_HOME", os.path.join(os.path.expanduser("~"), ".tartci"))) / "state"
+        events_env = os.environ.get("TARTCI_EVENT_LOG")
+        events = [Path(events_env)] if events_env else sorted((state / "macos-fleet").glob("*/events.jsonl"))
+        events = [p for p in events if p.exists()]
+        if not events:
+            return None
+        me = _serving_truth_host_id()
+        me = gate_job_demand.canonical_host(me) if me else me
+        if not me:
+            return (f"{stamp} launchd-watchdog: WARN serving-truth skipped: this host's host_id is "
+                    "unknown (set TARTCI_HOST_ID or install a fleet profile with host.id)")
+        import fleet_source  # noqa: PLC0415 - sibling module; validates a private source
+        selected = fleet_source.selected_published_supply()
+        advertised_path = str(selected) if selected is not None else ""
+        if not advertised_path:
+            checkout = os.environ.get("TARTCI_CHECKOUT") or host_off._update_checkout()
+            advertised_path = str(Path(checkout) / "fleet/advertised-labels.json") if checkout else ""
+        if not advertised_path:
+            return (f"{stamp} launchd-watchdog: WARN serving-truth skipped: no advertised-labels.json "
+                    "(set TARTCI_ADVERTISED_LABELS or TARTCI_CHECKOUT)")
+        advertised = json.loads(Path(advertised_path).read_text())
+        current = utcnow() if now is None else now
+        jobs, errors = serving_truth_alarm.fetch_demand(
+            os.environ.get("TARTCI_GH_CLI", "ghapp"), advertised, me, current)
+        rows = serving_truth_alarm.read_event_paths(
+            events, current - serving_truth_alarm.LOOKBACK_SECONDS)
+        out = serving_truth_alarm.alert_pass(
+            state / "serving-truth", rows, jobs, me=me,
+            regs=gate_job_demand.registrations(advertised), now=current,
+            shadow=mode != "on", demand_errors=errors)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{stamp} launchd-watchdog: WARN serving-truth check FAILED "
+                f"({type(exc).__name__}: {exc}); no serving alarm was raised")
+    parts = []
+    # Once per episode: a trip whose episode is already open was reported when
+    # it opened, and its evidence stays in the lookback for hours.
+    new = [t for t in out.get("trips") or []
+           if t.get("episode_key") in out.get("opened_keys", ())]
+    if new:
+        parts.append(f"{len(new)} rule trip(s) on {me} "
+                     f"({', '.join(t['rule'] for t in new)}), evidence recorded")
+    if out.get("demand_errors"):
+        parts.append(f"gate demand partly unread: {out['demand_errors'][0]}")
+    if not parts:
+        return None
+    return f"{stamp} launchd-watchdog: WARN serving-truth: " + "; ".join(parts)
+
+
 # ── rate limiting ────────────────────────────────────────────────────────────
 
 def _state_file() -> str:
@@ -1432,6 +1810,77 @@ def save_heal_log(path: str, data: dict[str, list[float]]) -> None:
     os.replace(tmp, path)
 
 
+def store_health_pass(
+    *,
+    participation_file: str,
+    status_only: bool,
+    dry_run: bool,
+    timeout_s: float = 10.0,
+    failure_threshold: int = 2,
+) -> dict[str, Any]:
+    """Probe the Tart store and fail closed after repeated I/O failures.
+
+    State is kept under TARTCI_HOME (normally the internal boot volume).  A
+    store timeout must not strand the watchdog, so the probe itself is always
+    bounded.  Draining is cooperative and leaves running jobs alone; rebooting
+    and process killing are deliberately outside this path.
+    """
+    try:
+        if timeout_s < 1 or timeout_s > 300:
+            return {"state": "unknown", "reason": "invalid store health timeout",
+                    "drain_required": False}
+        if failure_threshold < 1 or failure_threshold > 10:
+            return {"state": "unknown", "reason": "invalid store health threshold",
+                    "drain_required": False}
+        # resolve_tart_home is lexical for TART_HOME; it deliberately does not
+        # call isdir/stat on the potentially wedged store.  The bounded child
+        # below is the only operation that touches that path.
+        tart_home, resolution = resolve_tart_home()
+        if tart_home is None:
+            return {"state": "unknown", "reason": resolution, "drain_required": False}
+        state_path = os.path.join(os.environ.get(
+            "TARTCI_HOME", os.path.expanduser("~/.tartci")),
+            "state", "store-health.json")
+        previous = store_health.load(state_path)
+        result = store_health.probe(tart_home, timeout_s=timeout_s)
+        state = store_health.next_state(previous, result, failure_threshold)
+        state["path"] = tart_home
+        state["resolution"] = resolution
+        state["updated_at"] = int(time.time())
+        if not status_only and not dry_run:
+            store_health.save(state_path, state)
+        # Production pool mutation is an explicit rollout decision.  Keep the
+        # default report-only for this read-only recovery change; a future
+        # drained canary may set TARTCI_STORE_HEALTH_DRAIN=1 after observing
+        # the typed health receipts.
+        drain_enabled = os.environ.get("TARTCI_STORE_HEALTH_DRAIN") == "1"
+        if state.get("drain_required") and not status_only:
+            state["action"] = "would-drain" if dry_run else "drain-required"
+            if not drain_enabled:
+                state["action"] = "report-only"
+            elif not dry_run and pool_participating(participation_file):
+                tartci = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tartci")
+                try:
+                    drained = subprocess.run(
+                        [tartci, "pool", "drain"], text=True,
+                        capture_output=True, timeout=30, check=False,
+                    )
+                    state["drain_result"] = drained.returncode
+                    if drained.returncode == 0:
+                        state["action"] = "drained"
+                    else:
+                        state["action"] = "drain-failed"
+                        state["drain_error"] = (drained.stderr or drained.stdout)[-500:]
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    state["action"] = "drain-failed"
+                    state["drain_error"] = str(exc)
+                store_health.save(state_path, state)
+        return state
+    except Exception as exc:  # noqa: BLE001 - health must not stop the watchdog
+        return {"state": "unknown", "reason": f"store health unavailable: {exc}",
+                "drain_required": False}
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _iso(ts: float) -> str:
@@ -1448,7 +1897,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="report what heal/reload would do; take no action. "
                     "With --reload: exit 0 if it would proceed, 3 if refused")
-    ap.add_argument("--allow-mid-job", action="store_true",
+    ap.add_argument("--allow-mid-job", "--force", dest="allow_mid_job", action="store_true",
                     help="--reload only: proceed even though the lane is "
                     "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1477,6 +1926,8 @@ def main(argv: list[str] | None = None) -> int:
                     default=os.path.join(
                         os.environ.get("HOME", os.path.expanduser("~")),
                         ".config", "tartci", "native-build-participation"))
+    ap.add_argument("--store-health-timeout-seconds", type=float, default=10.0)
+    ap.add_argument("--store-health-failure-threshold", type=int, default=2)
     args = ap.parse_args(argv)
 
     if args.reload:
@@ -1495,12 +1946,18 @@ def main(argv: list[str] | None = None) -> int:
         print(vm_boot_line)
 
     agents = discover_agents(args.launch_agents_dir)
-    # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and
-    # deliberately imprecise in the safe direction: neither wedge signature fires
-    # while anything is building, so a busy host defers a heal to its next idle
-    # window rather than risking a bootout under someone else's live job.
-    vm_probe = probe_tart_vm_running()
     participating = pool_participating(args.participation_file)
+    store_health_result = store_health_pass(
+        participation_file=args.participation_file,
+        status_only=args.status,
+        dry_run=args.dry_run,
+        timeout_s=args.store_health_timeout_seconds,
+        failure_threshold=args.store_health_failure_threshold,
+    )
+    # Compute the VM-running guard ONCE per pass, but only after storage health
+    # is proven. A Tart inventory call can itself block on a wedged external
+    # volume; never let it outrun the bounded storage gate.
+    vm_probe = probe_tart_vm_running_after_storage(store_health_result)
     disabled = disabled_services()
     health = [
         gather_health(lbl, p, args.stale_log_seconds, vm_probe.running, participating,
@@ -1571,12 +2028,39 @@ def main(argv: list[str] | None = None) -> int:
         resolver_line = resolver_health_pass()
         if resolver_line:
             print(resolver_line)
+        serving_line = serving_truth_pass()
+        if serving_line:
+            print(serving_line)
         hold_line = debug_hold_pass()
         if hold_line:
             print(hold_line)
         peer_stall_line = peer_stall_pass()
         if peer_stall_line:
             print(peer_stall_line)
+        tailnet_line = tailnet_pass()
+        if tailnet_line:
+            print(tailnet_line)
+        interpreter_line = interpreter_refusal_pass()
+        if interpreter_line:
+            print(interpreter_line)
+        grant_line = interpreter_grant_pass()
+        if grant_line:
+            print(grant_line)
+        scratch_line = scratch_vm_pass()
+        if scratch_line:
+            print(scratch_line)
+        hygiene_line = host_hygiene_pass()
+        if hygiene_line:
+            print(hygiene_line)
+        cargo_line = agent_cargo_pass()
+        if cargo_line:
+            print(cargo_line)
+        store_line = store_stall_pass()
+        if store_line:
+            print(store_line)
+        git_line = git_maintenance_pass()
+        if git_line:
+            print(git_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
@@ -1624,6 +2108,7 @@ def main(argv: list[str] | None = None) -> int:
                 "executable": vm_probe.executable,
                 "tart_home": vm_probe.tart_home,
             },
+            "store_health": store_health_result,
             "agents": results,
             "config": config,
             "build_disagreement": disagreement,
@@ -1632,6 +2117,12 @@ def main(argv: list[str] | None = None) -> int:
         if not results:
             print(f"{_iso(now)} launchd-watchdog: no managed runner "
                   f"LaunchAgents found")
+        if store_health_result.get("state") != "healthy":
+            last_result = store_health_result.get("last_result", {})
+            print(f"{_iso(now)} launchd-watchdog: store-health: "
+                  f"{store_health_result.get('state')}: "
+                  f"{last_result.get('reason', store_health_result.get('reason', ''))} "
+                  f"[{store_health_result.get('action', 'report-only')}]")
         for r in results:
             mark = {"healthy": "✓", "attention": "!", "wedged": "✗",
                     "broken": "✗", "unknown": "?"}.get(

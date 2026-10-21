@@ -86,7 +86,7 @@ WORK_PATTERNS = (
 # providers/tart-macos/runner.sh `heartbeat` phases. Past waiting: the
 # supervisor has admitted work and owns (or is about to own) a VM or a runner.
 BUSY_PHASES = frozenset({
-    "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
+    "cloning", "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
     "admission-check", "admission-deferred", "admission-error",
     "minting-jit", "idle-wait", "idle-retarget-check",
     "job-running", "cancel-pending-terminal",
@@ -101,6 +101,7 @@ IDLE_PHASES = frozenset({
     "waiting", "loop", "yielding", "draining", "stopped",
     "scan_blind", "scan_blind_escalated", "jit-admission-denied",
     "vm-lease-denied", "admission-precheck-deferred", "admission-precheck-error",
+    "yielded-storage-health",
     # Before the lease: no VM exists yet. The clone that follows is covered
     # by the VM lease and the `tart clone` descendant.
     "admission-precheck",
@@ -111,6 +112,7 @@ IDLE_PHASES = frozenset({
     "lease-wait", "lease-never-fits", "job-claim-covered",
     # The host's VM DHCP breaker is open (vm-dhcp.lib.sh): no VM is cloned.
     "vm-dhcp-breaker-open",
+    "inventory-unavailable",
     # A parked warm VM: booted, holding no job and no cores. Stopping the lane
     # discards it and loses nothing (see parked_warm_vm below).
     "warm-parked",

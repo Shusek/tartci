@@ -59,7 +59,7 @@ def slot2_profile(home: str, tart_home: str, ccache_max_size: str = "40G") -> di
         "WorkingDirectory": home,
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
+        "ProcessType": "Standard",
         "StandardOutPath": log_path,
         "StandardErrorPath": log_path,
         "EnvironmentVariables": {

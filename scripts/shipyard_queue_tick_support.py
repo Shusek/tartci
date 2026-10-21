@@ -8,6 +8,8 @@ import datetime
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -216,6 +218,101 @@ def command_state_rows(args: argparse.Namespace) -> None:
         print("\t".join(row))
 
 
+# How long one `shipyard rescue --superseded-merge-group` may take before the
+# tick gives up on it for this pass.
+REAP_TIMEOUT_SECONDS = 60
+
+
+def _reap_payload(stdout: str) -> dict[str, Any]:
+    data = json.loads(stdout)
+    if not isinstance(data, dict):
+        raise ValueError("rescue output is not a JSON object")
+    inner = data.get("data")
+    data = inner if isinstance(inner, dict) else data
+    if not isinstance(data.get("runs"), list):
+        raise ValueError("rescue output carries no runs list")
+    return data
+
+
+def _reason(row: dict[str, Any]) -> str:
+    evidence = row.get("evidence")
+    if isinstance(evidence, str) and evidence:
+        return evidence
+    if isinstance(evidence, dict):
+        for key in ("reason", "detail", "why"):
+            if isinstance(evidence.get(key), str) and evidence[key]:
+                return evidence[key]
+        return json.dumps(evidence, sort_keys=True)[:240]
+    return "queue ref absent"
+
+
+def command_reap_superseded(args: argparse.Namespace) -> None:
+    """Run Shipyard's superseded merge-group reaper for one repository.
+
+    Never fails the tick: every failure, timeout or unreadable answer prints a
+    one-line summary and returns. `--apply` is passed only when `apply` is 1.
+    Each cancelled (or, in a dry run, would-cancel) run gets one line in the
+    log file: time, host, repository, run id, ref, status and reason.
+    """
+    command = [args.shipyard, "rescue", "--superseded-merge-group", "--repo", args.repo, "--json"]
+    if args.apply == "1":
+        command.append("--apply")
+    mode = "apply" if args.apply == "1" else "dry-run"
+    try:
+        # Its own process group, so a timeout kills every child it started and
+        # nothing is left holding the output pipes open.
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+    except OSError as error:
+        print(f"reap-superseded {args.repo}: mode={mode} could not run shipyard ({error}); skipped")
+        return
+    try:
+        stdout, stderr = process.communicate(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        process.communicate()
+        print(f"reap-superseded {args.repo}: mode={mode} timed out after {args.timeout}s; skipped")
+        return
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    try:
+        payload = _reap_payload(completed.stdout)
+    except (ValueError, json.JSONDecodeError):
+        line = next((part for part in completed.stderr.splitlines() if part.strip()), "no stderr")
+        print(f"reap-superseded {args.repo}: mode={mode} exit {completed.returncode}, "
+              f"unreadable output ({line[:200]}); skipped")
+        return
+    acted = [
+        row for row in payload["runs"]
+        if isinstance(row, dict) and row.get("status") in ("cancelled", "would-cancel", "failed")
+    ]
+    lines = [
+        "\t".join((
+            args.now, args.host, args.repo, str(row.get("run_id")), str(row.get("branch")),
+            str(row.get("status")), _reason(row).replace("\t", " ").replace("\n", " "),
+        ))
+        for row in acted
+    ]
+    if lines:
+        try:
+            log = Path(args.log)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+        except OSError as error:
+            print(f"reap-superseded {args.repo}: could not write {args.log} ({error})")
+    counts: dict[str, int] = {}
+    for row in payload["runs"]:
+        if isinstance(row, dict):
+            counts[str(row.get("status"))] = counts.get(str(row.get("status")), 0) + 1
+    summary = " ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "no candidates"
+    print(f"reap-superseded {args.repo}: mode={mode} exit {completed.returncode} {summary}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -255,6 +352,16 @@ def build_parser() -> argparse.ArgumentParser:
     rows = commands.add_parser("state-rows")
     rows.add_argument("path")
     rows.set_defaults(func=command_state_rows)
+
+    reap = commands.add_parser("reap-superseded")
+    reap.add_argument("shipyard")
+    reap.add_argument("repo")
+    reap.add_argument("apply", choices=("0", "1"))
+    reap.add_argument("log")
+    reap.add_argument("host")
+    reap.add_argument("now")
+    reap.add_argument("--timeout", type=float, default=REAP_TIMEOUT_SECONDS)
+    reap.set_defaults(func=command_reap_superseded)
 
     return parser
 

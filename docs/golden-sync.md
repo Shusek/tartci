@@ -29,9 +29,9 @@ runners. This page is the recipe today, and the design for making it one command
 
 | Host | alias | `TARTCI_GOLDENS` | Volume note |
 |------|-------|------------------|-------------|
-| Mac Studio | `macstudio` | `/Users/danielraffel/VMs/goldens` | primary / baker; internal data vol, runs hot — prune with care |
-| BlackBook (M5) | (local) | `/Users/danielraffel/VMs/goldens` | dev + overflow |
-| MacBook Pro (M1) | `m1` | `/Users/danielraffel/VMs/goldens` | travel; explicit `TARTCI_WIN_GOLDEN` pin (must re-point) |
+| Mac Studio | `macstudio` | `/Users/<you>/VMs/goldens` | primary / baker; internal data vol, runs hot — prune with care |
+| M5 laptop | (local) | `/Users/<you>/VMs/goldens` | dev + overflow |
+| MacBook Pro (M1) | `m1` | `/Users/<you>/VMs/goldens` | travel; explicit `TARTCI_WIN_GOLDEN` pin (must re-point) |
 
 All three use the same path today; confirm `$TARTCI_GOLDENS` per host rather than
 assuming — a host on an external/remote volume would differ.
@@ -52,7 +52,7 @@ assuming — a host on an external/remote volume would differ.
    rsync -a --partial --progress \
      -e "ssh -i ~/.ssh/<key> -o StrictHostKeyChecking=accept-new" \
      $TARTCI_GOLDENS/<golden>.qcow2 $TARTCI_GOLDENS/<golden>.qcow2.sha256 \
-     danielraffel@<PEER_TB_IP>:$TARTCI_GOLDENS/
+     <user>@<PEER_TB_IP>:$TARTCI_GOLDENS/
    ```
 4. **Verify** on the destination: `cd $TARTCI_GOLDENS && shasum -a 256 -c <golden>.qcow2.sha256` → must print `OK`.
 5. **Re-point the runner** only if it has an explicit pin: set (or delete)

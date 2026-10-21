@@ -8,6 +8,9 @@ The janitor is intentionally conservative:
   * GitHub runner deletion only touches stale offline registrations whose
     names match an allowed CI prefix and are not backed by a fresh live
     supervisor heartbeat.
+  * A registration this host could not have minted is never deleted: a
+    declared persistent runner, a name without the per-boot shape, or a
+    runner bound by label to another host (see `foreign_runner_reason`).
 """
 
 from __future__ import annotations
@@ -17,9 +20,12 @@ import datetime as dt
 import json
 import os
 import pathlib
+import plistlib
+import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -121,6 +127,157 @@ def github_cli() -> str:
 
 def starts_with_any(name: str, prefixes: list[str]) -> bool:
     return any(name.startswith(prefix) for prefix in prefixes if prefix)
+
+
+# A runner's state file lives only on the host that minted it, so "no local
+# state" proves ownerlessness only for a registration THIS host mints. Every
+# host's janitor sees every registration in the repository, and GitHub reports
+# a healthy, connected runner as offline for the seconds its broker long-poll
+# stalls. On 2026-09-29 m3's janitor read a bare-metal runner on another host
+# as offline once in 1,618 passes, found no state for it, and deleted the
+# registration; the runner then wiped its own configuration and the lane it
+# served sat dead for sixteen days with nothing alerting.
+PER_BOOT_RUNNER_RE = re.compile(r"^.+-[0-9]+-[0-9]+$")
+
+
+def runner_label_names(runner: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for label in runner.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def foreign_runner_reason(
+    runner: dict[str, Any],
+    persistent: list[str],
+    host_label_prefixes: list[str],
+    own_host_labels: list[str],
+    own_name_prefixes: list[str],
+) -> str:
+    """Why this host must not delete `runner`, or "" when it may.
+
+    Every doubt keeps the registration: a ghost costs one stale row, a wrong
+    delete takes a live lane offline until someone re-registers it by hand.
+    Ownership is checked on two axes, the name this host's lanes mint and the
+    host-bound label they advertise. They are independent only for macOS and
+    Windows runners: Linux per-boot names carry no host, so for Linux runners
+    the label is the only axis, which is why resolve_host_labels refuses an
+    ambiguous label set outright.
+    """
+    name = str(runner.get("name") or "")
+    if name in persistent:
+        return "persistent_runner"
+    if not PER_BOOT_RUNNER_RE.match(name):
+        return "not_a_per_boot_name"
+    if not starts_with_any(name, own_name_prefixes):
+        return "not_this_hosts_prefix"
+    for label in runner_label_names(runner):
+        if starts_with_any(label, host_label_prefixes) and label not in own_host_labels:
+            return f"bound_to_other_host:{label}"
+    return ""
+
+
+# The plists the Linux and Windows lanes are installed from. They are rendered
+# by hand with this host's `pulp-host-<host>` label baked into `--labels`, so
+# the installed files are the ground truth for which host label and name
+# prefix this host's own registrations carry.
+LOCAL_LANE_PLISTS = {
+    "com.danielraffel.pulp.tart-runner-linux.plist": "linux",
+    "com.danielraffel.pulp.qemu-runner-windows.plist": "windows",
+}
+
+
+def resolve_host_labels(
+    collected: list[str], host_label_prefixes: list[str]
+) -> tuple[list[str], str]:
+    """This host's one host-bound label, or none plus a problem when it is ambiguous.
+
+    A host owns exactly one host-bound label. Linux per-boot names carry no
+    host (`linux-ephr-<pid>-<n>` on every host), so for Linux runners the label
+    is the only ownership axis; a lane plist that also advertises another
+    host's label would let this janitor delete that host's runners. More than
+    one distinct host-bound label across the plists and TARTCI_HOST_LABEL
+    (which `collected` includes, so a declared label that disagrees with a
+    plist is the same case) therefore owns none, and the conflict is reported.
+    """
+    bound = sorted({label for label in collected if starts_with_any(label, host_label_prefixes)})
+    if len(bound) > 1:
+        return ([label for label in collected if not starts_with_any(label, host_label_prefixes)],
+                f"host_label_conflict:{','.join(bound)}")
+    return collected, ""
+
+
+def host_slug() -> str:
+    raw = (socket.gethostname().split(".")[0] or "host").lower()
+    return re.sub(r"[^a-z0-9]+", "-", raw).strip("-") or "host"
+
+
+def local_lane_identity(agents_dir: pathlib.Path | None) -> tuple[list[str], list[str]]:
+    """(host-bound labels, per-boot name prefixes) of this host's Linux/Windows lanes."""
+    labels: list[str] = []
+    prefixes: list[str] = []
+    if agents_dir is None:
+        return labels, prefixes
+    for filename, kind in LOCAL_LANE_PLISTS.items():
+        path = agents_dir / filename
+        try:
+            with path.open("rb") as handle:
+                plist = plistlib.load(handle)
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            continue
+        args = [str(a) for a in plist.get("ProgramArguments") or []]
+        env = plist.get("EnvironmentVariables") or {}
+        raw = [args[i + 1] for i, a in enumerate(args[:-1]) if a == "--labels"]
+        raw.append(str(env.get("TARTCI_RUNNER_LABELS") or ""))
+        for chunk in raw:
+            for label in chunk.split(","):
+                label = label.strip()
+                if label and label not in labels:
+                    labels.append(label)
+        if kind == "linux":
+            prefix = "linux-ephr-"
+        else:
+            prefix = str(env.get("TARTCI_RUNNER_NAME_PREFIX") or env.get("PULP_RUNNER_NAME_PREFIX")
+                         or f"win-ephr-{host_slug()}") + "-"
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+    return labels, prefixes
+
+
+def own_lane_name_prefixes(lanes: list[Any]) -> list[str]:
+    """Per-boot name prefixes of this host's own macOS fleet lanes.
+
+    Only the host-specific runner name (`studio-pulp-gate-01`), never the
+    shared lane identity (`pulp-gate-`): another host's lane of the same
+    identity mints names this host must not touch.
+    """
+    prefixes: list[str] = []
+    for lane in lanes:
+        name = getattr(lane, "runner_name", "") or ""
+        if name:
+            # A per-boot name is `<runner_name>-<pid>-<n>`.
+            stem = name.rstrip("-") + "-"
+            if stem not in prefixes:
+                prefixes.append(stem)
+    return prefixes
+
+
+def offline_tracker_path(state_root: str) -> pathlib.Path:
+    return pathlib.Path(state_root).expanduser() / "reap" / "runner-offline.json"
+
+
+def load_offline_tracker(path: pathlib.Path) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def offline_key(runner: dict[str, Any]) -> str:
+    return f"{runner.get('_endpoint') or ''}#{runner.get('id')}#{runner.get('name')}"
 
 
 def is_protected_name(name: str, protected: list[str]) -> bool:
@@ -405,6 +562,79 @@ def lease_references(store_dir: pathlib.Path | None = None) -> set[str] | None:
     return names
 
 
+# A clone left by a lane this host no longer runs (a retired lane, or one
+# renamed) has no loaded runner to match, so the rule above never owned it:
+# m1 kept pulp-preamble-m1-target-06-99292-1 for two months. Such a runner
+# name is still provably this host's when it carries the host id as one of its
+# dash-separated words and starts with an allowed CI prefix or the host id; it
+# must also sit untouched for RETIRED_LANE_MIN_AGE_SECS.
+RETIRED_LANE_MIN_AGE_SECS = 24 * 3600
+
+
+class TartciNames:
+    """Whether the fleet profile, a tartci config file or a LaunchAgent names a
+    VM (a golden, a rollback image): tart_image_prune's ownership rule, read
+    once and only when a retired-lane candidate needs it. Unreadable reads as
+    named."""
+
+    def __init__(self) -> None:
+        self._text: str | None = None
+        self._values: set[str] | None = None
+
+    def __call__(self, name: str) -> bool:
+        import tart_image_prune as prune  # noqa: PLC0415 - one ownership rule
+        if self._text is None:
+            home = pathlib.Path.home()
+            try:
+                self._values, _ = prune.profile_strings(pathlib.Path(os.environ.get(
+                    "TARTCI_FLEET_PROFILE", str(home / ".config/tartci/macos-fleet-profile.toml"))))
+            except (OSError, ValueError, RuntimeError):
+                self._values = None
+            # The state dir is left out: the retired lane's own state record
+            # names its clone, and that record is the proof required below.
+            self._text = prune.reference_text([home / ".config/tartci",
+                                               home / "Library/LaunchAgents"])
+        if self._values is None:
+            return True
+        return name in self._values or prune.named_in(name, self._text)
+
+
+def retired_lane_record(state_root: pathlib.Path, name: str, runner: str, pid: str) -> bool:
+    """Whether a lane's own state file (`<state_root>/<lane>/*.state.json`)
+    records exactly this VM, from a Tart provider, for this runner and
+    supervisor pid. A clone's name alone is no proof: an agent can name a
+    VM `pulp-m1-repro-20261016-1`."""
+    try:
+        paths = sorted(state_root.glob("*/*.state.json"))
+    except OSError:
+        return False
+    for path in paths:
+        if path.is_symlink():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(data, dict) and data.get("vm") == name
+                and str(data.get("provider") or "").startswith("tart-")
+                and data.get("runner") == runner and str(data.get("supervisor_pid")) == pid):
+            return True
+    return False
+
+
+def retired_clones_enabled() -> bool:
+    """Per-host opt-in for deleting retired lanes' clones; off reports only."""
+    flag = os.environ.get("TARTCI_REAP_RETIRED_ENABLE_FILE") or str(
+        pathlib.Path.home() / ".config" / "tartci" / "reap-retired-clones.enabled")
+    return pathlib.Path(flag).is_file()
+
+
+def retired_lane_runner(runner: str, host_id: str | None, prefixes: list[str]) -> bool:
+    if not host_id or host_id not in runner.split("-"):
+        return False
+    return runner.startswith(f"{host_id}-") or starts_with_any(runner, prefixes)
+
+
 def orphan_verdict(
     name: str,
     running: bool,
@@ -415,17 +645,37 @@ def orphan_verdict(
     now: float,
     min_age_secs: int,
     alive: Any = pid_alive,
+    host_id: str | None = None,
+    prefixes: list[str] | None = None,
+    named: Any = None,
+    record: Any = None,
+    retired_enabled: bool = False,
 ) -> tuple[bool, str]:
     """(delete?, why) for a VM no state file owns. Every doubt keeps it.
 
     Deleted only when ALL hold: the name is `<runner>-<pid>-<n>` for a lane
-    loaded on this host right now; that supervisor pid is not alive; no state
-    file names the VM; no lease record (live or stale) names it; it is
-    stopped; and its bundle has not changed for `min_age_secs`.
+    loaded on this host right now, or for a retired lane of this host (see
+    `retired_lane_runner`, which also needs a day untouched); that supervisor
+    pid is not alive; no state file names the VM; no lease record (live or
+    stale) names it; it is stopped; and its bundle has not changed for
+    `min_age_secs`.
     """
     match = ORPHAN_NAME_RE.match(name)
-    if not match or match.group("runner") not in lane_runners:
+    retired = False
+    if not match:
         return False, "not_a_lane_vm"
+    if match.group("runner") not in lane_runners:
+        if ":" in name or not retired_lane_runner(match.group("runner"), host_id,
+                                                   prefixes or []):
+            return False, "not_a_lane_vm"
+        # The image pruner's ownership rule: a VM any tartci file, the fleet
+        # profile or a LaunchAgent names (a golden, a rollback image) is kept.
+        if named is None or named(name):
+            return False, "named_by_tartci"
+        if record is None or not record(name, match.group("runner"), match.group("pid")):
+            return False, "no_retired_lane_record"
+        retired = True
+        min_age_secs = max(min_age_secs, RETIRED_LANE_MIN_AGE_SECS)
     if running:
         return False, "running"
     if name in states_by_vm:
@@ -442,7 +692,11 @@ def orphan_verdict(
         return False, "vm_bundle_unreadable"
     if age < min_age_secs:
         return False, "recent"
-    return True, f"supervisor {match.group('pid')} gone, stopped {int(age)}s"
+    if retired and not retired_enabled:
+        return False, (f"retired_clone_reap_off: would delete (retired lane, supervisor "
+                       f"{match.group('pid')} gone, stopped {int(age)}s)")
+    lane = "retired lane " if retired else ""
+    return True, f"{lane}supervisor {match.group('pid')} gone, stopped {int(age)}s"
 
 
 def split_paths(value: str | None) -> list[str]:
@@ -516,6 +770,60 @@ def remove_owned_path(path_text: Any, runner_name: str) -> str | None:
     return f"path_deleted:{path}"
 
 
+def reject_symlink_components(path: pathlib.Path, description: str) -> None:
+    """Refuse a path whose existing components include a symlink.
+
+    Comparing the state-file strings alone is insufficient: a parent symlink
+    can make ``work_dir/golden.qcow2`` resolve outside the owned job directory
+    while preserving the same lexical spelling.  ``lstat`` keeps this check
+    independent of the target's file type and also covers a symlinked sidecar.
+    Missing final files are allowed because recovery may be cleaning up a
+    partially-created job; any existing parent component must still be real.
+    """
+    if not path.is_absolute():
+        raise ValueError(f"relative {description} recovery path")
+    # macOS exposes the temporary directory through these system aliases. They
+    # are resolved before checking job-owned components; a symlink introduced
+    # below either alias remains rejected.
+    system_aliases = {
+        pathlib.Path("/var"): pathlib.Path("/private/var"),
+        pathlib.Path("/tmp"): pathlib.Path("/private/tmp"),
+    }
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"cannot inspect {description} recovery path") from exc
+        if stat.S_ISLNK(mode):
+            if current in system_aliases and pathlib.Path(os.path.realpath(current)) == system_aliases[current]:
+                continue
+            raise ValueError(f"linked Windows {description} recovery path")
+
+
+def unseal_windows_snapshot(state: dict[str, Any]) -> None:
+    """Clear the immutable flag only on this job's recorded private backing file."""
+    work = safe_owned_path(state.get("work_dir"), str(state.get("runner") or ""))
+    snapshot_text = state.get("golden_snapshot")
+    if not work or not isinstance(snapshot_text, str) or not snapshot_text:
+        return
+    reject_symlink_components(work, "job directory")
+    snapshot = pathlib.Path(snapshot_text)
+    if snapshot != work / "golden.qcow2":
+        raise ValueError("unsafe Windows golden snapshot recovery path")
+    reject_symlink_components(snapshot, "golden snapshot")
+    for path in (snapshot, pathlib.Path(f"{snapshot}.sha256")):
+        reject_symlink_components(path, "golden snapshot")
+        if path.exists():
+            if not path.is_file():
+                raise ValueError("non-file Windows golden snapshot recovery path")
+            if hasattr(os, "chflags"):
+                os.chflags(path, 0)
+
+
 def stop_pid(pid_value: Any, expected_start: Any) -> bool:
     try:
         pid = int(pid_value)
@@ -563,10 +871,37 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if derived not in prefixes:
             prefixes.append(derived)
     lane_runners = {lane.runner_name for lane in lanes or [] if lane.runner_name}
+    # The host id is the first word every loaded lane's runner shares.
+    host_words = {runner.split("-", 1)[0] for runner in lane_runners}
+    host_id = host_words.pop() if len(host_words) == 1 else None
     leases_seen = lease_references() if lane_runners else set()
+    tartci_names = TartciNames()
     store = ensure_tart_home()
     tart_home = pathlib.Path(store["path"])
     protected = [p for p in args.protected_names.split(",") if p]
+    persistent_runners = [p for p in args.persistent_runners.split(",") if p]
+    host_label_prefixes = [p for p in args.host_label_prefixes.split(",") if p]
+    agents_dir = (pathlib.Path(args.launch_agents_dir).expanduser() if args.launch_agents_dir
+                  else None if scoped_view(args)
+                  else pathlib.Path.home() / "Library/LaunchAgents")
+    lane_labels, lane_name_prefixes = local_lane_identity(agents_dir)
+    own_host_labels = [p for p in args.host_labels.split(",") if p]
+    own_host_labels += [label for label in lane_labels
+                        if starts_with_any(label, host_label_prefixes) and label not in own_host_labels]
+    own_host_labels, label_conflict = resolve_host_labels(own_host_labels, host_label_prefixes)
+    if label_conflict:
+        problems.append(label_conflict)
+    own_name_prefixes = [p for p in args.own_name_prefixes.split(",") if p]
+    for prefix in own_lane_name_prefixes(lanes or []) + lane_name_prefixes:
+        if prefix not in own_name_prefixes:
+            own_name_prefixes.append(prefix)
+    # Names this host mints are by definition its residue to inspect.
+    for prefix in own_name_prefixes:
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+    tracker_path = offline_tracker_path(args.state_root)
+    offline_tracker = load_offline_tracker(tracker_path)
+    offline_seen: dict[str, dict[str, Any]] = {}
     tart_providers = {"", "tart-macos", "tart-linux"}
 
     for tool in ("tart", github_cli()):
@@ -651,7 +986,11 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 if not owned and not protected_name:
                     orphaned, orphan_reason = orphan_verdict(
                         name, running, lane_runners, states_by_vm, leases_seen,
-                        tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs)
+                        tart_home / "vms" / name, now.timestamp(), args.orphan_age_secs,
+                        host_id=host_id, prefixes=prefixes, named=tartci_names,
+                        record=lambda vm, runner, pid: retired_lane_record(
+                            pathlib.Path(args.state_root).expanduser(), vm, runner, pid),
+                        retired_enabled=retired_clones_enabled())
                     if orphaned:
                         stale = True
                         action = "delete_orphaned_stopped_vm"
@@ -758,12 +1097,19 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         qemu_alive = pid_alive_same(state.get("qemu_pid"), state.get("qemu_pid_started_at"))
         age = int(state.get("_age_secs") or 0)
         keep_failed = bool(state.get("keep_failed"))
+        unknown_qemu_pid = ((not state.get("qemu_pid")
+                             or not state.get("qemu_pid_started_at"))
+                            and bool(state.get("golden_snapshot"))
+                            and state.get("phase") in {"preparing", "booting"})
         action = ""
         stale = False
 
         if not owned:
             if prefix_ok and protected_name:
                 problems.append(f"owned_marker_protected_name:{name}")
+        elif unknown_qemu_pid:
+            action = "qemu_pid_unknown_preserve"
+            problems.append(f"qemu_pid_unknown_preserve:{name}")
         elif keep_failed and qemu_alive and age < args.keep_failed_age_secs:
             action = "kept_failed_wait_for_operator"
         elif qemu_alive and not owner_pid_alive and age >= args.running_age_secs:
@@ -780,8 +1126,10 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if args.fix and action in ("stop_delete_qemu_vm", "delete_qemu_workdir"):
             try:
                 if qemu_alive:
-                    if stop_pid(state.get("qemu_pid"), state.get("qemu_pid_started_at")):
-                        fixed.append(f"qemu_stopped:{name}:{state.get('qemu_pid')}")
+                    if not stop_pid(state.get("qemu_pid"), state.get("qemu_pid_started_at")):
+                        raise RuntimeError("QEMU still alive; preserving Windows workdir")
+                    fixed.append(f"qemu_stopped:{name}:{state.get('qemu_pid')}")
+                unseal_windows_snapshot(state)
                 for key in ("work_dir", "port_lock"):
                     removed = remove_owned_path(state.get(key), runner_name)
                     if removed:
@@ -794,7 +1142,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         vms.append(
             {
                 "name": name,
-                "state": "running" if qemu_alive else "stopped",
+                "state": "unknown" if unknown_qemu_pid else ("running" if qemu_alive else "stopped"),
                 "provider": "qemu-windows",
                 "owned": owned,
                 "protected": protected_name,
@@ -856,9 +1204,32 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         stale = True
                         action = "suspect_live_owner_stale_offline_runner"
                         problems.append(f"suspect_live_owner_stale_offline_runner:{name}")
+                    elif refusal := foreign_runner_reason(
+                        runner, persistent_runners, host_label_prefixes, own_host_labels,
+                        own_name_prefixes,
+                    ):
+                        action = "keep_not_minted_here"
+                        runner["refusal"] = refusal
                     else:
-                        stale = True
-                        action = "delete_offline_runner"
+                        # A connected runner reads offline for the seconds its
+                        # broker long-poll stalls, so one reading proves
+                        # nothing. Delete only a registration seen offline on
+                        # several consecutive passes spanning a minimum age.
+                        key = offline_key(runner)
+                        now_epoch = now.timestamp()
+                        seen = dict(offline_tracker.get(key) or {"first_offline": now_epoch, "passes": 0})
+                        seen["passes"] = int(seen.get("passes") or 0) + 1
+                        offline_seen[key] = seen
+                        offline_for = now_epoch - float(seen.get("first_offline") or now_epoch)
+                        runner["offline_passes"] = seen["passes"]
+                        runner["offline_secs"] = int(offline_for)
+                        if (seen["passes"] < args.min_offline_passes
+                                or offline_for < args.min_offline_secs):
+                            action = "wait_offline_age"
+                            runner["refusal"] = "offline_too_recent"
+                        else:
+                            stale = True
+                            action = "delete_offline_runner"
                     if args.fix:
                         if action == "delete_offline_runner":
                             try:
@@ -894,6 +1265,15 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 runner["owner_pid_alive"] = owner_pid_alive
                 runner["state_file"] = state_file
 
+    # Only a complete census may rewrite the offline clocks: a row missing from
+    # a failed read is not a runner seen online. A dry run writes nothing.
+    if not unreadable and not getattr(args, "dry_run", False):
+        try:
+            tracker_path.parent.mkdir(parents=True, exist_ok=True)
+            tracker_path.write_text(json.dumps(offline_seen, sort_keys=True))
+        except OSError as exc:
+            problems.append(f"offline_tracker_unwritable:{exc}")
+
     # The poka-yoke. `matched` counts supervisor heartbeats found in the state
     # files; `expected` counts fleet lanes launchd reports loaded. They come
     # from DIFFERENT sources on purpose, so a tool that goes blind against the
@@ -914,6 +1294,10 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "repo": args.repo,
             "state_dirs": [str(path) for path in state_dirs],
             "prefixes": prefixes,
+            "own_name_prefixes": own_name_prefixes,
+            "host_labels": own_host_labels,
+            "min_offline_secs": args.min_offline_secs,
+            "min_offline_passes": args.min_offline_passes,
             "protected_names": protected,
             "fix": args.fix,
             "stopped_age_secs": args.stopped_age_secs,
@@ -939,6 +1323,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "kept": {v["name"]: v["orphan"] for v in vms
                      if v.get("orphan") and v.get("orphan") != "not_a_lane_vm"
                      and v.get("action") != "delete_orphaned_stopped_vm"},
+            "retired_would_delete": sorted(
+                v["name"] for v in vms
+                if str(v.get("orphan") or "").startswith("retired_clone_reap_off")),
         },
         "supervisor_coverage": supervisor_coverage.as_dict(),
         "supervisors": [
@@ -981,6 +1368,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "owner_pid_alive": runner.get("owner_pid_alive"),
                 "state_file": runner.get("state_file"),
                 "local_ownership": runner.get("action", ""),
+                "refusal": runner.get("refusal", ""),
+                "offline_passes": runner.get("offline_passes"),
+                "offline_secs": runner.get("offline_secs"),
             }
             for runner in runners
             if runner.get("owned")
@@ -1003,6 +1393,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Report or safely reap tartci CI VM residue")
     parser.add_argument("--json", action="store_true", help="emit JSON digest")
     parser.add_argument("--fix", action="store_true", help="perform safe fixes")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="change nothing (overrides --fix); print the VMs a fix would delete")
     parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "Generous-Corp/pulp"))
     parser.add_argument(
         "--state-dir",
@@ -1016,6 +1408,37 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--prefixes", default=os.environ.get("TARTCI_REAP_PREFIXES", "pulp-,linux-ephr-,win-ephr-,tartci-"))
     parser.add_argument("--protected-names", default=os.environ.get("TARTCI_REAP_PROTECTED_NAMES", "pulp-vm,rosetta-probe"))
+    parser.add_argument(
+        "--persistent-runners",
+        default=os.environ.get("TARTCI_REAP_PERSISTENT_RUNNERS", ""),
+        help="comma-separated runner names never deleted, whatever their state",
+    )
+    parser.add_argument(
+        "--host-label-prefixes",
+        default=os.environ.get("TARTCI_REAP_HOST_LABEL_PREFIXES", "pulp-host-"),
+        help="label prefixes that bind a runner to one host; another host's are never deleted",
+    )
+    parser.add_argument(
+        "--host-labels",
+        default=os.environ.get("TARTCI_HOST_LABEL", ""),
+        help="extra host-bound labels this host owns, beyond those read from its installed "
+             "Linux/Windows lane plists (comma-separated)",
+    )
+    parser.add_argument(
+        "--own-name-prefixes",
+        default=os.environ.get("TARTCI_REAP_OWN_NAME_PREFIXES", ""),
+        help="extra per-boot name prefixes this host mints, beyond its discovered lanes",
+    )
+    parser.add_argument(
+        "--launch-agents-dir",
+        default=os.environ.get("TARTCI_REAP_LAUNCH_AGENTS_DIR", ""),
+        help="where this host's lane plists are installed (default ~/Library/LaunchAgents "
+             "for the whole-host view)",
+    )
+    parser.add_argument("--min-offline-secs", type=int,
+                        default=int(os.environ.get("TARTCI_REAP_MIN_OFFLINE_SECS", "900")))
+    parser.add_argument("--min-offline-passes", type=int,
+                        default=int(os.environ.get("TARTCI_REAP_MIN_OFFLINE_PASSES", "3")))
     parser.add_argument("--macos-cap", type=int, default=int(os.environ.get("TARTCI_MACOS_VM_CAP", "2")))
     parser.add_argument("--stopped-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_STOPPED_AGE_SECS", "900")))
     parser.add_argument("--orphan-age-secs", type=int,
@@ -1044,7 +1467,18 @@ def ensure_tart_home() -> dict[str, Any]:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.dry_run:
+        args.fix = False
     digest, rc = build_digest(args)
+    if args.dry_run and not args.json:
+        orphans = digest.get("orphans") or {}
+        for row in digest.get("vms") or []:
+            if row.get("action") and row.get("stale"):
+                print(f"would {row['action']}: {row['name']}"
+                      + (f" ({row['orphan']})" if row.get("orphan") else ""))
+        for name in orphans.get("retired_would_delete", []):
+            print(f"would delete once ~/.config/tartci/reap-retired-clones.enabled exists: "
+                  f"{name} ({orphans.get('kept', {}).get(name, '')})")
     if args.json:
         print(json.dumps(digest, indent=2, sort_keys=True))
     else:

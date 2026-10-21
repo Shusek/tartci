@@ -37,6 +37,68 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 
 class VmLeaseHelperTests(unittest.TestCase):
+    def test_windows_runner_exports_granted_parallelism_to_guest_job(self) -> None:
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "4"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL="4"\n'
+            'Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f '
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL)\n',
+        )
+
+        positive = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "8"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(positive.returncode, 0, positive.stderr)
+        self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL="8"', positive.stdout)
+        # A zero grant is invalid and must not produce an unusable script.
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "0"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+
+    def test_the_listener_script_the_job_runs_carries_the_granted_parallelism(self) -> None:
+        # The script the guest runs, not only the fragment printer: the splice
+        # must replace the placeholder, or PowerShell gets it as a command.
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-listener-script", "6"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('$env:CMAKE_BUILD_PARALLEL_LEVEL="6"\n', result.stdout)
+        self.assertNotIn("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__", result.stdout)
+        # The parallelism is set before the listener starts the job.
+        self.assertLess(result.stdout.index("CMAKE_BUILD_PARALLEL_LEVEL"),
+                        result.stdout.index("Runner.Listener.exe"))
+        self.assertTrue(result.stdout.rstrip().endswith("exit $LASTEXITCODE"))
+        # An invalid grant sets no default and leaves no placeholder behind.
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-listener-script", "0"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(invalid.returncode, 0, invalid.stderr)
+        self.assertNotIn("CMAKE_BUILD_PARALLEL_LEVEL", invalid.stdout)
+        self.assertNotIn("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__", invalid.stdout)
+        self.assertIn("Runner.Listener.exe", invalid.stdout)
+
+    def test_the_job_runs_the_listener_script_function(self) -> None:
+        # The job must use the function the print-exit tests, not a copy.
+        source = WINDOWS_RUNNER.read_text()
+        self.assertEqual(source.count("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__"), 2)
+        self.assertIn('ps_run="$(windows_listener_script "$effective_win_cpus")"', source)
+
     def test_apply_false_cannot_enter_cleanup_provider(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"scripts").mkdir(); marker=root/"called"
@@ -76,8 +138,8 @@ class VmLeaseHelperTests(unittest.TestCase):
               export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipt_dir}
               export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1
               export TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
-              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp
-              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code
+              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Example/Code/pulp
+              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Example/Code
               export TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
               export TARTCI_WORKTREE_CLEANUP_APPLY=1
               export TARTCI_RUNNER_REPO=Generous-Corp/pulp
@@ -122,7 +184,7 @@ print('{{"ok":true,"reason":"acquired"}}')
                   export TARTCI_ROOT={root} TARTCI_DISK_DENIAL_RECEIPT_DIR={root / "receipts"}
                   export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1 TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
                   export TARTCI_WORKTREE_CLEANUP_APPLY=1
-                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
+                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Example/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Example/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
                   export TARTCI_RUNNER_REPO=Generous-Corp/pulp TARTCI_RECEIPT_HOST_ID=studio
                   export TARTCI_QUEUE_LANE_ID=studio-pulp-gate
                   mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
@@ -143,8 +205,28 @@ print('{{"ok":true,"reason":"acquired"}}')
                     return {retry_rc}
                   }}
                   tartci_try_worktree_cleanup() {{ return {cleanup_rc}; }}
-                  tartci_check_macos_disk_floor_with_cleanup_once /Volumes/Workshop/VMs lane runner
+                  export TARTCI_WORKTREE_CLEANUP_TART_HOME=/Volumes/Example/VMs
+                  tartci_check_macos_disk_floor_with_cleanup_once /Volumes/Example/VMs lane runner
                   rc=$?; test "$calls" -eq {expected_calls}; test "$rc" -eq {expected_rc}
+                ''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macos_preflight_cleanup_runs_only_for_the_rendered_tart_store(self) -> None:
+        # Without the rendered store, or for any other path, a denial stays a
+        # denial and cleanup is never tried.
+        for exported, path in (("", "/Volumes/Example/VMs"),
+                               ("export TARTCI_WORKTREE_CLEANUP_TART_HOME=/Volumes/Example/VMs",
+                                "/Volumes/Example/Other")):
+            with self.subTest(exported=exported, path=path):
+                result = _run_bash(f'''
+                  source {HELPER}; calls=0; cleaned=0
+                  tartci_check_disk_floor_observed() {{
+                    calls=$((calls+1)); TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON='{{"fresh":true}}'; return 75
+                  }}
+                  tartci_try_worktree_cleanup() {{ cleaned=1; return 0; }}
+                  {exported}
+                  tartci_check_macos_disk_floor_with_cleanup_once {path} lane runner
+                  rc=$?; test "$rc" -eq 75; test "$calls" -eq 1; test "$cleaned" -eq 0
                 ''')
                 self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -763,12 +845,12 @@ PY
             f"""
             set -euo pipefail
             source {HELPER}
-            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Workshop/Code/tart
+            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Example/Code/tart
             """
         )
         proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, "/Volumes/Workshop")
+        self.assertEqual(proc.stdout, "/Volumes/Example")
 
     def test_all_vm_providers_launch_the_writer_through_the_guardian(self) -> None:
         expected = {
@@ -1545,7 +1627,7 @@ fi
 
 
 class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
-    """With inventory unknown, the reservation files decide occupancy."""
+    """An unreadable inventory cannot authorize another clone."""
 
     CAP_LIB = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
 
@@ -1576,11 +1658,11 @@ class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             return proc.stdout.strip()
 
-    def test_unknown_inventory_with_free_reservations_boots(self) -> None:
+    def test_unknown_inventory_refuses_even_with_free_reservations(self) -> None:
         for via_arg in (True, False):
             with self.subTest(via_arg=via_arg):
-                self.assertIn("resv.", self._claim(0, inventory="unknown", via_arg=via_arg))
-                self.assertIn("resv.", self._claim(1, inventory="unknown", via_arg=via_arg))
+                self.assertEqual(self._claim(0, inventory="unknown", via_arg=via_arg), "")
+                self.assertEqual(self._claim(1, inventory="unknown", via_arg=via_arg), "")
 
     def test_unknown_inventory_with_full_reservations_waits(self) -> None:
         for via_arg in (True, False):
@@ -1590,6 +1672,35 @@ class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
     def test_a_readable_full_inventory_still_blocks(self) -> None:
         self.assertEqual(self._claim(0, inventory="2", via_arg=True), "")
         self.assertEqual(self._claim(0, inventory="2", via_arg=False), "")
+
+    def test_readable_inventory_with_capacity_still_claims(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertIn("resv.", self._claim(0, inventory="0", via_arg=via_arg))
+
+    def test_inventory_recovery_admits_without_stale_refusal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={tmp}/resv
+                export TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/no-cap-file
+                source {self.CAP_LIB}
+                running_macos_vms(){{ cat {tmp}/inventory; }}
+                echo unknown > {tmp}/inventory
+                first="$(tartci_claim_macos_slot 2)"
+                [ -z "$first" ]
+                echo 0 > {tmp}/inventory
+                second="$(tartci_claim_macos_slot 2)"
+                [ -f "$second" ]
+                printf 'recovered\\n'
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "recovered")
 
 
 if __name__ == "__main__":

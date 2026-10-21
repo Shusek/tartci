@@ -64,10 +64,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import runner_census
 from runner_census import RunnerCensus, RunnerRecord
+import fleet_source
 
 DEFAULT_PROFILE = "~/.config/tartci/macos-fleet-profile.toml"
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PUBLISHED_SUPPLY = ROOT / "fleet" / "advertised-labels.json"
+# Importing this module must remain safe for command help and argument
+# parsing.  Resolve the operator-selected source at the command boundary;
+# otherwise a malformed private source turns ``--help`` into a traceback.
+DEFAULT_PUBLISHED_SUPPLY = fleet_source.resolve(ROOT, allow_environment=False).published_supply
 # A peer with no `ssh` in the published supply is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 PEER_STATUS_COMMAND = "cd ~ && ~/.local/bin/tartci pool status --json"
@@ -698,7 +702,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=15.0, help="per-scope API timeout")
     parser.add_argument(
         "--published-supply",
-        default=str(DEFAULT_PUBLISHED_SUPPLY),
+        default=None,
         help="published supply naming which hosts declare each label",
     )
     parser.add_argument("--ssh", default="ssh", help="SSH client used to read peers' pool status")
@@ -712,7 +716,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="proceed even when this host is the last one serving a required label",
     )
     parser.add_argument("--json", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.published_supply is None:
+        args.published_supply = str(fleet_source.resolve(ROOT).published_supply)
+    return args
 
 
 def run(args: argparse.Namespace) -> Decision:

@@ -59,7 +59,12 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
+import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate jobs
+import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
+from python_child import child_python  # noqa: E402 - the interpreter children start with
+import fleet_source  # noqa: E402 - resolves the optional private fleet source
+import fleet_source_sync  # noqa: E402 - exports the private fleet source per commit
 
 try:
     import tomllib
@@ -109,8 +114,10 @@ ANNOUNCE_TIE_SECONDS = 10
 # A waiting ticket not refreshed within this long belongs to a host that has
 # stopped trying (halted, off the network, profile removed) and is ignored.
 WAITING_TICKET_TTL = 2 * 3600
-# Deferred this long without a turn is starvation: loud, and exit 3.
-STARVED_AFTER_SECONDS = 6 * 3600
+# Deferred without a turn this long is starvation: loud, and exit 3. Without
+# queued gate demand for this host the bound is STARVED_FALLBACK_SECONDS; with
+# it, STARVED_AFTER_SECONDS (set below), one hour past the dark-peer exclusion.
+STARVED_FALLBACK_SECONDS = 6 * 3600
 # The self-update agent's launchd StartInterval: one survey of every peer per
 # attempt (launchd/com.danielraffel.tartci.self-update.plist.template).
 SELF_UPDATE_INTERVAL_SECONDS = 1800
@@ -129,6 +136,10 @@ PEER_UNREACHABLE_MIN_READS = 4
 # measured on its own clock.
 PEER_UNREACHABLE_FRESH_SECONDS = 3600
 PEER_UNREADABLE_NAME = "peer-unreadable.json"
+# With gate demand queued, starvation is one hour past the point a dark peer
+# stops holding the turn: a single dark host must not make every other host
+# raise an issue two hours before the queue heals itself.
+STARVED_AFTER_SECONDS = PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600
 # A peer DRAINING with no live update marker, whose pool state has not changed
 # for this long, stops holding the update turn and is left to the capacity
 # floor, like an off peer. A self-update holds a live marker for its whole
@@ -136,6 +147,9 @@ PEER_UNREADABLE_NAME = "peer-unreadable.json"
 # old is an operator drain or an update that died after draining. The bound is
 # the marker's own TTL: a dead update's marker stops counting at the same age.
 PEER_DRAIN_STALE_SECONDS = ACTIVE_MARKER_TTL
+# A draining peer with NO update marker at all is an operator drain once its
+# pool state has been unchanged this long (see read_peer).
+PEER_DRAIN_GRACE_SECONDS = 15 * 60
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
@@ -168,7 +182,8 @@ EXIT_REFUSED = 3       # a precondition refused; the host was not touched
 # A peer was busy or had waited longer, so this host deferred its turn. That is
 # the protocol working, so it exits 0 and launchd's last exit stays clean;
 # waiting.json and `pool status` carry it, and it becomes EXIT_REFUSED plus a
-# self_update_starved event once it has lasted STARVED_AFTER_SECONDS.
+# self_update_starved event once it has lasted STARVED_AFTER_SECONDS (4 h) with
+# queued gate demand, or STARVED_FALLBACK_SECONDS (6 h) without it.
 EXIT_DEFERRED = 0
 # tartci pool off exits these when a precondition refuses before it stops
 # anything: 11 the capacity floor (including an unreadable census), 12 a lane
@@ -180,8 +195,20 @@ EXIT_FAILED = 4        # a mutation ran and failed; see the receipt for what was
 EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
 
+class ConfigError(ValueError):
+    """self-update.toml cannot be used as written."""
+
+
+class LauncherConsent(Exception):
+    """A new sealed launcher is installed but its volume probe fails."""
+
+
 class Refused(Exception):
     """A precondition failed before anything on the host changed."""
+
+
+class HostFault(Refused):
+    """A local host/build fault that must release a stale queue ticket."""
 
 
 class Deferred(Refused):
@@ -228,8 +255,9 @@ class System:
         if argv and argv[0] == "python3":
             # Helpers need tomllib (3.11+). This process was started by
             # tartci_toml_python, so its interpreter qualifies; a bare python3
-            # on PATH is /usr/bin/python3 (3.9) under ssh and launchd.
-            argv = [sys.executable, *argv[1:]]
+            # on PATH is /usr/bin/python3 (3.9) under ssh and launchd. Under
+            # launcher v2 that interpreter is the lane's shim (python_child).
+            argv = [child_python(), *argv[1:]]
         try:
             proc = subprocess.run(argv, cwd=cwd, env=merged, capture_output=True,
                                   text=True, timeout=timeout, check=False)
@@ -351,10 +379,16 @@ class Config:
     poll_seconds: int = DEFAULT_POLL_SECONDS
     idle_by_design: tuple[str, ...] = DEFAULT_IDLE_BY_DESIGN
     peers: dict[str, str] = dataclasses.field(default_factory=dict)
+    fleet_source_repository: str | None = None
+    fleet_source_canary: str | None = None
 
     @property
     def checkout(self) -> Path:
         return self.home / ".local" / "share" / "tartci" / "update-checkout"
+
+    @property
+    def fleet_source_store(self) -> Path:
+        return self.home / ".local" / "share" / "tartci" / "fleet-sources"
 
     @property
     def state_dir(self) -> Path:
@@ -493,6 +527,16 @@ def load_config(home: Path, settings: Path | None = None) -> Config:
                 setattr(cfg, key, float(data[key]))
         if isinstance(data.get("idle_by_design_labels"), list):
             cfg.idle_by_design = tuple(str(v) for v in data["idle_by_design_labels"])
+        section = data.get("fleet_source")
+        if section is not None:
+            if not isinstance(section, dict):
+                raise ConfigError(f"{path}: [fleet_source] must be a table, not {section!r}")
+            for key, value in section.items():
+                if key not in ("repository", "canary") or not isinstance(value, str) or not value.strip():
+                    raise ConfigError(f"{path}: [fleet_source] {key} must be a non-empty string "
+                                      "(keys: repository, canary)")
+            cfg.fleet_source_repository = section.get("repository", "").strip() or None
+            cfg.fleet_source_canary = section.get("canary", "").strip() or None
     return cfg
 
 
@@ -533,6 +577,22 @@ def launch_helper(cfg: Config) -> dict | None:
     return helper if isinstance(helper, dict) else None
 
 
+def launcher_pointer_path(cfg: Config) -> Path:
+    return cfg.home / ".config" / "tartci" / "launcher-generation.json"
+
+
+def _helper_app(cfg: Config) -> Path | None:
+    helper = launch_helper(cfg)
+    return Path(helper["path"]) if helper is not None and helper.get("path") else None
+
+
+def installed_layout(cfg: Config) -> str | None:
+    """The launcher layout this host runs: "v1", "v2", or None. The receipt
+    decides; without a launch helper record, v2 evidence on disk does."""
+    import launcher_layout  # noqa: PLC0415 - sibling module; owns the layout rules
+    return launcher_layout.installed(_read_json(cfg.install_receipt), cfg.home, _helper_app(cfg))
+
+
 def installed_commit(cfg: Config) -> tuple[str, str]:
     """(commit, source) of the cohort this host EXECUTES. Raises Refused.
 
@@ -545,7 +605,16 @@ def installed_commit(cfg: Config) -> tuple[str, str]:
     helper = launch_helper(cfg)
     if helper is None and not cfg.install_receipt.is_file():
         raise NotManaged(f"no install receipt at {cfg.install_receipt}")
-    if helper is not None:
+    if helper is not None and installed_layout(cfg) == "v2":
+        # A v2 app holds no commit: lanes run the generation its pointer names.
+        pointer = launcher_pointer_path(cfg)
+        generation = (_read_json(pointer) or {}).get("generation")
+        commit = None
+        if isinstance(generation, str) and generation:
+            manifest = Path(generation) / ".tartci-support-manifest.json"
+            commit = (_read_json(manifest) or {}).get("source_commit")
+        source = f"launcher v2 pointer {pointer}"
+    elif helper is not None:
         path = Path(helper["path"]) / "Contents" / "Resources" / "bundle.json"
         value = _read_json(path)
         commit = (value or {}).get("source_commit")
@@ -592,13 +661,225 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
-def configured_repository(cfg: Config, sys_: System) -> str:
-    """Resolve an explicit binding or the first readable accepted slug."""
-    bound = os.environ.get("GH_REPO", "").strip()
-    candidates = (bound,) if bound else (LEGACY_REPOSITORY, DEFAULT_REPOSITORY)
-    for repository in candidates:
-        if repository not in ACCEPTED_REPOSITORIES:
-            raise Refused(f"unsupported TartCI repository identity: {repository}")
+FLEET_SOURCE_ENV = ("TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+                    "TARTCI_FLEET_SOURCE_REPOSITORY")
+
+
+def installed_fleet_source_commit(cfg: Config) -> str | None:
+    """The private source commit the installed generation was built from."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    if isinstance(recorded, dict) and recorded.get("configured"):
+        commit = recorded.get("commit")
+        return commit if isinstance(commit, str) else None
+    return None
+
+
+def installed_fleet_source_record(cfg: Config) -> dict[str, Any] | None:
+    """The complete private-source record for the installed generation."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    if isinstance(recorded, dict) and recorded.get("configured") is True:
+        if all(isinstance(recorded.get(key), str) and recorded[key].strip()
+               for key in ("repository", "commit", "root")):
+            return {key: recorded[key] for key in ("repository", "commit", "root")}
+    return None
+
+
+def fleet_source_receipt_is_configured(cfg: Config) -> bool:
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    return (isinstance(recorded, dict) and "configured" in recorded
+            and recorded.get("configured") is not False)
+
+
+def fleet_source_env(record: dict[str, Any] | None) -> dict[str, str]:
+    """Return the source environment represented by an install receipt."""
+    if record is None:
+        return {}
+    return {
+        "TARTCI_FLEET_SOURCE_ROOT": record["root"],
+        "TARTCI_FLEET_SOURCE_COMMIT": record["commit"],
+        "TARTCI_FLEET_SOURCE_REPOSITORY": record["repository"],
+    }
+
+
+def fleet_source_env_snapshot() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in FLEET_SOURCE_ENV}
+
+
+def restore_fleet_source_env(snapshot: dict[str, str | None]) -> None:
+    for name, value in snapshot.items():
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+
+
+def _source_name(commit: str | None) -> str:
+    return commit[:12] if commit else "the public profiles"
+
+
+# A private-source commit the canary has installed and verified is adopted by
+# the other hosts only after it has served this long on the canary.
+FLEET_SOURCE_SOAK_SECONDS = 30 * 60
+FLEET_SOURCE_VERIFIED = "fleet-source-verified.json"
+
+
+def read_canary_verified(cfg: Config, sys_: System, canary: str) -> dict | None:
+    """The canary's last verified source commit, aged on the canary's clock.
+
+    {"repository", "commit", "age"} or None when it is unreadable or absent.
+    """
+    if canary == self_host_id(cfg):
+        value = _read_json(cfg.state_dir / FLEET_SOURCE_VERIFIED)
+        clock = sys_.now()
+    else:
+        target = published_peers(cfg, sys_).get(canary)
+        if not target:
+            return None
+        result = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+                           'date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/'
+                           + FLEET_SOURCE_VERIFIED + '" 2>/dev/null || true'], timeout=60)
+        first, _, rest = result.out.partition("\n")
+        if result.rc != 0 or not first.strip().isdigit():
+            return None
+        clock = float(first.strip())
+        try:
+            value = json.loads(rest) if rest.strip() else None
+        except json.JSONDecodeError:
+            value = None
+    if (not isinstance(value, dict) or not isinstance(value.get("verified_at"), (int, float))
+            or not isinstance(value.get("commit"), str)
+            or not fleet_source.COMMIT.fullmatch(value["commit"])):
+        return None
+    return {"repository": value.get("repository"), "commit": value["commit"],
+            "age": clock - float(value["verified_at"])}
+
+
+def publish_fleet_source_verified(cfg: Config, sys_: System, selected: dict | None) -> None:
+    """On the canary, after an install from `selected` verified: tell the fleet."""
+    if not selected or cfg.fleet_source_canary is None:
+        return
+    if self_host_id(cfg) != cfg.fleet_source_canary:
+        return
+    if installed_fleet_source_commit(cfg) != selected["commit"]:
+        return
+    _write_json(cfg.state_dir / FLEET_SOURCE_VERIFIED,
+                {"repository": selected["repository"], "commit": selected["commit"],
+                 "verified_at": sys_.now()})
+
+
+def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict | None:
+    """Select the configured private source's commit for this run.
+
+    Without `[fleet_source] repository` in self-update.toml this does nothing
+    and the public checkout stays the source. A move is one host first: the
+    canary (`[fleet_source] canary`) adopts main's head; every other host
+    adopts only the commit the canary has installed and verified, once it has
+    served FLEET_SOURCE_SOAK_SECONDS there, and otherwise stays on the commit
+    it was installed from (or on the public profiles). An unreadable or
+    damaged source refuses; it never falls back to the public profiles. The
+    selection goes into this process's environment, so every helper and the
+    installer read the same commit. With `write` false (a plan) nothing is
+    exported or pruned.
+    """
+    repository = cfg.fleet_source_repository
+    if repository is None:
+        return None
+    if launch_helper(cfg) is not None and installed_layout(cfg) == "v2":
+        # Launcher v2: the app holds only host policy, so a source move is a
+        # refresh when the app's inputs are unchanged and an acknowledged
+        # launcher change when they are not (the turn measures both). The
+        # installer's layout rules still apply first.
+        planned_layout(cfg)
+    elif launch_helper(cfg) is not None:
+        # A v1 sealed launcher seals the profile: a source move is a
+        # same-generation refresh, which keeps the live launcher; the
+        # installer then verifies it against the moved profile's policy
+        # digest, fails after the drain, and rolls back, every turn. Refuse
+        # before anything is read or drained.
+        raise Refused(
+            "fleet source refused on a sealed-launcher host: a [fleet_source] move changes the "
+            "profile the sealed TartCI Launcher's policy digest covers, and a source move does "
+            "not rebuild the launcher, so the install would fail after the drain and roll back "
+            "every turn. Fix: remove [fleet_source] from self-update.toml on this host, or move "
+            "it to launcher v2 (~/.config/tartci/launcher-v2.enabled, then an acknowledged "
+            "install), where a source move rebuilds the launcher only when its inputs change. "
+            "Verify: `tartci fleet-macos self-update --plan` no longer reports this refusal")
+    if cfg.fleet_source_canary is None:
+        raise Refused("fleet source has no canary: set [fleet_source] canary to the host that "
+                      "installs a new source commit first")
+
+    def api(path: str) -> tuple[int, str, str]:
+        result = sys_.run([gh_cli(), "api", path], cwd=str(cfg.home),
+                          env={"GH_REPO": repository}, timeout=60)
+        return result.rc, result.out, result.err
+
+    installed = installed_fleet_source_commit(cfg)
+    me = self_host_id(cfg)
+    if me != cfg.fleet_source_canary:
+        # A mistyped canary would leave every host on its installed commit
+        # forever with nothing saying why: refuse instead.
+        published = set(published_peers(cfg, sys_)) | {me}
+        if cfg.fleet_source_canary not in published:
+            raise Refused(f"[fleet_source] canary {cfg.fleet_source_canary!r} is not a published "
+                          f"host id ({', '.join(sorted(published))}); fix self-update.toml")
+    try:
+        if me == cfg.fleet_source_canary:
+            commit, tree = fleet_source_sync.head(api, repository)
+            why = "canary: main's head"
+        else:
+            verified = read_canary_verified(cfg, sys_, cfg.fleet_source_canary)
+            if (verified and verified["repository"] == repository
+                    and verified["age"] >= FLEET_SOURCE_SOAK_SECONDS):
+                commit, tree = fleet_source_sync.head(api, repository, verified["commit"])
+                why = (f"verified on canary {cfg.fleet_source_canary} "
+                       f"{int(verified['age'] // 60)} min ago")
+            elif installed:
+                commit, tree = fleet_source_sync.head(api, repository, installed)
+                why = (f"staying on the installed commit: canary {cfg.fleet_source_canary} "
+                       + ("has verified nothing newer" if not verified else
+                          f"verified {verified['commit'][:12]} only "
+                          f"{int(verified['age'] // 60)} min ago"))
+            else:
+                print(f"self-update: fleet source {repository}: staying on the public "
+                      f"profiles until canary {cfg.fleet_source_canary} verifies a commit")
+                return None
+        if write:
+            root = fleet_source_sync.export(api, repository, commit, tree, cfg.fleet_source_store)
+        else:
+            root = cfg.fleet_source_store / commit
+            if fleet_source.marker_problem(root, repository, commit) is not None:
+                raise Refused(f"fleet source {repository}@{commit[:12]} is not exported yet; "
+                              "a plan writes nothing, an apply exports it")
+    except (fleet_source_sync.SyncError, OSError) as exc:
+        raise Refused(f"fleet source {repository}: {exc}") from exc
+    os.environ.update(dict(zip(FLEET_SOURCE_ENV, (str(root), commit, repository))))
+    try:
+        resolved_source = fleet_source.resolve(cfg.checkout)
+    except ValueError as exc:
+        raise Refused(f"fleet source {repository}@{commit[:12]}: {exc}") from exc
+    if write:
+        keep = {commit, installed or ""}
+        fleet_source_sync.prune(cfg.fleet_source_store, keep, now=sys_.now())
+    return {"repository": repository, "commit": commit, "root": str(root), "why": why,
+            **resolved_source.provenance}
+
+
+# A read that failed in transit (a timeout, a connection error, a 5xx) is
+# retried once after this pause; a definite answer (404, 403) is not. m1 on
+# 2026-10-16 refused a self-update because both reads hung for 60 s while
+# every other ghapp call on the host was also timing out.
+REPOSITORY_READ_RETRY_SECONDS = 20
+# gh's own transport errors read "error connecting to api.github.com" and
+# "dial tcp: lookup api.github.com: no such host". Only a failed read (rc != 0)
+# is matched: a successful read's JSON can contain any of these words.
+_TRANSIENT_READ = re.compile(r"(?i)TimeoutExpired|timed out|connection (?:reset|refused)|"
+                             r"error connecting to|no such host|dial tcp|i/o timeout|"
+                             r"could not resolve|network|HTTP 5\d\d|\b50[0-4]\b|EOF")
+
+
+def _read_repository(cfg: Config, sys_: System, repository: str) -> tuple[str | None, str]:
+    """(canonical full_name or None, why it was not read)."""
+    for attempt in (1, 2):
         result = sys_.run([gh_cli(), "api", f"repos/{repository}"],
                           cwd=str(cfg.checkout), env={"GH_REPO": repository}, timeout=60)
         try:
@@ -606,10 +887,31 @@ def configured_repository(cfg: Config, sys_: System) -> str:
         except (json.JSONDecodeError, AttributeError):
             canonical = None
         if result.rc == 0 and canonical in ACCEPTED_REPOSITORIES:
+            return canonical, ""
+        why = (f"exit {result.rc}: {result.text.strip()[:160]}" if result.rc != 0
+               else f"answered {canonical or 'no full_name'}")
+        if attempt == 1 and result.rc != 0 and _TRANSIENT_READ.search(result.text or ""):
+            sys_.sleep(REPOSITORY_READ_RETRY_SECONDS)
+            continue
+        return None, why + (" (after one retry)" if attempt == 2 else "")
+    return None, "unreachable"
+
+
+def configured_repository(cfg: Config, sys_: System) -> str:
+    """Resolve an explicit binding or the first readable accepted slug."""
+    bound = os.environ.get("GH_REPO", "").strip()
+    candidates = (bound,) if bound else (LEGACY_REPOSITORY, DEFAULT_REPOSITORY)
+    reasons = []
+    for repository in candidates:
+        if repository not in ACCEPTED_REPOSITORIES:
+            raise Refused(f"unsupported TartCI repository identity: {repository}")
+        canonical, why = _read_repository(cfg, sys_, repository)
+        if canonical:
             return canonical
+        reasons.append(f"{repository}: {why}")
         if bound:
             break
-    raise Refused("no accepted TartCI repository is readable")
+    raise Refused("no accepted TartCI repository is readable: " + "; ".join(reasons))
 
 
 def repository_url(repository: str) -> str:
@@ -657,7 +959,10 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
 
     The target is the newest first-parent main commit that is past the soak
     AND whose check runs are green. An explicit --target must itself be on
-    main's first-parent chain and meet both.
+    main's first-parent chain and meet both. If the recorded install is not
+    in the checkout, an explicit target may still recover the host, but skew
+    counts remain unknown rather than pretending the whole main history is
+    undeployed.
     """
     git = ["git", "-C", str(cfg.checkout)]
     skew: dict[str, Any] = {"installed": installed, "measured_at": _iso(now),
@@ -680,15 +985,18 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
             skew.update(state="unknown", selected_target=None, selection_reason="not on first-parent chain",
                         reason=f"--target {target_ref} is not on origin/main's first-parent chain")
             return skew
-    if sys_.run([*git, "cat-file", "-e", f"{installed}^{{commit}}"]).rc != 0:
+    installed_known = sys_.run([*git, "cat-file", "-e", installed + "^{commit}"]).rc == 0
+    if not installed_known and not explicit:
         skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
         return skew
-    if sys_.run([*git, "merge-base", "--is-ancestor", installed, skew["main"]]).rc != 0:
+    if installed_known and sys_.run(
+        [*git, "merge-base", "--is-ancestor", installed, skew["main"]]
+    ).rc != 0:
         skew.update(state="diverged",
                     reason=f"installed {installed[:12]} is not an ancestor of origin/main")
         return skew
-    log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct",
-                    f"{installed}..{skew['main']}"])
+    log_ref = f"{installed}..{skew['main']}" if installed_known else skew["main"]
+    log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct", log_ref])
     if log.rc != 0:
         skew["reason"] = f"git log failed: {log.text}"
         return skew
@@ -697,12 +1005,15 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
         parts = line.split()
         if len(parts) == 2 and SHA.fullmatch(parts[0]) and parts[1].isdigit():
             commits.append((parts[0], int(parts[1])))
-    skew["behind"] = len(commits)
+    skew["behind"] = None if not installed_known else len(commits)
+    if not installed_known:
+        skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
     if not commits:
-        skew["state"] = "current"
+        skew["state"] = "unknown" if not installed_known else "current"
         return skew
-    skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
-    skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
+    if installed_known:
+        skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
+        skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
     if explicit:
         commits = [(sha, ts) for sha, ts in commits if sha == head_sha]
         if not commits:
@@ -747,6 +1058,11 @@ def render_skew(skew: dict | None) -> str:
         return f"tartci: current with main (measured {skew.get('measured_at')})"
     if state == "not_applicable":
         return f"tartci: skew n/a ({skew.get('reason')})"
+    if state in ("behind", "soaking", "unverified") and skew.get("behind") is None:
+        requested = skew.get("requested_target")
+        selection = (f"; selected {skew.get('selected_target') or 'none'} (requested {requested}; "
+                     f"{skew.get('selection_reason', 'same')})" if requested else "")
+        return f"tartci: skew UNKNOWN ({skew.get('reason') or 'unknown installed commit'})" + selection
     if state in ("behind", "soaking", "unverified"):
         flag = " STALE" if skew.get("stale") else ""
         requested = skew.get("requested_target")
@@ -763,7 +1079,16 @@ def render_skew(skew: dict | None) -> str:
 # ── one host at a time ─────────────────────────────────────────────────────
 
 def published_supply(cfg: Config, sys_: System) -> dict[str, Any]:
-    """main's fleet/advertised-labels.json (the target can predate a host)."""
+    """The target's published supply, from the selected fleet source."""
+    source = fleet_source.resolve(cfg.checkout)
+    if source.configured:
+        try:
+            value = json.loads(source.published_supply.read_text())
+        except (OSError, json.JSONDecodeError):
+            value = None
+        if not isinstance(value, dict):
+            raise Refused(f"published supply {source.published_supply} is unreadable")
+        return value
     shown = sys_.run(["git", "-C", str(cfg.checkout), "show",
                       "origin/main:fleet/advertised-labels.json"])
     try:
@@ -807,6 +1132,28 @@ def self_host_id(cfg: Config) -> str:
 WAITING_SEPARATOR = "--- waiting ---"
 UNREADABLE_SEPARATOR = "--- unreadable ---"
 POOL_SINCE_SEPARATOR = "--- pool-state-since ---"
+PAUSED_SEPARATOR = "--- self-update-paused ---"
+# halt_reason, run by the PEER's own /usr/bin/python3 (any 3.x, no imports
+# from tartci) so a peer of any version reports whether its self-update is
+# halted. test_fleet_self_update checks it agrees with halt_reason.
+_PEER_HALTED = (
+    "import json, os, glob, datetime as d\n"
+    "s = (os.environ.get(\"TARTCI_HOME\") or os.path.expanduser(\"~/.tartci\")) + \"/state/self-update\"\n"
+    "def t(x):\n"
+    "    try: return d.datetime.strptime(str(x), \"%Y-%m-%dT%H:%M:%SZ\").replace(tzinfo=d.timezone.utc).timestamp()\n"
+    "    except ValueError: return 0.0\n"
+    "def r(p):\n"
+    "    try: v = json.load(open(p))\n"
+    "    except Exception: return None\n"
+    "    return v if isinstance(v, dict) else None\n"
+    "c = t((r(s + \"/halt-cleared.json\") or {}).get(\"at\")); n = 0\n"
+    "for p in sorted(glob.glob(s + \"/attempts/*.json\")):\n"
+    "    v = r(p)\n"
+    f"    if not v or v.get(\"mode\") != \"apply\" or v.get(\"status\") not in {json.dumps(list(TERMINAL_STATUSES))}:\n"
+    "        continue\n"
+    "    if t(v.get(\"started_at\")) < c: continue\n"
+    "    n = 0 if v.get(\"status\") == \"succeeded\" else n + 1\n"
+    f"print(\"halted\" if n >= {MAX_CONSECUTIVE_FAILURES} else \"\")\n")
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
@@ -814,7 +1161,9 @@ _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/' + PEER_UNREADABLE_NAME
                 + '" 2>/dev/null || true; echo; echo "' + POOL_SINCE_SEPARATOR + '"; '
                 'stat -f %m "${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}" '
-                '2>/dev/null || true')
+                '2>/dev/null || true; echo; echo "' + PAUSED_SEPARATOR + '"; '
+                'test -s "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/scheduled-pause.json" '
+                '&& echo paused || true; /usr/bin/python3 -c \'' + _PEER_HALTED + '\' 2>/dev/null || true')
 
 
 def _ssh_failure_kind(result: Result) -> str:
@@ -848,8 +1197,11 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     service on purpose (m5studio, off for a store move on 2026-10-01, blocked
     every other host's update for 11 h). It is marked `off`, and whether this
     host may still go out is the capacity floor's call, which counts an off
-    host as serving nothing. Draining, unreadable or updating peers still
-    refuse.
+    host as serving nothing. So is a DRAINING peer with no live update marker
+    whose self-update is paused or halted, or whose markerless drain is older
+    than PEER_DRAIN_GRACE_SECONDS (an operator drain: a containment drain on
+    2026-10-16, held every other host's turn for 3 h). Updating, unreadable
+    and freshly draining peers still refuse.
     """
     out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
                            "off": False, "readable": False, "clock": None, "unreadable": None}
@@ -873,6 +1225,8 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
     out["clock"] = clock
     rest, _, pool_since_text = rest.partition(POOL_SINCE_SEPARATOR)
+    pool_since_text, _, paused_text = pool_since_text.partition(PAUSED_SEPARATOR)
+    held = set(paused_text.split())   # "paused" and/or "halted"
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
     waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
     pool_since = (int(pool_since_text.strip())
@@ -924,6 +1278,25 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
                    evidence=(f"peer {host_id} has been draining for "
                              f"{(clock - pool_since) / 3600:.1f} h with no update marker "
                              "(left to the capacity floor)"))
+        return out
+    # An operator's drain: no update marker at all, so no self-update is in
+    # it. A self-update writes its marker BEFORE it drains, and a dead one's
+    # marker keeps it busy above until the marker's TTL; the grace only
+    # covers a marker written between this read's marker and pool reads.
+    # A peer whose own self-update the operator paused cannot be in an
+    # update without a live marker either. Both are left to the capacity
+    # floor, like an off peer.
+    operator_drain = (active is None and pool_since is not None
+                      and clock - pool_since >= PEER_DRAIN_GRACE_SECONDS)
+    stopped = sorted(held & {"paused", "halted"})
+    if value.get("state") == "draining" and (stopped or operator_drain):
+        why = (f"its self-update is {' and '.join(stopped)}, so no update is in this drain"
+               if stopped else
+               f"an operator drain: no update marker for more than "
+               f"{PEER_DRAIN_GRACE_SECONDS // 60} min")
+        age = (f" for {int((clock - pool_since) // 60)} min" if pool_since is not None else "")
+        out.update(busy=False, off=True,
+                   evidence=f"peer {host_id} is draining{age}, {why} (left to the capacity floor)")
         return out
     if not is_off and not serving:
         since = (f", pool state unchanged for {int((clock - pool_since) // 60)} min"
@@ -1081,21 +1454,194 @@ def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> 
     ticket = waiting_ticket(cfg) or {}
     since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
     ticket = {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
-              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue")}
+              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue"),
+              "issue_body": ticket.get("issue_body")}
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return ticket
 
 
-def clear_waiting(cfg: Config) -> None:
+PENDING_FIX_NAME = "pending-fix.json"
+
+
+def clear_waiting(cfg: Config, now: float | None = None) -> None:
+    """This host has its turn: leave the queue, and finish its starvation issue.
+
+    The fix time is recorded first (pending-fix.json), then the ticket goes.
+    The issue's marker is PATCHed with fixed_at and only then is the issue
+    closed; a failed PATCH or close is retried on the next run, so a transient
+    API error never leaves a closed issue whose marker says fixed_at null.
+    """
     ticket = waiting_ticket(cfg) or {}
     if ticket.get("issue"):
-        # The host has its turn again: the starvation issue closes itself.
-        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
-        host_off._close_issue(str(ticket["issue"]))
+        fixed_at = _iso(time.time() if now is None else now)
+        body = ticket.get("issue_body")
+        try:
+            fixed_body = tartci_incident.fixed(body, fixed_at) if isinstance(body, str) and body else None
+        except ValueError:
+            fixed_body = None
+        pending = _pending_fixes(cfg)
+        pending.append({"issue": str(ticket["issue"]), "issue_body": fixed_body,
+                        "fixed_at": fixed_at, "patched": fixed_body is None})
+        _write_json(cfg.state_dir / PENDING_FIX_NAME, {"fixes": pending})
     (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
+    finish_pending_fixes(cfg)
 
 
-def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str) -> None:
+def _pending_fixes(cfg: Config) -> list[dict]:
+    value = _read_json(cfg.state_dir / PENDING_FIX_NAME)
+    fixes = value.get("fixes") if isinstance(value, dict) else None
+    return [fix for fix in fixes if isinstance(fix, dict) and fix.get("issue")] \
+        if isinstance(fixes, list) else []
+
+
+# GitHub answers 404 for an issue that no longer exists (or that the App can
+# no longer see) and 410 for a deleted one. Neither changes on a retry.
+_ISSUE_GONE = re.compile(r"HTTP 40[4]|HTTP 410|\"status\"\s*:\s*\"?(?:404|410)\b|\b(?:Not Found|was deleted)\b")
+
+
+def _issue_gone(text: str) -> bool:
+    return bool(_ISSUE_GONE.search(text or ""))
+
+
+def finish_pending_fixes(cfg: Config) -> bool:
+    """PATCH each recorded fix time into its issue's marker, then close the
+    issue. Whatever fails stays recorded for the next run, except an issue
+    GitHub says is gone (404 or 410): that is dropped and logged once, since
+    no retry can reach it. True when none is left."""
+    pending = _pending_fixes(cfg)
+    if not pending:
+        return True
+    import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    left = []
+    for fix in pending:
+        step, rc, text = "", 0, ""
+        if not fix.get("patched"):
+            step = "patch"
+            rc, text = host_off._patch_issue_body(fix["issue"], str(fix["issue_body"]))
+            if rc == 0:
+                fix["patched"] = True
+        if rc == 0:
+            step = "close"
+            rc, text = host_off._close_issue(fix["issue"])
+        if rc == 0:
+            continue
+        fix["error"] = f"{step}: {text}"[:300]
+        if _issue_gone(text):
+            print(f"self-update: starvation issue #{fix['issue']} is gone ({fix['error']}); "
+                  f"dropping its fix time {fix.get('fixed_at')}")
+            host_off.event(cfg.state_dir, "self_update_issue_gone",
+                           f"starvation issue #{fix['issue']} is gone; fix time not recorded",
+                           {"issue": fix["issue"], "fixed_at": fix.get("fixed_at"),
+                            "error": fix["error"]})
+            continue
+        print(f"self-update: starvation issue #{fix['issue']}: "
+              + ("fixed_at not recorded" if step == "patch" else "not closed")
+              + f" ({fix['error']}); retrying next run")
+        left.append(fix)
+    path = cfg.state_dir / PENDING_FIX_NAME
+    if left:
+        _write_json(path, {"fixes": left})
+    else:
+        path.unlink(missing_ok=True)
+    return not left
+
+
+def _turn_holder(reason: str) -> tuple[str, str]:
+    """(cause, the peers named) from the reason a deferral recorded."""
+    text = reason or ""
+    if text.startswith("yielding the update turn to a host that has waited longer: "):
+        return "waited_longer", text.split(": ", 1)[1]
+    if text.startswith("another fleet host is not serving normally: "):
+        evidence = text.split(": ", 1)[1]
+        dark = any(word in evidence.lower() for word in ("unreadable", "unreachable"))
+        return ("dark" if dark else "busy"), evidence
+    if text.startswith("peer announced first") or text.startswith("peer changed after announcing"):
+        return "announced", text.split(": ", 1)[1] if ": " in text else text
+    return "unknown", text
+
+
+def starvation_body(cfg: Config, me: str, ticket: dict, waited: float, reason: str,
+                    now: float) -> str:
+    """What happened, the evidence, the likely cause, the exact fix, whether it
+    is safe to apply unattended, and how to verify: one issue a reader can act
+    on without opening a host."""
+    cause, named = _turn_holder(reason)
+    since = _iso(float(ticket["since"]))
+    demand = ticket.get("demand") or []
+    dark = _read_json(cfg.state_dir / PEER_UNREADABLE_NAME) or {}
+    if demand:
+        bound = (f"while gate jobs it serves were queued. The bound with queued gate demand "
+                 f"is {STARVED_AFTER_SECONDS // 3600} h: one hour past the "
+                 f"{PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h after which a dark peer stops "
+                 "holding the turn.")
+    else:
+        bound = (f"with no queued gate demand read for it"
+                 f"{' (the demand read failed)' if ticket.get('demand_error') else ''}. "
+                 f"The bound without demand is {STARVED_FALLBACK_SECONDS // 3600} h.")
+    lines = [
+        f"**What happened.** {me} has had no tartci self-update turn for "
+        f"{waited / 3600:.1f} h (in the update queue since {since}), {bound}",
+        "",
+        "**Evidence.**",
+        f"- Deferral reason: {reason[:300]}",
+        f"- Waiting ticket: since {since}, target {str(ticket.get('target') or '')[:12]}",
+    ]
+    for job in demand[:5]:
+        lines.append(f"- Queued gate job {job.get('id')} ({job.get('repo')} "
+                     f"{job.get('workflow')}: {job.get('name')}) since {job.get('created_at')}")
+    if len(demand) > 5:
+        lines.append(f"- ...and {len(demand) - 5} more queued gate jobs")
+    if ticket.get("demand_error"):
+        lines.append(f"- Gate demand read failed: {str(ticket['demand_error'])[:200]}")
+    for peer, streak in sorted(dark.items()) if isinstance(dark, dict) else []:
+        if isinstance(streak, dict) and isinstance(streak.get("since"), (int, float)):
+            lines.append(f"- {peer} unreadable since {_iso(float(streak['since']))} "
+                         f"({streak.get('reads')} reads; excluded: {bool(streak.get('excluded'))})")
+    lines += ["", "**Likely cause and fix.**"]
+    if cause == "dark":
+        lines += [
+            f"A peer this host cannot read holds the turn ({named[:200]}). It stops holding "
+            f"it automatically once it has been dark for {PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h, "
+            "read unreadable by every readable peer.",
+            "- Check the dark host at the machine: `tartci pool status`.",
+            f"- To update {me} now instead, on {me}: `tartci fleet-macos self-update --plan`, "
+            "then `tartci fleet-macos self-update --apply`.",
+            "- Safe to auto-apply: no. The automatic exclusion already runs; a manual "
+            "update takes this host out of service.",
+        ]
+    elif cause == "busy":
+        lines += [
+            f"A peer is not serving normally ({named[:200]}), so this host will not drain too.",
+            "- On that peer: `tartci pool status`, and let its update or drain finish.",
+            "- Safe to auto-apply: no; wait for the peer, or fix it by hand.",
+        ]
+    elif cause == "waited_longer":
+        lines += [
+            f"{named[:200]} joined the update queue first and goes first.",
+            "- On that host: `tartci fleet-macos self-update --plan` shows why it has not "
+            "updated. If its ticket is stale, move it aside there: "
+            "`mv ~/.tartci/state/self-update/waiting.json ~/.tartci/state/self-update/waiting.json.aside` "
+            "(it rejoins at the back on its next attempt).",
+            "- Safe to auto-apply: no; moving a ticket changes the queue order.",
+        ]
+    else:
+        lines += [
+            f"A peer holds the turn ({named[:200]}).",
+            "- On every host: `tartci pool status`.",
+            "- Safe to auto-apply: no.",
+        ]
+    lines += [
+        "",
+        f"**Verify.** On {me}, `tartci fleet-macos self-update --plan` takes the turn, or "
+        "`~/.tartci/state/self-update/waiting.json` is gone. This issue records the fix "
+        "time on its marker and closes itself when the host gets its turn.",
+    ]
+    marker = tartci_incident.marker(me, "self_update_starved", since, _iso(now))
+    return tartci_incident.with_marker("\n".join(lines), marker)
+
+
+def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: str,
+                     now: float | None = None) -> None:
     """Once per episode, a GitHub issue: the event log alone was read by nobody.
 
     During the 2026-10-01 stall three hosts crossed the bound and wrote
@@ -1105,24 +1651,496 @@ def starvation_issue(cfg: Config, me: str, ticket: dict, waited: float, reason: 
     if ticket.get("issue") or os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
         return
     import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+    now = time.time() if now is None else now
     title = (f"[tartci] {me} self-update starved for {waited / 3600:.1f} h "
              f"since {_iso(float(ticket['since']))}")
-    body = (f"{me} has deferred its tartci self-update for {waited / 3600:.1f} h: {reason}\n\n"
-            "A busy, unreachable or longer-waiting peer holds the update turn. Check "
-            "tartci pool status on every host. This issue closes itself when the host "
-            "gets its turn.")
+    body = starvation_body(cfg, me, ticket, waited, reason, now)
     rc, text = host_off._open_issue(title, body)
     if rc == 0 and text.strip().isdigit():
         ticket["issue"] = text.strip()
+        ticket["issue_body"] = body
     else:
         ticket["issue_error"] = text[:300]
 
 
+def mid_job_lanes(plan_text: str) -> list[str]:
+    """The `lane: state, detail` rows under `mid-job lanes:` in `pool off --plan`."""
+    rows: list[str] = []
+    inside = False
+    for line in plan_text.splitlines():
+        if line.strip() == "mid-job lanes:":
+            inside = True
+            continue
+        if inside:
+            if not line.startswith("    ") or ":" not in line:
+                break
+            rows.append(line.strip()[:300])
+    return rows
+
+
+def launcher_ack_path(cfg: Config) -> Path:
+    return cfg.home / ".config" / "tartci" / "launcher-change-ack"
+
+
+def launcher_change_refusal(cfg: Config, target: str, installed: str,
+                            refresh: bool) -> str | None:
+    """Why this update must not replace the sealed launcher yet, or None.
+
+    The launcher bundle seals the support tree and its commit, so every update
+    to a new commit replaces TartCILauncher.app, and replacing it can reset
+    its Removable Volumes consent. On a host whose Tart store is on an
+    external volume the helper's open() then blocks and every lane stops. The
+    update proceeds only once an operator has acknowledged that exact target
+    commit in launcher-change-ack (the bundle digest cannot be the key: each
+    build is re-signed with a new timestamp). Checked before any drain.
+    """
+    if launch_helper(cfg) is None or refresh or target == installed:
+        return None
+    try:
+        acknowledged = launcher_ack_path(cfg).read_text().strip()
+    except OSError:
+        acknowledged = ""
+    if acknowledged == target:
+        return None
+    return (f"launcher change needs consent: {installed[:12]} -> {target[:12]} replaces "
+            "TartCI Launcher, which can reset its Removable Volumes consent; acknowledge "
+            f"with: echo {target} > {launcher_ack_path(cfg)}")
+
+
+def planned_layout(cfg: Config) -> str | None:
+    """The launcher layout the installer will write ("v1"/"v2"), None on a host
+    without a launch helper. Refuses with the installer's own finding (an
+    untrusted opt-in file, a v2 host whose opt-in is gone) before any drain."""
+    if launch_helper(cfg) is None:
+        return None
+    import launcher_layout  # noqa: PLC0415 - sibling module; owns the layout rules
+    try:
+        return launcher_layout.decide(cfg.home,
+                                      launcher_layout.read_receipt(cfg.install_receipt),
+                                      app=_helper_app(cfg))
+    except launcher_layout.LayoutError as exc:
+        raise Refused(f"launcher layout: {exc}") from exc
+
+
+@dataclasses.dataclass
+class LauncherChange:
+    """Whether a v2 turn replaces the stable app, and why (B1).
+
+    The app is keyed on what it is made of (the inputs digest of main.swift,
+    Info.plist and policy.json), who signs it and for which team. A turn that
+    leaves all three equal installs no new app, so its Removable Volumes grant
+    stands; any difference, or a move from v1, is a launcher change.
+    """
+    live_layout: str | None
+    live_inputs: str | None
+    target_inputs: str
+    live_identity: str
+    identity: str
+    live_team: str | None
+    team: str
+
+    @property
+    def differs(self) -> list[str]:
+        out = []
+        if self.live_layout != "v2":
+            out.append(f"layout {self.live_layout or 'none'} -> v2")
+        if self.live_inputs != self.target_inputs:
+            out.append(f"inputs {str(self.live_inputs)[:12]} -> {self.target_inputs[:12]}")
+        if self.live_identity != self.identity:
+            out.append(f"identity {self.live_identity[:12]} -> {self.identity[:12]}")
+        if self.live_team != self.team:
+            out.append(f"team {self.live_team} -> {self.team}")
+        return out
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.differs)
+
+    @property
+    def ack(self) -> str:
+        return f"v2 inputs={self.target_inputs} identity={self.identity} team={self.team}"
+
+    def describe(self) -> str:
+        if not self.changed:
+            return ("launcher v2: no launcher change (inputs, signing identity and team equal "
+                    "the live app's); the app stays in place")
+        return "launcher v2: launcher change (" + "; ".join(self.differs) + ")"
+
+
+def choose_signer(sys_: System, home: Path, live_identity: str) -> str:
+    """The identity a v2 turn signs with: the live app's own certificate while
+    the dedicated keychain still holds it, else the keychain's one Developer ID
+    Application identity (a rotated certificate, so a launcher change)."""
+    keychain = signing_keychain(home)
+    result = sys_.run(["security", "find-identity", "-v", "-p", "codesigning",
+                       *([keychain] if keychain else [])])
+    found = re.findall(r'\b([0-9A-F]{40})\b "Developer ID Application', result.out or "")
+    if live_identity in found:
+        return live_identity
+    if len(set(found)) == 1:
+        return found[0]
+    raise Refused(f"the dedicated signing keychain holds {len(set(found))} Developer ID "
+                  f"Application identities and not the live launcher's {live_identity}; "
+                  "keep exactly one there (`pulp ship doctor`)")
+
+
+def certificate_team(sys_: System, home: Path, identity: str) -> str | None:
+    """The Team ID in the dedicated keychain's Developer ID Application
+    certificate `identity` ("Developer ID Application: Name (TEAMID)")."""
+    keychain = signing_keychain(home)
+    result = sys_.run(["security", "find-identity", "-v", "-p", "codesigning",
+                       *([keychain] if keychain else [])])
+    match = re.search(rf'\b{re.escape(identity)}\b "Developer ID Application: [^"]*\(([A-Z0-9]{{10}})\)"',
+                      result.out or "")
+    return match.group(1) if match else None
+
+
+def v2_launcher_change(cfg: Config, sys_: System, helper: dict, profile: Path,
+                       identity: str, live_identity: str) -> LauncherChange:
+    """Measure, before any drain, whether this v2 turn needs a new app."""
+    resources = Path(helper["path"]) / "Contents" / "Resources"
+    digest = sys_.run(["python3", "-c",
+                       "import sys, tomllib; sys.path.insert(0, 'scripts'); "
+                       "import macos_launcher_identity as m; "
+                       "print(m.source_inputs_digest('.', tomllib.loads(open(sys.argv[1]).read())))",
+                       str(profile)], cwd=str(cfg.checkout))
+    target_inputs = digest.out.strip()
+    if digest.rc != 0 or not re.fullmatch(r"[0-9a-f]{64}", target_inputs):
+        raise Refused(f"cannot measure the target's launcher inputs: {digest.text[:300]}")
+    detail = sys_.run(["codesign", "-d", "--verbose=2", helper["path"]])
+    team = re.search(r"^TeamIdentifier=(\S+)$", detail.text or "", re.MULTILINE)
+    return LauncherChange(
+        live_layout=installed_layout(cfg),
+        live_inputs=(_read_json(resources / "inputs.json") or {}).get("sha256"),
+        target_inputs=target_inputs, live_identity=live_identity, identity=identity,
+        live_team=team.group(1) if team else None,
+        team=signing_team(sys_, cfg.home, identity, str(helper.get("team_id"))))
+
+
+def signing_team(sys_: System, home: Path, identity: str, profile_team: str) -> str:
+    """The team the new app would carry: the signing certificate's own Team
+    ID, which must be the profile's launch_helper.team_id (the policy pins it)."""
+    team = certificate_team(sys_, home, identity)
+    if team != profile_team:
+        raise Refused(f"the signing certificate {identity} is for team {team or 'unknown'}, not "
+                      f"the profile's launch_helper.team_id {profile_team}; a launcher signed by it "
+                      "would fail its own policy. Fix the keychain (`pulp ship doctor`) or the profile")
+    return team
+
+
+def v2_ack_refusal(cfg: Config, change: LauncherChange) -> str | None:
+    """Why a v2 launcher change may not go ahead yet, or None: the operator
+    acknowledges exactly this inputs digest, signing identity and team."""
+    if not change.changed:
+        return None
+    try:
+        acknowledged = launcher_ack_path(cfg).read_text().strip()
+    except OSError:
+        acknowledged = ""
+    if acknowledged == change.ack:
+        return None
+    return (f"launcher change needs consent ({'; '.join(change.differs)}): a new TartCI "
+            "Launcher can reset its Removable Volumes consent; acknowledge with: "
+            f"echo '{change.ack}' > {launcher_ack_path(cfg)}")
+
+
+def launcher_consent_alert(cfg: Config, me: str, target: str, installed: str,
+                           refusal: str | None, now: float) -> None:
+    """One issue while a launcher change waits for consent; it closes once the
+    change is acknowledged or no longer needed. Best effort: never raises."""
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "launcher-consent-alert.json"
+        since = (host_off._read_json(path) or {}).get("since") or _iso(now)
+        ack = launcher_ack_path(cfg)
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update to `{target[:12]}` would replace TartCI Launcher "
+                f"(installed from `{installed[:12]}`). It refused before draining: the host "
+                "is still serving on the installed generation.", "",
+                "## Evidence",
+                f"- `{ack}` does not name `{target}`",
+                "- the self-update receipt's `refused` step quotes this refusal", "",
+                "## Likely cause",
+                "Every TartCI commit seals a new launcher bundle. Replacing the bundle can "
+                "reset its per-app Removable Volumes consent; this host's Tart store is on "
+                "an external volume, so without that consent the helper blocks in open() "
+                "and no lane starts.", "",
+                "## Fix", "```sh",
+                "# 1. allow this one update to replace the launcher",
+                f"echo {target} > {ack}",
+                "# 2. right after it installs: grant Removable Volumes to TartCI Launcher",
+                "#    System Settings > Privacy & Security > Files and Folders >",
+                "#    TartCI Launcher > Removable Volumes (on)",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. The consent is a person's decision in System Settings.", "",
+                "## How to verify",
+                "The next self-update passes this gate and installs; `tartci pool on` then "
+                "passes the launch-helper volume probe. This issue closes itself.",
+            ])
+            title = (f"[tartci] {me}: grant Removable Volumes to TartCI Launcher before "
+                     f"self-update installs {target[:12]}")
+            marker = tartci_incident.marker(me, "launcher_consent_needed", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=refusal is not None, resolved=refusal is None,
+            since=since if refusal is not None else None,
+            raise_event=lambda: host_off.event(cfg.state_dir, "launcher_consent_needed",
+                                               (refusal or "")[:300],
+                                               {"target": target, "installed": installed}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: launcher-consent alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+# pool on's readiness failure from macos_launcher_probe (any outcome: a denial
+# exits at once, a blocked open() times out).
+LAUNCH_PROBE_FAILED = re.compile(r"launch helper volume probe")
+# The probe's own control write was slow too (macos_launcher_probe): the volume,
+# not the launcher's consent, is the cause.
+LAUNCH_PROBE_SLOW_VOLUME = re.compile(r"volume I/O slow")
+
+
+def probe_slow_volume(probe: str) -> bool:
+    return bool(LAUNCH_PROBE_SLOW_VOLUME.search(probe or ""))
+
+
+def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float) -> None:
+    """One issue when a new launcher's volume probe fails and the host is left
+    OFF without a rollback. Best effort: never raises."""
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "launcher-probe-alert.json"
+        since = _iso(now)
+
+        def render() -> tuple[str, str]:
+            if probe_slow_volume(probe):
+                return render_slow()
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update installed `{target[:12]}`, which replaced TartCI "
+                "Launcher, and then `pool on` failed the launch-helper volume probe. "
+                "Self-update STOPPED with the host OFF and did not roll back.", "",
+                "## Evidence",
+                f"- pool on: `{probe.strip()[:600]}`",
+                "- the self-update receipt's `pool-on` and `failed` steps", "",
+                "## Likely cause",
+                "Replacing the launcher app reset its per-app Removable Volumes consent, so "
+                "the helper blocks in open() on the external-volume Tart store. A rollback "
+                "would replace the app again and reset the consent again, so none was done.",
+                "",
+                "## Fix", "```sh",
+                "# 1. System Settings > Privacy & Security > Files and Folders >",
+                "#    TartCI Launcher > Removable Volumes (on)",
+                "# 2. then, on the host:",
+                "tartci pool on",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. The consent is a person's decision in System Settings, and a rollback "
+                "would undo it again.", "",
+                "## How to verify",
+                "`tartci pool on` passes the launch-helper volume probe and the lanes start. "
+                "This issue closes after the next self-update that completes.",
+            ])
+            title = f"[tartci] {me} is OFF: grant Removable Volumes to TartCI Launcher, then pool on"
+            marker = tartci_incident.marker(me, "launcher_probe_failed", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        def render_slow() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update installed `{target[:12]}`, which replaced TartCI "
+                "Launcher, and then `pool on` failed the launch-helper volume probe because "
+                "the Tart store's volume was slow. Self-update STOPPED with the host OFF and "
+                "did not roll back.", "",
+                "## Evidence",
+                f"- pool on: `{probe.strip()[:600]}`",
+                "- the probe's own control write into the same directory was slow too, so "
+                "this is the volume, not the launcher's Removable Volumes consent", "",
+                "## Likely cause",
+                "Heavy I/O on the external volume that holds the Tart store (a large VM "
+                "copy, a reclaim scan, Spotlight or backup), or a failing disk.", "",
+                "## Fix", "```sh",
+                "# 1. find what is loading the volume",
+                "sudo fs_usage -w -f filesys | grep -i Volumes   # or Activity Monitor > Disk",
+                "# 2. once a write to the store is fast again, on the host:",
+                "tartci pool on",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Whether the volume is healthy is a person's call; a rollback would "
+                "replace the launcher again.", "",
+                "## How to verify",
+                "`tartci pool on` passes the launch-helper volume probe and the lanes start. "
+                "This issue closes after the next self-update that completes.",
+            ])
+            title = f"[tartci] {me} is OFF: its Tart store volume was too slow for the launcher probe"
+            marker = tartci_incident.marker(me, "launcher_probe_slow_volume", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=True, resolved=False, since=since,
+            raise_event=lambda: host_off.event(cfg.state_dir, "launcher_probe_failed",
+                                               probe[:300], {"target": target}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never changes the outcome
+        print(f"self-update: launcher-probe alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def close_launcher_probe_alert(cfg: Config) -> None:
+    """Close the issue once a self-update completes. Best effort."""
+    path = cfg.state_dir / "launcher-probe-alert.json"
+    if not path.is_file():
+        return
+    try:
+        import host_off  # noqa: PLC0415
+        host_off.episode_alert(path, active=False, resolved=True, since=None,
+                               raise_event=lambda: None, render=lambda: ("", ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"self-update: launcher-probe alert close failed: {exc}", flush=True)
+
+
+def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: float,
+                        now: float) -> None:
+    """One issue while the self-update drain timed out waiting on a lane; it
+    closes on the next drain that completes. `busy` None means the wait ended.
+
+    The bounded wait only failed the attempt, and a human heard of it only
+    when consecutive failures halted self-update. Best effort: never raises.
+    """
+    if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
+        return
+    try:
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        path = cfg.state_dir / "drain-timeout-alert.json"
+        # One episode across attempts: a later timeout keeps the first's time.
+        since = (host_off._read_json(path) or {}).get("since") or _iso(now)
+        lanes = "; ".join(busy or []) or "(not named)"
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update drained the pool and then waited {waited / 60:.0f} min "
+                f"(the bound) for its own lanes to finish, and they did not: {lanes}. "
+                "The attempt failed and the host was put back ON; the update did not land.", "",
+                "## Evidence",
+                f"- the self-update receipt's `wait-idle` steps name what it waited on: {lanes}",
+                "- `tartci pool off --plan` on the host lists `mid-job lanes:`", "",
+                "## Likely cause",
+                "A lane job that runs longer than the bound (a long build, or a hung job "
+                "that is not timing out), or a lane supervisor whose VM lease or heartbeat "
+                "outlived its work. Only tartci's own lanes count: a manual VM never "
+                "blocks the drain.", "",
+                "## Fix", "```sh",
+                "tartci pool off --plan        # which lane, which pid",
+                "# a real job: let it finish; self-update retries on its next tick",
+                "# a hung job: cancel it in GitHub Actions, then let the lane tear down",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Killing a lane mid-job kills someone's CI run.", "",
+                "## How to verify",
+                "The next self-update logs `wait-idle: no owned lane mid-job`; this issue "
+                "then closes itself.",
+            ])
+            title = (f"[tartci] {me} self-update drain timed out after {waited / 60:.0f} min "
+                     f"waiting on a lane")
+            marker = tartci_incident.marker(me, "self_update_drain_timeout", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        host_off.episode_alert(
+            path, active=busy is not None,
+            resolved=busy is None, since=since if busy is not None else None,
+            raise_event=lambda: host_off.event(cfg.state_dir, "self_update_drain_timeout",
+                                               f"waited {waited:.0f}s on {lanes}"[:300],
+                                               {"lanes": busy or []}, now),
+            render=render)
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: drain-timeout alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+# A gate-demand snapshot older than this is not used: the bound falls back.
+GATE_DEMAND_FRESH_SECONDS = 10 * 60
+
+
+def _demand_fetch() -> gate_job_demand.Fetch:
+    return gate_job_demand.gh_fetcher(os.environ.get("TARTCI_GH_CLI") or "ghapp")
+
+
+def _gate_queue_path(cfg: Config) -> Path:
+    return _gate_queue_path_in(cfg.state_dir)
+
+
+def refresh_gate_demand(cfg: Config, me: str, now: float) -> dict:
+    """Read the queued self-hosted gate jobs this host serves and keep them in
+    gate-queue.json. A host with no published registration reads nothing."""
+    source = fleet_source.resolve(cfg.checkout)
+    advertised = _read_json(source.published_supply)
+    regs = gate_job_demand.registrations(advertised, me)
+    if not regs:
+        return {}
+    try:
+        jobs, errors = gate_job_demand.queued_jobs(_demand_fetch(), regs, now)
+    except Exception as error:  # noqa: BLE001 - a failed read is recorded, not raised
+        jobs, errors = [], [str(error)[:300]]
+    snapshot = {"observed_at": _iso(now), "host_id": me, "jobs": jobs, "errors": errors}
+    _write_json(_gate_queue_path(cfg), snapshot)
+    return snapshot
+
+
+def gate_demand(cfg: Config, me: str, now: float | None = None) -> tuple[list[dict], list[str]]:
+    """(queued gate jobs this host serves, read errors) from a fresh snapshot."""
+    return gate_demand_at(_gate_queue_path(cfg), me, now)
+
+
+def gate_demand_at(path: Path, me: str, now: float | None = None) -> tuple[list[dict], list[str]]:
+    """gate_demand for the snapshot at `path`; a stale or missing snapshot is
+    no demand, reported as an error."""
+    now = time.time() if now is None else now
+    value = _read_json(path)
+    if not isinstance(value, dict) or value.get("host_id") != me:
+        return [], ["no gate-demand snapshot for this host"]
+    observed = gate_job_demand.epoch(value.get("observed_at"))
+    if observed is None or not 0 <= now - observed <= GATE_DEMAND_FRESH_SECONDS:
+        return [], ["the gate-demand snapshot is stale"]
+    jobs = value.get("jobs") if isinstance(value.get("jobs"), list) else []
+    errors = value.get("errors") if isinstance(value.get("errors"), list) else []
+    return gate_job_demand.jobs_for(jobs, me, now), [str(error) for error in errors]
+
+
+def gate_demand_waiting(cfg: Config, me: str = "", now: float | None = None) -> bool:
+    """Whether queued gate jobs this host serves are waiting."""
+    return bool(gate_demand(cfg, me, now)[0])
+
+
+def _gate_queue_path_in(state_dir: Path) -> Path:
+    return Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(state_dir / "gate-queue.json"))
+
+
 def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
-    """Record the deferral; EXIT_DEFERRED until it has lasted STARVED_AFTER_SECONDS."""
+    """Record the deferral; become loud past the starvation bound: one hour
+    after the dark-peer exclusion when gate jobs this host serves are queued,
+    STARVED_FALLBACK_SECONDS otherwise or when the demand read failed."""
     ticket = note_waiting(cfg, me, target, reason, now)
     waited = max(0.0, now - float(ticket["since"]))
-    if waited < STARVED_AFTER_SECONDS:
+    refresh_gate_demand(cfg, me, now)
+    demand, demand_errors = gate_demand(cfg, me, now)
+    ticket["demand"] = demand[:20]
+    # A failed demand read falls back to the long bound, and says so: a blind
+    # read is not "no demand".
+    ticket["demand_error"] = "; ".join(demand_errors)[:300] or None
+    _write_json(cfg.state_dir / "waiting.json", ticket)
+    if demand_errors:
+        print(f"self-update: gate demand unread ({ticket['demand_error']}); "
+              f"starvation bound {STARVED_FALLBACK_SECONDS // 3600} h")
+    bound = STARVED_AFTER_SECONDS if demand else STARVED_FALLBACK_SECONDS
+    if waited < bound:
         print(f"self-update: DEFERRED ({waited / 3600:.1f} h in the update queue): {reason}")
         return EXIT_DEFERRED
     print(f"self-update: STARVED: no update turn for {waited / 3600:.1f} h "
@@ -1131,9 +2149,11 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
         import host_off  # noqa: PLC0415 - sibling module; owns the event log format
         host_off.event(cfg.state_dir, "self_update_starved",
                        f"no update turn for {waited / 3600:.1f} h: {reason[:200]}",
-                       {"since": _iso(float(ticket["since"])), "target": target[:12]}, now)
+                       {"since": _iso(float(ticket["since"])), "target": target[:12],
+                        "gate_jobs": [job.get("id") for job in demand[:20]],
+                        "demand_error": ticket.get("demand_error")}, now)
         ticket["starved_evented"] = now
-    starvation_issue(cfg, me, ticket, waited, reason)
+    starvation_issue(cfg, me, ticket, waited, reason, now)
     _write_json(cfg.state_dir / "waiting.json", ticket)
     return EXIT_REFUSED
 
@@ -1149,7 +2169,7 @@ _PYTHON_SHIM_DIR: str | None = None
 
 
 def python_shim_dir() -> str:
-    """A private directory whose `python3` is this interpreter.
+    """A private directory whose `python3` is this process's child interpreter.
 
     Prepended to PATH for every tartci call, so the installed generation AND an
     older one being rolled back to (whose shell helpers may call a bare
@@ -1159,9 +2179,28 @@ def python_shim_dir() -> str:
     global _PYTHON_SHIM_DIR
     if _PYTHON_SHIM_DIR is None or not os.path.isdir(_PYTHON_SHIM_DIR):
         directory = tempfile.mkdtemp(prefix="tartci-self-update-python-")
-        os.symlink(sys.executable, os.path.join(directory, "python3"))
+        os.symlink(child_python(), os.path.join(directory, "python3"))
         _PYTHON_SHIM_DIR = directory
     return _PYTHON_SHIM_DIR
+
+
+def installed_lane_python(home: Path) -> str | None:
+    """The absolute TARTCI_PYTHON the installed fleet lanes run, or None."""
+    import plistlib  # noqa: PLC0415
+    for plist in sorted((home / "Library" / "LaunchAgents").glob(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+        try:
+            value = plistlib.loads(plist.read_bytes()).get("EnvironmentVariables", {}).get(
+                "TARTCI_PYTHON")
+        except (OSError, plistlib.InvalidFileException, ValueError, AttributeError):
+            continue
+        if isinstance(value, str) and value.startswith("/"):
+            return value
+    return None
+
+
+def python_pin_path(home: Path) -> Path:
+    return Path(os.environ.get("TARTCI_PYTHON_PIN") or home / ".config" / "tartci" / "python.pin")
 
 
 def census_env(repository: str | None = None) -> dict[str, str]:
@@ -1169,12 +2208,20 @@ def census_env(repository: str | None = None) -> dict[str, str]:
     # the interpreter every tartci helper runs under, including on rollback.
     env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
-        "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
+        "TARTCI_PYTHON": child_python(),
         "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
     if repository is not None:
         env["GH_REPO"] = repository
+    for name in (
+        "TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+        "TARTCI_FLEET_SOURCE_REPOSITORY", "TARTCI_ADVERTISED_LABELS",
+        "TARTCI_JOB_CLAIM_SUPPLY",
+    ):
+        value = os.environ.get(name, "").strip()
+        if value:
+            env[name] = value
     return env
 
 
@@ -1464,10 +2511,22 @@ def restore_writable(root: Path) -> None:
                 os.chmod(path, (path.stat().st_mode & 0o7777) | 0o200)
 
 
+def launch_python(profile: Path) -> str:
+    """The interpreter a launcher is built and verified with: the profile's
+    host.python when it declares one (the installer will pin exactly that),
+    else the render handoff, TARTCI_PYTHON, or this process's own."""
+    host = _toml(profile).get("host") or {}
+    declared = host.get("python") if isinstance(host, dict) else None
+    if isinstance(declared, str) and declared.startswith("/"):
+        return os.path.realpath(declared)
+    return os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or child_python())
+
+
 def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, target: str,
-                   out_dir: Path) -> tuple[Path, Path]:
+                   out_dir: Path, *, layout: str = "v1", identity: str | None = None,
+                   expected_inputs: str | None = None) -> tuple[Path, Path]:
     live = Path(helper["path"])
-    identity = extract_signing_identity(sys_, live, out_dir)
+    identity = identity or extract_signing_identity(sys_, live, out_dir)
     pinned = keychain_args(cfg.home)
     signing_probe(sys_, identity, out_dir, pinned)
     bundle = out_dir / "TartCILauncher.app"
@@ -1475,11 +2534,12 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     manifest = cfg.checkout / ".tartci-support-manifest.json"
     set_immutable(cfg.checkout, manifest, sys_)
     try:
-        launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-            "TARTCI_PYTHON") or sys.executable)
+        launcher_python = launch_python(profile)
         result = sys_.run(["bash", "scripts/build_macos_launcher.sh", "--output", str(bundle),
                            "--approval-output", str(approval), "--identity", identity,
-                           "--support-root", ".", "--profile", str(profile), *pinned],
+                           "--support-root", ".", "--profile", str(profile),
+                           "--python", launcher_python, *pinned,
+                           *(["--layout", "v2"] if layout == "v2" else [])],
                           cwd=str(cfg.checkout),
                           env={"TARTCI_RENDER_PYTHON": launcher_python,
                                "TARTCI_PYTHON": launcher_python},
@@ -1491,8 +2551,23 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
     if not bundle.is_dir() or not approval.is_file():
         raise Refused(f"launcher build produced no bundle (exit {result.rc}): "
                       + "\n".join(l for l in result.text.splitlines() if not l.startswith("rm:")))
-    verify_bundle(cfg, sys_, bundle, profile, target)
+    if layout == "v2":
+        verify_bundle_v2(sys_, bundle, expected_inputs)
+    else:
+        verify_bundle(cfg, sys_, bundle, profile, target)
     return bundle, approval
+
+
+def verify_bundle_v2(sys_: System, bundle: Path, expected_inputs: str | None) -> None:
+    """A new v2 app: built from exactly the inputs this turn measured, and signed."""
+    inputs = (_read_json(bundle / "Contents" / "Resources" / "inputs.json") or {}).get("sha256")
+    if not expected_inputs or inputs != expected_inputs:
+        raise Refused(f"new launcher v2 inputs {inputs} != the target's {expected_inputs}")
+    if (bundle / "Contents" / "Resources" / "bundle.json").exists():
+        raise Refused("new launcher v2 carries a v1 bundle.json")
+    check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
+    if check.rc != 0:
+        raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
 
 
 def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target: str) -> None:
@@ -1504,8 +2579,7 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     lanes = (_read_json(resources / "lanes.json") or {}).get("lanes") or {}
     rendered = cfg.state_dir / "verify-render"
     shutil.rmtree(rendered, ignore_errors=True)
-    launcher_python = os.path.realpath(os.environ.get("TARTCI_RENDER_PYTHON") or os.environ.get(
-        "TARTCI_PYTHON") or sys.executable)
+    launcher_python = launch_python(profile)
     result = sys_.run(["python3", "scripts/macos_fleet_lanes.py", "render", str(profile),
                        "--output", str(rendered)], cwd=str(cfg.checkout),
                       env={"TARTCI_RENDER_PYTHON": launcher_python,
@@ -1527,9 +2601,13 @@ def verify_bundle(cfg: Config, sys_: System, bundle: Path, profile: Path, target
     check = sys_.run(["codesign", "--verify", "--deep", "--strict", str(bundle)])
     if check.rc != 0:
         raise Refused(f"new launcher fails codesign --verify --deep --strict: {check.text}")
-    # Every support agent the profile declares must render from the target
-    # checkout, checked here so a missing or broken template refuses the update
-    # before any drain rather than after the lanes are back.
+    check_support_agent_templates(cfg, sys_, profile, target)
+
+
+def check_support_agent_templates(cfg: Config, sys_: System, profile: Path, target: str) -> None:
+    """Every support agent the profile declares must render from the target
+    checkout, checked before any drain so a missing or broken template refuses
+    the update rather than surfacing after the lanes are back."""
     agents = sys_.run(["python3", "scripts/support_agents.py", "check-templates",
                        "--profile-file", str(profile)], cwd=str(cfg.checkout))
     if agents.rc != 0:
@@ -1610,11 +2688,32 @@ def _ts(text: str | None) -> float:
         return 0.0
 
 
-def recent_attempt(cfg: Config, target: str, now: float) -> str | None:
+def _same_fleet_source(first: Any, second: Any) -> bool:
+    """Whether two attempts selected the same profile source.
+
+    The target commit alone is not enough for a same-generation reinstall:
+    moving from the public profiles to a private source deliberately keeps the
+    TartCI generation unchanged.  Older receipts have no source field, which
+    is the public-source value and remains comparable to ``None``.
+    """
+    if not first and not second:
+        return True
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    # A new commit on the same private authority is still the same source
+    # class.  The source move itself gets a fresh window when crossing the
+    # public/private boundary, but a busy private authority must not make the
+    # canary drain once per commit.
+    return bool(first) == bool(second)
+
+
+def recent_attempt(cfg: Config, target: str, now: float,
+                   fleet_source: dict[str, Any] | None = None) -> str | None:
     for path, value in _attempts(cfg.state_dir):
         # A refusal changed nothing, so it does not spend the attempt.
         if (value.get("mode") != "apply" or value.get("target") != target
-                or value.get("status") not in TERMINAL_STATUSES):
+                or value.get("status") not in TERMINAL_STATUSES
+                or not _same_fleet_source(value.get("fleet_source"), fleet_source)):
             continue
         if now - _ts(value.get("started_at")) < cfg.rate_hours * 3600:
             return f"{path.name} ({value.get('status')})"
@@ -1665,7 +2764,8 @@ def prune_refusals(state_dir: Path, now: float) -> None:
 
 def checked_in_profile(cfg: Config) -> Path:
     name = _toml(cfg.installed_profile).get("name")
-    for path in sorted((cfg.checkout / "profiles").glob("*-macos-fleet.toml")):
+    source = fleet_source.resolve(cfg.checkout)
+    for path in sorted(source.profiles_dir.glob("*-macos-fleet.toml")):
         if _toml(path).get("name") == name:
             return path
     raise Refused(f"no checked-in profile named {name!r} at the target commit")
@@ -1685,6 +2785,37 @@ def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900,
     """The TARGET commit's tartci, run from the managed checkout."""
     return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(repository),
                     timeout=timeout)
+
+
+def handoff_target_orchestrator(cfg: Config, target: str, *,
+                                apply: bool, scheduled: bool, refresh: bool) -> bool:
+    """Run the target checkout's orchestration code before sealed builds.
+
+    A sealed launcher starts the self-update script copied into its installed
+    generation.  That copy may predate a launcher verification fix and can
+    therefore reject the target's corrected bundle forever.  Once the
+    authenticated checkout is detached at the selected target, hand off to
+    its own dispatcher.  The environment marker prevents the target copy from
+    handing off to itself again.
+    """
+    if (not apply or refresh
+            or os.environ.get("TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR") == "1"):
+        return False
+    if orchestrator_generation() is None:
+        return False
+    if launch_helper(cfg) is None:
+        return False
+    dispatcher = cfg.checkout / "tartci"
+    args = [str(dispatcher), "fleet-macos", "self-update", "--apply",
+            "--target", target, "--home", str(cfg.home)]
+    if scheduled:
+        args.append("--scheduled")
+    # The checkout was authenticated and detached immediately before this
+    # call. Replace the installed-generation process so launchd's signal
+    # reaches the real orchestrator and its output remains attached.
+    environment = {**os.environ, "TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"}
+    os.execve(str(dispatcher), args, environment)
+    return True  # only reachable under the unit-test execve stub
 
 
 def installed_tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
@@ -1802,7 +2933,8 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
 
 
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
-                  explicit: bool = False, scheduled: bool = False) -> int:
+                  explicit: bool = False, scheduled: bool = False,
+                  reinstall: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
@@ -1818,9 +2950,30 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_FAILED
     if apply:
         recover_left_off(cfg, sys_)
+        finish_pending_fixes(cfg)
+    # Resolve launcher layout before reading the installed generation or any
+    # selected source. A missing receipt must still refuse when the helper app
+    # on disk proves that this host runs v2.
+    try:
+        planned_layout(cfg)
+    except Refused as exc:
+        reason = f"launcher layout: {exc}" if not str(exc).startswith("launcher layout:") else str(exc)
+        if apply:
+            receipt = Receipt(cfg, sys_, None, "apply")
+            receipt.step("refused", reason, ok=False)
+            receipt.finish("refused", reason)
+        else:
+            print(f"self-update: REFUSED {reason}")
+        return EXIT_REFUSED
     try:
         installed, source = installed_commit(cfg)
+        previous_fleet_source = installed_fleet_source_record(cfg)
+        if fleet_source_receipt_is_configured(cfg) and previous_fleet_source is None:
+            raise Refused("installed private-source receipt lacks the source root and repository; "
+                          "refusing a source move until the host is reinstalled from a complete "
+                          "source receipt")
         refresh_checkout(cfg, sys_)
+        selected_source = sync_fleet_source(cfg, sys_, write=apply)
     except NotManaged as exc:
         print(f"self-update: not applicable: {exc}")
         _write_json(cfg.state_dir / "skew.json", {"state": "not_applicable", "reason": str(exc),
@@ -1850,6 +3003,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
+    if selected_source:
+        print(f"self-update: fleet source {selected_source['repository']}"
+              f"@{selected_source['commit'][:12]} (installed from "
+              f"{_source_name(installed_fleet_source_commit(cfg))}; {selected_source['why']})")
     print(f"self-update: {render_skew(skew)}")
     if skew.get("explicit"):
         print(f"self-update: selected {skew.get('selected_target') or 'none'} "
@@ -1862,10 +3019,39 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_UNKNOWN
     target = skew.get("target")
     refresh = None
-    if not target and skew["state"] == "current":
+    if reinstall:
+        # The operator's own request: reinstall the generation this host runs,
+        # with the current settings (a removed [fleet_source], say), through the
+        # same drain, install, pool-on and verify path as any update. It never
+        # takes a NEW private source: that waits for the canary and its soak.
+        recorded = installed_fleet_source_record(cfg) or {}
+        if selected_source and ((selected_source.get("repository"), selected_source.get("commit"))
+                                != (recorded.get("repository"), recorded.get("commit"))):
+            reason = (f"--reinstall-current refused: it would install private source "
+                      f"{selected_source.get('repository')}@{str(selected_source.get('commit'))[:12]} "
+                      f"(installed from "
+                      + (f"{recorded['repository']}@{recorded['commit'][:12]}" if recorded
+                         else "the public profiles")
+                      + "), which only a canary-gated update may do. "
+                      "It reinstalls on the installed source, or moves to the public profiles "
+                      "when [fleet_source] is removed. Fix: wait for the normal update, or "
+                      "remove [fleet_source] to go public")
+            print(f"self-update: REFUSED {reason}")
+            return EXIT_REFUSED
+        target = installed
+        refresh = ("operator requested --reinstall-current: reinstall the installed "
+                   "generation with the current settings")
+        print(f"self-update: same-generation reinstall requested: {installed[:12]}")
+    elif not target:
         refresh = refresh_reason(cfg, sys_)
-        if refresh:
-            # Same generation, reinstalled only to rewrite its receipt.
+        # A private-source change is a same-generation install. It must not
+        # wait for an unrelated TartCI commit to finish its soak: the running
+        # code is unchanged, while the selected profile bytes still need to
+        # reach the installed generation. The ordinary TartCI target remains
+        # gated by its own skew state below.
+        source_moved = bool(refresh and refresh.startswith("fleet source moved to "))
+        if refresh and (source_moved and skew["state"] in ("current", "soaking", "behind", "unverified")
+                        or not source_moved and skew["state"] == "current"):
             target = installed
             print(f"self-update: same-generation reinstall needed: {refresh}")
     if not target:
@@ -1881,8 +3067,27 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          soak_until=skew.get("soak_until"))
     receipt.value["previous"] = installed
     receipt.value["refresh"] = refresh
+    receipt.value["fleet_source"] = selected_source
+    try:
+        if apply and launch_helper(cfg) is not None:
+            _checkout(cfg, sys_, target)
+        if handoff_target_orchestrator(cfg, target, apply=apply, scheduled=scheduled,
+                                       refresh=bool(refresh)):
+            return EXIT_OK
+    except (FileNotFoundError, PermissionError) as exc:
+        reason = f"target dispatcher unavailable: {type(exc).__name__}: {exc}"
+        receipt.step("refused", reason, ok=False)
+        receipt.finish("refused", reason)
+        print(f"self-update: REFUSED {reason}", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         me = self_host_id(cfg)
+        # Observe peers before any later gate can defer this run.  In
+        # particular, capacity-floor and installer checks may refuse before
+        # the queue decision below; skipping the survey there meant a dead
+        # peer never accumulated its unreadable-read streak and every host
+        # could wait forever for a fresh report.  Plans remain read-only.
+        survey = survey_peers(cfg, sys_, me, record=apply)
         if apply:
             paused = scheduled_pause(cfg.state_dir)
             if paused:
@@ -1890,9 +3095,18 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
-            prior = recent_attempt(cfg, target, now)
+            # An operator's --reinstall-current is not a retry of an automatic
+            # attempt, so the attempt rate does not hold it back.
+            prior = None if reinstall else recent_attempt(cfg, target, now, selected_source)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
+        layout = planned_layout(cfg)
+        consent = (launcher_change_refusal(cfg, target, installed, bool(refresh))
+                   if layout != "v2" else None)
+        if apply:
+            launcher_consent_alert(cfg, me, target, installed, consent, now)
+        if consent is not None:
+            raise Refused(consent)
         if apply and scheduled:
             sys_.sleep(stagger_seconds(me))
         _checkout(cfg, sys_, target)
@@ -1908,16 +3122,37 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step(name)
         helper = launch_helper(cfg)
         bundle = approval = None
-        if helper is not None and not refresh:
+        identity = None
+        change = None
+        if helper is not None and (not refresh or layout == "v2"):
             with tempfile.TemporaryDirectory() as scratch:
-                identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
+                live_identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
                 receipt.step("signing-keychain", unlock_signing_keychain(sys_, cfg.home))
+                identity = (choose_signer(sys_, cfg.home, live_identity) if layout == "v2"
+                            else live_identity)
                 signing_probe(sys_, identity, Path(scratch), keychain_args(cfg.home))
-            receipt.step("signing", f"{'would build' if not apply else 'will build'} a sealed "
-                         f"launcher signed by {identity} (extracted from the live bundle's leaf "
-                         "certificate; a timestamped signing probe with it succeeded)")
+            if layout == "v2":
+                change = v2_launcher_change(cfg, sys_, helper, profile, identity, live_identity)
+                receipt.step("launcher", change.describe())
+                ack = v2_ack_refusal(cfg, change)
+                if apply:
+                    launcher_consent_alert(cfg, me, target, installed, ack, now)
+                if ack is not None:
+                    raise Refused(ack)
+            receipt.step("signing", f"{'would sign' if not apply else 'will sign'} "
+                         + ("a sealed launcher" if layout != "v2" else
+                            "the launch set" + (" and a new launcher" if change.changed else ""))
+                         + f" with {identity} (a timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
+        if helper is not None and layout == "v2":
+            keychain = signing_keychain(cfg.home)
+            if not keychain:
+                raise Refused("launcher v2 signs every launch set through the dedicated signing "
+                              "keychain, and keychain.env names none; run `pulp ship doctor`")
+            install_args += ["--launch-set-identity", str(identity),
+                             "--launch-set-keychain", keychain]
+            check_support_agent_templates(cfg, sys_, profile, target)
         repository = configured_repository(cfg, sys_)
         print(f"self-update: repository={repository}")
         if helper is None:
@@ -1937,7 +3172,6 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        survey = survey_peers(cfg, sys_, me, record=apply)
         busy, waiting, off = survey.busy, survey.waiting, survey.off
         ticket = waiting_ticket(cfg)
         my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
@@ -1974,14 +3208,24 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step("capacity-floor", str(exc), ok=False)
         if refusals:
             raise Refused(" | ".join(refusals))
-        if helper is not None and apply and not refresh:
+        # A v2 refresh (a [fleet_source] move) builds too when the app's
+        # inputs changed: the installer verifies the live app against the
+        # moved profile.
+        if (helper is not None and apply and (not refresh or layout == "v2")
+                and (layout != "v2" or change.changed)):
             # Built only once every cheap gate passed: a refused run must not
             # have spent a signing build, and a rebuild must always be possible.
             builds = cfg.state_dir / "builds"
             out_dir = builds / target
             clear_dir(out_dir)
             out_dir.mkdir(parents=True)
-            bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+            try:
+                bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir,
+                                                  layout=layout, identity=identity,
+                                                  expected_inputs=change.target_inputs
+                                                  if change else None)
+            except Refused as exc:
+                raise HostFault(str(exc)) from exc
             prune_dirs(builds, KEEP_BUILDS)
             install_args += ["--launch-helper-source", str(bundle)]
             receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
@@ -1996,13 +3240,26 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
-                  helper=helper, approval=approval, excluded=survey.excluded)
-        return run.execute()
+                  helper=helper, approval=approval, excluded=survey.excluded,
+                  previous_fleet_source=previous_fleet_source)
+        rc = run.execute()
+        if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
+            publish_fleet_source_verified(cfg, sys_, selected_source)
+        return rc
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.value["deferred"] = True
         receipt.finish("refused", str(exc))
         return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
+    except HostFault as exc:
+        # A pre-drain refusal must not retain an old queue ticket forever.
+        # Leave the turn available to peers; the next scheduled attempt gets
+        # a fresh ticket and naturally backs off behind any active holder.
+        if apply:
+            clear_waiting(cfg)
+        receipt.step("refused", str(exc), ok=False)
+        receipt.finish("refused", str(exc))
+        return EXIT_REFUSED
     except Refused as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))
@@ -2022,8 +3279,16 @@ def refresh_reason(cfg: Config, sys_: System) -> str | None:
     """Why a current host must reinstall its own generation, or None.
 
     Today: its receipt no longer matches the OS-managed interpreter because
-    macOS was updated (interpreter_changed_by_os_update). Read-only.
+    macOS was updated (interpreter_changed_by_os_update), or the configured
+    private fleet source moved to a commit it was not installed from.
+    Read-only.
     """
+    if cfg.fleet_source_repository is not None:
+        selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
+        installed = installed_fleet_source_commit(cfg)
+        if selected and selected != installed:
+            return (f"fleet source moved to {selected[:12]} "
+                    f"(installed from {_source_name(installed)})")
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         problems = (json.loads(status.out).get("fleet") or {}).get("problems") or []
@@ -2053,13 +3318,15 @@ class Run:
                  previous: str, profile: Path, install_args: list[str], allow: bool,
                  helper: dict | None, approval: Path | None,
                  repository: str | None = None,
-                 excluded: list[str] | None = None) -> None:
+                 excluded: list[str] | None = None,
+                 previous_fleet_source: dict[str, Any] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
         self.repository = repository
+        self.previous_fleet_source = previous_fleet_source
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
@@ -2067,6 +3334,15 @@ class Run:
         self.phase = "announce"
         receipt.value.update(approval=str(approval) if approval else None,
                              pin_path=str(self.pin_path) if self.pin_path else None)
+
+    def launch_set_args(self) -> list[str]:
+        """The forward install's launch-set signing options, for a v2 rollback."""
+        args = self.install_args
+        try:
+            return ["--launch-set-identity", args[args.index("--launch-set-identity") + 1],
+                    "--launch-set-keychain", args[args.index("--launch-set-keychain") + 1]]
+        except (ValueError, IndexError) as exc:
+            raise Failed("a launcher v2 rollback has no launch-set signing options") from exc
 
     # ── entry ───────────────────────────────────────────────────────────
     def _record_skew_after_apply(self) -> None:
@@ -2095,10 +3371,12 @@ class Run:
             self.receipt.step("announce", str(self.cfg.state_dir / "active.json"))
             # This host has its turn: whatever the update's outcome, it no
             # longer holds a place in the queue.
-            clear_waiting(self.cfg)
+            clear_waiting(self.cfg, self.sys.now())
             self._snapshot()
             try:
                 self._update()
+            except LauncherConsent as exc:
+                return self._stop_for_consent(str(exc))
             except Refused as exc:
                 return self._safe_recover(f"refused after drain: {exc}", refused=True)
             except Failed as exc:
@@ -2109,6 +3387,7 @@ class Run:
             except Exception as exc:  # noqa: BLE001 - never leave the host out
                 return self._safe_recover(f"{type(exc).__name__} during {self.phase}: {exc}")
             self._record_skew_after_apply()
+            close_launcher_probe_alert(self.cfg)
             self.receipt.finish("succeeded")
             prune_dirs(self.cfg.state_dir / "rollback", KEEP_SNAPSHOTS)
             return EXIT_OK
@@ -2139,7 +3418,17 @@ class Run:
             if result.rc != 0:
                 raise Refused(f"cannot snapshot the live launcher: {result.text}")
             self._verify_snapshot_bundle(snap)
-        _write_json(snap / "snapshot.json", {"previous": self.previous, "at": _iso(self.sys.now())})
+        # The interpreter the running generation's lanes use, and its pin:
+        # a rollback reinstalls with these, never with the new generation's.
+        # m5s, 2026-10-15: the rollback rendered the old launcher against the
+        # new pin and refused ("launch helper lanes are missing pinned
+        # interpreter"), leaving the host off.
+        pin = python_pin_path(self.cfg.home)
+        previous_pin = pin.read_text().strip() if pin.is_file() else None
+        _write_json(snap / "snapshot.json", {
+            "previous": self.previous, "at": _iso(self.sys.now()),
+            "python": installed_lane_python(self.cfg.home), "python_pin": previous_pin,
+            "launcher_layout": installed_layout(self.cfg) if self.helper is not None else None})
         self.snapshot = snap
         self.receipt.value["snapshot"] = str(snap)
         self.receipt.step("snapshot", f"{snap} (previous generation {self.previous[:12]})")
@@ -2152,12 +3441,20 @@ class Run:
                                "print(m.profile_policy_digest(sys.argv[1]))",
                                str(snap / "profile.toml")], cwd=str(self.cfg.checkout))
         pin = (snap / "approved.sha256").read_text().strip()
-        check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify",
-                              str(snap / "TartCILauncher.app"),
-                              "--identifier", str(self.helper.get("identifier", "")),
-                              "--team-id", str(self.helper.get("team_id", "")),
-                              "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
-                             cwd=str(self.cfg.checkout))
+        if installed_layout(self.cfg) == "v2":
+            check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify-v2",
+                                  str(snap / "TartCILauncher.app"),
+                                  "--identifier", str(self.helper.get("identifier", "")),
+                                  "--team-id", str(self.helper.get("team_id", "")),
+                                  "--sha256", pin, "--profile", str(snap / "profile.toml")],
+                                 cwd=str(self.cfg.checkout))
+        else:
+            check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify",
+                                  str(snap / "TartCILauncher.app"),
+                                  "--identifier", str(self.helper.get("identifier", "")),
+                                  "--team-id", str(self.helper.get("team_id", "")),
+                                  "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
+                                 cwd=str(self.cfg.checkout))
         if policy.rc != 0 or check.rc != 0:
             raise Refused("the snapshot of the live launcher does not verify against the current "
                           f"approval pin, so it could not be rolled back to: "
@@ -2202,6 +3499,9 @@ class Run:
         self._relay()
         self.phase = "pool-on"
         if not self._pool_on():
+            if self.approval is not None and LAUNCH_PROBE_FAILED.search(
+                    getattr(self, "pool_on_text", "") or ""):
+                raise LauncherConsent(self.pool_on_text)
             raise Failed("pool on failed after install")
         self.phase = "verify"
         verify(cfg, sys_, self.target, self.receipt)
@@ -2240,7 +3540,9 @@ class Run:
         self.receipt.step("vm-dhcp-verify", result.text.strip()[-500:], ok=result.rc == 0)
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
-        deadline = self.sys.now() + self.cfg.wait_seconds
+        started = self.sys.now()
+        deadline = started + self.cfg.wait_seconds
+        waiting_on: list[str] | None = None
         while True:
             plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
             if plan.rc == 0:
@@ -2254,9 +3556,21 @@ class Run:
                               f"{plan.text[:300]}")
             if plan.rc != 12:
                 raise Failed(f"pool off --plan refused (exit {plan.rc}): {plan.text[:300]}")
+            # Say what the drain waits on, once per change: a receipt that
+            # reads only "drain" for half an hour looks stuck (m1, 2026-10-16,
+            # waiting on one Forge gate job).
+            busy = mid_job_lanes(f"{plan.out}\n{plan.err}")
+            if busy != waiting_on:
+                waiting_on = busy
+                self.receipt.step("wait-idle", "waiting on " + ("; ".join(busy) or
+                                                                 "an owned lane (not named)"))
             if self.sys.now() >= deadline:
-                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s")
+                drain_timeout_alert(self.cfg, self.me, busy, self.sys.now() - started,
+                                    self.sys.now())
+                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s: "
+                             + ("; ".join(busy) or "(not named)"))
             self.sys.sleep(self.cfg.poll_seconds)
+        drain_timeout_alert(self.cfg, self.me, None, self.sys.now() - started, self.sys.now())
         self.receipt.step("wait-idle", "no owned lane mid-job")
 
     def _writer_fence(self) -> list[str]:
@@ -2278,11 +3592,19 @@ class Run:
             return []
         return [str(shipyard), "writer-domain-exec", "--path", str(self.cfg.shim), "--"]
 
-    def _install(self, args: list[str]) -> None:
+    def _install(self, args: list[str], python: str | None = None) -> None:
         fence = self._writer_fence()
+        env = census_env(self.repository)
+        if python:
+            # Only a rollback names one. TARTCI_ROLLBACK_PYTHON outranks the
+            # snapshot profile's host.python, which may name the switch the
+            # preflight refused; an older installer reads TARTCI_PYTHON only.
+            env["TARTCI_PYTHON"] = python
+            if python.startswith("/"):
+                env["TARTCI_ROLLBACK_PYTHON"] = python
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
-                                           cwd=str(self.cfg.checkout), env=census_env(self.repository),
+                                           cwd=str(self.cfg.checkout), env=env,
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
@@ -2330,6 +3652,7 @@ class Run:
             if restore_receipt:
                 args.append("--restore-receipt")
             on = installed_tartci(self.cfg, self.sys, *args)
+            self.pool_on_text = on.text
             if on.rc == 0:
                 self.receipt.step("pool-on", "installed shim" +
                                   ("; restored prior receipted serving set without fresh relay proof"
@@ -2341,21 +3664,63 @@ class Run:
                 self.sys.sleep(self.POOL_ON_BACKOFF[attempt - 1])
         return False
 
-    def _reinstall_previous(self) -> None:
+    def _reinstall_previous(self, *, failed_source_env: dict[str, str | None] | None = None) -> None:
         """Reinstall the snapshot generation from its own commit (pin + bundle)."""
         cfg, sys_ = self.cfg, self.sys
-        _checkout(cfg, sys_, self.previous)
-        result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
-                        "--output", ".tartci-support-manifest.json")
-        if result.rc != 0:
-            raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
-        args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
-                "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
-        if self.helper is not None:
-            self._write_pin((self.snapshot / "approved.sha256").read_text())
-            self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
-        self._install(args)
+        current_env = fleet_source_env_snapshot()
+        try:
+            restore_fleet_source_env(current_env |
+                                     {name: fleet_source_env(self.previous_fleet_source).get(name)
+                                      for name in FLEET_SOURCE_ENV})
+            _checkout(cfg, sys_, self.previous)
+            result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
+                            "--output", ".tartci-support-manifest.json")
+            if result.rc != 0:
+                raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
+            args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
+                    "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
+            if self.helper is not None:
+                self._write_pin((self.snapshot / "approved.sha256").read_text())
+                self.receipt.step("pin-restore", "previous approval restored from the snapshot")
+                args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
+                # The layout the snapshot ran, explicitly: a v1 -> v2 move rolls
+                # back to v1 with the opt-in still present. A v2 rollback names
+                # the signing keychain, which the installer uses only when the
+                # previous generation's signed set cannot simply be pointed at
+                # again.
+                snap = _read_json(self.snapshot / "snapshot.json") or {}
+                layout = (snap.get("launcher_layout")
+                          if snap.get("launcher_layout") in ("v1", "v2") else "v1")
+                args += ["--launcher-layout", layout]
+                if layout == "v2":
+                    args += self.launch_set_args()
+            self._install(args, python=self._restore_previous_python())
+        except BaseException:
+            # The failed target may still be live. Keep its source selected so
+            # recovery helpers cannot reinstall the old code with the new
+            # generation's profile source.
+            restore_fleet_source_env(failed_source_env or current_env)
+            raise
+
+    def _restore_previous_python(self) -> str | None:
+        """Pin the interpreter the previous generation's lanes ran (else its
+        old pin) and return it, for the rollback install."""
+        snap = (_read_json(self.snapshot / "snapshot.json") if self.snapshot else None) or {}
+        previous = snap.get("python") if isinstance(snap.get("python"), str) else None
+        pin_value = snap.get("python_pin") if isinstance(snap.get("python_pin"), str) else None
+        pin = python_pin_path(self.cfg.home)
+        # The pin names what the rollback installs: the installer honours
+        # TARTCI_ROLLBACK_PYTHON only when it equals the pin or a lane's.
+        restore = previous if previous and previous.startswith("/") else pin_value
+        if restore:
+            pin.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pin.with_name(f".{pin.name}.rollback")
+            tmp.write_text(restore + "\n")
+            os.replace(tmp, pin)
+        if restore or previous:
+            self.receipt.step("python-restore",
+                              f"rollback runs the previous interpreter {restore or previous}")
+        return restore or previous
 
     def _pool_state(self) -> str:
         status = installed_tartci(self.cfg, self.sys, "pool", "status", "--json")
@@ -2365,7 +3730,8 @@ class Run:
             return "unknown"
 
     def _ensure_on(self, *, allow_reinstall: bool = True,
-                   restore_receipt: bool = False) -> str:
+                   restore_receipt: bool = False,
+                   failed_previous_source_env: dict[str, str | None] | None = None) -> str:
         """Put the host back in service, whatever else failed. Returns the
         resulting pool state: "on", "undrained", or what the host is left in.
 
@@ -2399,7 +3765,7 @@ class Run:
             if running == self.previous and self.snapshot is not None:
                 self.receipt.step("reinstall-for-pool-on",
                                   f"pool on refused; reinstalling {self.previous[:12]}")
-                self._reinstall_previous()
+                self._reinstall_previous(failed_source_env=failed_previous_source_env)
             else:
                 self.receipt.step(
                     "reinstall-for-pool-on",
@@ -2442,6 +3808,8 @@ class Run:
             on = False
             try:
                 self._repin_to_live()
+                if self._running() == self.previous:
+                    self._restore_previous_source_env()
                 on = self._pool_on()
             except BaseException:  # noqa: BLE001
                 pass
@@ -2467,11 +3835,43 @@ class Run:
         elif running == self.previous:
             self._write_pin((self.snapshot / "approved.sha256").read_text())
 
+    def _restore_previous_source_env(self) -> None:
+        """Make recovery helpers use the source recorded for the live rollback."""
+        restore_fleet_source_env({
+            name: fleet_source_env(self.previous_fleet_source).get(name)
+            for name in FLEET_SOURCE_ENV
+        })
+        self.receipt.step("source-restore", "previous installed source selected for recovery")
+
     def _running(self) -> str | None:
         try:
             return installed_commit(self.cfg)[0]
         except Refused:
             return None
+
+    def _stop_for_consent(self, probe: str) -> int:
+        """Stop with the new launcher installed and the host OFF; never roll back.
+
+        Rolling back replaces TartCILauncher.app a second time, which can reset
+        its Removable Volumes consent again; the new bundle stays in place and
+        a person grants the consent, then turns the pool on.
+        """
+        self.receipt.step("failed", f"pool on failed after installing a new launcher: {probe[:500]}",
+                          ok=False)
+        self._repin_to_live()
+        launcher_probe_alert(self.cfg, self.me, self.target, probe, self.sys.now())
+        if probe_slow_volume(probe):
+            next_step = ("The Tart store volume was slow (the probe's control write was slow "
+                         "too); once writes to it are fast again, run `tartci pool on`.")
+        else:
+            next_step = ("Grant Removable Volumes to TartCI Launcher (System Settings > "
+                         "Privacy & Security > Files and Folders), then run `tartci pool on`.")
+        return self._terminal(
+            "failed",
+            f"launch helper volume probe failed after installing a new launcher for "
+            f"{self.target[:12]}; STOPPED and NOT rolled back (a rollback replaces the launcher "
+            f"again and can reset its consent). {next_step} Probe: {probe[:300]}",
+            pool_state=self._pool_state_quiet())
 
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
         self.receipt.step("refused" if refused else "failed", reason, ok=False)
@@ -2488,10 +3888,13 @@ class Run:
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
             # back), so putting the host back is: pin, then pool on.
+            failed_previous_source_env = fleet_source_env_snapshot()
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            state = self._ensure_on(restore_receipt=True)
+            self._restore_previous_source_env()
+            state = self._ensure_on(restore_receipt=True,
+                                    failed_previous_source_env=failed_previous_source_env)
             if state not in ("on", "undrained"):
                 return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
                                       f"failed (generation {self.previous[:12]} is installed)",
@@ -2769,7 +4172,10 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
     waited = max(0.0, now - float(ticket["since"]))
     # The run that crossed the bound records it, so a reader whose clock is
     # behind the run's still says STARVED.
-    starved = waited >= STARVED_AFTER_SECONDS or bool(ticket.get("starved_evented"))
+    has_demand = bool(gate_demand_at(_gate_queue_path_in(state_dir),
+                                      str(ticket.get("host_id") or ""), now)[0])
+    bound = STARVED_AFTER_SECONDS if has_demand else STARVED_FALLBACK_SECONDS
+    starved = waited >= bound or bool(ticket.get("starved_evented"))
     word = "STARVED" if starved else "deferred"
     return (f"self-update: {word}, {waited / 3600:.1f} h in the update queue (since "
             f"{_iso(float(ticket['since']))}): {ticket.get('reason')}")
@@ -2795,6 +4201,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="print each published peer and the SSH target it resolves to")
     mode.add_argument("--refresh-skew", action="store_true",
                       help="fetch main and record skew only (no other checks)")
+    parser.add_argument("--reinstall-current", action="store_true",
+                        help="with --plan or --apply: reinstall the installed generation with the "
+                        "current settings (to apply a settings change, such as a removed "
+                        "[fleet_source], without waiting for a new commit)")
     parser.add_argument("--scheduled", action="store_true",
                         help="apply after this host's stagger offset (the periodic agent)")
     parser.add_argument("--if-older", type=int, default=0,
@@ -2803,7 +4213,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--settings", type=Path, default=None,
                         help="settings TOML (default ~/.config/tartci/self-update.toml)")
     args = parser.parse_args(argv)
-    cfg = load_config(Path(args.home), args.settings)
+    try:
+        cfg = load_config(Path(args.home), args.settings)
+    except ConfigError as exc:
+        print(f"self-update: REFUSED: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
     sys_ = System()
     if args.status:
         print("\n".join(status_lines(cfg.state_dir)))
@@ -2869,9 +4283,13 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(cfg.state_dir / "skew.json", skew)
         print(render_skew(skew))
         return 0
+    if args.reinstall_current and (args.target or args.scheduled):
+        parser.error("--reinstall-current reinstalls the installed generation; it takes no "
+                     "--target and is never --scheduled")
     target_ref = args.target or "origin/main"
     return plan_or_apply(cfg, sys_, apply=args.apply, target_ref=target_ref,
-                         explicit=args.target is not None, scheduled=args.scheduled)
+                         explicit=args.target is not None, scheduled=args.scheduled,
+                         reinstall=args.reinstall_current)
 
 
 if __name__ == "__main__":

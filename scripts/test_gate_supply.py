@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import testing_support  # noqa: E402
 import argparse
+import contextlib
 import datetime as dt
 import json
+import io
 import re
 import os
 import plistlib
@@ -58,7 +60,8 @@ class ClassifyAndFitTests(unittest.TestCase):
             "waiting": "free", "backoff": "free", "loop": "free",
             "booting": "in_flight", "minting-jit": "in_flight", "idle-wait": "in_flight",
             "job-running": "blocked", "vm-lease-denied": "blocked", "scan_blind": "blocked",
-            "draining": "blocked", "something-new": "unknown",
+            "draining": "blocked", "yielded-storage-health": "blocked",
+            "yielded_storage_health": "blocked", "something-new": "unknown",
         }
         for phase, expected in cases.items():
             with self.subTest(phase=phase):
@@ -91,6 +94,25 @@ class ClassifyAndFitTests(unittest.TestCase):
         control, _ = gate_supply.classify_lane(
             lane_env(), {"ts": stamp(10), "phase": "waiting"}, MERGE, [MERGE, PR], time.time())
         self.assertEqual(control, "free")
+
+    def test_tart_storage_health_is_required_for_capacity(self) -> None:
+        missing, detail = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "ts": stamp(5), "phase": "waiting"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(missing, "unknown")
+        self.assertIn("storage health", detail)
+        healthy, _ = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "storage_health": "ok",
+                         "ts": stamp(5), "phase": "waiting"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(healthy, "free")
+
+        unhealthy, detail = gate_supply.classify_lane(
+            lane_env(), {"provider": "tart-macos", "storage_health": "unknown",
+                         "ts": stamp(5), "phase": "yielded-storage-health"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(unhealthy, "unknown")
+        self.assertIn("storage health", detail)
 
     def test_a_lane_in_flight_for_the_other_class_does_not_cover_this_one(self) -> None:
         state, _ = gate_supply.classify_lane(
@@ -195,12 +217,20 @@ class BuildReportTests(unittest.TestCase):
         report = self._report(lanes)
         self.assertEqual((report["free"], report["in_flight"]), (0, 1))
 
-    def test_an_unreadable_inventory_falls_back_to_reservations_like_the_slot_claim(self) -> None:
+    def test_an_unreadable_inventory_advertises_no_new_vm_slots(self) -> None:
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "waiting"})}
         report = self._report(lanes, running_error=True)
-        self.assertEqual((report["verdict"], report["inventory"], report["free"]), ("ok", "reservations", 1))
+        self.assertEqual((report["verdict"], report["inventory"], report["free"]), ("ok", "unavailable", 0))
+        self.assertIsNone(report["running_vms"])
+        self.assertIsNone(report["vm_slots_free"])
         full = self._report(lanes, running_error=True, reserved=2)
         self.assertEqual((full["verdict"], full["free"]), ("ok", 0))
+
+    def test_inventory_unavailable_heartbeat_is_blocked(self) -> None:
+        lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "inventory-unavailable"})}
+        report = self._report(lanes)
+        self.assertEqual((report["verdict"], report["free"], report["lanes"][0]["state"]),
+                         ("ok", 0, "blocked"))
 
     def test_blindness_is_unknown_never_zero(self) -> None:
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "waiting"})}
@@ -272,6 +302,58 @@ class DecideTests(unittest.TestCase):
     def test_unreadable_siblings_are_unknown(self) -> None:
         verdict, _ = self._decide(1, [self._peer("studio", 0)], {"verdict": "unknown", "reason": "x"})
         self.assertEqual(verdict, "unknown")
+
+
+class ErrorEnvelopeTests(unittest.TestCase):
+    def test_peer_transport_error_is_typed_and_decide_remains_unknown(self) -> None:
+        with mock.patch.object(
+            gate_supply.subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 1)
+        ):
+            report = gate_supply.fetch_peer("m5", "m5", REPO, MERGE, ssh="ssh", timeout=2)
+        self.assertEqual(report["schema"], gate_supply.SCHEMA)
+        self.assertEqual((report["host"], report["repo"], report["class"]), ("m5", REPO, MERGE))
+        self.assertIn("fetched_at", report)
+        verdict, _ = gate_supply.decide(
+            1, [report], {"verdict": "ok", "lanes": []}, own_slot=1,
+            own_state_dir="", repo=REPO, class_label=MERGE, max_age=60, now=time.time()
+        )
+        self.assertEqual(verdict, "unknown")
+        local_verdict, _ = gate_supply.decide(
+            1, [], report, own_slot=1, own_state_dir="", repo=REPO,
+            class_label=MERGE, max_age=60, now=time.time()
+        )
+        self.assertEqual(local_verdict, "unknown")
+
+    def test_local_report_error_is_typed_and_decide_remains_unknown(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(gate_supply, "host_report", side_effect=RuntimeError("launchd")), \
+                contextlib.redirect_stdout(output):
+            rc = gate_supply.main(["report", "--repo", REPO, "--class", MERGE, "--json"])
+        self.assertEqual(rc, 2)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["schema"], gate_supply.SCHEMA)
+        self.assertEqual((report["repo"], report["class"]), (REPO, MERGE))
+        self.assertTrue(report["host"])
+        self.assertIn("fetched_at", report)
+        verdict, _ = gate_supply.decide(
+            1, [report], {"verdict": "ok", "lanes": []}, own_slot=1,
+            own_state_dir="", repo=REPO, class_label=MERGE, max_age=60, now=time.time()
+        )
+        self.assertEqual(verdict, "unknown")
+
+    def test_decide_cli_local_report_error_uses_typed_unknown_envelope(self) -> None:
+        peer = {"schema": gate_supply.SCHEMA, "host": "m5", "verdict": "ok",
+                "repo": REPO, "class": MERGE, "free": 0, "in_flight": 0,
+                "fetched_at": int(time.time())}
+        output = io.StringIO()
+        with mock.patch.object(gate_supply, "fetch_peer", return_value=peer), \
+                mock.patch.object(gate_supply, "host_report",
+                                  side_effect=RuntimeError("launchd")), \
+                contextlib.redirect_stdout(output):
+            rc = gate_supply.main(["decide", "--repo", REPO, "--class", MERGE,
+                                   "--demand", "1", "--peers", "m5=m5"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(output.getvalue(), "unknown local siblings: local report failed: launchd\n")
 
 
 class HostReportCliTests(unittest.TestCase):
@@ -484,7 +566,7 @@ class ProfileRenderTests(unittest.TestCase):
         self.assertNotEqual(self._run(zero_age).returncode, 0)
 
     @testing_support.requires_tomllib
-    def test_only_m1_pulp_gate_falls_back_and_only_to_m3(self) -> None:
+    def test_no_shipped_profile_enables_the_young_work_fallback(self) -> None:
         import macos_fleet_lanes as fleet  # noqa: PLC0415
         enabled = []
         for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
@@ -493,9 +575,10 @@ class ProfileRenderTests(unittest.TestCase):
                 env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
                 if "TARTCI_FALLBACK_PEERS" in env:
                     enabled.append((path.name, lane["id"], env["TARTCI_FALLBACK_PEERS"]))
-        # m5 is excluded on purpose: deferring to a starved host keeps young
-        # work there, and an unreachable peer turns every decision into a hold.
-        self.assertEqual(enabled, [("m1-macos-fleet.toml", "pulp-gate", "studio=m3")])
+        # m1 was the only fallback lane; since 2026-10-16 it is overflow-only
+        # and takes nothing younger than its 600 s floor. The mechanism stays,
+        # tested above through profiles that add the key back.
+        self.assertEqual(enabled, [])
         self.assertEqual(self._run((ROOT / "profiles" / "m1-macos-fleet.toml").read_text()).returncode, 0)
 
 

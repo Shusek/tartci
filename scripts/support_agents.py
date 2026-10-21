@@ -78,6 +78,7 @@ except ImportError:  # Python < 3.11 (/usr/bin/python3 on macOS is 3.9)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import reuse_canary  # noqa: E402
 import schedule_backstop_mode  # noqa: E402
+import fleet_source  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TABLE = "support_agents"
@@ -110,8 +111,31 @@ def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
     """
     table = profile.get("launchd_watchdog") if isinstance(profile.get("launchd_watchdog"), dict) else {}
     stale = table.get("stale_log_seconds")
-    return ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
-            if type(stale) is int else {})
+    environment = ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
+                   if type(stale) is int else {})
+    configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
+    if configured_root:
+        source = fleet_source.resolve(ROOT)
+        environment.update({
+            "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
+            "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
+            "TARTCI_FLEET_SOURCE_REPOSITORY": source.repository or "",
+            "TARTCI_ADVERTISED_LABELS": str(source.published_supply),
+            "TARTCI_JOB_CLAIM_SUPPLY": str(source.published_supply),
+        })
+    return environment
+
+
+def _disk_watch_paths(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The volumes the disk watchdog probes: the Tart store and the cache root.
+
+    Rendered into the agent so its pass needs no tomllib. Absent both, the
+    placeholder stays and the watchdog drops it (it probes nothing).
+    """
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    paths = [host.get(key) for key in ("tart_home", "cache_root")]
+    paths = [p for i, p in enumerate(paths) if isinstance(p, str) and p and p not in paths[:i]]
+    return {"DISK_WATCH_PATHS": ":".join(paths)} if paths else {}
 
 
 def _backstop_env(profile: Dict[str, Any]) -> Dict[str, str]:
@@ -158,6 +182,12 @@ REGISTRY: Dict[str, Agent] = {
                               kickstart=True, settings=_tart_home,
                               environment=_watchdog_env),
     "reap": Agent("com.danielraffel.tartci.reap", None, kickstart=True, settings=_tart_home),
+    # Write-latency watchdog for the Tart store and cache volumes (outage O10).
+    "disk-watchdog": Agent("com.danielraffel.tartci.disk-watchdog", None, kickstart=True,
+                           settings=_disk_watch_paths),
+    # A bounded history of this host's pool status, so host signals can be
+    # scored against what happened rather than only live.
+    "pool-log": Agent("com.danielraffel.tartci.pool-log", None, kickstart=True),
 }
 
 # Agents in the scanned prefixes that another codified path installs or
@@ -167,6 +197,12 @@ OTHER_OWNERS: Dict[str, str] = {
     "com.danielraffel.tartci.self-update": "scripts/install_self_update_agent.sh",
     "com.danielraffel.tartci.http-connect-ssh-relay": "scripts/network_profile.py reconcile",
     "com.danielraffel.tartci.orchard-worker": "scripts/disable_orchard.sh (retirement)",
+    # Persistent-runner healing is installed per runner, not per fleet profile:
+    # the host job on the runner's own host and the central job on one fleet
+    # host, by the recipe in docs/runbook.md ("Runners the janitor must never
+    # delete").
+    "com.danielraffel.tartci.runner-host-health": "docs/runbook.md (persistent runner, its own host)",
+    "com.danielraffel.tartci.persistent-runner-heal": "docs/runbook.md (persistent runners, one fleet host)",
 }
 
 

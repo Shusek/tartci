@@ -410,7 +410,7 @@ class HostDeliveryReportTests(unittest.TestCase):
                 "source_commit": commit,
                 "support_manifest_sha256": "a" * 64,
                 "profile_policy_sha256": "b" * 64,
-                "tart_home": "/Volumes/Workshop/VMs",
+                "tart_home": "/Volumes/Example/VMs",
             }))
             (app / "Contents/Resources/lanes.json").write_text(json.dumps({
                 "schema": 1, "lanes": {"studio-pulp-gate": {"environment": {}}},
@@ -446,6 +446,32 @@ class HostDeliveryReportTests(unittest.TestCase):
         self.assertEqual(lane["in_force"]["source_commit"], self.head)
         self.assertFalse(lane["accepts_generation_install"])
         self.assertIn("never execs", lane["how_to_update"])
+
+    def test_a_v2_lane_reads_its_version_through_the_pointer(self) -> None:
+        """A v2 app holds no commit: the generation its pointer names does,
+        and an install moves that pointer, so the lane is deployable."""
+        label = host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate"
+        generation = self._generation_lane(label, self.old_commit)
+        (self.agents / f"{label}.plist").unlink()
+        app = self._sealed_lane(label, self.head, marker=False)
+        pointer = self.tmp / "launcher-generation.json"
+        pointer.write_text(json.dumps({"schema": 1, "generation": str(generation)}))
+        (app / "Contents/Resources/policy.json").write_text(
+            json.dumps({"schema": 2, "pointer": str(pointer)}))
+        (generation / ".tartci-launch-set.json").write_text(json.dumps(
+            {"sequence": 4, "lanes": {"studio-pulp-gate": {}}}))
+        lane = self._report()["lanes"][0]
+        self.assertEqual(lane["delivery"], "sealed-bundle")
+        self.assertEqual(lane["in_force"]["layout"], "v2")
+        self.assertEqual(lane["in_force"]["source_commit"], self.old_commit)
+        self.assertEqual(lane["in_force"]["launch_set_sequence"], 4)
+        self.assertTrue(lane["staleness"]["stale"])
+        self.assertTrue(lane["accepts_generation_install"])
+        self.assertIn("pointer", lane["how_to_update"])
+        pointer.unlink()
+        lane = self._report()["lanes"][0]
+        self.assertIsNone(lane["in_force"]["source_commit"])
+        self.assertIn("no readable launcher pointer", lane["in_force"]["detail"])
 
     def test_the_mechanism_is_derived_from_the_plist_not_the_hostname(self) -> None:
         """Same host, same report run, both mechanisms present. A hostname

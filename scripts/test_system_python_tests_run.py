@@ -45,8 +45,8 @@ SELF_DECLARED = "3.9-safe"
 # dropping the declaration is a visible edit here rather than a silent change
 # to which tests must run on 3.9.
 EXPECTED_SELF_DECLARED = frozenset({
-    "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard", "state_age",
-    "vm_dhcp_breaker",
+    "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
+    "pool_log", "state_age", "vm_dhcp_breaker",
 })
 
 LANES = ("3.11-only: asserts a macos_fleet_lanes surface (pool status, validate, render), "
@@ -63,6 +63,21 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_fleet_source.py",
+     "FleetSourceTests.test_a_profile_that_is_not_toml_is_refused"):
+        ("3.11-only: source resolution parses profile TOML when the interpreter provides "
+         "tomllib; Python 3.9 trusts the immutable export marker after sync validation"),
+    ("test_fleet_source_sync.py",
+     "ExportWithoutTomllibTests.test_the_same_export_succeeds_where_tomllib_is_present"):
+        ("3.11-only: the success control for the 3.9 refusal; exporting needs tomllib to "
+         "validate profile TOML, which is exactly what the refusal test proves 3.9 lacks"),
+    ("test_fleet_source_sync.py", "ExportTests"):
+        ("3.11-only: source export validates profile TOML before publishing the immutable "
+         "export; Python 3.9 cannot perform the export"),
+    ("test_host_hygiene.py", "ForeignVms"):
+        ("3.11-only: host_hygiene judges VM ownership with tart_image_prune.plan(), which "
+         "reads the fleet profile with tomllib; without it nothing is judged foreign "
+         "(NoTomllib.test_without_tomllib_nothing_is_judged_foreign)"),
     ("test_vm_boot_alert.py",
      "Alert.test_the_host_and_ssh_target_come_from_the_profile"):
         ("3.11-only: vm_boot_alert._alert_host() reads the host id and ssh target from the "

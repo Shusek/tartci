@@ -93,6 +93,37 @@ class PeerStall(unittest.TestCase):
         return psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS, me=host,
                               run=self.fleet.run, close=self.close, **kw)
 
+    def test_configured_advertised_supply_is_used_without_checkout(self):
+        supply = self.tmp / "advertised-labels.json"
+        supply.write_text(json.dumps({
+            "schema": "tartci.advertised-labels/v1",
+            "registrations": [],
+            "hosts": [
+                {"host_id": "m1", "ssh": "m1"},
+                {"host_id": "studio", "ssh": "m3"},
+            ],
+        }) + "\n")
+        profile = self.tmp / "macos-fleet-profile.toml"
+        profile.write_text('[host]\nid = "m1"\nssh = "m1"\n')
+        with (
+            mock.patch.dict(os.environ, {
+                "TARTCI_ADVERTISED_LABELS": str(supply),
+                "TARTCI_FLEET_PROFILE": str(profile),
+            }, clear=False),
+            mock.patch.object(psa.pathlib.Path, "home", return_value=self.tmp),
+        ):
+            out = psa.alert_pass(
+                now=RECEIPT_TS + 60,
+                directory=self.tmp / "configured",
+                peers=None,
+                me=None,
+                run=self.fleet.run,
+                issue=self.issue,
+                close=self.close,
+            )
+        self.assertFalse(out["skipped"])
+        self.assertTrue(out["peers"]["studio"]["active"])
+
     def test_m3_stalled_97_h_is_one_issue_named_by_a_peer(self):
         out = self.run_pass(RECEIPT_TS + 60)
         self.assertTrue(out["peers"]["studio"]["active"])
@@ -341,7 +372,7 @@ class PeerStall(unittest.TestCase):
         self.assertEqual((peers, me), (expected, "m5"))
         # A node name that names no published host (no profile read): read every host.
         with mock.patch.object(vm_boot_alert, "_alert_host",
-                               return_value=("Daniels-Mac-Studio", "x")):
+                               return_value=("studio-host", "x")):
             self.assertIsNone(psa.published_peers(home=self.tmp, run=git)[1])
         cfg = fsu.Config(home=self.tmp)
         with mock.patch.object(fsu, "published_supply", return_value=supply):
@@ -384,6 +415,50 @@ class PeerStall(unittest.TestCase):
         main = main[main.index("def main("):]
         self.assertLess(main.index("for h in health:"), main.index("peer_stall_pass()"),
                         "the peer read runs after the heal work")
+
+
+
+class ConfiguredFleetSourceTests(unittest.TestCase):
+    """Peers come from a configured private source, validated, never a fallback."""
+
+    def setUp(self) -> None:
+        import test_fleet_source  # noqa: PLC0415 - owns what a valid source is
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = test_fleet_source.configured_source(self.tmp / "source", {
+            "hosts": [{"host_id": "m1", "ssh": "m1"}, {"host_id": "studio", "ssh": "m3"}]})
+        patcher = mock.patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("TARTCI_ADVERTISED_LABELS", None)
+
+    @staticmethod
+    def git(argv):
+        raise AssertionError(f"read the public supply: {argv}")
+
+    def test_a_configured_source_is_read_without_git(self):
+        import vm_boot_alert
+        with mock.patch.object(vm_boot_alert, "_alert_host", return_value=("m1", "m1")):
+            peers, me = psa.published_peers(home=self.tmp, run=self.git)
+        self.assertEqual(({"m1": "m1", "studio": "m3"}, "m1"), (peers, me))
+
+    def test_an_invalid_source_refuses_without_falling_back(self):
+        (self.tmp / "source" / "profiles" / "canary-macos-fleet.toml").write_text("schema = 2\n")
+        with self.assertRaisesRegex(RuntimeError, "published supply refused: .*stale"):
+            psa.published_peers(home=self.tmp, run=self.git)
+
+    def test_a_disagreeing_advertised_labels_refuses(self):
+        os.environ["TARTCI_ADVERTISED_LABELS"] = str(self.tmp / "public.json")
+        with self.assertRaisesRegex(RuntimeError, "configured fleet source publishes"):
+            psa.published_peers(home=self.tmp, run=self.git)
+
+    def test_a_configured_source_alone_is_not_skipped_as_unmanaged(self):
+        with mock.patch.object(psa.pathlib.Path, "home", return_value=self.tmp), \
+                mock.patch.object(psa, "published_peers", return_value=({}, "m1")) as peers:
+            out = psa.alert_pass(now=RECEIPT_TS, directory=self.tmp / "state",
+                                 peers=None, me=None, run=lambda argv: (1, "", ""))
+        peers.assert_called_once()
+        self.assertNotEqual("no self-update checkout", out.get("reason"))
 
 
 if __name__ == "__main__":

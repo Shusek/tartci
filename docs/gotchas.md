@@ -1,4 +1,9 @@
-# tartci gotchas — symptom → cause → fix
+# tartci gotchas: symptom, cause, fix
+
+Use this page when a command or lane behaves differently from what you expect.
+Each entry starts with the visible symptom, names the likely cause, and ends
+with a fix or a next diagnostic step. The entries describe current behavior;
+dates identify incidents that are useful for historical context.
 
 ## `tartci` looks missing over SSH after it was installed
 
@@ -89,8 +94,9 @@ say so (`self_update_paused`, with the stall's start) rather than reading like
 a failed update. The remedy is the stall's: reboot when the lanes are idle.
 Do not kickstart self-update during the stall.
 
-Hard-won, one bullet each. Grouped by lane. If a build/install behaves
-inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
+The entries are grouped by the kind of failure they describe. If a fresh host
+does not behave as expected, start with the matching symptom and run the
+diagnostic command shown in that entry.
 
 ## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
 
@@ -207,7 +213,7 @@ first; list it only when what it asserts really needs tomllib.
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
-  M3 runner LaunchAgents fail or leave `/Volumes/Workshop/VMs` idle.**
+  M3 runner LaunchAgents fail or leave `/Volumes/<data-volume>/VMs` idle.**
   → *Cause:* launchd started `/bin/bash` directly. macOS attributed external-
   volume access to mutable/shared interpreter identities rather than to TartCI;
   static runner labels and free VM slots could then look healthy while the
@@ -304,7 +310,7 @@ first; list it only when what it asserts really needs tomllib.
 
 - **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
   them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
-  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/Workshop/VMs`); a
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/<data-volume>/VMs`); a
   shell over ssh has none, so `tart` reads its default `~/.tart`. Before
   2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
   doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0

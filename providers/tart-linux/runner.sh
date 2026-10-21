@@ -37,7 +37,10 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
-export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
+# shellcheck source=../common/tart-home.lib.sh
+. "$TARTCI_ROOT/providers/common/tart-home.lib.sh"
+TART_HOME="$(tartci_default_tart_home)" || exit 1
+export TART_HOME
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/tartci}}"

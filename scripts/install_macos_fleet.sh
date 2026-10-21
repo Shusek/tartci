@@ -19,7 +19,10 @@ CONFIG=""
 SUPPORT_MANIFEST=""
 SUPPORT_SOURCE=""
 LAUNCH_HELPER_SOURCE=""
-USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--preflight|--skip-preflight] [--apply]"
+LAUNCHER_LAYOUT=""
+LAUNCH_SET_IDENTITY=""
+LAUNCH_SET_KEYCHAIN=""
+USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--launcher-layout v1|v2] [--launch-set-identity ID --launch-set-keychain PATH] [--preflight|--skip-preflight] [--apply]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
@@ -39,6 +42,20 @@ while [ "$#" -gt 0 ]; do
       shift
       [ "$#" -gt 0 ] || { echo "--launch-helper-source requires a path" >&2; exit 2; }
       LAUNCH_HELPER_SOURCE="$1"
+      ;;
+    --launcher-layout)
+      shift
+      case "${1:-}" in v1|v2) LAUNCHER_LAYOUT="$1" ;; *) echo "--launcher-layout must be v1 or v2" >&2; exit 2 ;; esac
+      ;;
+    --launch-set-identity)
+      shift
+      [ "$#" -gt 0 ] || { echo "--launch-set-identity requires a signing identity" >&2; exit 2; }
+      LAUNCH_SET_IDENTITY="$1"
+      ;;
+    --launch-set-keychain)
+      shift
+      [ "$#" -gt 0 ] || { echo "--launch-set-keychain requires a keychain path" >&2; exit 2; }
+      LAUNCH_SET_KEYCHAIN="$1"
       ;;
     -*) echo "$USAGE" >&2; exit 2 ;;
     *) [ -z "$CONFIG" ] || { echo "$USAGE" >&2; exit 2; }; CONFIG="$1" ;;
@@ -68,35 +85,82 @@ fi
 PY="$ROOT/scripts/macos_fleet_lanes.py"
 POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # macOS's system Python can be 3.9; all TOML-aware installer helpers require
-# Python 3.11+ and its stdlib tomllib module.
-PYTHON_BIN=""
-if [ -n "${TARTCI_PYTHON:-}" ]; then
-  case "$TARTCI_PYTHON" in
-    */*) PYTHON_BIN="$TARTCI_PYTHON" ;;
-    *) PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)" ;;
-  esac
-else
-  for candidate in python3 python3.12 python3.11; do
-    candidate="$(command -v "$candidate" 2>/dev/null || true)"
-    if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-      PYTHON_BIN="$candidate"
-      break
-    fi
+# Python 3.11+ and its stdlib tomllib module. Keep this order identical to the
+# launcher builder and the installed launchd helpers.
+# shellcheck disable=SC1091
+. "$ROOT/providers/common/toml-python.lib.sh"
+# A self-update rollback reinstalls the interpreter the previous generation's
+# lanes ran (fleet_self_update sets TARTCI_ROLLBACK_PYTHON). It wins over the
+# snapshot profile's host.python, which may name a switch the preflight
+# refused; the profile itself is not rewritten, because a sealed launcher's
+# policy digest covers it. It is honoured only when it is the interpreter this
+# host is pinned to (fleet_self_update restores the pin first) or one an
+# installed lane runs, so a stray export cannot skip the preflight.
+tartci_is_rollback_python() {
+  local plist candidate
+  [ "$(tartci_pinned_python 2>/dev/null || true)" = "$1" ] && return 0
+  for plist in "${TARTCI_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"/com.danielraffel.tartci.tart-runner-macos-fleet.*.plist; do
+    [ -f "$plist" ] || continue
+    candidate="$(awk '
+      /<key>TARTCI_PYTHON<\/key>/ { want = 1; next }
+      want && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit }
+    ' "$plist")"
+    [ "$candidate" = "$1" ] && return 0
   done
-  for candidate in \
-    /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
-    /opt/homebrew/bin/python3 \
-    /usr/local/bin/python3.12 /usr/local/bin/python3.11 \
-    /usr/local/bin/python3; do
-    if [ -z "$PYTHON_BIN" ] && [ -x "$candidate" ] \
-        && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
-      PYTHON_BIN="$candidate"
-      break
+  return 1
+}
+if [ -n "${TARTCI_ROLLBACK_PYTHON:-}" ]; then
+  case "$TARTCI_ROLLBACK_PYTHON" in
+    /*) ;;
+    *) echo "fleet install: TARTCI_ROLLBACK_PYTHON must be an absolute path: $TARTCI_ROLLBACK_PYTHON" >&2
+       exit 2 ;;
+  esac
+  tartci_is_rollback_python "$TARTCI_ROLLBACK_PYTHON" || {
+    echo "fleet install: TARTCI_ROLLBACK_PYTHON=$TARTCI_ROLLBACK_PYTHON is not a rollback interpreter:" \
+         "it is neither $(tartci_python_pin_file) nor any installed lane's TARTCI_PYTHON" >&2
+    exit 2
+  }
+  [ -x "$TARTCI_ROLLBACK_PYTHON" ] && [ ! -d "$TARTCI_ROLLBACK_PYTHON" ] || {
+    echo "fleet install: the rollback interpreter is not an executable file: $TARTCI_ROLLBACK_PYTHON" >&2
+    exit 127
+  }
+  if PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")" \
+      && [ "$PROFILE_PYTHON" != "$TARTCI_ROLLBACK_PYTHON" ]; then
+    echo "fleet install (rollback) uses the previous lanes' interpreter $TARTCI_ROLLBACK_PYTHON, not the profile's host.python $PROFILE_PYTHON" >&2
+  fi
+  export TARTCI_PYTHON="$TARTCI_ROLLBACK_PYTHON"
+# A profile's host.python is the interpreter this host runs, full stop: it
+# wins over the environment, the previous pin and any PATH search, and a
+# missing or unusable one refuses the install rather than falling back.
+elif PROFILE_PYTHON="$(tartci_profile_python "$CONFIG")"; then
+  if [ -n "${TARTCI_PYTHON:-}" ] && [ "$TARTCI_PYTHON" != "$PROFILE_PYTHON" ]; then
+    echo "fleet install uses the profile's host.python $PROFILE_PYTHON, not TARTCI_PYTHON=$TARTCI_PYTHON" >&2
+  fi
+  [ -x "$PROFILE_PYTHON" ] && [ ! -d "$PROFILE_PYTHON" ] || {
+    echo "fleet install: the profile's host.python is not an executable file: $PROFILE_PYTHON" >&2
+    exit 127
+  }
+  export TARTCI_PYTHON="$PROFILE_PYTHON"
+fi
+if [ -n "${TARTCI_PYTHON:-}" ] && [[ "$TARTCI_PYTHON" == */* ]]; then
+  python_probe="$TARTCI_PYTHON"
+  python_probe_hops=0
+  while [ -L "$python_probe" ]; do
+    python_probe_hops=$((python_probe_hops + 1))
+    if [ "$python_probe_hops" -gt 16 ]; then
+      echo "fleet install refused a symlink cycle while resolving Python: $TARTCI_PYTHON" >&2
+      exit 127
     fi
+    python_probe_target="$(readlink "$python_probe")"
+    case "$python_probe_target" in
+      /*) python_probe="$python_probe_target" ;;
+      *) python_probe="$(cd "$(dirname "$python_probe")" && pwd)/$python_probe_target" ;;
+    esac
   done
 fi
+PYTHON_BIN="$(tartci_toml_python_path)" || exit $?
 [ -n "$PYTHON_BIN" ] || {
-  echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+  echo "fleet install could not find a Python 3.11+ interpreter with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
 # Record the executable behind a Homebrew `python3` symlink.  Do this without
@@ -123,26 +187,44 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# Switching the lane interpreter: macOS grants (Full Disk Access, Removable
+# Volumes, Local Network) belong to the binary, so prove the NEW one can use the
+# VM store from launchd before any lane runs it. If it cannot, keep the
+# interpreter the lanes run now and record why; the watchdog raises an issue
+# naming the grant (scripts/interpreter_alert.py). m5s, 2026-10-15.
+SWITCH_RECORD="${TARTCI_HOME:-$HOME/.tartci}/state/interpreter-switch-refused"
+PREVIOUS_PYTHON="$(tartci_lane_pinned_python 2>/dev/null || true)"
+# A rollback restores an interpreter the previous generation already ran, so
+# it is not a switch to prove. There is no skip for tests: they stub launchctl
+# or name a preflight with TARTCI_INTERPRETER_PREFLIGHT.
+if [ -z "${TARTCI_ROLLBACK_PYTHON:-}" ] && [ -n "$PREVIOUS_PYTHON" ] \
+    && [ "$PREVIOUS_PYTHON" != "$PYTHON_BIN" ] \
+    && [ -x "$PREVIOUS_PYTHON" ] && "$PREVIOUS_PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
+  preflight_rc=0
+  if [ -n "${TARTCI_INTERPRETER_PREFLIGHT:-}" ]; then
+    preflight_text="$("$TARTCI_INTERPRETER_PREFLIGHT" "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
+  else
+    preflight_text="$("$PREVIOUS_PYTHON" "$ROOT/scripts/interpreter_preflight.py" \
+      "$CONFIG" "$PYTHON_BIN" 2>&1)" || preflight_rc=$?
+  fi
+  if [ "$preflight_rc" -ne 0 ]; then
+    echo "fleet install keeps the lane interpreter $PREVIOUS_PYTHON: $preflight_text" >&2
+    mkdir -p "$(dirname "$SWITCH_RECORD")"
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PYTHON_BIN" "$PREVIOUS_PYTHON" \
+      "$(printf '%s' "$preflight_text" | tr '\t\n' '  ')" >"$SWITCH_RECORD"
+    PYTHON_BIN="$PREVIOUS_PYTHON"
+  else
+    rm -f "$SWITCH_RECORD"
+  fi
+else
+  # No switch is attempted, so no switch stands refused.
+  rm -f "$SWITCH_RECORD"
+fi
 # The interpreter is part of the installed launch contract.  Probe GitHub
 # through that exact executable before writing any LaunchAgent; a PATH python3
 # may be a newly linked Homebrew build that is blocked by the host firewall.
 if [ "${TARTCI_TESTING:-0}" != 1 ]; then
-  if ! /usr/bin/python3 - "$PYTHON_BIN" <<'PY'
-import subprocess
-import sys
-
-interpreter = sys.argv[1]
-code = ("import urllib.request; "
-        "urllib.request.urlopen('https://api.github.com', timeout=2).read(1)")
-try:
-    result = subprocess.run([interpreter, "-c", code], text=True,
-                            capture_output=True, timeout=3, check=False)
-except subprocess.TimeoutExpired:
-    raise SystemExit(f"interpreter GitHub probe timed out after 3s: {interpreter}")
-if result.returncode != 0:
-    detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["unknown error"]
-    raise SystemExit(f"interpreter GitHub probe failed ({interpreter}): {detail[0]}")
-PY
+  if ! /usr/bin/python3 "$SUPPORT_SOURCE/scripts/probe_interpreter_github.py" "$PYTHON_BIN"
   then
     echo "fleet install requires the pinned interpreter to reach api.github.com: $PYTHON_BIN" >&2
     exit 127
@@ -172,6 +254,19 @@ cleanup_plan() {
 }
 trap cleanup_plan EXIT
 "$PYTHON_BIN" "$PY" validate "$CONFIG"
+# A profile that pins mise ([mise]) names one exact binary by digest. Refuse a
+# missing or different binary here, before any LaunchAgent or receipt changes;
+# the message names the expected and found digest and the fix.
+"$PYTHON_BIN" "$ROOT/scripts/mise_pin.py" check "$CONFIG" >/dev/null || {
+  echo "fleet install refused: the profile's [mise] binary is not the pinned one (see above)" >&2
+  exit 3
+}
+# A profile with [rustup] keeps the host's rustup from checking for or
+# installing its own updates; refuse the install if rustup does not record it.
+"$PYTHON_BIN" "$ROOT/scripts/rustup_settings.py" apply "$CONFIG" >/dev/null || {
+  echo "fleet install refused: the profile's [rustup] could not be set to never self-update (see above)" >&2
+  exit 3
+}
 "$PYTHON_BIN" "$PY" render "$CONFIG" --output "$plan_dir" >/dev/null
 "$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" verify "$SUPPORT_MANIFEST" \
   --root "$SUPPORT_SOURCE" >/dev/null
@@ -217,6 +312,39 @@ for target in "$AGENTS_DIR"/com.danielraffel.tartci.tart-runner-macos-fleet.*.pl
   is_expected_name "$(basename "$target")" || stale_targets+=("$target")
 done
 
+# Which launcher layout this install writes (scripts/launcher_layout.py): v2
+# only on a host that opted in. A refused opt-in file, or a v2 host whose
+# opt-in is gone, stops here, before the dry run reports anything.
+plan_launcher_layout=""
+plan_installed_layout=""
+plan_has_helper="$("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_fleet_lanes as fleet
+helper = fleet.load(Path(sys.argv[1])).get("launch_helper")
+print(helper["path"] if helper is not None else "")
+PY
+)" || exit 2
+if [ -n "$plan_has_helper" ]; then
+  layout_args=(--home "$HOME" --receipt "$RECEIPT" --app "$plan_has_helper")
+  [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
+  plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
+  plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT" --home "$HOME" --app "$plan_has_helper")" || exit 3
+elif [ -n "$LAUNCHER_LAYOUT" ]; then
+  echo "--launcher-layout is invalid for a profile without launch_helper" >&2
+  exit 2
+fi
+if [ "$plan_launcher_layout" = v2 ]; then
+  [ -n "$LAUNCH_SET_IDENTITY" ] && [ -n "$LAUNCH_SET_KEYCHAIN" ] || {
+    echo "launcher v2 needs --launch-set-identity and --launch-set-keychain: a launch set is signed only through the dedicated signing keychain" >&2
+    exit 2
+  }
+elif [ -n "$LAUNCH_SET_IDENTITY$LAUNCH_SET_KEYCHAIN" ]; then
+  echo "--launch-set-identity and --launch-set-keychain are only for launcher v2" >&2
+  exit 2
+fi
+
 echo "macOS fleet profile install plan:"
 echo "  config=$CONFIG"
 echo "  install_count=${#candidates[@]}"
@@ -235,6 +363,12 @@ echo "  entrypoint=$ENTRYPOINT"
 echo "  agent_hygiene_entrypoint=$AGENT_HYGIENE_ENTRYPOINT"
 echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
+if [ -n "$plan_launcher_layout" ]; then
+  echo "  launcher_layout=$plan_launcher_layout installed=${plan_installed_layout:-none}"
+  if [ -n "$plan_installed_layout" ] && [ "$plan_installed_layout" != "$plan_launcher_layout" ]; then
+    echo "  launcher_change=$plan_installed_layout->$plan_launcher_layout (a new launcher: it needs its own approval digest and the Removable Volumes grant)"
+  fi
+fi
 echo "  activation=deferred to tartci pool on"
 
 # Authenticate the exact support commit before the dry-run exit. This makes
@@ -344,6 +478,13 @@ launcher_target=""
 launcher_candidate=""
 launcher_backup=""
 launcher_touched=0
+launcher_unchanged=0
+launcher_layout=""
+launcher_source_commit=""
+pointer_file="$HOME/.config/tartci/launcher-generation.json"
+pointer_backup=""
+pointer_touched=0
+pointer_restore_failed=0
 support_root=""
 installed_support_manifest=""
 launch_entrypoint=""
@@ -355,6 +496,27 @@ retired_backups=()
 
 rollback() {
   local i target backup
+  if [ "$pointer_touched" = 1 ]; then
+    # Lanes go back to the generation the pointer named before this install:
+    # one rename over the new pointer, so no moment has no pointer at all.
+    if [ -n "$pointer_backup" ] && [ -e "$pointer_backup" ]; then
+      if ! mv -f "$pointer_backup" "$pointer_file"; then
+        # The lanes would start the generation this install just failed on.
+        # The pool is off for the whole install and stays off: `pool on`
+        # refuses while the pointer does not name the receipt's generation.
+        pointer_restore_failed=1
+        echo "FINDING launcher_pointer_restore_failed: rollback could not put the launcher pointer back." >&2
+        echo "  what: $pointer_file still names the generation this failed install published" >&2
+        echo "  cause: renaming $pointer_backup over it failed (see the mv error above)" >&2
+        echo "  host: left OFF; tartci pool on refuses until the pointer matches the install receipt" >&2
+        echo "  fix: mv -f '$pointer_backup' '$pointer_file' (or reinstall), then tartci pool on" >&2
+        echo "  verify: tartci doctor fleet reports launcher_layout_v2 and executed_generation ok" >&2
+      fi
+    elif ! rm -f "$pointer_file"; then
+      pointer_restore_failed=1
+      echo "FINDING launcher_pointer_restore_failed: rollback could not remove the new launcher pointer $pointer_file; host left OFF" >&2
+    fi
+  fi
   if [ "$launcher_touched" = 1 ]; then
     rm -rf -- "$launcher_target"
     if [ -n "$launcher_backup" ] && { [ -e "$launcher_backup" ] || [ -L "$launcher_backup" ]; }; then
@@ -400,7 +562,12 @@ rollback() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -ne 0 ]; then rollback; fi
+  if [ "$rc" -ne 0 ]; then
+    rollback
+    # A failed pointer restore is its own failure: never the install's
+    # ordinary exit code, so no caller mistakes it for a clean rollback.
+    [ "$pointer_restore_failed" != 1 ] || rc=6
+  fi
   [ -n "$stage_dir" ] && rm -rf "$stage_dir"
   [ -n "$receipt_tmp" ] && rm -f "$receipt_tmp"
   [ -z "$wrapper_candidate" ] || rm -f "$wrapper_candidate"
@@ -546,7 +713,31 @@ actual_host_id="$("$shipyard_bin" runner tag 2>/dev/null)" || {
   echo "fleet profile host mismatch: profile=$profile_host_id shipyard=$actual_host_id" >&2
   exit 3
 }
+# The layout the plan reported is the one this install writes; re-read now
+# that the profile is locked, and refuse if anything changed in between.
+verify_launcher() {  # PATH [SOURCE_COMMIT]: the launcher identity record, or refuse
+  if [ "$launcher_layout" = v2 ]; then
+    "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify-v2 "$1" \
+      --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+      --sha256 "$launcher_sha256" --profile "$locked_config" \
+      --support-root "$SUPPORT_SOURCE"
+  else
+    "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$1" \
+      --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+      --sha256 "$launcher_sha256" \
+      --profile-policy-sha256 "$launcher_profile_policy_sha256" \
+      ${2:+--source-commit "$2"}
+  fi
+}
 if [ "$launch_helper_json" != "null" ]; then
+  layout_args=(--home "$HOME" --receipt "$RECEIPT"
+               --app "$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")")
+  [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
+  launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
+  [ "$launcher_layout" = "$plan_launcher_layout" ] || {
+    echo "launcher layout changed after the plan ($plan_launcher_layout -> $launcher_layout); run the install again" >&2
+    exit 3
+  }
   launcher_target="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
   launcher_approval_path="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["approval_sha256_path"])' <<<"$launch_helper_json")"
   launcher_identifier="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
@@ -573,9 +764,10 @@ print(value.strip())
 PY
 )"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
-  # A sealed launcher owns the lane environment; reject a source bundle that
-  # was rendered without the same verified interpreter as this install.
-  "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
+  # A v1 launcher owns the lane environment; reject a source bundle that
+  # was rendered without the same verified interpreter as this install. A v2
+  # app carries no lanes: the launch set pins them, below.
+  [ "$launcher_layout" = v2 ] || "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
 import json, sys
 from pathlib import Path
 bundle, expected = Path(sys.argv[1]), sys.argv[2]
@@ -585,11 +777,10 @@ if not lanes or any((row.get("environment") or {}).get("TARTCI_PYTHON") != expec
                     for row in lanes.values()):
     raise SystemExit(f"launch helper lanes are missing pinned interpreter: {expected}")
 PY
-  launcher_identity_json="$("$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256")"
-  launcher_source_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
+  launcher_identity_json="$(verify_launcher "$LAUNCH_HELPER_SOURCE")" || exit 3
+  # A v1 app is sealed to one commit; a v2 app to its inputs, checked above.
+  [ "$launcher_layout" = v2 ] \
+    || launcher_source_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
   mkdir -p "$(dirname "$launcher_target")"
   "$PYTHON_BIN" - "$profile_home" "$launcher_target" <<'PY' || {
 import os
@@ -610,13 +801,17 @@ PY
     echo "launch helper parent chain must be owned, home-relative, and non-symlinked" >&2
     exit 3
   }
-  launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
-  /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
-  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
-    --source-commit "$launcher_source_commit" >/dev/null
+  # An identical live bundle stays in place: replacing the app directory can
+  # reset its per-app Removable Volumes consent, and then the helper's open()
+  # on an external-volume Tart store blocks.
+  if "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" same \
+      "$launcher_target" "$LAUNCH_HELPER_SOURCE"; then
+    launcher_unchanged=1
+  else
+    launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
+    /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
+    verify_launcher "$launcher_candidate" "$launcher_source_commit" >/dev/null
+  fi
 elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
   echo "--launch-helper-source is invalid for a profile without launch_helper" >&2
   exit 2
@@ -868,7 +1063,7 @@ source_authority_commit="$(verify_source_commit "$support_commit")" || source_au
   echo "fleet install could not authenticate the exact TartCI source commit" >&2
   exit 3
 }
-if [ -n "$launcher_target" ]; then
+if [ -n "$launcher_target" ] && [ "$launcher_layout" = v1 ]; then
   [ "$launcher_source_commit" = "$support_commit" ] || {
     echo "fleet install requires launcher and support cohorts from the same exact commit" >&2
     exit 3
@@ -880,7 +1075,10 @@ if [ -n "$launcher_target" ]; then
   }
 fi
 
-if [ -n "$launcher_target" ]; then
+if [ -n "$launcher_target" ] && [ "$launcher_unchanged" = 1 ]; then
+  verify_launcher "$launcher_target" "$launcher_source_commit" >/dev/null
+  echo "launcher: unchanged, left in place: $launcher_target"
+elif [ -n "$launcher_target" ]; then
   if { [ -e "$launcher_target" ] || [ -L "$launcher_target" ]; } \
       && { [ -L "$launcher_target" ] || [ ! -d "$launcher_target" ]; }; then
     echo "fleet install requires a regular app directory at the launch helper path: $launcher_target" >&2
@@ -897,12 +1095,31 @@ if [ -n "$launcher_target" ]; then
   mv "$launcher_candidate" "$launcher_target"
   launcher_candidate=""
   durable_tree "$launcher_target"
-  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
-    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
-    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
-    --source-commit "$launcher_source_commit" >/dev/null
+  verify_launcher "$launcher_target" "$launcher_source_commit" >/dev/null
   maybe_test_crash launcher
+fi
+
+# Launcher v2 runs what the generation's signed launch set says: write the
+# set for these lanes, sign it through the dedicated keychain, and point at
+# it. The previous pointer is kept for rollback().
+if [ "$launcher_layout" = v2 ]; then
+  if [ -e "$pointer_file" ] || [ -L "$pointer_file" ]; then
+    pointer_backup="$backup_dir/$(basename "$pointer_file").previous"
+    cp -p "$pointer_file" "$pointer_backup"
+    durable_directory "$backup_dir"
+  fi
+  pointer_touched=1
+  "$PYTHON_BIN" "$ROOT/scripts/launch_set.py" install \
+    --generation "$support_root" --render-dir "$render_dir" \
+    --tart-home "$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["tart_home"])' "$launcher_target/Contents/Resources/policy.json")" \
+    --pin "$PYTHON_BIN" --pointer "$pointer_file" \
+    --floor "$HOME/.config/tartci/launcher-floor.json" \
+    --root "$(cd "$SUPPORT_GENERATIONS" && pwd -P)" --team-id "$launcher_team_id" \
+    --identity "$LAUNCH_SET_IDENTITY" --keychain "$LAUNCH_SET_KEYCHAIN" >/dev/null || {
+    echo "fleet install could not publish the launcher v2 launch set (see above)" >&2
+    exit 3
+  }
+  durable_file "$pointer_file"
 fi
 
 for candidate in "${candidates[@]}"; do
@@ -958,6 +1175,7 @@ receipt_tmp="$(mktemp "$(dirname "$RECEIPT")/.macos-fleet-install.json.XXXXXX")"
   --entrypoint "$ENTRYPOINT" --entrypoint-source "$wrapper_candidate" \
   --launch-entrypoint "$launch_entrypoint" \
   --source-authority-commit "$source_authority_commit" \
+  ${launcher_layout:+--launcher-layout "$launcher_layout"} \
   --output "$receipt_tmp" >/dev/null
 if [ -e "$RECEIPT" ] || [ -L "$RECEIPT" ]; then receipt_backup="$backup_dir/$(basename "$RECEIPT").previous"; mv "$RECEIPT" "$receipt_backup"; durable_directory "$(dirname "$RECEIPT")"; durable_directory "$backup_dir"; fi
 receipt_touched=1
@@ -974,6 +1192,23 @@ if [ -e "$LOADED_RECEIPT" ] || [ -L "$LOADED_RECEIPT" ]; then
 fi
 loaded_receipt_touched=1
 maybe_test_crash receipt
+
+# Every tartci LaunchAgent without its own TARTCI_PYTHON (the watchdog,
+# reclaim, self-update) resolves the interpreter through this pin, so they run
+# the same binary as the lanes. Written before the entrypoint swap, so no
+# LaunchAgent of the new generation ever starts without it; the old
+# generation's picker never reads it, so a rollback is unaffected.
+pin_file="$(tartci_python_pin_file)"
+pin_tmp="$(mktemp "$(dirname "$pin_file")/.python.pin.XXXXXX")"
+printf '%s\n' "$PYTHON_BIN" >"$pin_tmp"
+chmod 644 "$pin_tmp"
+durable_file "$pin_tmp"
+mv -f "$pin_tmp" "$pin_file"
+durable_file "$pin_file"
+# A working pin is in place: the watchdog's unpinned-interpreter issue closes.
+rm -f "$(tartci_interpreter_refusal_file)"
+# The verified mise pin (or its removal, when the profile no longer pins one).
+"$PYTHON_BIN" "$ROOT/scripts/mise_pin.py" write "$CONFIG" "$HOME/.config/tartci/mise.pin"
 
 if [ -d "$ENTRYPOINT" ] && [ ! -L "$ENTRYPOINT" ]; then
   echo "fleet install refuses a directory at the canonical TartCI entrypoint: $ENTRYPOINT" >&2
@@ -1002,6 +1237,11 @@ tartci_pool_lock_release
 lock_owned=0
 trap - EXIT
 rm -rf "$stage_dir" "$plan_dir"
+# Shared object stores this host lists get no automatic git maintenance: one
+# store's background repacks ran 53 at once on m3 (2026-10-16). No list, no-op.
+"$PYTHON_BIN" "$ROOT/scripts/git_maintenance_guard.py" enforce \
+  || echo "fleet install: could not enforce git maintenance settings (see above)" >&2
 echo "installed ${#changed_targets[@]} profile-rendered LaunchAgents; retired ${#retired_paths[@]} declared legacy LaunchAgents"
+echo "pinned interpreter $PYTHON_BIN in $pin_file"
 echo "verified receipt $RECEIPT; pool admission remains closed"
 echo "run 'tartci pool on' at an approved idle boundary"

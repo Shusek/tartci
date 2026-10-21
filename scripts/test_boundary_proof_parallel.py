@@ -110,7 +110,25 @@ class Harness:
 
     def stub_gh(self, *, fail: str | None = None) -> None:
         if fail is None:
-            self._exe("stub-gh", "#!/bin/bash\necho '{}'\n")
+            group = json.dumps({
+                "visibility": "selected",
+                "allows_public_repositories": True,
+            })
+            repository = json.dumps({"visibility": "public"})
+            repositories = json.dumps({
+                "total_count": 1,
+                "repositories": [{"full_name": REPO}],
+            })
+            self._exe(
+                "stub-gh",
+                "#!/bin/bash\n"
+                "case \"${2:-}\" in\n"
+                f"  */repositories*) echo {repositories!r} ;;\n"
+                f"  */runner-groups/*) echo {group!r} ;;\n"
+                f"  repos/*) echo {repository!r} ;;\n"
+                "  *) echo '{}' ;;\n"
+                "esac\n",
+            )
         else:
             self._exe("stub-gh", f"#!/bin/bash\necho {fail!r} >&2\nexit 1\n")
 
@@ -314,7 +332,11 @@ class TransientAccessFailureTests(unittest.TestCase):
         h = Harness(Path(raw))
         h.stub_shipyard([("admit", "clean", 0)])
         count = h.tmp / "gh-calls"
-        group = json.dumps({"visibility": "selected"})
+        group = json.dumps({
+            "visibility": "selected",
+            "allows_public_repositories": True,
+        })
+        repository = json.dumps({"visibility": "public"})
         repos = json.dumps({"total_count": 1, "repositories": [{"full_name": REPO}]})
         # The first `failures` calls fail; later calls answer like GitHub.
         h._exe("stub-gh", (
@@ -322,7 +344,7 @@ class TransientAccessFailureTests(unittest.TestCase):
             f"echo x >>{str(count)!r}\n"
             f"n=$(wc -l <{str(count)!r} | tr -d ' ')\n"
             f"if [ \"$n\" -le {failures} ]; then echo {fail!r} >&2; exit 1; fi\n"
-            f"case \"$2\" in *repositories*) echo {repos!r} ;; *) echo {group!r} ;; esac\n"))
+            f"case \"$2\" in *repositories*) echo {repos!r} ;; *runner-groups*) echo {group!r} ;; repos/*) echo {repository!r} ;; *) echo '{{}}' ;; esac\n"))
         denied = h.tmp / "denied"
         result = h.run(
             access_function()

@@ -131,6 +131,96 @@ class BootSshWaitTests(unittest.TestCase):
 
 
 class BootHelperUsesTheBoundedWaitTests(unittest.TestCase):
+    def test_unreadable_inventory_has_no_lease_or_clone_side_effect(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        script = (
+            "set -u\n"
+            "tartci_pool_admission_open(){ return 0; }\n"
+            "tartci_pool_lock_absent(){ return 0; }\n"
+            "running_macos_vms(){ echo unknown; }\n"
+            "note(){ :; }\n"
+            "event(){ :; }\n"
+            "heartbeat(){ echo \"phase=$1\"; }\n"
+            "tartci_vm_lease_cores(){ echo LEASE_CALLED; exit 91; }\n"
+            "tartci_acquire_vm_lease(){ echo LEASE_CALLED; exit 91; }\n"
+            "tartci_vm_lease_guard_run(){ echo CLONE_CALLED; exit 91; }\n"
+            "discard_current_vm(){ echo DELETE_CALLED; exit 91; }\n"
+            "tartci_release_vm_lease(){ echo RELEASE_CALLED; exit 91; }\n"
+            + body + "\n"
+            "boot_vm_to_ssh 1 test-vm macos normal; rc=$?\n"
+            "echo \"rc=$rc lease_denied=$BOOT_LEASE_DENIED\"\n"
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("phase=inventory-unavailable", result.stdout)
+        self.assertIn("rc=75 lease_denied=0", result.stdout)
+        self.assertNotIn("LEASE_CALLED", result.stdout)
+        self.assertNotIn("CLONE_CALLED", result.stdout)
+        self.assertNotIn("DELETE_CALLED", result.stdout)
+        self.assertNotIn("RELEASE_CALLED", result.stdout)
+
+    def test_drain_before_inventory_starts_no_tart_read_or_lease(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        script = (
+            "tartci_pool_admission_open(){ return 1; }\n"
+            "tartci_pool_lock_absent(){ return 0; }\n"
+            "tartci_pool_read_state(){ echo draining; }\n"
+            "running_macos_vms(){ echo INVENTORY_CALLED; }\n"
+            "tartci_acquire_vm_lease(){ echo LEASE_CALLED; }\n"
+            "note(){ :; }\n"
+            "heartbeat(){ echo \"phase=$1\"; }\n"
+            + body + "\n"
+            "boot_vm_to_ssh 1 test-vm macos normal; echo \"rc=$?\"\n"
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("phase=draining", result.stdout)
+        self.assertIn("rc=75", result.stdout)
+        self.assertNotIn("INVENTORY_CALLED", result.stdout)
+        self.assertNotIn("LEASE_CALLED", result.stdout)
+
+    def test_drain_after_lease_releases_before_clone(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        script = (
+            "checks=0\n"
+            "tartci_pool_admission_open(){ checks=$((checks + 1)); [ \"$checks\" -eq 1 ]; }\n"
+            "tartci_pool_lock_absent(){ return 0; }\n"
+            "tartci_pool_read_state(){ echo draining; }\n"
+            "running_macos_vms(){ echo 0; }\n"
+            "tartci_vm_lease_cores(){ echo 2; }\n"
+            "tartci_vm_lease_mem_mb(){ echo 4096; }\n"
+            "tartci_acquire_vm_lease(){ echo LEASE_ACQUIRED; }\n"
+            "tartci_release_vm_lease(){ echo LEASE_RELEASED; }\n"
+            "tartci_boundary_proof_start(){ :; }\n"
+            "tartci_boundary_proof_abandon(){ echo PROOF_ABANDONED; }\n"
+            "tartci_vm_lease_guard_run(){ echo CLONE_CALLED; }\n"
+            "note(){ :; }\n"
+            "heartbeat(){ echo \"phase=$1\"; }\n"
+            + body + "\n"
+            "TART_HOME=/tmp RUNNER_NAME=test SLOT=1\n"
+            "boot_vm_to_ssh 1 test-vm macos normal; echo \"rc=$?\"\n"
+        )
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LEASE_ACQUIRED", result.stdout)
+        self.assertIn("LEASE_RELEASED", result.stdout)
+        self.assertIn("PROOF_ABANDONED", result.stdout)
+        self.assertIn("phase=draining", result.stdout)
+        self.assertIn("rc=75", result.stdout)
+        self.assertNotIn("CLONE_CALLED", result.stdout)
+
+    def test_unreadable_inventory_refuses_before_lease_or_clone(self) -> None:
+        body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
+        check = body.index('inventory="$(running_macos_vms)"')
+        lease = body.index("tartci_acquire_vm_lease")
+        clone = body.index("tartci_vm_lease_guard_run tart clone")
+        self.assertLess(check, lease)
+        self.assertLess(check, clone)
+        self.assertIn("heartbeat inventory-unavailable", body[check:lease])
+
     def test_the_boot_helper_waits_through_the_bounded_function(self) -> None:
         body = function_body(RUNNER.read_text(encoding="utf-8"), "boot_vm_to_ssh")
         self.assertIn('tartci_vm_ssh_wait "$VM_USER@$ip"', body)

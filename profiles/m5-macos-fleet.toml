@@ -34,6 +34,15 @@ persistent_runner_labels = []
 # below its computed floor. `refuse` denies the new clone instead; flip it only
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
+# The pinned mise binary (runbook: Pinned mise). Built from source at mise
+# v2026.10.11 and copied from m1 by digest. m5 had no earlier pin, so the
+# rollback is deleting this table; the 2026.10.8 binary stays installed for the
+# interactive shell. It changes no PATH and no lane.
+[mise]
+version = "2026.10.11"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.11/bin/mise"
+sha256 = "25e38f796fff67fc5f4c44f6963d4b8ed15be82a5d9244f693cc55d40a245ee3"
+
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
@@ -134,12 +143,12 @@ replaces_launchd_labels = [
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
 guest_heartbeat_stale_seconds = 600
-# The queue scan this supervisor runs is latency-sensitive: a Background
-# supervisor's GitHub API calls measured materially slower than the same calls
-# at normal priority, and every observed scan failure on this lane is a
-# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
-# promote the supervisor out of the background band. Gate lanes only.
-process_type = "Adaptive"
+# Standard, never Background or Adaptive: every lane's queue scan holds the
+# host-global observation lock, and a supervisor launchd leaves in the
+# darwinbg band (Adaptive without an XPC transaction is in that band) makes
+# each GitHub call several times slower while it holds the lock, starving
+# every other lane on the host. The validator refuses both values.
+process_type = "Standard"
 # Release-first slot (docs/assignment-v2-rollout.md, "Release event classes").
 # Slot 2 consults both release classes before the gate classes and falls back
 # to gate work whenever no release waits; slot 1 keeps gate-first order. This
@@ -259,10 +268,14 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
-priority = "gate"
+# Vellum is advisory to Pulp's required gate: vm=60, while Pulp
+# event-class leases derive 100 (PR head) / 110 (merge group).
+priority = "vm"
+supervisors = 1
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
-workflows = ["Locked macOS GPU proof", "README clean release proof"]
+workflows = ["Locked macOS GPU proof"]
+runner_idle_timeout_seconds = 60
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
