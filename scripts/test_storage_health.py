@@ -87,10 +87,27 @@ class StorageHealthTests(unittest.TestCase):
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
         loop = runner[runner.index("heartbeat loop\n  while true; do"):]
         self.assertLess(loop.index("tartci_storage_health_check"), loop.index("tartci_warm_tick"))
-        self.assertIn("heartbeat yielded-storage-health", loop)
-        helper = (ROOT / "providers" / "common" / "storage-health.lib.sh").read_text()
-        self.assertNotIn("storage-health-$(hostname", helper)
-        self.assertIn("state_args", helper)
+        self.assertIn("heartbeat yielded-storage-health", runner)
+
+    def test_runner_has_one_storage_gate_and_uses_write_probe(self):
+        """The #625 runner gate must not be shadowed by a sourced duplicate."""
+        runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
+        self.assertEqual(runner.count("tartci_storage_health_check(){"), 1)
+        self.assertNotIn("providers/common/storage-health.lib.sh", runner)
+        body = runner[runner.index("tartci_storage_health_check(){"):]
+        body = body[:body.index("\nruntime_emit_complete(){")]
+        self.assertIn("scripts/storage_health.py", body)
+        self.assertIn("--failure-threshold", body)
+        self.assertIn("--recovery-threshold", body)
+
+    def test_storage_gate_does_not_change_capacity_or_active_vm_state(self):
+        runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
+        body = runner[runner.index("tartci_storage_health_check(){"):]
+        body = body[:body.index("\nruntime_emit_complete(){")]
+        self.assertNotIn("tartci_vm_lease", body)
+        self.assertNotIn("tartci_effective_cap", body)
+        self.assertNotIn("tart stop", body)
+        self.assertNotIn("tart delete", body)
 
     def test_unreadable_state_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:

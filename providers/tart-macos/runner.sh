@@ -445,8 +445,6 @@ source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
-# shellcheck source=providers/common/storage-health.lib.sh
-source "$TARTCI_ROOT/providers/common/storage-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 # shellcheck source=providers/tart-macos/assignment-v2.lib.sh
@@ -855,18 +853,28 @@ EOF
 }
 
 tartci_storage_health_check(){
-  local result=""
-  if result="$(python3 "$TARTCI_ROOT/scripts/store_health.py" \
-      --path "$TART_HOME" --timeout-seconds "$STORAGE_HEALTH_TIMEOUT" --json \
-      2>/dev/null)"; then
+  local path="${1:-$TART_HOME}" result="" rc=0 status="unknown" reason=""
+  local -a state_args=()
+  [ -z "${TARTCI_STORAGE_HEALTH_STATE:-}" ] \
+    || state_args=(--state "$TARTCI_STORAGE_HEALTH_STATE")
+  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" \
+    --path "$path" "${state_args[@]}" \
+    --timeout "$STORAGE_HEALTH_TIMEOUT" \
+    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}" \
+    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}" \
+    2>&1)" || rc=$?
+  rc="${rc:-0}"
+  [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
+  if [ "$rc" -eq 0 ]; then
     STORAGE_HEALTH_STATE=ok
     event storage_health "Tart store probe succeeded" \
-      "state=ok" "path=$TART_HOME"
+      "state=ok" "path=$path"
     return 0
   fi
+  reason="$(printf '%s\n' "$result" | tail -1)"
   STORAGE_HEALTH_STATE=unknown
   event yielded_storage_health "Tart store probe failed" \
-    "state=unknown" "path=$TART_HOME" "reason=probe_failed"
+    "state=unknown" "path=$path" "reason=$reason"
   heartbeat yielded-storage-health
   note "Tart store health is unknown — deferring new VM admission"
   return 75
@@ -2621,15 +2629,7 @@ if [ "$LOOP" = 1 ]; then
     # expiry/teardown can mutate the store, so it must not run while the
     # storage gate is degraded or quarantined. A pending delete from an
     # already-active VM was reconciled above and remains the only exception.
-    storage_health_rc=0
-    storage_health_json=""
-    storage_health_json="$(tartci_storage_health_check "$TART_HOME")" || storage_health_rc=$?
-    if [ "$storage_health_rc" -ne 0 ]; then
-      storage_health_status="quarantined"
-      [ "$storage_health_rc" -eq 10 ] && storage_health_status=degraded
-      note "storage health $storage_health_status; refusing new VM admission: $storage_health_json"
-      event storage_health "status=$storage_health_status detail=$storage_health_json"
-      heartbeat yielded-storage-health
+    if ! tartci_storage_health_check "$TART_HOME"; then
       sleep "$POLL"
       continue
     fi
@@ -2902,9 +2902,8 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
-  storage_health_rc=0
-  storage_health_json="$(tartci_storage_health_check "$TART_HOME")" || storage_health_rc=$?
-  [ "$storage_health_rc" -eq 0 ] || die "storage health refused one-shot admission: $storage_health_json"
+  tartci_storage_health_check "$TART_HOME" \
+    || die "storage health refused one-shot admission"
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
