@@ -391,9 +391,17 @@ def run_reaper(script: pathlib.Path, *, fix: bool, worktrees_root: str,
         code: int | None = proc.wait(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
+        # A process may ignore SIGKILL while its kernel task is blocked in
+        # uninterruptible I/O.  Keep the reclaim pass bounded even then.
+        try:
+            proc.wait(timeout=min(10.0, effective_timeout))
+        except subprocess.TimeoutExpired:
+            record["error"] = (
+                f"timed out after {effective_timeout:g}s; kill acknowledged "
+                "but child did not exit within 10s")
         code = None
-        record["error"] = f"timed out after {effective_timeout:g}s and was killed"
+        if "error" not in record:
+            record["error"] = f"timed out after {effective_timeout:g}s and was killed"
         if deadline is not None and effective_timeout < timeout_s:
             record["reason"] = "pass_deadline"
     reader.join(timeout=10)
