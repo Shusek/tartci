@@ -253,6 +253,7 @@ PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_YIELD_BOUND=0
 PRINT_HOST_HEALTH=0
+PRINT_STORAGE_HEALTH=0
 PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
@@ -444,6 +445,8 @@ source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
+# shellcheck source=providers/common/storage-health.lib.sh
+source "$TARTCI_ROOT/providers/common/storage-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 # shellcheck source=providers/tart-macos/assignment-v2.lib.sh
@@ -545,6 +548,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-yield-bound) PRINT_YIELD_BOUND=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-storage-health) PRINT_STORAGE_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   --print-runner-contract) PRINT_RUNNER_CONTRACT="$2"; shift 2;;
@@ -2558,6 +2562,7 @@ i=0
   exit 0
 }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+[ "$PRINT_STORAGE_HEALTH" = 1 ] && { tartci_storage_health_check "$TART_HOME"; exit $?; }
 trap 'handle_supervisor_signal' INT TERM
 trap 'cleanup' EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
@@ -2612,9 +2617,26 @@ if [ "$LOOP" = 1 ]; then
       fi
       heartbeat loop
     fi
-    # A parked warm VM expires, yields or follows the pool before anything
-    # else. A warm teardown that did not complete is now CURRENT_VM, which the
-    # block above reconciles (pending delete) or exits on, on the next pass.
+    # Prove the Tart store is usable before reconciling a parked warm VM. Warm
+    # expiry/teardown can mutate the store, so it must not run while the
+    # storage gate is degraded or quarantined. A pending delete from an
+    # already-active VM was reconciled above and remains the only exception.
+    storage_health_rc=0
+    storage_health_json=""
+    storage_health_json="$(tartci_storage_health_check "$TART_HOME")" || storage_health_rc=$?
+    if [ "$storage_health_rc" -ne 0 ]; then
+      storage_health_status="quarantined"
+      [ "$storage_health_rc" -eq 10 ] && storage_health_status=degraded
+      note "storage health $storage_health_status; refusing new VM admission: $storage_health_json"
+      event storage_health "status=$storage_health_status detail=$storage_health_json"
+      heartbeat yielded-storage-health
+      sleep "$POLL"
+      continue
+    fi
+    # A parked warm VM expires, yields or follows the pool after storage is
+    # proven healthy. A warm teardown that did not complete is now CURRENT_VM,
+    # which the block above reconciles (pending delete) or exits on, on the
+    # next pass.
     tartci_warm_tick || true
     [ -z "$CURRENT_VM" ] || continue
     if ! tartci_pool_admission_open; then
@@ -2880,6 +2902,9 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
+  storage_health_rc=0
+  storage_health_json="$(tartci_storage_health_check "$TART_HOME")" || storage_health_rc=$?
+  [ "$storage_health_rc" -eq 0 ] || die "storage health refused one-shot admission: $storage_health_json"
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
