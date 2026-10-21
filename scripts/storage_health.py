@@ -162,10 +162,10 @@ def run_probe_bounded(path: Path, timeout: float) -> tuple[bool, str, float]:
         # Do not wait for a filesystem syscall that is stuck in the kernel. The
         # supervisor remains bounded; any orphan is harmless and holds no Tart VM.
         child.kill()
-        reap_after_kill(child)
+        reaped = reap_after_kill(child)
         if child.stdout is not None:
             child.stdout.close()
-        return False, "probe_timeout", timeout
+        return False, "probe_timeout" if reaped else "probe_timeout_unreaped", timeout
     try:
         payload = json.loads(stdout)
         return bool(payload["ok"]), str(payload["reason"]), float(payload["elapsed_seconds"])
@@ -223,7 +223,7 @@ def run(args: argparse.Namespace) -> int:
     command = [sys.executable, str(Path(__file__).resolve()), "--storage-health-worker"] + sys.argv[1:]
     child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        stdout, stderr = child.communicate(timeout=args.timeout + 1.0)
+        stdout, stderr = child.communicate(timeout=args.timeout + 2.0)
     except subprocess.TimeoutExpired:
         reap_after_kill(child)
         if child.stdout is not None:
