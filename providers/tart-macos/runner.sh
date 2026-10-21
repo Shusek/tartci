@@ -854,15 +854,16 @@ EOF
 
 tartci_storage_health_check(){
   local path="${1:-$TART_HOME}" result="" rc=0 status="unknown" reason=""
-  local -a state_args=()
-  [ -z "${TARTCI_STORAGE_HEALTH_STATE:-}" ] \
-    || state_args=(--state "$TARTCI_STORAGE_HEALTH_STATE")
-  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" \
-    --path "$path" "${state_args[@]}" \
-    --timeout "$STORAGE_HEALTH_TIMEOUT" \
-    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}" \
-    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}" \
-    2>&1)" || rc=$?
+  local -a probe_args=(
+    --path "$path"
+    --timeout "$STORAGE_HEALTH_TIMEOUT"
+    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}"
+    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}"
+  )
+  if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
+    probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")
+  fi
+  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" "${probe_args[@]}" 2>&1)" || rc=$?
   rc="${rc:-0}"
   [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
   if [ "$rc" -eq 0 ]; then
@@ -2905,6 +2906,19 @@ else
   tartci_storage_health_check "$TART_HOME" \
     || die "storage health refused one-shot admission"
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
+  # Loop mode claims the host-wide Apple guest slot before calling run_one.
+  # --once enters run_one directly, so make the same atomic reservation here;
+  # the inventory value is bounded and must be numeric before it can be used.
+  # Without this reservation two manually started one-shot candidates could
+  # race the two-guest ceiling even though each sees a free slot.
+  cap="$(tartci_effective_cap)"
+  inventory="$(running_macos_vms)"
+  case "$inventory" in
+    ''|*[!0-9]*) die "Tart inventory unavailable: refusing one-shot admission" ;;
+  esac
+  resv="$(tartci_claim_macos_slot "$cap" "$inventory")"
+  [ -n "$resv" ] || die "macOS VM cap $cap is full: refusing one-shot admission"
+  CURRENT_RESV="$resv"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"
