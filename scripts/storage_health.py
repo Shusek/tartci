@@ -15,6 +15,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from python_child import child_python
+
 HEALTHY, DEGRADED, QUARANTINED = 0, 10, 20
 TERMINATE_GRACE_SECONDS = 0.5
 
@@ -153,7 +155,7 @@ def reap_after_kill(child: subprocess.Popen[object]) -> bool:
 
 def run_probe_bounded(path: Path, timeout: float) -> tuple[bool, str, float]:
     child = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--probe-only", "--path", str(path)],
+        [child_python(), str(Path(__file__).resolve()), "--probe-only", "--path", str(path)],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True,
     )
     try:
@@ -220,7 +222,7 @@ def run_worker(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
-    command = [sys.executable, str(Path(__file__).resolve()), "--storage-health-worker"] + sys.argv[1:]
+    command = [child_python(), str(Path(__file__).resolve()), "--storage-health-worker"] + sys.argv[1:]
     child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         stdout, stderr = child.communicate(timeout=args.timeout + 2.0)
