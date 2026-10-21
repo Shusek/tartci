@@ -73,6 +73,47 @@ def save_state(path: Path, state: dict) -> None:
         raise
 
 
+def quarantine_result(path: Path, state_path: Path, args: argparse.Namespace,
+                      reason: str) -> dict:
+    """Build the fail-closed result used when the worker cannot persist state."""
+    return {
+        "schema": 1,
+        "status": "quarantined",
+        "reason": reason,
+        "path": str(path),
+        "state": str(state_path),
+        "failure_streak": args.failure_threshold,
+        "healthy_streak": 0,
+    }
+
+
+def persist_quarantine_marker(state_path: Path) -> None:
+    """Leave a durable local marker when the JSON state cannot be written."""
+    Path(str(state_path) + ".quarantine").touch(exist_ok=True)
+
+
+def durable_quarantine(path: Path, state_path: Path, args: argparse.Namespace,
+                       reason: str) -> dict:
+    """Persist quarantine before returning an exceptional worker result.
+
+    The marker is checked before a later probe, even when an older healthy JSON
+    state remains. This closes the window where a timeout or state write error
+    could be followed by a fresh invocation that reopened admission.
+    """
+    result = quarantine_result(path, state_path, args, reason)
+    try:
+        persist_quarantine_marker(state_path)
+    except OSError:
+        # State may itself be unavailable. The caller still fails closed and
+        # reports the exact persistence failure; there is no safe write target.
+        pass
+    try:
+        save_state(state_path, result)
+    except OSError:
+        pass
+    return result
+
+
 def probe(path: Path) -> tuple[bool, str, float]:
     """Inspect the store directory without changing its contents.
 
@@ -203,8 +244,17 @@ def run_worker(args: argparse.Namespace) -> int:
         with lock_path.open("a+") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             previous = load_state(state_path, path)
-            if not previous and quarantine_marker.exists():
-                previous = {"status": "quarantined", "failure_streak": args.failure_threshold, "healthy_streak": 0}
+            if quarantine_marker.exists():
+                if not previous:
+                    previous = {
+                        "failure_streak": args.failure_threshold,
+                        "healthy_streak": 0,
+                    }
+                elif previous.get("status") != "quarantined":
+                    # A marker left by an exceptional failure invalidates any
+                    # prior healthy streak; require the full recovery window.
+                    previous["healthy_streak"] = 0
+                previous["status"] = "quarantined"
             if previous.get("state_unreadable"):
                 result = {"schema": 1, "status": "quarantined", "reason": "health_state_unreadable", "path": str(path), "state": str(state_path), "failure_streak": args.failure_threshold, "healthy_streak": 0}
                 print(json.dumps(result, sort_keys=True))
@@ -229,13 +279,14 @@ def run_worker(args: argparse.Namespace) -> int:
                 elif quarantine_marker.exists():
                     quarantine_marker.unlink()
             except OSError:
-                result.update(status="quarantined", reason="health_state_write_failed")
+                result = durable_quarantine(path, state_path, args, "health_state_write_failed")
                 print(json.dumps(result, sort_keys=True))
                 return QUARANTINED
             print(json.dumps(result, sort_keys=True))
             return HEALTHY if status == "healthy" else DEGRADED if status == "degraded" else QUARANTINED
     except OSError:
-        print(json.dumps({"schema": 1, "status": "quarantined", "reason": "health_state_lock_failed", "path": str(path), "state": str(state_path), "failure_streak": args.failure_threshold, "healthy_streak": 0}, sort_keys=True))
+        result = durable_quarantine(path, state_path, args, "health_state_lock_failed")
+        print(json.dumps(result, sort_keys=True))
         return QUARANTINED
 
 
@@ -250,14 +301,20 @@ def run(args: argparse.Namespace) -> int:
             child.stdout.close()
         if child.stderr is not None:
             child.stderr.close()
-        print(json.dumps({"schema": 1, "status": "quarantined", "reason": "health_supervisor_timeout", "path": args.path, "state": args.state or str(default_state(Path(args.path))), "failure_streak": args.failure_threshold, "healthy_streak": 0}, sort_keys=True))
+        path = Path(args.path)
+        state_path = Path(args.state) if args.state else default_state(path)
+        result = durable_quarantine(path, state_path, args, "health_supervisor_timeout")
+        print(json.dumps(result, sort_keys=True))
         return QUARANTINED
     if child.returncode in (HEALTHY, DEGRADED, QUARANTINED) and stdout.strip():
         print(stdout, end="")
         return child.returncode
     if stderr.strip():
         print(stderr, file=sys.stderr, end="")
-    print(json.dumps({"schema": 1, "status": "quarantined", "reason": "health_worker_failed", "path": args.path, "state": args.state or str(default_state(Path(args.path))), "failure_streak": args.failure_threshold, "healthy_streak": 0}, sort_keys=True))
+    path = Path(args.path)
+    state_path = Path(args.state) if args.state else default_state(path)
+    result = durable_quarantine(path, state_path, args, "health_worker_failed")
+    print(json.dumps(result, sort_keys=True))
     return QUARANTINED
 
 

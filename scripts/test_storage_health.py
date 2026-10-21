@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "storage_health.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+import storage_health  # noqa: E402
 
 
 class StorageHealthTests(unittest.TestCase):
@@ -66,6 +70,28 @@ class StorageHealthTests(unittest.TestCase):
             state.unlink()
             still_closed = self.run_probe(root, state)
             self.assertEqual(still_closed.returncode, 20)
+
+    def test_quarantine_marker_overrides_healthy_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "volume"
+            root.mkdir()
+            state = Path(temp) / "state.json"
+            self.assertEqual(self.run_probe(root, state).returncode, 0)
+            Path(str(state) + ".quarantine").touch()
+            recovering = self.run_probe(root, state, recovery_threshold=2)
+            self.assertEqual(recovering.returncode, 20)
+            self.assertEqual(json.loads(recovering.stdout)["reason"], "recovery_check_pending")
+
+    def test_durable_quarantine_keeps_marker_when_state_write_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "volume"
+            root.mkdir()
+            state = Path(temp) / "state.json"
+            args = argparse.Namespace(failure_threshold=2)
+            with patch.object(storage_health, "save_state", side_effect=OSError("wedged state")):
+                result = storage_health.durable_quarantine(root, state, args, "health_worker_failed")
+            self.assertEqual(result["status"], "quarantined")
+            self.assertTrue(Path(str(state) + ".quarantine").exists())
 
     def test_unbounded_configuration_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
