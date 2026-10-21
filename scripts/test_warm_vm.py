@@ -497,6 +497,7 @@ class RunnerWiringTests(unittest.TestCase):
 
     def test_the_loop_ticks_first_claims_through_the_parked_slot_and_parks_when_idle(self) -> None:
         loop = self.source[self.source.index('heartbeat loop\n  while true; do'):]
+        loop = loop[:loop.index('\nelse\n  tartci_storage_health_check')]
         self.assertLess(loop.index("tartci_warm_tick"), loop.index("tartci_pool_admission_open"))
         self.assertIn('resv="$(tartci_warm_or_claim_slot "$cap" "$r")"', loop)
         self.assertNotIn("tartci_claim_macos_slot", loop)
