@@ -50,7 +50,7 @@ case "$MODE" in
   live)
     [ "$AUTHORITY" = 1 ] || { echo "--mode live requires --authority" >&2; exit 2; }
     [ "${#CLASSES[@]}" -ge 1 ] || { echo "--mode live requires at least one --class" >&2; exit 2; }
-    for class in "${CLASSES[@]}"; do
+    for class in ${CLASSES[@]+"${CLASSES[@]}"}; do
       case "$class" in
         redispatch|rearm) ;;
         *) echo "invalid --class $class: live classes are redispatch and rearm" >&2; exit 2 ;;
@@ -116,7 +116,7 @@ PY
 echo "Shipyard carrier scheduler install plan:"
 echo "  mode=$MODE authority=$AUTHORITY classes=${CLASS_LIST:-none}"
 echo "  shipyard=$SHIPYARD"
-for repo in "${REPOS[@]}"; do echo "  repo=$repo"; done
+for repo in ${REPOS[@]+"${REPOS[@]}"}; do echo "  repo=$repo"; done
 echo "  executable=$ENTRYPOINT steward-scheduler (the installed generation)"
 echo "  config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
@@ -195,7 +195,7 @@ rollback() {
 }
 trap rollback EXIT
 
-python3 - "$STAGED_CONFIG" "$MODE" "$AUTHORITY" "$CLASS_LIST" "$SHIPYARD" "${REPOS[@]}" <<'PY'
+python3 - "$STAGED_CONFIG" "$MODE" "$AUTHORITY" "$CLASS_LIST" "$SHIPYARD" ${REPOS[@]+"${REPOS[@]}"} <<'PY'
 import json, os, pathlib, re, stat, subprocess, sys
 target, mode, authority, class_list, shipyard, *entries = sys.argv[1:]
 classes = [entry for entry in class_list.split(",") if entry]

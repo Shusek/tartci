@@ -235,7 +235,7 @@ tartci_vm_lease_guard_exec qemu-system-aarch64 \
 QPID_STARTED_AT="$(tartci_pid_started_at "$QPID")"
 write_state booting
 
-wsh(){ ssh -n "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$WUSER@127.0.0.1" "$@"; }
+wsh(){ ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$KEY" -p "$PORT" "$WUSER@127.0.0.1" "$@"; }
 
 note "waiting for SSH (Win boot ~2-4 min)…"
 up=0; for _ in $(seq 1 150); do wsh 'echo ok' >/dev/null 2>&1 && { up=1; break; }; sleep 4; done

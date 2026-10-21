@@ -114,13 +114,13 @@ TART_RUN_ARGS=(--no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux")
 if [ "$CROSS" = 1 ] && [ "$EMULATOR" = "rosetta" ]; then
   TART_RUN_ARGS+=(--rosetta=rosetta)
 fi
-tart run "${TART_RUN_ARGS[@]}" "$VM" >/dev/null 2>&1 & RPID=$!
+tart run ${TART_RUN_ARGS[@]+"${TART_RUN_ARGS[@]}"} "$VM" >/dev/null 2>&1 & RPID=$!
 
 IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$VM" 2>/dev/null || true)"; [ -n "$IP" ] && break; sleep 2; done
 [ -n "$IP" ] || die "no IP for $VM after 120s"
 GUEST_TRANSPORT=""
 for _ in $(seq 1 90); do
-  if ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
   if tart exec "$VM" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
   sleep 2
 done
@@ -137,7 +137,7 @@ note "guest transport: $GUEST_TRANSPORT"
 run_guest_script(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
     # ssh-stdin: the guest script is fed by `run_guest_script <<'GUEST'`
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
+    ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY" "$VM_USER@$IP" \
       "REF='$REF' BUILD_TYPE='$BUILD_TYPE' NO_GPU='$NO_GPU' CTEST_ARGS='$CTEST_ARGS' TARGET_ARCH='$TARGET_ARCH' CROSS='$CROSS' SELF_TEST='$SELF_TEST' X64_SKIA_DIR='$X64_SKIA_DIR' EMULATOR='$EMULATOR' bash -s"
   else
     tart exec -i "$VM" env \
@@ -379,7 +379,7 @@ fi
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
   -DPULP_BUILD_TESTS=ON -DPULP_BUILD_EXAMPLES=ON $GPU_FLAG \
-  "${CROSS_FLAGS[@]}" \
+  ${CROSS_FLAGS[@]+"${CROSS_FLAGS[@]}"} \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 cmake --build build --parallel "$(nproc)"
 echo "=== ccache stats ==="; ccache -s 2>/dev/null | grep -iE 'hits|misses|cache size' || true

@@ -863,7 +863,7 @@ tartci_storage_health_check(){
   if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
     probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")
   fi
-  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" "${probe_args[@]}" 2>&1)" || rc=$?
+  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" ${probe_args[@]+"${probe_args[@]}"} 2>&1)" || rc=$?
   rc="${rc:-0}"
   [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
   if [ "$rc" -eq 0 ]; then
@@ -938,7 +938,7 @@ queued_work(){
   fi
   run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
-    "${WORKFLOW_ARGS[@]}" \
+    ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} \
     --labels "$LABELS" \
     --provider tart-macos \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
@@ -976,7 +976,7 @@ tier_queued_work(){
   [ "${#tier_args[@]}" -gt 0 ] || return 1
   scan_cmd=(python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
-    "${tier_args[@]}" \
+    ${tier_args[@]+"${tier_args[@]}"} \
     --labels "$LABELS,$tier_labels" \
     --provider tart-macos-tier \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-$tier_labels" \
@@ -985,7 +985,7 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
-  run_scan_capture "${scan_cmd[@]}" --match-labels 1
+  run_scan_capture ${scan_cmd[@]+"${scan_cmd[@]}"} --match-labels 1
 }
 
 # Print `count|registration labels|zero-based tier`. A scan error at any tier is
@@ -1122,11 +1122,11 @@ yield_bound_reached(){
     done < <(tier_workflow_args "$tier_labels")
     [ "${#scan_args[@]}" -gt 0 ] || { printf '%s\n' 0; return 0; }
   else
-    scan_args=("${WORKFLOW_ARGS[@]}")
+    scan_args=(${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"})
   fi
   if ! count="$(run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
       --repo "$REPO" \
-      "${scan_args[@]}" \
+      ${scan_args[@]+"${scan_args[@]}"} \
       --labels "$selected_labels" \
       --provider tart-macos-yield-bound \
       --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-yield-bound" \
@@ -1184,7 +1184,7 @@ sweep_lane_ghost_runners(){
 stop_current_aqua_runner(){
   if [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ]; then
     bounded_teardown_command aqua-stop \
-      ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
+      ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
       "\$HOME/.tartci/bin/guest-aqua-runner.sh stop '$CURRENT_AQUA_LABEL'" \
       >/dev/null 2>&1 || true
   fi
@@ -1495,7 +1495,7 @@ capture_current_job(){
     return 2
   fi
   started="$(date +%s)"
-  python3 "${args[@]}" >"$CURRENT_SCAN_TMP" 2>>"$EVENT_LOG" & CURRENT_SCAN_PID=$!
+  python3 ${args[@]+"${args[@]}"} >"$CURRENT_SCAN_TMP" 2>>"$EVENT_LOG" & CURRENT_SCAN_PID=$!
   while kill -0 "$CURRENT_SCAN_PID" 2>/dev/null; do
     heartbeat job-running
     sleep 1
@@ -1611,7 +1611,7 @@ cancel_current_run(){
 
 ensure_runner_version(){
   local ip="$1"
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY'" <<'GUEST'
 set -euo pipefail
 desired="$1"
@@ -1695,14 +1695,14 @@ run_runner_until_done_unlayered(){
   # Claim the guest secret/service cleanup target before the first byte crosses
   # SSH, so a failed stream or pending signal cannot leave an unowned JIT file.
   CURRENT_AQUA_LABEL="$aqua_label"
-  if ! printf '%s' "$jit" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! printf '%s' "$jit" | ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "umask 077; root=\"\$HOME/.tartci/aqua-runner/$aqua_label\"; mkdir -p \"\$root\"; cat >\"\$root/jit.cfg\""; then
     note "[$vm] failed to stream JIT config into the guest"
     stop_current_aqua_runner
     return 1
   fi
   jit=""
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
      mkdir -p \"\$HOME/Library/Caches/Pulp\" && ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
@@ -1841,13 +1841,13 @@ tartci_guest_silent_secs(){
 install_and_preflight_aqua_runner(){
   local ip="$1" vm="$2" aqua_label
   aqua_label="com.tartci.aqua.$vm"
-  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     'umask 077; mkdir -p ~/.tartci/bin; cat > ~/.tartci/bin/guest-aqua-runner.sh; chmod 700 ~/.tartci/bin/guest-aqua-runner.sh' \
     <"$TARTCI_ROOT/providers/tart-macos/guest-aqua-runner.sh"; then
     note "[$vm] failed to install Aqua runner launcher"
     return 1
   fi
-  if ! ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "\$HOME/.tartci/bin/guest-aqua-runner.sh preflight '$aqua_label'"; then
     note "[$vm] console Aqua session preflight failed — refusing to mint JIT config"
     return 1
@@ -1963,7 +1963,7 @@ boot_vm_to_ssh(){
     tart_dirs+=(--dir="artifact-cache:$ARTIFACT_CACHE_ROOT:ro")
     CURRENT_ARTIFACT_CACHE=1
   fi
-  tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
+  tartci_vm_lease_guard_exec tart run --no-graphics ${tart_dirs[@]+"${tart_dirs[@]}"} \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat "$boot_phase"
@@ -2027,7 +2027,7 @@ tartci_vm_ssh_wait(){
     BOOT_SSH_ATTEMPTS=$((BOOT_SSH_ATTEMPTS + 1))
     if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "$bound" \
          --operation boot_ssh_probe -- \
-         ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$dest" true >/dev/null 2>&1; then
+         ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$dest" true >/dev/null 2>&1; then
       BOOT_SSH_WAITED_SECS=$(( SECONDS - started ))
       return 0
     fi
@@ -2424,11 +2424,11 @@ run_one(){
   # reclaim it even when a signal lands immediately after GitHub creates it.
   CURRENT_REGISTERED_RUNNER="$vm"
   IFS=',' read -r -a labels_split <<< "$selected_labels"
-  for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${labels_split[@]+"${labels_split[@]}"}; do label_args+=(-f "labels[]=$l"); done
   local jit_error="$STATE_DIR/$vm.jit-error"
   jit="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
         "$JIT_GH_CLI" api -X POST "$selected_runner_api_root/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$selected_group_id" "${label_args[@]}" \
+        -f "name=$vm" -F "runner_group_id=$selected_group_id" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release
     if grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$jit_error"; then

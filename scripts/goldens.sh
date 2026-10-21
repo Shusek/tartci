@@ -207,7 +207,7 @@ cmd_doctor(){
   [ -n "$receipt" ] || die "no golden receipt found; provide --receipt FILE"
   local args=("$receipt" --max-age-days "$max_age")
   [ "$promotion" = 1 ] && args+=(--promotion)
-  exec python3 "$(dirname "${BASH_SOURCE[0]}")/../providers/common/pulp-golden-receipt.py" "${args[@]}"
+  exec python3 "$(dirname "${BASH_SOURCE[0]}")/../providers/common/pulp-golden-receipt.py" ${args[@]+"${args[@]}"}
 }
 
 cmd_sync(){
