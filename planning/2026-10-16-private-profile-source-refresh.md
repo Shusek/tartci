@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation and verification repair merged; canary passed; rollback and wider rollout remain gated
+Status: implementation and verification repair merged; standalone readiness evidence recorded; canary soak and rollback remain gated
 
 ## Goal
 
@@ -88,10 +88,11 @@ and landed.
 ## Current rollout status
 
 The private authority projection was rerun against fresh exact `origin/main`
-checkouts of TartCI and Pulp and passed. The selected canary now uses the
-immutable private source and passed standalone verification, source
-provenance, published-supply, rendered-launch, and readiness checks. The other
-reachable hosts remain on the public source.
+checkouts of TartCI and Pulp and passed. The selected canary has standalone
+verification, source provenance, published-supply, rendered-launch, and
+readiness evidence. This record does not claim a completed fleet canary: the
+per-host go decision, soak window, and rollback proof are still absent. The
+other reachable hosts remain on the public source.
 
 During the rollout gate, a completed update on another host left its pool
 services loaded but its participation state off. The supported `pool on` path
@@ -101,6 +102,10 @@ host was deliberately left on the public generation until a later reviewed
 retry. This is evidence for a follow-up self-update recovery test, not a reason
 to bypass the capacity floor.
 
-The wider rollout remains stopped until the canary has a documented soak and
-rollback to the checked-in source. After that, each additional host needs its
-own reviewed, one-host-at-a-time rollout and the same verification record.
+The wider rollout remains stopped until the canary has a named per-host go
+decision, a documented soak, and rollback to the checked-in source. The m5s
+sealed launcher must refuse the private-data read until its approved launcher
+generation is installed; a Tart-store stall also requires the documented
+reboot and recovery action before participation is restored. After that, each
+additional host needs its own reviewed, one-host-at-a-time rollout and the same
+verification record.
