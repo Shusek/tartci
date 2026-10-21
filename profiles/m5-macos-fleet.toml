@@ -34,6 +34,15 @@ persistent_runner_labels = []
 # below its computed floor. `refuse` denies the new clone instead; flip it only
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
+# The pinned mise binary (runbook: Pinned mise). Built from source at mise
+# v2026.10.11 and copied from m1 by digest. m5 had no earlier pin, so the
+# rollback is deleting this table; the 2026.10.8 binary stays installed for the
+# interactive shell. It changes no PATH and no lane.
+[mise]
+version = "2026.10.11"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.11/bin/mise"
+sha256 = "25e38f796fff67fc5f4c44f6963d4b8ed15be82a5d9244f693cc55d40a245ee3"
+
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
