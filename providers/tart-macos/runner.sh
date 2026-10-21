@@ -2906,6 +2906,19 @@ else
   tartci_storage_health_check "$TART_HOME" \
     || die "storage health refused one-shot admission"
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
+  # Loop mode claims the host-wide Apple guest slot before calling run_one.
+  # --once enters run_one directly, so make the same atomic reservation here;
+  # the inventory value is bounded and must be numeric before it can be used.
+  # Without this reservation two manually started one-shot candidates could
+  # race the two-guest ceiling even though each sees a free slot.
+  cap="$(tartci_effective_cap)"
+  inventory="$(running_macos_vms)"
+  case "$inventory" in
+    ''|*[!0-9]*) die "Tart inventory unavailable: refusing one-shot admission" ;;
+  esac
+  resv="$(tartci_claim_macos_slot "$cap" "$inventory")"
+  [ -n "$resv" ] || die "macOS VM cap $cap is full: refusing one-shot admission"
+  CURRENT_RESV="$resv"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"

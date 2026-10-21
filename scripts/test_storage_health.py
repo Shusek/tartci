@@ -90,6 +90,8 @@ class StorageHealthTests(unittest.TestCase):
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
         once = runner.rsplit("else\n", 1)[1]
         self.assertLess(once.index("tartci_storage_health_check"), once.index("tartci_pool_admission_open"))
+        self.assertLess(once.index("tartci_claim_macos_slot"), once.index("run_one 1"))
+        self.assertIn("running_macos_vms", once)
         self.assertIn('[ -z "$CURRENT_VM" ] || continue', runner)
 
     def test_loop_guards_storage_before_warm_reconciliation(self):
