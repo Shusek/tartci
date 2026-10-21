@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from typing import Optional
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -227,6 +228,72 @@ class Validation(unittest.TestCase):
             bad.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n')
             with self.assertRaisesRegex(ValueError, "reclaim.repo is required"):
                 fleet.load(bad)
+
+
+class VolumeStallGuards(Isolated):
+    """A wedged scan root must not start another potentially wedged Git walk."""
+
+    @testing_support.requires_tomllib
+    def test_scan_timeout_overlapping_configured_root_returns_a_skip_reason(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml")
+        reason = pr.skip_reason_for_scan_timeouts(
+            [str(repo.worktrees / "nested"), str(self.tmp / "unrelated")], profile)
+        self.assertIn("configured Pulp root overlaps timed-out scan path", reason)
+        self.assertIn(str(repo.worktrees / "nested"), reason)
+
+    @testing_support.requires_tomllib
+    def test_timeout_on_an_unrelated_root_does_not_skip_reapers(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml")
+        self.assertIsNone(pr.skip_reason_for_scan_timeouts([str(self.tmp / "other")], profile))
+
+    @testing_support.requires_tomllib
+    def test_explicit_skip_does_not_materialize_or_invoke_a_reaper(self):
+        repo = PulpRepo(self.tmp)
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append(script)
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+
+        out = pr.run(fix=True, profile=repo.profile(self.tmp / "p.toml"),
+                     state_dir=self.state, reaper=reaper,
+                     skip_reason="skipped: external volume scan timed out")
+        self.assertTrue(out["enabled"])
+        self.assertEqual(out["runs"], [])
+        self.assertEqual(calls, [])
+        self.assertEqual(out["skipped"]["all"],
+                         "skipped: external volume scan timed out")
+
+    def test_git_timeout_is_clamped_to_the_remaining_pass_budget(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 0, "origin", "")
+
+        pr._git(pathlib.Path("/repo"), "rev-parse", runner=runner,
+                deadline=time.monotonic() + 0.05)
+        self.assertEqual(len(calls), 1)
+        self.assertLess(calls[0], pr.GIT_TIMEOUT_S)
+
+    @testing_support.requires_tomllib
+    def test_expired_pass_deadline_skips_reapers_fail_closed(self):
+        repo = PulpRepo(self.tmp)
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append(script)
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+
+        out = pr.run(fix=True, profile=repo.profile(self.tmp / "p.toml"),
+                     state_dir=self.state, reaper=reaper,
+                     deadline=time.monotonic() - 1)
+        self.assertTrue(out["enabled"])
+        self.assertEqual(out["runs"], [])
+        self.assertEqual(calls, [])
+        self.assertIn("deadline", out["reason"])
 
 
 class Materialize(Isolated):
@@ -695,6 +762,26 @@ class DiscoveredPulpRoots(Isolated):
 
 
 class DiskReclaimIntegration(Isolated):
+    @testing_support.requires_tomllib
+    def test_scan_timeout_skips_pulp_reapers_and_is_recorded(self):
+        repo = PulpRepo(self.tmp)
+        os.environ["TARTCI_FLEET_PROFILE"] = str(repo.profile(self.tmp / "p.toml"))
+        scan = self.tmp / "scan"
+        scan.mkdir()
+        state = self.tmp / "reclaim-state"
+        out = io.StringIO()
+        with unittest.mock.patch.object(dr, "SCAN_TIMEOUTS", [str(repo.worktrees)]), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(scan), "--json", "--state-dir", str(state),
+                            "--boot-floor-gb", "0"])
+        self.assertEqual(code, 0)
+        report = json.loads(out.getvalue())
+        reason = report["pulp_reapers"]["reason"]
+        self.assertIn("configured Pulp root overlaps timed-out scan path", reason)
+        self.assertEqual(report["pulp_reapers"]["runs"], [])
+        receipt = json.loads((state / "last-run.json").read_text())
+        self.assertEqual(receipt["pulp_reapers"]["reason"], reason)
+
     @testing_support.requires_tomllib
     def test_receipt_event_and_log_line_carry_the_pulp_result(self):
         repo = PulpRepo(self.tmp)

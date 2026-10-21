@@ -99,6 +99,9 @@ SELF_LABEL = "com.danielraffel.tartci.launchd-watchdog"
 # old. During a legit build the log DOES go this stale (run_one is quiet until the job
 # ends), which is why the alive-but-frozen signature also requires no running VM.
 DEFAULT_STALE_LOG_S = 1800  # 30 min
+# Bound the Tart inventory subprocess; tests and operators may lower this
+# value when exercising the fail-closed timeout path.
+TART_INVENTORY_TIMEOUT_S = 30
 
 
 
@@ -644,7 +647,8 @@ def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
     try:
         process = store_health.run_bounded(
             [tart_cli, "list", "--format", "json"],
-            timeout=30, operation="tart_inventory", env=env)
+            timeout=TART_INVENTORY_TIMEOUT_S,
+            operation="tart_inventory", env=env)
         return process.returncode, process.stdout, process.stderr
     except store_health.ObservationError as exc:
         return 124 if exc.kind == "timeout" else 127, "", str(exc)

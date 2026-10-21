@@ -1244,6 +1244,18 @@ class RootDiscoveryTests(unittest.TestCase):
             code_ctl = dr.main(["--roots", str(self.present_a), "--json"])
         self.assertEqual(code_ctl, 0)
 
+    def test_stalled_root_metadata_probe_fails_closed(self):
+        """A wedged root probe must not leave reclaim orphaned in os.access."""
+        def stalled(_operation, *, description, timeout=dr.ROOT_PROBE_TIMEOUT_S):
+            raise OSError(errno.ETIMEDOUT, f"{description} timed out")
+
+        buffer = io.StringIO()
+        with unittest.mock.patch.object(dr, "bounded_fs_call", side_effect=stalled), \
+                redirect_stdout(io.StringIO()), redirect_stderr(buffer):
+            code = dr.main(["--roots", str(self.present_a), "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("probe failed", buffer.getvalue())
+
     def test_a_host_matching_no_candidate_exits_two(self):
         with unittest.mock.patch.object(
                 dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
