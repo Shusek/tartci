@@ -278,6 +278,23 @@ class VolumeStallGuards(Isolated):
         self.assertEqual(len(calls), 1)
         self.assertLess(calls[0], pr.GIT_TIMEOUT_S)
 
+    @testing_support.requires_tomllib
+    def test_expired_pass_deadline_skips_reapers_fail_closed(self):
+        repo = PulpRepo(self.tmp)
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append(script)
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+
+        out = pr.run(fix=True, profile=repo.profile(self.tmp / "p.toml"),
+                     state_dir=self.state, reaper=reaper,
+                     deadline=time.monotonic() - 1)
+        self.assertTrue(out["enabled"])
+        self.assertEqual(out["runs"], [])
+        self.assertEqual(calls, [])
+        self.assertIn("deadline", out["reason"])
+
 
 class Materialize(Isolated):
     def test_checkout_is_origin_main_and_carries_tools_ci(self):
