@@ -253,6 +253,7 @@ PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_YIELD_BOUND=0
 PRINT_HOST_HEALTH=0
+PRINT_STORAGE_HEALTH=0
 PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
@@ -545,6 +546,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-yield-bound) PRINT_YIELD_BOUND=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-storage-health) PRINT_STORAGE_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   --print-runner-contract) PRINT_RUNNER_CONTRACT="$2"; shift 2;;
@@ -851,18 +853,29 @@ EOF
 }
 
 tartci_storage_health_check(){
-  local result=""
-  if result="$(python3 "$TARTCI_ROOT/scripts/store_health.py" \
-      --path "$TART_HOME" --timeout-seconds "$STORAGE_HEALTH_TIMEOUT" --json \
-      2>/dev/null)"; then
+  local path="${1:-$TART_HOME}" result="" rc=0 status="unknown" reason=""
+  local -a probe_args=(
+    --path "$path"
+    --timeout "$STORAGE_HEALTH_TIMEOUT"
+    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}"
+    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}"
+  )
+  if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
+    probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")
+  fi
+  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" "${probe_args[@]}" 2>&1)" || rc=$?
+  rc="${rc:-0}"
+  [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
+  if [ "$rc" -eq 0 ]; then
     STORAGE_HEALTH_STATE=ok
     event storage_health "Tart store probe succeeded" \
-      "state=ok" "path=$TART_HOME"
+      "state=ok" "path=$path"
     return 0
   fi
+  reason="$(printf '%s\n' "$result" | tail -1)"
   STORAGE_HEALTH_STATE=unknown
   event yielded_storage_health "Tart store probe failed" \
-    "state=unknown" "path=$TART_HOME" "reason=probe_failed"
+    "state=unknown" "path=$path" "reason=$reason"
   heartbeat yielded-storage-health
   note "Tart store health is unknown — deferring new VM admission"
   return 75
@@ -2558,6 +2571,7 @@ i=0
   exit 0
 }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+[ "$PRINT_STORAGE_HEALTH" = 1 ] && { tartci_storage_health_check "$TART_HOME"; exit $?; }
 trap 'handle_supervisor_signal' INT TERM
 trap 'cleanup' EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
@@ -2612,9 +2626,18 @@ if [ "$LOOP" = 1 ]; then
       fi
       heartbeat loop
     fi
-    # A parked warm VM expires, yields or follows the pool before anything
-    # else. A warm teardown that did not complete is now CURRENT_VM, which the
-    # block above reconciles (pending delete) or exits on, on the next pass.
+    # Prove the Tart store is usable before reconciling a parked warm VM. Warm
+    # expiry/teardown can mutate the store, so it must not run while the
+    # storage gate is degraded or quarantined. A pending delete from an
+    # already-active VM was reconciled above and remains the only exception.
+    if ! tartci_storage_health_check "$TART_HOME"; then
+      sleep "$POLL"
+      continue
+    fi
+    # A parked warm VM expires, yields or follows the pool after storage is
+    # proven healthy. A warm teardown that did not complete is now CURRENT_VM,
+    # which the block above reconciles (pending delete) or exits on, on the
+    # next pass.
     tartci_warm_tick || true
     [ -z "$CURRENT_VM" ] || continue
     if ! tartci_pool_admission_open; then
@@ -2880,7 +2903,22 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
+  tartci_storage_health_check "$TART_HOME" \
+    || die "storage health refused one-shot admission"
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
+  # Loop mode claims the host-wide Apple guest slot before calling run_one.
+  # --once enters run_one directly, so make the same atomic reservation here;
+  # the inventory value is bounded and must be numeric before it can be used.
+  # Without this reservation two manually started one-shot candidates could
+  # race the two-guest ceiling even though each sees a free slot.
+  cap="$(tartci_effective_cap)"
+  inventory="$(running_macos_vms)"
+  case "$inventory" in
+    ''|*[!0-9]*) die "Tart inventory unavailable: refusing one-shot admission" ;;
+  esac
+  resv="$(tartci_claim_macos_slot "$cap" "$inventory")"
+  [ -n "$resv" ] || die "macOS VM cap $cap is full: refusing one-shot admission"
+  CURRENT_RESV="$resv"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"
