@@ -276,9 +276,6 @@ ALLOWED = {
      "VolumeStallGuards.test_timeout_on_an_unrelated_root_does_not_skip_reapers"):
         "3.11-only: builds a temporary [reclaim] profile with tomllib to verify unrelated roots remain eligible",
     ("test_pulp_reapers.py",
-     "VolumeStallGuards.test_expired_pass_deadline_skips_reapers_fail_closed"):
-        "3.11-only: builds a temporary [reclaim] profile with tomllib to verify an expired pass deadline skips reapers",
-    ("test_pulp_reapers.py",
      "Materialize.test_origin_without_tools_ci_is_refused_and_nothing_runs"):
         reads_profile("pulp_reapers.run()"),
     ("test_pulp_reapers.py",
