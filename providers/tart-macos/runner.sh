@@ -854,15 +854,16 @@ EOF
 
 tartci_storage_health_check(){
   local path="${1:-$TART_HOME}" result="" rc=0 status="unknown" reason=""
-  local -a state_args=()
-  [ -z "${TARTCI_STORAGE_HEALTH_STATE:-}" ] \
-    || state_args=(--state "$TARTCI_STORAGE_HEALTH_STATE")
-  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" \
-    --path "$path" "${state_args[@]}" \
-    --timeout "$STORAGE_HEALTH_TIMEOUT" \
-    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}" \
-    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}" \
-    2>&1)" || rc=$?
+  local -a probe_args=(
+    --path "$path"
+    --timeout "$STORAGE_HEALTH_TIMEOUT"
+    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}"
+    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}"
+  )
+  if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
+    probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")
+  fi
+  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" "${probe_args[@]}" 2>&1)" || rc=$?
   rc="${rc:-0}"
   [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
   if [ "$rc" -eq 0 ]; then
