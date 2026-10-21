@@ -330,7 +330,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   write_state booted
   local sshok=0
-  for _ in $(seq 1 90); do ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
+  for _ in $(seq 1 90); do ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     discard_current_linux_vm
@@ -339,7 +339,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   t_booted="$(now_epoch)"
   write_state cache-setup
-  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "sudo mkdir -p /mnt/host && \
      (sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || mountpoint -q /mnt/host) && \
      bash -s -- /mnt/host/ccache" \
@@ -387,13 +387,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${_ls[@]+"${_ls[@]}"}; do label_args+=(-f "labels[]=$l"); done
   # Claim uncertain-outcome cleanup before the state-creating POST. If GitHub
   # creates the registration but the response is lost, teardown still queries
   # and removes this exact non-busy name.
   CURRENT_JIT_REGISTERED=1
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
     note "[$i] JIT config mint failed — discarding VM"
@@ -412,7 +412,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # Write the JIT config and run the agent once. A JIT runner processes exactly
   # one job and deregisters. The host cache binding above is mandatory so a
   # mount regression cannot silently turn every ephemeral job cold.
-  ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
      touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \

@@ -31,7 +31,7 @@ DST="$TARTCI_GOLDENS/$NAME.qcow2"
 SSH=(ssh -n -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
 
 echo "→ clean-shutdown the guest"
-"${SSH[@]}" "shutdown /s /t 0 /f" 2>/dev/null || true
+${SSH[@]+"${SSH[@]}"} "shutdown /s /t 0 /f" 2>/dev/null || true
 
 echo "→ wait for QEMU to power off"
 qpid="$(pgrep -f 'qemu-system-aarch64 .*pulp-windows' | head -1 || true)"

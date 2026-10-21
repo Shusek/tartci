@@ -98,14 +98,14 @@ rm -f "$boot_log"
 
 sshok=0
 for _ in $(seq 1 90); do
-  if ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" true 2>/dev/null; then sshok=1; break; fi
+  if ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$IP" true 2>/dev/null; then sshok=1; break; fi
   sleep 2
 done
 [ "$sshok" = 1 ] || die "ssh did not become ready for $VM at $IP"
 note "vm $VM up at $IP — running build ($BUILD_TYPE) + ctest in guest"
 
 set +e
-ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
+ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
   "BUILD_TYPE='$BUILD_TYPE' BUILD_TARGET='$BUILD_TARGET' CMAKE_ARGS='$CMAKE_ARGS' CTEST_ARGS='$CTEST_ARGS' bash -s" <<'GUEST'
 set -euo pipefail
 eval "$(/opt/homebrew/bin/brew shellenv)"

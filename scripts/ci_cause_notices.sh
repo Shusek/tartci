@@ -138,7 +138,7 @@ for id in $ids; do
     args=(cause extract --log "$log" --job-json "$payload" --job "$name" --repo "$repo")
     [ -n "$event" ] && args+=(--event "$event")
     [ -n "$pr" ] && args+=(--pr "$pr")
-    if "$bin" "${args[@]}" --notice; then
+    if "$bin" ${args[@]+"${args[@]}"} --notice; then
         named=$((named + 1))
     else
         echo "ci-cause: job $id: shipyard cause extract failed"

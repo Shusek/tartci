@@ -578,7 +578,7 @@ run_one(){ # $1=iteration index
   }
 
   # ssh-stdin: callers pipe scripts and the JIT config into wsh
-  wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
+  wsh(){ ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
   # Wait for SSH, but bail the moment QEMU dies — that's how a free-port TOCTOU
   # (another process grabbed $port between the probe close and QEMU's bind)
   # surfaces: qemu exits instantly. Without this check the wait would burn the
@@ -619,7 +619,7 @@ run_one(){ # $1=iteration index
 
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${_ls[@]+"${_ls[@]}"}; do label_args+=(-f "labels[]=$l"); done
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
     cleanup_job success
@@ -632,7 +632,7 @@ run_one(){ # $1=iteration index
     return 75
   fi
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
     note "[$i] JIT mint failed — discarding VM"

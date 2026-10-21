@@ -602,7 +602,7 @@ cmd_launchd() {
           [ "$arg" = "--dry-run" ] && network_args+=(--dry-run)
         done
         local network_output
-        if ! network_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" "${network_args[@]}")"; then
+        if ! network_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" ${network_args[@]+"${network_args[@]}"})"; then
           printf '%s\n' "$network_output"
           return 6
         fi
@@ -618,7 +618,7 @@ cmd_launchd() {
         # next pass, so it is printed but not reported as exit 6, which is
         # reserved for a reconcile or relay probe that actually failed.
         local network_rc=0 network_text
-        network_text="$(tartci_toml_python "$HERE/scripts/network_profile.py" "${network_args[@]}")" \
+        network_text="$(tartci_toml_python "$HERE/scripts/network_profile.py" ${network_args[@]+"${network_args[@]}"})" \
           || network_rc=$?
         if [ "$network_rc" -eq 3 ]; then
           printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -691,7 +691,7 @@ tartci_pool_capacity_floor_preflight() {
   local action="$1" allow="$2" output rc=0
   local -a floor_args=(check --action "$action")
   [ "$allow" = 1 ] && floor_args+=(--allow-last-serving-host)
-  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" "${floor_args[@]}" 2>&1)" || rc=$?
+  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" ${floor_args[@]+"${floor_args[@]}"} 2>&1)" || rc=$?
   # The floor's own exit code (0 ok, 3 last serving host, 4 capacity unknown)
   # survives the collapse to 11 so callers can say which refusal it was.
   TARTCI_POOL_FLOOR_EXIT="$rc"
@@ -1077,7 +1077,7 @@ EOF
           # Any failed bootstrap, kickstart, or loaded-spec verification closes
           # admission, attempts to stop every receipted activation agent, and
           # proves the disabled/absent postcondition before claiming rollback.
-          for label in "${activation_attempted[@]}"; do
+          for label in ${activation_attempted[@]+"${activation_attempted[@]}"}; do
             launchd_target="$(tartci_pool_launchd_target "$label")"
             launchctl disable "$launchd_target" >/dev/null 2>&1 \
               || launchctl disable "$launchd_target" >/dev/null 2>&1 \
@@ -1357,7 +1357,7 @@ PY
       [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
       # Which launcher layout this host runs (v1 or v2) and its v2 opt-in file.
       local launcher_json
-      launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status "${launcher_args[@]}" --receipt "$fleet_receipt" 2>/dev/null)" \
+      launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status ${launcher_args[@]+"${launcher_args[@]}"} --receipt "$fleet_receipt" 2>/dev/null)" \
         || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
       [ -n "$launcher_json" ] || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
       # Whether the VM store and repository volumes answer at all: the last
@@ -1395,7 +1395,7 @@ EOF
         "$status_python" "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
         "$status_python" "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
           || echo "launchd timers: UNREADABLE"
-        "$status_python" "$HERE/scripts/launcher_layout.py" --status-text "${launcher_args[@]}" --receipt "$fleet_receipt" 2>/dev/null \
+        "$status_python" "$HERE/scripts/launcher_layout.py" --status-text ${launcher_args[@]+"${launcher_args[@]}"} --receipt "$fleet_receipt" 2>/dev/null \
           || echo "launcher: UNREADABLE"
         "$status_python" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import store_stall; print(store_stall.describe(json.loads(sys.argv[1])))' "$store_json" "$HERE/scripts" 2>/dev/null \
           || echo "store: UNREADABLE"

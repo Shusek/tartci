@@ -301,7 +301,7 @@ while IFS= read -r candidate; do candidates+=("$candidate"); done < <(find "$pla
 [ "${#candidates[@]}" -gt 0 ] || { echo "fleet profile rendered no LaunchAgents" >&2; exit 2; }
 is_expected_name() {
   local wanted="$1" candidate
-  for candidate in "${candidates[@]}"; do
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
     [ "$(basename "$candidate")" = "$wanted" ] && return 0
   done
   return 1
@@ -329,7 +329,7 @@ PY
 if [ -n "$plan_has_helper" ]; then
   layout_args=(--home "$HOME" --receipt "$RECEIPT" --app "$plan_has_helper")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
-  plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
+  plan_launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" ${layout_args[@]+"${layout_args[@]}"})" || exit 3
   plan_installed_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" --installed --receipt "$RECEIPT" --home "$HOME" --app "$plan_has_helper")" || exit 3
 elif [ -n "$LAUNCHER_LAYOUT" ]; then
   echo "--launcher-layout is invalid for a profile without launch_helper" >&2
@@ -348,12 +348,12 @@ fi
 echo "macOS fleet profile install plan:"
 echo "  config=$CONFIG"
 echo "  install_count=${#candidates[@]}"
-for candidate in "${candidates[@]}"; do echo "  install=$AGENTS_DIR/$(basename "$candidate")"; done
+for candidate in ${candidates[@]+"${candidates[@]}"}; do echo "  install=$AGENTS_DIR/$(basename "$candidate")"; done
 if [ "${#replacements[@]}" -gt 0 ]; then
-  for label in "${replacements[@]}"; do echo "  retire=$AGENTS_DIR/$label.plist"; done
+  for label in ${replacements[@]+"${replacements[@]}"}; do echo "  retire=$AGENTS_DIR/$label.plist"; done
 fi
 if [ "${#stale_targets[@]}" -gt 0 ]; then
-  for target in "${stale_targets[@]}"; do echo "  retire_stale_fleet=$target"; done
+  for target in ${stale_targets[@]+"${stale_targets[@]}"}; do echo "  retire_stale_fleet=$target"; done
 fi
 echo "  receipt=$RECEIPT"
 echo "  installed_profile=$PROFILE_SNAPSHOT"
@@ -733,7 +733,7 @@ if [ "$launch_helper_json" != "null" ]; then
   layout_args=(--home "$HOME" --receipt "$RECEIPT"
                --app "$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")")
   [ -z "$LAUNCHER_LAYOUT" ] || layout_args+=(--explicit "$LAUNCHER_LAYOUT")
-  launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" "${layout_args[@]}")" || exit 3
+  launcher_layout="$("$PYTHON_BIN" "$ROOT/scripts/launcher_layout.py" ${layout_args[@]+"${layout_args[@]}"})" || exit 3
   [ "$launcher_layout" = "$plan_launcher_layout" ] || {
     echo "launcher layout changed after the plan ($plan_launcher_layout -> $launcher_layout); run the install again" >&2
     exit 3
@@ -852,22 +852,22 @@ for target in "$AGENTS_DIR"/com.danielraffel.tartci.tart-runner-macos-fleet.*.pl
   is_expected_name "$(basename "$target")" || stale_targets+=("$target")
 done
 
-for candidate in "${candidates[@]}"; do
+for candidate in ${candidates[@]+"${candidates[@]}"}; do
   label="$(basename "$candidate" .plist)"
   assert_agent_unloaded "$label" target || exit 3
 done
 if [ "${#persistent_labels[@]}" -gt 0 ]; then
-  for label in "${persistent_labels[@]}"; do
+  for label in ${persistent_labels[@]+"${persistent_labels[@]}"}; do
     assert_agent_unloaded "$label" "declared persistent" || exit 3
   done
 fi
 if [ "${#replacements[@]}" -gt 0 ]; then
-  for label in "${replacements[@]}"; do
+  for label in ${replacements[@]+"${replacements[@]}"}; do
     assert_agent_unloaded "$label" replaced || exit 3
   done
 fi
 if [ "${#stale_targets[@]}" -gt 0 ]; then
-  for target in "${stale_targets[@]}"; do
+  for target in ${stale_targets[@]+"${stale_targets[@]}"}; do
     label="$(basename "$target" .plist)"
     assert_agent_unloaded "$label" "stale managed" || exit 3
   done
@@ -1122,7 +1122,7 @@ if [ "$launcher_layout" = v2 ]; then
   durable_file "$pointer_file"
 fi
 
-for candidate in "${candidates[@]}"; do
+for candidate in ${candidates[@]+"${candidates[@]}"}; do
   target="$AGENTS_DIR/$(basename "$candidate")"
   backup=""
   if [ -e "$target" ] || [ -L "$target" ]; then backup="$backup_dir/$(basename "$target").previous"; mv "$target" "$backup"; durable_directory "$AGENTS_DIR"; durable_directory "$backup_dir"; fi
@@ -1134,7 +1134,7 @@ for candidate in "${candidates[@]}"; do
   durable_file "$target"
 done
 if [ "${#replacements[@]}" -gt 0 ]; then
-  for label in "${replacements[@]}"; do
+  for label in ${replacements[@]+"${replacements[@]}"}; do
     target="$AGENTS_DIR/$label.plist"
     [ -e "$target" ] || [ -L "$target" ] || continue
     backup="$backup_dir/$(basename "$target").retired"
@@ -1146,7 +1146,7 @@ if [ "${#replacements[@]}" -gt 0 ]; then
   done
 fi
 if [ "${#stale_targets[@]}" -gt 0 ]; then
-  for target in "${stale_targets[@]}"; do
+  for target in ${stale_targets[@]+"${stale_targets[@]}"}; do
     [ -e "$target" ] || [ -L "$target" ] || continue
     backup="$backup_dir/$(basename "$target").stale"
     mv "$target" "$backup"
