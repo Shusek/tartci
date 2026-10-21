@@ -40,8 +40,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: danielraffel/Shipyard
-          # Shipyard v0.326.0 (#824, #827, #828, #829).
-          ref: e9866ff9f08c791ccae73dbfc46fbededd6d4f42
+          # Shipyard v0.344.1: refuses an App APPROVE stamped `unattributed`,
+          # signers only from the base config, and the rebase carry.
+          ref: 76e5c7032351b4445a8dcad133002eaa8f1887e6
           persist-credentials: false
       - name: Set up Python
         id: python
