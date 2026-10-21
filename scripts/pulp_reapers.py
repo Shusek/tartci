@@ -116,7 +116,8 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 
 def bounded_fs_call(operation: Callable[[], Any], *, description: str,
-                    timeout: float = FS_TIMEOUT_S) -> Any:
+                    timeout: float = FS_TIMEOUT_S,
+                    deadline: float | None = None) -> Any:
     """Run one filesystem probe with a deadline and fail closed on a stall."""
     result: dict[str, Any] = {}
     errors: list[BaseException] = []
@@ -127,6 +128,10 @@ def bounded_fs_call(operation: Callable[[], Any], *, description: str,
         except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
             errors.append(exc)
 
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise OSError("ETIMEDOUT", f"pass deadline reached before {description}")
     worker = threading.Thread(target=invoke, name=f"pulp reaper fs {description}", daemon=True)
     worker.start()
     worker.join(timeout)
@@ -258,10 +263,10 @@ def skip_reason_for_scan_timeouts(
     return None
 
 
-def free_bytes(path: pathlib.Path) -> int | None:
+def free_bytes(path: pathlib.Path, deadline: float | None = None) -> int | None:
     try:
         return bounded_fs_call(lambda: shutil.disk_usage(path).free,
-                               description=f"disk usage {path}")
+                               description=f"disk usage {path}", deadline=deadline)
     except OSError:
         return None
 
@@ -380,7 +385,7 @@ def run_reaper(script: pathlib.Path, *, fix: bool, worktrees_root: str,
     argv = ["/bin/bash", str(script)] + (["--yes"] if fix else [])
     env = {**os.environ, "PULP_WORKTREES_ROOT": worktrees_root,
            "PULP_WORKTREE_BUILD_IDLE_HOURS": str(idle_hours)}
-    before = free_bytes(measure_path)
+    before = free_bytes(measure_path, deadline)
     started = time.time()
     record: dict[str, Any] = {"reaper": name, "mode": "fix" if fix else "dry-run",
                               "worktrees_root": worktrees_root,
@@ -431,7 +436,7 @@ def run_reaper(script: pathlib.Path, *, fix: bool, worktrees_root: str,
     reader.join(timeout=10)
     if proc.stdout is not None:
         proc.stdout.close()
-    after = free_bytes(measure_path)
+    after = free_bytes(measure_path, deadline)
     record["exit_code"] = code
     record["duration_s"] = round(time.time() - started, 1)
     record["free_bytes_after"] = after
@@ -567,13 +572,13 @@ def same_origin_worktrees(root: pathlib.Path, origin: str, runner: Runner = subp
     seen = 0
     try:
         children = bounded_fs_call(lambda: sorted(root.iterdir()),
-                                   description=f"list worktree root {root}")
+                                   description=f"list worktree root {root}", deadline=deadline)
     except OSError:
         return matching, seen, unreadable, clones
     for child in children:
         try:
             is_worktree = bounded_fs_call((child / ".git").is_file,
-                                          description=f"check worktree {child}")
+                                          description=f"check worktree {child}", deadline=deadline)
         except OSError:
             unreadable.append(str(child))
             continue
@@ -649,14 +654,15 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         except Exception as exc:  # noqa: BLE001 - the reapers still run
             report["host_vitals_sensor"] = {"state": "refresh_failed", "detail": str(exc)}
     try:
-        root_is_dir = bounded_fs_call(root.is_dir, description=f"check worktree root {root}")
+        root_is_dir = bounded_fs_call(root.is_dir, description=f"check worktree root {root}",
+                                      deadline=deadline)
     except OSError as exc:
         report["error"] = f"worktrees_root probe failed: {exc}"
         return report
     if not root_is_dir:
         report["error"] = f"worktrees_root {root} is not a directory"
         return report
-    free = free_bytes(root)
+    free = free_bytes(root, deadline)
     report["free_bytes_before"] = free
     # Unknown free space is not pressure: guessing "full" would run the heavier
     # reaper on exactly the host whose volume we cannot read.
@@ -696,7 +702,7 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
                                timeout_s=REAPER_TIMEOUT_S[name])
         report["runs"].append(record)
         report["reclaimed_bytes"] += int(record.get("reclaimed_bytes") or 0)
-    report["free_bytes_after"] = free_bytes(root)
+    report["free_bytes_after"] = free_bytes(root, deadline)
     # Agents do not always create worktrees where the profile says: on m5s on
     # 2026-10-04, 32 coverage build dirs (~725 GB) in ~/Code worktrees filled
     # the boot volume while this ran only over the profile's root on another
