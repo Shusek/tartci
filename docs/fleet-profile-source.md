@@ -74,9 +74,10 @@ Each self-update run then:
 4. reinstalls the current generation when the installed receipt was built from
    a different source commit.
 
-The receipt records the source commit and the SHA-256 digests of the exported
-profile set, published supply, and complete source tree. Those digests identify
-the bytes used by that installation; they do not replace the commit marker.
+The install receipt records the source commit and the SHA-256 digests of the
+published supply and the complete source tree; the attempt receipt also records
+the digest of the profile set. Those digests identify the bytes used by that
+installation; they do not replace the commit marker.
 
 A canary that is not a published host id refuses the run on every other
 host, naming the published ids, rather than leaving them on their installed
@@ -93,6 +94,15 @@ newest three exports and the installed one are kept.
 Once the setting is present, an unreadable or damaged source refuses the run
 (`UNKNOWN`, recorded in `skew.json`); it never falls back to the public
 profiles. Without the setting nothing changes.
+
+Self-update takes the source only from `self-update.toml`. It clears any
+`TARTCI_FLEET_SOURCE_*` variables it inherits (from a shell that exported them
+for offline tooling, or from an agent plist) before it selects, so removing
+`[fleet_source]` always moves the host to the public profiles.
+
+A source move that installs and then fails verification is rolled back like a
+new generation: the previous source is reinstalled, even though the TartCI
+generation did not change.
 
 TartCI validates the source, its export marker and its generated profile digest before reading it. If an explicit source
 is missing, empty, or invalid, the command fails. It does not silently use the
