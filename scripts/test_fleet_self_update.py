@@ -69,6 +69,7 @@ class FakeSystem(su.System):
         self.peer_halted: set[str] = set()   # peers whose self-update halted on failures
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
+        self.workflow_runs: dict[str, list] = {}   # sha -> actions/runs entries
         self.signing_rc = 0
         self.locked = False          # dedicated keychain locked in this session
         self.unlocked = False
@@ -174,6 +175,11 @@ class FakeSystem(su.System):
                 return self.repository_failures[repository].pop(0)
             if repository in self.unreadable_repositories:
                 return su.Result(1, "", "not found")
+            if "/actions/runs?head_sha=" in a[2]:
+                sha = a[2].split("head_sha=")[1].split("&")[0]
+                if sha not in self.workflow_runs:
+                    return su.Result(1, "", "not recorded")
+                return ok(json.dumps({"workflow_runs": self.workflow_runs[sha]}))
             if "check-runs" in a[2]:
                 sha = a[2].split("/commits/")[1].split("/")[0]
                 runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
@@ -2951,6 +2957,33 @@ class ChecksAndTargetTests(Base):
         self.assertIn("not green: ", skew["selection_reason"])
         self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
         self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_pull_request_judgement_on_mains_tip_is_not_its_check(self) -> None:
+        # tartci 0b651d9b, 2026-10-22: a pull-request comment ran the
+        # review-verdict workflow on main's tip, and its in-progress check run
+        # held m5s's self-update as "not green: review-verdict=in_progress".
+        lint = {"name": "lint", "status": "completed", "conclusion": "success",
+                "check_suite": {"id": 1}}
+        verdict = {"name": "review-verdict", "status": "in_progress", "conclusion": None,
+                   "check_suite": {"id": 7}}
+        self.sys.checks[T_OLD] = [lint, verdict]
+        self.sys.workflow_runs[T_OLD] = [
+            {"event": "push", "check_suite_id": 1},
+            {"event": "issue_comment", "check_suite_id": 7},
+        ]
+        self.assertEqual(su.checks_green(self.cfg, self.sys, T_OLD), (True, "all checks green"))
+        # The same run from a push is the commit's own check, and holds it.
+        self.sys.workflow_runs[T_OLD][1]["event"] = "push"
+        self.assertEqual(su.checks_green(self.cfg, self.sys, T_OLD),
+                         (False, "not green: review-verdict=in_progress"))
+        # When the workflow runs cannot be read, every check run counts.
+        del self.sys.workflow_runs[T_OLD]
+        self.assertFalse(su.checks_green(self.cfg, self.sys, T_OLD)[0])
+        # Only pull-request judgements on a commit is not a green commit.
+        self.sys.checks[T_OLD] = [verdict]
+        self.sys.workflow_runs[T_OLD] = [{"event": "issue_comment", "check_suite_id": 7}]
+        self.assertEqual(su.checks_green(self.cfg, self.sys, T_OLD),
+                         (False, "no check runs recorded"))
 
     def test_default_path_falls_back_to_soaked_green_and_records_skipped(self) -> None:
         self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
