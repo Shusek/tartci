@@ -2555,9 +2555,11 @@ def fleet_readiness(
                     if orphan_writer is not None:
                         problems.append(orphan_problem(orphan_writer, label))
                     elif state_dir.is_dir() and any(state_dir.glob("*.handoff")):
+                        writer = writers[0] if writers else None
                         problems.append({"code": "supervisor_handoff_pending", "label": label,
-                                         "detail": "a replacement supervisor waits for the "
-                                                   "previous one to finish its job"})
+                                         "detail": f"supervisor pid {writer} still serves "
+                                                   "this lane; its replacement waits for "
+                                                   "it to exit"})
                     else:
                         problems.append({"code": "heartbeat_missing", "label": label})
                     continue
