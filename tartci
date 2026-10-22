@@ -1461,6 +1461,15 @@ if fleet["managed"]:
         print("verified running supervisors: unknown (not checked from here)")
     else:
         print(f"verified running supervisors: {verified}/{fleet['expected_supervisors']}")
+    # Say why. Without this, "fleet ready: NO" sent every reader to --json.
+    if not fleet["fleet_ready"]:
+        for problem in (fleet.get("problems") or [])[:6]:
+            if isinstance(problem, dict):
+                where = f" {problem['label']}" if problem.get("label") else ""
+                detail = f": {problem['detail']}" if problem.get("detail") else ""
+                print(f"  problem: {problem.get('code')}{where}{detail}"[:300])
+            else:
+                print(f"  problem: {problem}"[:300])
     # Deliberately its own line and not folded into `fleet ready`. A supervisor
     # can be installed, loaded, running and freshly heartbeating while serving
     # nothing at all, and printing only the first four made a lane that cloned

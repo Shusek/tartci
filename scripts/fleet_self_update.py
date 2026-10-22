@@ -94,7 +94,11 @@ INSTALL_RETRY_SECONDS = 30
 # Readiness problems that only mean a supervisor loaded by `pool on` has not yet
 # written its first heartbeat; verification re-reads them for a bounded window.
 SETTLING_PROBLEM_CODES = frozenset({"heartbeat_missing", "supervisor_not_running",
-                                    "supervisor_pid_missing"})
+                                    "supervisor_pid_missing",
+                                    # The previous generation's supervisor is
+                                    # finishing its job before it hands the lane
+                                    # over (runner.sh tartci_lane_claim).
+                                    "orphaned_supervisor", "supervisor_handoff_pending"})
 # Readiness problems about the host itself, not the generation: an install
 # neither causes nor fixes them, so verifying a new generation must not fail
 # on them. m5 (AC sleep 1) rolled back every update once its idle sleep
