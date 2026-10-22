@@ -176,7 +176,7 @@ tartci_assignment_v2_tier_demand(){
   error_file="$(mktemp "$STATE_DIR/$RUNNER_NAME.assignment-scan.XXXXXX")" || return 1
   if python3 "$TARTCI_ROOT/scripts/assignment_scan.py" \
     --repo "$REPO" \
-    "${tier_args[@]}" \
+    ${tier_args[@]+"${tier_args[@]}"} \
     --labels "$selected_labels" \
     --require-label "$tier_label" \
     --require-head-repo "$REPO" \

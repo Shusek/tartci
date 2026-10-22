@@ -18,6 +18,11 @@ import bash32_array_lint as lint  # noqa: E402
 # state path is set, and macOS /bin/bash 3.2 aborts on it under `set -u`.
 UNGUARDED_629 = '    --path "$path" "${state_args[@]}" \\'
 GUARDED_629 = '    --path "$path" ${state_args[@]+"${state_args[@]}"} \\'
+# lifecycle.lib.sh's vm_lifecycle event before the guard: `pairs` is empty
+# when every lifecycle span is, and the file is sourced into a `set -u` lane.
+UNGUARDED_LIFECYCLE = ('  event vm_lifecycle "served=$served warm=$LC_WARM rc=$4 ${pairs[*]}" \\\n'
+                       '    "served=$served" "warm=$LC_WARM" "rc=$4" "${pairs[@]}"')
+LIFECYCLE = Path(__file__).resolve().parent.parent / "providers" / "tart-macos" / "lifecycle.lib.sh"
 
 
 def names(text: str) -> list[str]:
@@ -98,6 +103,17 @@ class Files(unittest.TestCase):
         result = self.run_lint()
         self.assertEqual(0, result.returncode, result.stderr)
 
+    def test_a_sourced_library_is_checked_without_its_own_nounset(self) -> None:
+        self.write("providers/x/lifecycle.lib.sh",
+                   f"#!/usr/bin/env bash\nemit(){{\n{UNGUARDED_LIFECYCLE}\n}}\n")
+        result = self.run_lint()
+        self.assertEqual(1, result.returncode)
+        self.assertIn("lifecycle.lib.sh:3: ${pairs[@]}", result.stderr)
+        self.assertIn("lifecycle.lib.sh:4: ${pairs[@]}", result.stderr)
+        # The same text in a script that is not a library and sets no nounset passes.
+        (self.root / "providers/x/lifecycle.lib.sh").rename(self.root / "providers/x/emit.sh")
+        self.assertEqual(0, self.run_lint().returncode)
+
     def test_this_repository_is_clean(self) -> None:
         result = subprocess.run([sys.executable, str(Path(lint.__file__))],
                                 capture_output=True, text=True, check=False)
@@ -114,6 +130,34 @@ class Bash32(unittest.TestCase):
         script = f'set -u\nstate_args=()\nprintf "[%s]" {line}\necho done\n'
         return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
                               check=False)
+
+    def emit_lifecycle(self, library: Path) -> subprocess.CompletedProcess[str]:
+        """Source ``library`` into a `set -u` lane and emit a VM's lifecycle
+        event when every span is empty."""
+        script = (f'set -u\nsource "{library}"\ntartci_lifecycle_reset\n'
+                  'tartci_lifecycle_pairs(){ :; }\n'
+                  'event(){ printf "<%s>" "$@"; echo; }\n'
+                  'tartci_lifecycle_emit 100.5 200.5 300.5 0\necho done\n')
+        return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
+                              check=False)
+
+    def test_a_lifecycle_event_with_no_spans_does_not_abort_the_lane(self) -> None:
+        result = self.emit_lifecycle(LIFECYCLE)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("<vm_lifecycle><served=0 warm=0 rc=0 ><served=0><warm=0><rc=0>",
+                      result.stdout)
+        self.assertTrue(result.stdout.rstrip().endswith("done"))
+        # Negative control: the line as it was aborts under bash 3.2.
+        text = LIFECYCLE.read_text()
+        guarded = text[text.index("  event vm_lifecycle"):].split("\n", 2)
+        guarded = "\n".join(guarded[:2])
+        self.assertEqual(1, text.count(guarded))
+        with tempfile.TemporaryDirectory() as scratch:
+            old = Path(scratch) / "lifecycle.lib.sh"
+            old.write_text(text.replace(guarded, UNGUARDED_LIFECYCLE))
+            aborted = self.emit_lifecycle(old)
+        self.assertNotEqual(0, aborted.returncode)
+        self.assertIn("pairs[*]: unbound variable", aborted.stderr)
 
     def test_the_unguarded_line_aborts_and_the_guarded_one_does_not(self) -> None:
         aborted = self.run_bash('"${state_args[@]}"')

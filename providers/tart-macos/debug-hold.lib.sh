@@ -36,7 +36,7 @@ tartci_debug_hold_scrub_guest(){
   [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ] || return 1
   stop_current_aqua_runner
   bounded_teardown_command debug-hold-scrub \
-    ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
+    ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
     "root=\"\$HOME/.tartci/aqua-runner/$CURRENT_AQUA_LABEL\"; rm -rf \"\$root\" \
        \"\$HOME/actions-runner/.runner\" \"\$HOME/actions-runner/.credentials\" \
        \"\$HOME/actions-runner/.credentials_rsaparams\" && \

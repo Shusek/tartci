@@ -153,13 +153,13 @@ tartci_job_claim_acquire(){
     --claim-id "$claim_id" --lane "$RUNNER_NAME" --vm "$vm" --pid "$$"
     --fleet-runners-file "$runners" --ttl "${TARTCI_JOB_CLAIM_TTL_SECS:-1800}")
   [ -z "$peers" ] || base_args+=(--fleet-claims-file "$peers")
-  _tartci_job_claim_call out "${base_args[@]}" --queued "$queued" ${lower[@]+"${lower[@]}"} || rc=$?
+  _tartci_job_claim_call out ${base_args[@]+"${base_args[@]}"} --queued "$queued" ${lower[@]+"${lower[@]}"} || rc=$?
   if [ "$rc" -eq 4 ]; then
     # A sibling holds a claim and our count was only "at least one". Buy the
     # real magnitude now, and only now.
     if exact="$(tartci_job_claim_exact_count "$selected_tier")"; then
       rc=0
-      _tartci_job_claim_call out "${base_args[@]}" --queued "$exact" || rc=$?
+      _tartci_job_claim_call out ${base_args[@]+"${base_args[@]}"} --queued "$exact" || rc=$?
     else
       rm -f "$runners" ${peers:+"$peers"}
       event job_claim_unavailable "reason=exact_count_unavailable labels=$selected_labels"
