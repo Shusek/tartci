@@ -1584,6 +1584,20 @@ SERVINGPY
 
 usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
+# These commands have no --help of their own: asked for help, they would run
+# (setup installs packages, up/serve/prepare/windows start VMs). Print their
+# lines from the usage above instead, and nothing else.
+case "${1:-}:${2:-}" in
+  doctor:-h|doctor:--help|setup:-h|setup:--help|up:-h|up:--help|serve:-h|serve:--help|\
+  prepare:-h|prepare:--help|windows:-h|windows:--help|goldens:-h|goldens:--help|\
+  hooks:-h|hooks:--help|tart-image-sync:-h|tart-image-sync:--help)
+    usage | awk -v cmd="tartci $1" '
+      index($0, cmd) && substr($0, index($0, cmd) + length(cmd), 1) ~ /^( |$)/ { on = 1; print; next }
+      on && /^ +#/ { print; next }
+      { on = 0 }'
+    exit 0 ;;
+esac
+
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
