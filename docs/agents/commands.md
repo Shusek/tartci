@@ -33,6 +33,7 @@ would do; **write** changes host state.
 | `tartci hooks print` | read | prints agent hook settings; never writes them |
 | `tartci launchd status` | read | serve LaunchAgent state |
 | `tartci fleet-macos tool-freshness [--json]` | read | Shipyard and pulp CLI versus latest release |
+| `tartci fleet update ...` | as `fleet-macos self-update` | the same command under a shorter name; every option passes through. It updates this host only, waiting its turn so one host updates at a time |
 | `tartci fleet-macos self-update --plan` | plan | default mode; steps 1 to 4 of the update, read-only |
 | `tartci pool <on\|drain\|off> --plan` | plan | prints the transition, writes nothing |
 | `tartci launchd reload <label> --dry-run` | plan | prints the plan or `REFUSE` (exit 0 or 3) |

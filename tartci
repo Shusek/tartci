@@ -28,6 +28,9 @@
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci governor [show|set K=V|unset K|explain|fleet|keys] # one per-host governor config
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
+#   tartci fleet update [--plan|--apply|--status|--verify ...]
+#                              # update THIS host's tartci, one host at a time
+#                              # (same as tartci fleet-macos self-update)
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
 #   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
@@ -1578,6 +1581,15 @@ case "${1:-help}" in
   governor) shift; cmd_governor "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;
+  fleet)
+    shift
+    case "${1:-}" in
+      update) shift; cmd_fleet_macos self-update "$@" ;;
+      ""|-h|--help|help) usage | awk '/tartci fleet update/ { on = 1; print; next }
+                                      on && /^ +#/ { print; next } { on = 0 }' ;;
+      *) echo "tartci fleet: unknown subcommand: $1 (try: tartci fleet update --plan)" >&2
+         exit 2 ;;
+    esac ;;
   support-manifest) shift; cmd_support_manifest "$@" ;;
   gate-slot2) shift; cmd_gate_slot2 "$@" ;;
   tart-image-sync) shift; cmd_tart_image_sync "$@" ;;
