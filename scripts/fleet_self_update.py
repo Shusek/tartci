@@ -84,6 +84,8 @@ DEFAULT_SOAK_SECONDS = 1800
 DEFAULT_RATE_HOURS = 6
 DEFAULT_STALE_HOURS = 24
 DEFAULT_WAIT_SECONDS = 90 * 60
+# While the drain waits on the same lanes, a receipt step at least this often.
+WAIT_IDLE_NOTE_SECONDS = 5 * 60
 DEFAULT_POLL_SECONDS = 45
 INSTALL_ATTEMPTS = 4
 # `shipyard writer-domain-exec` exits this, naming WRITER_DOMAIN_OVERLAP, when a
@@ -3723,6 +3725,7 @@ class Run:
         started = self.sys.now()
         deadline = started + self.cfg.wait_seconds
         waiting_on: list[str] | None = None
+        noted = started
         while True:
             plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
             if plan.rc == 0:
@@ -3740,10 +3743,18 @@ class Run:
             # reads only "drain" for half an hour looks stuck (m1, 2026-10-16,
             # waiting on one Forge gate job).
             busy = mid_job_lanes(f"{plan.out}\n{plan.err}")
+            lanes = "; ".join(busy) or "an owned lane (not named)"
             if busy != waiting_on:
                 waiting_on = busy
-                self.receipt.step("wait-idle", "waiting on " + ("; ".join(busy) or
-                                                                 "an owned lane (not named)"))
+                noted = self.sys.now()
+                self.receipt.step("wait-idle", "waiting on " + lanes)
+            elif self.sys.now() - noted >= WAIT_IDLE_NOTE_SECONDS:
+                # Unchanged, but say so: m1 on 2026-10-22 waited on one job
+                # with steps at 08:00 and 08:55 and nothing between, which
+                # reads as a hung update.
+                noted = self.sys.now()
+                self.receipt.step("wait-idle", f"still waiting on {lanes}, "
+                                  f"{int((noted - started) // 60)} min")
             if self.sys.now() >= deadline:
                 drain_timeout_alert(self.cfg, self.me, busy, self.sys.now() - started,
                                     self.sys.now())

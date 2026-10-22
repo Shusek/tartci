@@ -1810,6 +1810,17 @@ class DrainWaitVisibilityTests(Base):
         self.assertEqual(waits, [f"waiting on {FORGE}", f"waiting on {FORGE}; {other}",
                                  "no owned lane mid-job"])
 
+    def test_a_long_unchanged_wait_still_writes_a_step_every_five_minutes(self) -> None:
+        # m1, 2026-10-22: steps at 08:00 then 08:55, nothing between.
+        self.sys.offplan = [12] * 12 + [0]
+        self.sys.offplan_text = [plan_text(FORGE)] * 12 + ["plan"]
+        self.assertUpdated(self.apply())
+        waits = [s["detail"] for s in self.steps() if s["step"] == "wait-idle"]
+        self.assertEqual(waits[0], f"waiting on {FORGE}")
+        self.assertEqual(waits[1], f"still waiting on {FORGE}, 5 min")
+        self.assertEqual(waits[-1], "no owned lane mid-job")
+        self.assertEqual(len(waits), 3)
+
     def test_a_drain_timeout_opens_one_issue_naming_the_lane_and_a_clean_drain_closes_it(
             self) -> None:
         self.sys.offplan = [12]
