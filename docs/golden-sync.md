@@ -58,6 +58,12 @@ assuming — a host on an external/remote volume would differ.
 5. **Re-point the runner** only if it has an explicit pin: set (or delete)
    `TARTCI_WIN_GOLDEN` in `~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist`
    (back up first). No pin → the provider default already points at the canonical name.
+   If the golden ships its own UEFI variable store (its boot entry lives there
+   rather than in `\EFI\BOOT\BOOTAA64.EFI`), copy that file with it and set
+   both `TARTCI_WIN_VARS_TEMPLATE` (its path) and `TARTCI_WIN_VARS_SHA256` (its
+   SHA-256). Each job copies the template and verifies the copy before QEMU
+   writes to it; a mismatch fails the job before boot. One without the other
+   is refused at startup.
 6. **Reload the agent only when idle** (log tail shows `waiting … queued=0`, no
    Windows build running — reloading mid-build kills the job). If you changed
    `TARTCI_WIN_GOLDEN` (or any plist env var), you MUST do a **full

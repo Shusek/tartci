@@ -94,19 +94,38 @@ tartci_vm_leases_enabled || die "manual Windows clone requires a VM lease"
 nice -n 20 "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN" \
   || die "Windows clone golden failed SHA-256 admission"
 
-# Firmware code + a vars TEMPLATE. The golden's ESP is BOOTAA64-auto-boot, so a
-# fresh template-seeded efivars boots it (no custom NVRAM entry needed).
+# Firmware code + a vars TEMPLATE, copied fresh into every job.
 FW=""
 for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
          /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do
   [ -f "$c" ] && FW="$c" && break
 done
 [ -n "$FW" ] || die "no edk2-aarch64-code.fd"
-VARS_TPL=""
-for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do
-  [ -f "$v" ] && VARS_TPL="$v" && break
-done
-[ -n "$VARS_TPL" ] || die "no edk2 vars template"
+# A golden whose boot entry lives in its own UEFI variable store ships that
+# store beside it; TARTCI_WIN_VARS_TEMPLATE names it and TARTCI_WIN_VARS_SHA256
+# pins it. Every job copies it and verifies the copy before QEMU writes to it.
+# Without it, the stock edk2 template serves a golden that auto-boots
+# \EFI\BOOT\BOOTAA64.EFI.
+VARS_TPL="${TARTCI_WIN_VARS_TEMPLATE:-}"
+VARS_SHA256="${TARTCI_WIN_VARS_SHA256:-}"
+if [ -n "$VARS_TPL" ]; then
+  [ -n "$VARS_SHA256" ] || die "TARTCI_WIN_VARS_TEMPLATE requires TARTCI_WIN_VARS_SHA256"
+  "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/windows_efi_vars.py" \
+    --template "$VARS_TPL" --sha256 "$VARS_SHA256" --check >/dev/null \
+    || die "EFI vars template failed its pinned SHA-256: $VARS_TPL"
+else
+  [ -z "$VARS_SHA256" ] || die "TARTCI_WIN_VARS_SHA256 is set without TARTCI_WIN_VARS_TEMPLATE"
+  for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
+  [ -n "$VARS_TPL" ] || die "no edk2 vars template"
+fi
+copy_efi_vars(){ # $1=destination
+  if [ -n "$VARS_SHA256" ]; then
+    "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/windows_efi_vars.py" \
+      --template "$VARS_TPL" --sha256 "$VARS_SHA256" --dest "$1" >/dev/null
+  else
+    cp "$VARS_TPL" "$1"
+  fi
+}
 
 # Pick a free host port for SSH hostfwd (per-job; no fixed 2222 collision).
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
@@ -220,7 +239,7 @@ write_state preparing
   || die "Windows clone golden failed private snapshot admission"
 note "CoW overlay off verified private snapshot → $OVERLAY"
 tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$JOBBASE" -F qcow2 "$OVERLAY" >/dev/null
-cp "$VARS_TPL" "$EFIVARS"
+copy_efi_vars "$EFIVARS" || die "EFI vars copy failed its pinned SHA-256"
 
 note "booting $JOB headless (ssh: 127.0.0.1:$PORT)"
 tartci_vm_lease_guard_exec qemu-system-aarch64 \
