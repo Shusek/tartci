@@ -3315,6 +3315,18 @@ def _state_words(state: str) -> str:
     return {"on": "on", "undrained": "serving again (undrained)"}.get(state, state.upper())
 
 
+def _same_source_bytes(cfg: Config) -> bool:
+    """Whether the selected source's tree digest is the installed receipt's."""
+    recorded = (_read_json(cfg.install_receipt) or {}).get("fleet_source")
+    digest = recorded.get("tree_sha256") if isinstance(recorded, dict) else None
+    if not isinstance(digest, str) or not digest:
+        return False
+    try:
+        return fleet_source.resolve(cfg.checkout).tree_sha256 == digest
+    except (ValueError, OSError):
+        return False
+
+
 def refresh_reason(cfg: Config, sys_: System) -> str | None:
     """Why a current host must reinstall its own generation, or None.
 
@@ -3327,8 +3339,15 @@ def refresh_reason(cfg: Config, sys_: System) -> str | None:
         selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
         installed = installed_fleet_source_commit(cfg)
         if selected and selected != installed:
-            return (f"fleet source moved to {selected[:12]} "
-                    f"(installed from {_source_name(installed)})")
+            if installed and _same_source_bytes(cfg):
+                # A commit that changed only other files in the private repo
+                # (a backup, a README): the installed bytes are the selected
+                # ones, so a reinstall would drain the host for nothing.
+                print(f"self-update: fleet source moved to {selected[:12]} with the "
+                      f"installed profiles and supply unchanged; no reinstall")
+            else:
+                return (f"fleet source moved to {selected[:12]} "
+                        f"(installed from {_source_name(installed)})")
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         problems = (json.loads(status.out).get("fleet") or {}).get("problems") or []
