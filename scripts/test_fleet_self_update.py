@@ -50,6 +50,11 @@ class FakeSystem(su.System):
         self.clock = NOW
         self.calls: list[tuple[list[str], str | None]] = []
         self.pool_state = "on"
+        self.store_result = {"ms": 4.0}  # the pre-drain write into the Tart store
+        self.store_writes: list[str] = []
+        # None: healthy, checked a minute before the fake clock (as idle
+        # lanes keep it); a test sets a tuple to pin the record.
+        self.store_health_result = None
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -135,6 +140,18 @@ class FakeSystem(su.System):
     def run_critical(self, argv, *, cwd=None, env=None, timeout=900, record=None):
         self.critical.append(list(argv))
         return self.run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def store_write(self, directory, timeout=10.0):
+        self.store_writes.append(directory)
+        if isinstance(self.store_result, list):  # successive results
+            return dict(self.store_result.pop(0) if len(self.store_result) > 1
+                        else self.store_result[0])
+        return dict(self.store_result)
+
+    def store_health(self, directory):
+        if self.store_health_result is None:
+            return "healthy", "directory_metadata_ok", su._iso(self.clock - 60)
+        return self.store_health_result
 
     def process_start(self, pid):
         if pid in self.procs:
@@ -828,6 +845,8 @@ class HappyPathTests(Base):
         self.assertEqual(order, sorted(order))
         self.assertEqual(self.last()["status"], "succeeded")
         self.assertFalse((self.cfg.state_dir / "active.json").exists())
+        # No launch helper, no launcher change: the store is never written.
+        self.assertEqual([], self.sys.store_writes)
         # pool on and status go through the INSTALLED shim from $HOME.
         shim_calls = [(a, cwd) for a, cwd in self.sys.calls if a[0].endswith(".local/bin/tartci")]
         self.assertTrue(shim_calls and all(cwd == str(self.home) for _, cwd in shim_calls))
@@ -1800,6 +1819,17 @@ class DrainWaitVisibilityTests(Base):
         self.assertEqual(waits, [f"waiting on {FORGE}", f"waiting on {FORGE}; {other}",
                                  "no owned lane mid-job"])
 
+    def test_a_long_unchanged_wait_still_writes_a_step_every_five_minutes(self) -> None:
+        # m1, 2026-10-22: steps at 08:00 then 08:55, nothing between.
+        self.sys.offplan = [12] * 12 + [0]
+        self.sys.offplan_text = [plan_text(FORGE)] * 12 + ["plan"]
+        self.assertUpdated(self.apply())
+        waits = [s["detail"] for s in self.steps() if s["step"] == "wait-idle"]
+        self.assertEqual(waits[0], f"waiting on {FORGE}")
+        self.assertEqual(waits[1], f"still waiting on {FORGE}, 5 min")
+        self.assertEqual(waits[-1], "no owned lane mid-job")
+        self.assertEqual(len(waits), 3)
+
     def test_a_drain_timeout_opens_one_issue_naming_the_lane_and_a_clean_drain_closes_it(
             self) -> None:
         self.sys.offplan = [12]
@@ -2367,6 +2397,53 @@ class AgentTemplateTests(unittest.TestCase):
         self.assertIn(3, wd.APPLICATION_EXIT_CODES["com.danielraffel.tartci.self-update"])
 
 
+class ProgressLineTests(Base):
+    """--status and pool status say which step a running update is in."""
+
+    def running(self, steps: list[tuple[str, str, str]], pid: int | None = None) -> None:
+        su._write_json(self.cfg.state_dir / "active.json",
+                       {"host_id": "m1", "pid": pid or os.getpid(), "target": T_NEW})
+        su._write_json(self.cfg.state_dir / "attempts" / "20270101T000000Z-x.json",
+                       {"mode": "apply", "status": "running", "target": T_NEW,
+                        "started_at": "2027-01-01T00:00:00Z",
+                        "steps": [{"at": at, "step": name, "ok": True, "detail": detail}
+                                  for at, name, detail in steps]})
+
+    def test_a_drain_waiting_on_a_job_says_so_and_what_is_left(self) -> None:
+        self.running([("2027-01-01T00:00:10Z", "snapshot", "snap"),
+                      ("2027-01-01T00:00:20Z", "drain", "keeps every label served"),
+                      ("2027-01-01T00:01:00Z", "wait-idle", "waiting on lane: busy"),
+                      ("2027-01-01T00:30:00Z", "wait-idle", "waiting on lane: busy")])
+        now = su._ts("2027-01-01T01:01:00Z")
+        self.assertEqual(
+            f"self-update: IN PROGRESS to {T_NEW[:12]} (started 2027-01-01T00:00:00Z, "
+            "61 min): wait-idle for 60 min: waiting on lane: busy; "
+            "then off, install, pool-on, verify",
+            su.progress_line(self.cfg.state_dir, now))
+
+    def test_the_line_reaches_status(self) -> None:
+        self.running([("2027-01-01T00:00:20Z", "install", "")])
+        self.assertTrue(any(line.startswith("self-update: IN PROGRESS")
+                            for line in su.status_lines(self.cfg.state_dir)))
+
+    def test_a_dead_update_is_reported_stale(self) -> None:
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.running([("2027-01-01T00:00:20Z", "drain", "")], pid=dead.pid)
+        self.assertIn("STALE active.json", su.progress_line(self.cfg.state_dir))
+
+    def test_no_update_running_adds_nothing(self) -> None:
+        self.assertIsNone(su.progress_line(self.cfg.state_dir))
+        self.assertFalse(any("IN PROGRESS" in line
+                             for line in su.status_lines(self.cfg.state_dir)))
+class HandoffSettlesTests(unittest.TestCase):
+    def test_a_handoff_in_progress_settles_instead_of_failing_verify(self) -> None:
+        # The previous supervisor finishing its job before it hands the lane
+        # over must be re-read, not rolled back.
+        self.assertIn("orphaned_supervisor", su.SETTLING_PROBLEM_CODES)
+        self.assertIn("supervisor_handoff_pending", su.SETTLING_PROBLEM_CODES)
+
+
 class VerifySettleTests(Base):
     def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
         self.assertEqual(
@@ -2555,6 +2632,107 @@ class RelayRollbackTests(Base):
         self.assertIn("relay", self.last()["error"])
 
 
+class StoreWriteChildTests(unittest.TestCase):
+    """System.store_write runs the write in a child it can abandon: a write
+    stuck in a wedged volume must never hold the self-update process."""
+
+    def test_the_write_is_made_by_a_child_not_this_process(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            child = ("import json, os, sys, time; t = time.monotonic(); "
+                     "open(os.path.join(sys.argv[1], 'pid'), 'w').write(str(os.getpid())); "
+                     "print(json.dumps({'ms': 1.0}))")
+            with mock.patch.object(su, "STORE_WRITE_CHILD", child):
+                self.assertEqual({"ms": 1.0}, su.System().store_write(store))
+            self.assertNotEqual(str(os.getpid()), Path(store, "pid").read_text())
+
+    def test_a_write_that_never_returns_is_abandoned_on_time(self) -> None:
+        children = []
+        real_popen = su.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            children.append(real_popen(*args, **kwargs))
+            return children[-1]
+        with tempfile.TemporaryDirectory() as store:
+            with mock.patch.object(su, "STORE_WRITE_CHILD", "import time; time.sleep(60)"), \
+                    mock.patch.object(su.subprocess, "Popen", popen):
+                started = time.monotonic()
+                result = su.System().store_write(store, timeout=0.5)
+            self.assertEqual({"timed_out": True, "timeout": 0.5}, result)
+            self.assertLess(time.monotonic() - started, 5)
+        # The child's whole process group is gone: nothing left sleeping.
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(children[0].pid, 0)
+
+    def test_a_child_that_cannot_start_is_an_error_not_an_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            with mock.patch.object(su, "child_python", side_effect=RuntimeError("no python")):
+                self.assertIn("could not start", su.System().store_write(store)["error"])
+            with mock.patch.object(su.subprocess, "Popen", side_effect=OSError("no fork")):
+                self.assertIn("could not start", su.System().store_write(store)["error"])
+
+    def test_the_child_runs_isolated(self) -> None:
+        argvs = []
+        real_popen = su.subprocess.Popen
+
+        def popen(argv, *args, **kwargs):
+            argvs.append(argv)
+            return real_popen(argv, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as store, \
+                mock.patch.object(su.subprocess, "Popen", popen):
+            su.System().store_write(store)
+        self.assertEqual("-I", argvs[0][1])
+
+    def test_a_real_write_reports_milliseconds_and_leaves_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            result = su.System().store_write(store)
+            self.assertIn("ms", result)
+            self.assertEqual([], os.listdir(store))
+
+
+class StoreHealthRecordTests(unittest.TestCase):
+    """System.store_health reads the storage-health gate's real record."""
+
+    def setUp(self) -> None:
+        import storage_health
+        self.sh = storage_health
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.tmp / "home"
+        self.store = self.tmp / "store"
+        self.store.mkdir()
+        patch = mock.patch.object(Path, "home", classmethod(lambda cls: self.home))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.state = self.sh.default_state(self.store)
+        self.assertTrue(str(self.state).startswith(str(self.home)))
+
+    def record(self, status: str = "healthy") -> None:
+        self.sh.save_state(self.state, {
+            "schema": 1, "status": status, "reason": "directory_metadata_ok",
+            "path": str(self.store), "failure_streak": 0, "healthy_streak": 3,
+            "checked_at": "2026-10-22T15:04:23Z"})
+
+    def test_a_fresh_record_is_healthy_with_its_check_time(self) -> None:
+        self.record()
+        self.assertEqual(("healthy", "directory_metadata_ok", "2026-10-22T15:04:23Z"),
+                         su.System().store_health(str(self.store)))
+
+    def test_a_quarantine_marker_wins_over_a_healthy_record(self) -> None:
+        self.record()
+        Path(str(self.state) + ".quarantine").write_text("")
+        self.assertEqual("quarantined", su.System().store_health(str(self.store))[0])
+
+    def test_no_record_is_unknown(self) -> None:
+        status, reason, _ = su.System().store_health(str(self.store))
+        self.assertEqual("unknown", status)
+        self.assertIn("no storage-health record", reason)
+
+    def test_a_corrupt_record_is_unknown(self) -> None:
+        self.state.parent.mkdir(parents=True, exist_ok=True)
+        self.state.write_text("{not json")
+        self.assertEqual("unknown", su.System().store_health(str(self.store))[0])
+
+
 class LauncherProbeStopTests(Base):
     """After installing a NEW sealed launcher, a failed volume probe stops the
     update with the host OFF instead of rolling back: a rollback replaces the
@@ -2608,6 +2786,126 @@ class LauncherProbeStopTests(Base):
         self.assertNotIn("Removable Volumes to TartCI Launcher", body)
         self.assertNotIn("Files and Folders", body)
         self.assertIn("tartci pool on", body)
+
+    def test_a_slow_store_refuses_a_launcher_change_before_drain(self) -> None:
+        # m5studio, 2026-10-18: the probe failed after the install and the
+        # host stayed OFF for days. Checked first, nothing changes.
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.installs())
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertTrue(self.sys.store_writes, "the store was checked")
+        receipt = self.latest_receipt()
+        self.assertIn("Tart store volume slow before a launcher change", receipt["error"])
+        self.assertIn("4200 ms", receipt["error"])
+
+    def test_a_slow_store_on_apply_releases_the_queue_ticket(self) -> None:
+        # HostFault, not a plain refusal: the turn goes to the next host.
+        (self.cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        (self.cfg.state_dir / "waiting.json").write_text(json.dumps({"since": su.time.time() - 60}))
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+
+    def test_a_plan_never_writes_to_the_store(self) -> None:
+        self.plan()
+        self.assertEqual([], self.sys.store_writes)
+        steps = [s for s in self.latest_receipt()["steps"] if s["step"] == "store-volume"]
+        self.assertTrue(steps and "a plan writes nothing" in steps[-1]["detail"], steps)
+
+    def test_an_unhealthy_store_refuses_without_a_write(self) -> None:
+        for status in ("quarantined", "degraded", "unknown"):
+            self.sys.store_writes.clear()
+            self.sys.store_health_result = (status, "probe_timeout", su._iso(NOW - 60))
+            self.assertEqual(su.EXIT_REFUSED, self.apply(), status)
+            self.assertEqual([], self.sys.store_writes, status)
+            self.assertEqual([], self.sys.mutations(), status)
+            self.assertIn(f"storage health for", self.latest_receipt()["error"])
+            self.assertIn(status, self.latest_receipt()["error"])
+
+    def record_aged(self, minutes: float) -> None:
+        self.sys.store_health_result = ("healthy", "directory_metadata_ok",
+                                        su._iso(self.sys.clock - minutes * 60))
+
+    def a_store_write_timed_out_last_attempt(self) -> None:
+        self.sys.store_result = [{"timed_out": True, "timeout": 10.0}, {"ms": 4.0}]
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.sys.store_writes.clear()
+        self.sys.clock += 1800
+
+    def test_a_stale_healthy_record_on_a_busy_host_lets_the_write_decide(self) -> None:
+        # Lanes mid-job do not rewrite the record; that is not a refusal.
+        (self.cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        self.record_aged(180)
+        self.apply()
+        self.assertTrue(self.sys.store_writes)
+        self.assertNotIn("stale", str(self.latest_receipt().get("error")))
+        self.assertNotEqual("refused", self.latest_receipt()["status"])
+
+    def test_a_stale_record_after_a_timed_out_write_refuses_without_a_write(self) -> None:
+        self.a_store_write_timed_out_last_attempt()
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.store_writes)
+        self.assertEqual([], self.sys.mutations())
+        error = self.latest_receipt()["error"]
+        self.assertIn("is stale: its healthy record is 180 min old", error)
+        self.assertIn("the last store write timed out", error)
+
+    def test_a_wedged_store_is_written_once_however_many_attempts_follow(self) -> None:
+        # Re-review: the stale refusal ran no write and reset the guard, so a
+        # hanging write was retried every other attempt (writes 1,1,2,2,3),
+        # each stranding a child in an uninterruptible wait.
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        for attempt in range(3):
+            self.record_aged(180)
+            self.assertEqual(su.EXIT_REFUSED, self.apply(), attempt)
+            self.sys.clock += 1800
+        self.assertEqual(1, len(self.sys.store_writes))
+
+    def test_a_deferral_between_attempts_does_not_reset_the_guard(self) -> None:
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.sys.clock += 1800
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(su.EXIT_DEFERRED, self.apply())
+        self.assertTrue(self.latest_receipt().get("deferred"))
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.sys.clock += 1800
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(1, len(self.sys.store_writes))
+        self.assertIn("the last store write timed out", self.latest_receipt()["error"])
+
+    def test_the_stale_bound_is_ten_minutes(self) -> None:
+        self.a_store_write_timed_out_last_attempt()
+        self.record_aged(11)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.store_writes, "11 min is stale")
+        self.record_aged(9)
+        self.apply()
+        self.assertTrue(self.sys.store_writes, "9 min is fresh: the write decides")
+
+    def test_a_store_that_turns_slow_during_the_drain_puts_the_pool_back(self) -> None:
+        self.sys.store_result = [{"ms": 4.0}, {"ms": 4200.0}]
+        self.apply()
+        self.assertEqual(2, len(self.sys.store_writes), "checked before and after the drain")
+        self.assertEqual([], self.installs(), "nothing installed")
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertIn("slow after the drain", self.latest_receipt()["error"])
+        self.assertEqual("refused", self.latest_receipt()["status"])
+
+    def test_a_store_write_that_hangs_also_refuses_before_drain(self) -> None:
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("did not finish within 10s", self.latest_receipt()["error"])
+
+    def latest_receipt(self) -> dict:
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(receipts[-1].read_text())
 
     def test_any_other_pool_on_failure_still_rolls_back(self) -> None:
         # pool on fails every attempt after the install, then serves the rollback.
@@ -2828,6 +3126,24 @@ class SealedRollbackTests(Base):
                     if "--apply" in a and "install" in a]
         self.assertEqual(installs[-1].get("TARTCI_ROLLBACK_PYTHON"), "/old/lane-python3.15")
         self.assertEqual(pin.read_text().strip(), "/old/lane-python3.15")
+
+    def test_a_running_update_shows_in_status_with_its_step(self) -> None:
+        # m1, 2026-10-22: a 20 min drain wait was invisible in --status.
+        receipt = self.cfg.state_dir / "attempts" / "20261022T074900Z-afd9b8171459.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({
+            "mode": "apply", "status": "running", "target": "afd9b817" * 5,
+            "started_at": "2026-10-22T07:49:00Z", "pid": 4242, "pid_start": "Thu 07:49",
+            "steps": [{"at": "2026-10-22T07:50:00Z", "step": "drain", "ok": True,
+                       "detail": "waiting for 2 VMs"}]}))
+        self.sys.procs[4242] = "Thu 07:49"
+        line = su.running_line(self.cfg.state_dir, self.sys)
+        self.assertIn("IN PROGRESS to afd9b817afd9", line)
+        self.assertIn("pid 4242", line)
+        self.assertIn("last step drain at 2026-10-22T07:50:00Z: waiting for 2 VMs", line)
+        self.assertIn(line, su.status_lines(self.cfg.state_dir, self.sys))
+        del self.sys.procs[4242]
+        self.assertIn("INTERRUPTED", su.running_line(self.cfg.state_dir, self.sys))
 
     def test_signing_probe_failure_refuses_before_drain(self) -> None:
         self.sys.signing_rc = 1
@@ -4395,6 +4711,8 @@ class LauncherV2SelfUpdateTests(Base):
                         .endswith("pulp-signing.keychain-db"))
         self.assertEqual("0" * 64 + "\n", self.pin().read_text(), "the approval pin stays")
         self.assertIn("no launcher change", self.step("launcher"))
+        # An unchanged v2 launcher has no volume probe to fail: no store write.
+        self.assertEqual([], self.sys.store_writes)
 
     def test_changed_inputs_need_the_exact_ack_before_any_drain(self) -> None:
         app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"

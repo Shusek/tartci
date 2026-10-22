@@ -642,6 +642,27 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertIn("orphaned_supervisor", {
                 problem["code"] for problem in value["problems"]
             })
+            # A sealed-launcher host runs supervisors from inside the app, not
+            # from a generation directory; an orphan there is an orphan too
+            # (m5studio slot2, 2026-10-22).
+            launcher_orphan_table = subprocess.CompletedProcess(
+                [], 0,
+                process_table.stdout
+                + f"999 1 Mon Sep  1 00:00:02 2026 bash {root}/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop\n",
+                "",
+            )
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running_one, running_two, launcher_orphan_table,
+                                  unmanaged_list, domain],
+                 ), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertFalse(value["fleet_ready"])
+            self.assertIn("orphaned_supervisor", {
+                problem["code"] for problem in value["problems"]
+            })
             unexpected_domain = subprocess.CompletedProcess(
                 [], 0,
                 "34889 143 com.danielraffel.tartci.tart-runner-macos-fleet.m3.extra\n",
@@ -703,6 +724,103 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertIsNone(value["verified_running_supervisors"])
             self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
             self.assertIn("source disappeared", value["problems"][0]["detail"])
+
+    def test_an_orphan_serving_a_launcher_lane_is_named_not_heartbeat_missing(self) -> None:
+        """m5studio slot2, 2026-10-22: the replaced launcher's supervisor kept
+        serving the lane beside its replacement, holding a VM reservation, and
+        pool status said only heartbeat_missing."""
+        started = "Mon Sep  1 00:00:00 2026"
+        orphan_start = "Mon Sep  1 00:00:09 2026"
+        heartbeat_ts = dt.datetime.now(dt.timezone.utc).isoformat()
+
+        def scenario(two_writer: int, *, orphan_alive: bool = True,
+                     handoff: bool = False, reservation: bool = True,
+                     zombie: bool = False):
+            td = tempfile.TemporaryDirectory()
+            self.addCleanup(td.cleanup)
+            root = Path(td.name)
+            agents = root / "agents"
+            agents.mkdir()
+            app = f"{root}/.local/libexec/TartCILauncher.app/Contents/Resources/support"
+            receipt = {"plists": {"one.plist": "a", "two.plist": "b"},
+                       "retired_launchd_labels": []}
+            for label, writer in (("one", 201), ("two", two_writer)):
+                state_dir = root / f"{label}-state"
+                state_dir.mkdir()
+                (state_dir / f"{label}.state.json").write_text(json.dumps({
+                    "ts": heartbeat_ts, "supervisor_pid": str(writer),
+                    "supervisor_pid_started_at": orphan_start if writer == 777 else started,
+                }))
+                if label == "two" and handoff:
+                    (state_dir / "two.handoff").write_text("202 x\n")
+                (agents / f"{label}.plist").write_bytes(plistlib.dumps({
+                    "EnvironmentVariables": {"HOME": str(root),
+                                             "TARTCI_STATE_DIR": str(state_dir)}}))
+            if reservation:
+                resv = root / ".config/tartci/macos-vm-reservations"
+                resv.mkdir(parents=True)
+                (resv / "resv.abc123").write_text("777 1792679439")
+            table = (
+                f"101 1 {started} /x/tartci-launcher --lane one\n"
+                f"102 1 {started} /x/tartci-launcher --lane two\n"
+                f"201 101 {started} bash {app}/providers/tart-macos/runner.sh --loop\n"
+                f"202 102 {started} bash {app}/providers/tart-macos/runner.sh --loop\n"
+                f"888 555 {started} bash {app}/providers/tart-macos/runner.sh --loop\n"
+            )
+            if zombie:
+                # macOS shows a zombie's command as <defunct>.
+                table += f"777 1 {orphan_start} <defunct>\n"
+            elif orphan_alive:
+                table += (f"777 1 {orphan_start} bash "
+                          f"{app}/providers/tart-macos/runner.sh --loop\n")
+            calls = [
+                subprocess.CompletedProcess([], 0, "state = running\npid = 101\n", ""),
+                subprocess.CompletedProcess([], 0, "state = running\npid = 102\n", ""),
+                subprocess.CompletedProcess([], 0, table, ""),
+            ]
+            if orphan_alive:
+                calls.append(subprocess.CompletedProcess(
+                    [], 0, "PID\tStatus\tLabel\n-\t0\tcom.example.idle\n", ""))
+            calls.append(subprocess.CompletedProcess([], 0, "", ""))
+            args = (Path("receipt"), Path("config"), agents, Path("support"))
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(fleet.subprocess, "run", side_effect=calls), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                return fleet.fleet_readiness(*args, participating=True, pool_state="on")
+
+        value = scenario(777)
+        self.assertFalse(value["fleet_ready"])
+        named = [p for p in value["problems"] if p["code"] == "orphaned_supervisor"]
+        self.assertEqual(1, len(named), value["problems"])
+        self.assertEqual("two", named[0]["label"])
+        self.assertIn("orphaned supervisor pid 777", named[0]["detail"])
+        self.assertIn("serving two", named[0]["detail"])
+        self.assertIn("holds a VM reservation", named[0]["detail"])
+        self.assertNotIn("heartbeat_missing", {p["code"] for p in value["problems"]})
+
+        # Without a reservation it says so by leaving the clause out.
+        value = scenario(777, reservation=False)
+        named = [p for p in value["problems"] if p["code"] == "orphaned_supervisor"]
+        self.assertNotIn("VM reservation", named[0]["detail"])
+
+        # CONTROL: once the writer is gone, nothing is serving the lane but its
+        # own (silent) supervisor: that is heartbeat_missing.
+        value = scenario(777, orphan_alive=False)
+        self.assertIn("heartbeat_missing", {p["code"] for p in value["problems"]})
+        self.assertNotIn("orphaned_supervisor", {p["code"] for p in value["problems"]})
+
+        # A zombie can be neither signalled nor served by: it is never named as
+        # an orphan, so pool status never tells anyone to kill it.
+        value = scenario(777, orphan_alive=False, zombie=True)
+        self.assertNotIn("orphaned_supervisor", {p["code"] for p in value["problems"]})
+        self.assertFalse(any("kill -TERM 777" in str(p.get("detail")) for p in value["problems"]))
+
+        # A replacement waiting for the previous supervisor's job is a handoff.
+        value = scenario(888, orphan_alive=False, handoff=True)
+        pending = [p for p in value["problems"] if p["code"] == "supervisor_handoff_pending"]
+        self.assertEqual(1, len(pending), value["problems"])
+        self.assertIn("supervisor pid 888 still serves this lane", pending[0]["detail"])
+        self.assertIn("kill -TERM 888", pending[0]["detail"])
 
     def test_heartbeat_identity_spans_wrapper_and_direct_topologies(self) -> None:
         """A lane on an external volume runs through a signed launch_helper, so
