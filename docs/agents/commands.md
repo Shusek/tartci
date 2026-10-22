@@ -15,6 +15,7 @@ would do; **write** changes host state.
 | `tartci doctor fleet [--json] [--no-census]` | read | executed generation, drain capability, runner census across repo and org scopes. Exit 0 healthy, 1 problem, 2 undetermined. Reason codes are in `scripts/fleet_reasons.json` |
 | `tartci doctor --reap --json` | read | stale owned VM, overlay and runner residue. Exit 0 healthy, 1 stale or wedged, 2 unreadable |
 | `tartci doctor build-disagreement [--json]` | read | cross-host compile or link disagreement (cache poisoning). Off by default |
+| `tartci version [--json]` | read | the commit this copy runs: an installed generation's support manifest, or a checkout's HEAD (and whether it has uncommitted changes). Exit 1 when neither says |
 | `tartci status --json` | read | providers, capacity, role, janitor install state |
 | `tartci host-profile [--json]` | read | derived role and budget (`PULP_BUILD_JOBS`, `PULP_BUILD_MEM_BUDGET_MB`) |
 | `tartci host-profile --delivery [--json]` | read | how code reaches each lane, and staleness |
