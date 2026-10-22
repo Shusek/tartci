@@ -1,6 +1,7 @@
 """The pinned EFI variable store a Windows golden can ship beside it."""
 
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -64,6 +65,18 @@ class WindowsEfiVarsTests(unittest.TestCase):
         result = self.run_helper("--sha256", self.digest, "--dest", str(existing))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(existing.read_bytes(), b"keep me")
+
+    def test_a_failed_copy_removes_the_partial_destination(self):
+        # The template becomes unreadable after the startup check: the copy
+        # fails part-way and must not leave a file QEMU could boot from.
+        dest = self.root / "efivars.fd"
+        self.template.chmod(0)
+        self.addCleanup(self.template.chmod, 0o644)
+        if os.access(self.template, os.R_OK):
+            self.skipTest("running as a user who can read mode-0 files")
+        result = self.run_helper("--sha256", self.digest, "--dest", str(dest))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(dest.exists())
 
     def test_malformed_pin_is_an_argument_error(self):
         self.assertEqual(self.run_helper("--sha256", "abc", "--check").returncode, 2)

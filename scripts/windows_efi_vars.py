@@ -46,6 +46,23 @@ def _regular_file(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be a regular file, not a link or directory: {path}")
 
 
+def _copy_verified(template: Path, dest: Path, expected: str) -> None:
+    """Create dest exclusively, copy, and verify; any failure removes dest."""
+    try:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError as exc:
+        raise ValueError(f"destination already exists: {dest}") from exc
+    try:
+        with os.fdopen(fd, "wb") as out, template.open("rb") as src:
+            shutil.copyfileobj(src, out, 1 << 20)
+        actual = _digest(dest)
+        if actual != expected:
+            raise ValueError(f"EFI vars copy SHA-256 mismatch: expected {expected}, got {actual}")
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--template", required=True)
@@ -68,14 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"windows-efi-vars: template verified {expected}")
             return 0
         dest = Path(args.dest)
-        if dest.exists() or dest.is_symlink():
-            raise ValueError(f"destination already exists: {dest}")
-        shutil.copyfile(template, dest)
-        actual = _digest(dest)
-        if actual != expected:
-            dest.unlink()
-            raise ValueError(f"EFI vars copy SHA-256 mismatch: expected {expected}, got {actual}")
-        os.chmod(dest, 0o600)
+        _copy_verified(template, dest, expected)
     except (OSError, ValueError) as exc:
         print(f"windows-efi-vars: {exc}", file=sys.stderr)
         return 1
