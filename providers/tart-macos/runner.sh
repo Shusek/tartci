@@ -845,7 +845,34 @@ heartbeat(){
 {"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","storage_health":"$(json_sanitize "$STORAGE_HEALTH_STATE")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","serving_blocked_cause":"$(json_sanitize "$SERVING_BLOCKED_CAUSE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
+    if ! python3 - "$tmp_file" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+    then
+      rm -f "$tmp_file"
+      return 1
+    fi
     mv -f "$tmp_file" "$state_file"
+    if ! python3 - "$STATE_DIR" <<'PY'
+import errno, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno != errno.EINVAL:
+            raise
+finally:
+    os.close(fd)
+PY
+    then
+      return 1
+    fi
   else
     rm -f "$tmp_file"
     return 1
@@ -853,7 +880,7 @@ EOF
 }
 
 tartci_storage_health_check(){
-  local path="${1:-$TART_HOME}" result="" rc=0 status="unknown" reason=""
+  local path="${1:-$TART_HOME}" mode="${2:-state}" result="" rc=0 status="unknown" reason=""
   local -a probe_args=(
     --path "$path"
     --timeout "$STORAGE_HEALTH_TIMEOUT"
@@ -863,6 +890,7 @@ tartci_storage_health_check(){
   if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
     probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")
   fi
+  [ "$mode" = observe ] && probe_args+=(--observe-only)
   result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" ${probe_args[@]+"${probe_args[@]}"} 2>&1)" || rc=$?
   rc="${rc:-0}"
   [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
@@ -2118,7 +2146,7 @@ run_one(){
   # Storage liveness is a separate admission axis.  A healthy SSH/control
   # plane does not prove that Tart's store can answer open/fstat; unknown or
   # timed-out storage yields before a job claim, clone, or VM lease is taken.
-  tartci_storage_health_check || return $?
+  tartci_storage_health_check "$TART_HOME" observe || return $?
   # The host's VM DHCP breaker comes first: while the host's DHCP server is
   # not answering no boot can succeed, so nothing else is worth doing, and a
   # lane that backs off here has taken no job claim. Order of the pre-boot
@@ -2643,14 +2671,6 @@ if [ "$LOOP" = 1 ]; then
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
-      sleep "$POLL"
-      continue
-    fi
-    # Refresh the independent storage receipt even while the queue is empty.
-    # This keeps gate_supply from treating an old pre-probe `waiting` heartbeat
-    # as free capacity, and it lets a recovered mount become routable without
-    # requiring demand to enter run_one first.
-    if ! tartci_storage_health_check; then
       sleep "$POLL"
       continue
     fi

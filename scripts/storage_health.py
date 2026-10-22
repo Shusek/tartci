@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,54 @@ def default_state(path: Path) -> Path:
     host = os.uname().nodename.split(".", 1)[0] or "host"
     digest = hashlib.sha256(str(path).encode()).hexdigest()[:12]
     return Path.home() / ".tartci" / "state" / f"storage-health-{host}-{digest}.json"
+
+
+def state_path_is_safe(state_path: Path, target: Path, *, resolve_target: bool = True) -> bool:
+    """Reject state paths that could resolve into the probed volume.
+
+    Do this lexically and inspect only the state path's existing components.
+    Resolving the complete path can itself touch a wedged external volume;
+    the admission guard must not do that before its bounded worker starts.
+    """
+    state = os.path.abspath(os.fspath(state_path))
+    probe = os.path.abspath(os.fspath(target))
+    try:
+        if os.path.commonpath((state, probe)) == probe:
+            return False
+    except ValueError:
+        return False
+
+    if resolve_target:
+        # Only the bounded worker follows aliases. The outer timeout path uses
+        # lexical-only validation so reporting a stuck probe cannot itself
+        # touch the wedged volume.
+        try:
+            state_real = os.path.realpath(state)
+            probe_real = os.path.realpath(probe)
+            if os.path.commonpath((state_real, probe_real)) == probe_real:
+                return False
+        except (OSError, ValueError):
+            return False
+
+    try:
+        shared = os.path.commonpath((state, probe))
+    except ValueError:
+        return False
+    state_suffix = os.path.relpath(state, shared)
+    current = shared
+    for component in Path(state_suffix).parts:
+        if component == os.curdir:
+            continue
+        current = os.path.join(current, component)
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            break
+        except OSError:
+            return False
+        if stat.S_ISLNK(mode):
+            return False
+    return True
 
 
 def load_state(path: Path, target: Path) -> dict:
@@ -237,6 +286,11 @@ def run_probe_bounded(path: Path, timeout: float) -> tuple[bool, str, float]:
 def run_worker(args: argparse.Namespace) -> int:
     path = Path(args.path)
     state_path = Path(args.state) if args.state else default_state(path)
+    if not state_path_is_safe(state_path, path):
+        print(json.dumps(quarantine_result(path, state_path, args,
+                                            "health_state_path_unsafe"),
+                         sort_keys=True))
+        return QUARANTINED
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
     quarantine_marker = Path(str(state_path) + ".quarantine")
     try:
@@ -303,6 +357,18 @@ def run(args: argparse.Namespace) -> int:
             child.stderr.close()
         path = Path(args.path)
         state_path = Path(args.state) if args.state else default_state(path)
+        if args.state:
+            # Do not write an explicit custom path after a timeout; it may be
+            # an alias into the volume whose probe just wedged.
+            result = quarantine_result(path, state_path, args,
+                                       "health_supervisor_timeout")
+            print(json.dumps(result, sort_keys=True))
+            return QUARANTINED
+        if not state_path_is_safe(state_path, path, resolve_target=False):
+            result = quarantine_result(path, state_path, args,
+                                       "health_state_path_unsafe")
+            print(json.dumps(result, sort_keys=True))
+            return QUARANTINED
         result = durable_quarantine(path, state_path, args, "health_supervisor_timeout")
         print(json.dumps(result, sort_keys=True))
         return QUARANTINED
@@ -313,9 +379,32 @@ def run(args: argparse.Namespace) -> int:
         print(stderr, file=sys.stderr, end="")
     path = Path(args.path)
     state_path = Path(args.state) if args.state else default_state(path)
+    if args.state:
+        result = quarantine_result(path, state_path, args, "health_worker_failed")
+        print(json.dumps(result, sort_keys=True))
+        return QUARANTINED
+    if not state_path_is_safe(state_path, path, resolve_target=False):
+        result = quarantine_result(path, state_path, args, "health_state_path_unsafe")
+        print(json.dumps(result, sort_keys=True))
+        return QUARANTINED
     result = durable_quarantine(path, state_path, args, "health_worker_failed")
     print(json.dumps(result, sort_keys=True))
     return QUARANTINED
+
+
+def run_observe(args: argparse.Namespace) -> int:
+    """Probe liveness without advancing recovery hysteresis or writing state."""
+    ok, reason, elapsed = run_probe_bounded(Path(args.path), args.timeout)
+    result = {
+        "schema": 1,
+        "status": "healthy" if ok else "quarantined",
+        "reason": reason,
+        "path": str(args.path),
+        "state": args.state,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+    print(json.dumps(result, sort_keys=True))
+    return HEALTHY if ok else QUARANTINED
 
 
 def main() -> int:
@@ -326,6 +415,7 @@ def main() -> int:
     parser.add_argument("--failure-threshold", type=int, default=2)
     parser.add_argument("--recovery-threshold", type=int, default=3)
     parser.add_argument("--probe-only", action="store_true")
+    parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--storage-health-worker", action="store_true")
     args = parser.parse_args()
     if args.probe_only:
@@ -335,6 +425,8 @@ def main() -> int:
     if not (0 < args.timeout <= 60) or not (1 <= args.failure_threshold <= 10) or not (1 <= args.recovery_threshold <= 20):
         print(json.dumps({"schema": 1, "status": "quarantined", "reason": "health_configuration_invalid", "path": args.path, "state": args.state or str(default_state(Path(args.path))), "failure_streak": 0, "healthy_streak": 0}, sort_keys=True))
         return QUARANTINED
+    if args.observe_only:
+        return run_observe(args)
     return run_worker(args) if args.storage_health_worker else run(args)
 
 
