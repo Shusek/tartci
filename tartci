@@ -21,6 +21,7 @@
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
 #   tartci ccache reset [--reset] [--plan] [--force]  # operator reset; refuses
 #                              # while a VM runs or holds a lease (exit 3)
+#   tartci version [--json]    # the commit this copy runs (installed generation or checkout)
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
@@ -280,6 +281,39 @@ if value["present"]:
         value["inode"], value["mtime_ns"]
     ))
 '
+}
+
+# The commit this copy runs. An installed generation names it in its support
+# manifest; a checkout asks git. Plain bash and sed: it must answer on a host
+# whose Python or TOML tooling is what is broken.
+cmd_version() {
+  local json=0 commit="" source="" dirty=false
+  case "${1:-}" in
+    --json) json=1 ;;
+    "") ;;
+    -h|--help) echo "usage: tartci version [--json]"; return 0 ;;
+    *) echo "usage: tartci version [--json]" >&2; return 2 ;;
+  esac
+  if [ -f "$HERE/.tartci-support-manifest.json" ]; then
+    commit="$(sed -n 's/.*"source_commit": *"\([0-9a-f]\{40\}\)".*/\1/p' \
+      "$HERE/.tartci-support-manifest.json" | head -n 1)"
+    source=generation
+  elif git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    commit="$(git -C "$HERE" rev-parse HEAD 2>/dev/null)"
+    source=checkout
+    [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null)" ] || dirty=true
+  fi
+  if [ -z "$commit" ]; then
+    echo "tartci version: cannot tell which commit $HERE runs (no support manifest, not a git checkout)" >&2
+    return 1
+  fi
+  if [ "$json" = 1 ]; then
+    printf '{"commit": "%s", "source": "%s", "root": "%s", "dirty": %s}\n' \
+      "$commit" "$source" "$HERE" "$dirty"
+  else
+    printf 'tartci %s (%s %s%s)\n' "${commit:0:12}" "$source" "$HERE" \
+      "$([ "$dirty" = true ] && echo ', with uncommitted changes')"
+  fi
 }
 
 cmd_status() {
@@ -1571,6 +1605,7 @@ case "${1:-help}" in
   steward-scheduler) shift; cmd_steward_scheduler "$@" ;;
   queue-saturation) shift; cmd_queue_saturation "$@" ;;
   ccache)  shift; cmd_ccache "$@" ;;
+  version|--version|-V) shift; cmd_version "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
   network-profile) shift; cmd_network_profile "$@" ;;
