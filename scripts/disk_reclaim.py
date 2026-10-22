@@ -120,8 +120,14 @@ PASS_DEADLINE: float | None = None
 
 
 def bounded_fs_call(operation: Any, *, description: str,
-                    timeout: float = ROOT_PROBE_TIMEOUT_S) -> Any:
-    """Run one filesystem metadata call with a fail-closed deadline."""
+                    timeout: float = ROOT_PROBE_TIMEOUT_S,
+                    pass_deadline: bool = True) -> Any:
+    """Run one filesystem metadata call with a fail-closed deadline.
+
+    `pass_deadline=False` gives the call its own `timeout` even once the pass
+    deadline is spent; it is for the single statfs that measures free space
+    after the pass, which must not inherit what the walk used up.
+    """
     result: dict[str, Any] = {}
     error: list[BaseException] = []
 
@@ -131,7 +137,8 @@ def bounded_fs_call(operation: Any, *, description: str,
         except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
             error.append(exc)
 
-    remaining = None if PASS_DEADLINE is None else PASS_DEADLINE - time.monotonic()
+    remaining = (None if PASS_DEADLINE is None or not pass_deadline
+                 else PASS_DEADLINE - time.monotonic())
     if remaining is not None and remaining <= 0:
         raise OSError(errno.ETIMEDOUT, f"reclaim pass deadline reached before {description}")
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
@@ -195,6 +202,12 @@ def has_marker(path: pathlib.Path, markers: Iterable[str]) -> str | None:
 #: developer parking a worktree inside one puts it at depth one, so a bound of
 #: four covers both with a sub-directory to spare.
 NESTED_SOURCE_MAXDEPTH = 4
+# Subdirectories of a build tree that a test suite writes its own projects
+# into. Pulp: ${CMAKE_BINARY_DIR}/test-tmp/<name>/ (tools/cli/CMakeLists.txt).
+# Below one, only a `.git` marks a checkout; a CMakeLists.txt there is the
+# test's output, and read as source it kept m3's 55 GiB
+# pulp-p0a-failure-proof/build from ever being reclaimed.
+GENERATED_SCRATCH_DIRS = ("test-tmp",)
 
 #: How far below a candidate the pre-delete age re-read looks. Deeper than the
 #: scan pass on purpose: the process guard only sees an ABSOLUTE path in a
@@ -220,9 +233,9 @@ def nested_source_marker(
     the process scan make. A subtree we were refused could hold a checkout, so
     "could not look" must never render as "nothing there".
     """
-    stack: list[tuple[pathlib.Path, int]] = [(path, 0)]
+    stack: list[tuple[pathlib.Path, int, bool]] = [(path, 0, False)]
     while stack:
-        current, depth = stack.pop()
+        current, depth, generated = stack.pop()
         if depth >= maxdepth:
             continue
         try:
@@ -233,7 +246,8 @@ def nested_source_marker(
             continue
         for entry in entries:
             child = pathlib.Path(entry.path)
-            if depth > 0 and entry.name in SOURCE_MARKERS:
+            if depth > 0 and entry.name in SOURCE_MARKERS and \
+                    (not generated or entry.name == ".git"):
                 # A linked worktree's `.git` is a regular file, and a
                 # `CMakeLists.txt` is never a directory, so this deliberately
                 # does not test the entry's type.
@@ -243,7 +257,8 @@ def nested_source_marker(
                     continue
             except OSError:
                 continue
-            stack.append((child, depth + 1))
+            stack.append((child, depth + 1,
+                          generated or (depth == 0 and entry.name in GENERATED_SCRATCH_DIRS)))
     return None, True
 
 
@@ -463,12 +478,27 @@ def free_bytes(path: pathlib.Path) -> int | None:
     (m3 scans /Volumes/<data-volume>). An unmount inside that window, or an EIO off
     a failing disk, reaches here. Deleting this branch would turn that into a
     traceback out of the janitor instead of an honest "unknown".
+
+    Bounded by its own timeout, never by the pass deadline: on m3
+    (2026-10-22) the walk spent the whole 900 s pass, the re-measure was
+    refused without a statfs, and every pass exited 4 while the volume sat
+    at 92%. One statfs is cheap; the walk is what the deadline bounds.
     """
     try:
         return bounded_fs_call(lambda: shutil.disk_usage(path).free,
-                               description=f"disk usage {path}")
+                               description=f"disk usage {path}", pass_deadline=False)
     except OSError:
         return None
+
+
+def used_percent(path: pathlib.Path) -> float | None:
+    """Percent of `path`'s volume in use, or None when it cannot be read."""
+    try:
+        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
+                                description=f"disk usage {path}", pass_deadline=False)
+    except OSError:
+        return None
+    return 100.0 * usage.used / usage.total if usage.total else None
 
 
 def path_spellings(path: pathlib.Path) -> set[str]:
@@ -696,8 +726,10 @@ def volumes_free_bytes(roots: list[pathlib.Path]) -> list[dict[str, Any]]:
             if device in seen:
                 continue
             seen.add(device)
-        out.append({"root": str(root), "device": device,
-                    "free_bytes": free_bytes(root)})
+        free = free_bytes(root)
+        out.append({"root": str(root), "device": device, "free_bytes": free,
+                    # Only alongside a known free figure: unknown stays unknown.
+                    "used_percent": None if free is None else used_percent(root)})
     return out
 
 
@@ -1070,6 +1102,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pressure-free-gb", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_FREE_GB", "200")),
                         help="free space below which the shorter age gate applies (default 200)")
+    parser.add_argument("--pressure-used-percent", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_USED_PERCENT", "0")),
+                        help="also apply the shorter age gate on a volume at least this "
+                             "percent used (default 0: off; the installed agent sets it "
+                             "below the readiness disk_pressure limit)")
     parser.add_argument("--pressure-min-age-days", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS", "7")),
                         help="age gate used under disk pressure (default 7)")
@@ -1210,7 +1247,14 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         volume["device"] for volume in volumes_before
         if volume["device"] is not None
         and volume["free_bytes"] is not None
-        and volume["free_bytes"] < args.pressure_free_gb * GIB
+        and (volume["free_bytes"] < args.pressure_free_gb * GIB
+             # A large volume reaches the readiness limit (DISK_PROBLEM_PERCENT
+             # in macos_fleet_lanes) with hundreds of GiB free: m3's 3.6 TiB
+             # Workshop volume did at ~290 GiB, so the GiB test alone never
+             # fired while the host was already out of the fleet.
+             or (args.pressure_used_percent > 0
+                 and volume.get("used_percent") is not None
+                 and volume["used_percent"] >= args.pressure_used_percent))
     }
     pressure = bool(pressured_devices)
 
