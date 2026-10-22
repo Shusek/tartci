@@ -33,7 +33,9 @@ would do; **write** changes host state.
 | `tartci hooks print` | read | prints agent hook settings; never writes them |
 | `tartci launchd status` | read | serve LaunchAgent state |
 | `tartci fleet-macos tool-freshness [--json]` | read | Shipyard and pulp CLI versus latest release |
-| `tartci fleet update ...` | as `fleet-macos self-update` | the same command under a shorter name; every option passes through. It updates this host only, waiting its turn so one host updates at a time |
+| `tartci update --status [--json]` | read | one line: installed commit, skew, the live update step and how long it has run, last result |
+| `tartci update --wait [--json] [--timeout S]` | read | silent until this host's running update ends, then one line; exit 0 succeeded, 3 refused, 4 failed, 124 timed out. Run it in the background to be woken |
+| `tartci update [--yes]` | apply | update this host (same engine as `fleet-macos self-update --apply`): asks y/N on a terminal, never applies without one unless `--yes`; prints one line and keeps the full output in `~/.tartci/state/self-update/last-update-output.log` |
 | `tartci fleet-macos self-update --plan` | plan | default mode; steps 1 to 4 of the update, read-only |
 | `tartci pool <on\|drain\|off> --plan` | plan | prints the transition, writes nothing |
 | `tartci launchd reload <label> --dry-run` | plan | prints the plan or `REFUSE` (exit 0 or 3) |
