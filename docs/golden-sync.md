@@ -50,7 +50,7 @@ assuming — a host on an external/remote volume would differ.
    `--partial --progress`, NOT `--info=progress2` which it lacks):
    ```bash
    rsync -a --partial --progress \
-     -e "ssh -i ~/.ssh/<key> -o StrictHostKeyChecking=accept-new" \
+     -e "ssh -i ~/.ssh/<key> -o HostKeyAlias=<peer-alias> -o StrictHostKeyChecking=yes" \
      $TARTCI_GOLDENS/<golden>.qcow2 $TARTCI_GOLDENS/<golden>.qcow2.sha256 \
      <user>@<PEER_TB_IP>:$TARTCI_GOLDENS/
    ```
@@ -112,9 +112,12 @@ golden yet, bake one from scratch (runbook §4), then the rest copy via `--from`
 
 `sync`:
 1. **Discovers the fastest link** to HOST — probes a Thunderbolt link-local peer
-   (`169.254.x` on `bridge0` that identifies as HOST, reusing the ssh alias's
-   user/key), falls back to the alias (LAN/Tailscale). `--via IP` overrides the
-   TB IP if auto-detect misses it.
+   (`169.254.x` neighbours on `bridge0` only, that identify as HOST, reusing
+   the ssh alias's user/key), falls back to the alias (LAN/Tailscale). `--via IP`
+   overrides the TB IP if auto-detect misses it. Every raw-IP connection (probe,
+   rsync, `--via`) uses `-o HostKeyAlias=<HOST's known_hosts name>
+   -o StrictHostKeyChecking=yes`, so a peer that cannot present HOST's existing
+   host key is refused; nothing is ever added to `known_hosts`.
 2. **rsyncs** the canonical golden + `.sha256` into the target's *own*
    `$TARTCI_GOLDENS` (read from its runner plist, not assumed); resumable
    (`--partial`), openrsync-safe flags. `--dry-run` stops here.

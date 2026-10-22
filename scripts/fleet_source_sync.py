@@ -44,6 +44,10 @@ class SyncError(RuntimeError):
     pass
 
 
+class NotOnMain(SyncError):
+    """A commit asked for by id is not main's head or one of its ancestors."""
+
+
 def _json(api: Api, path: str) -> dict:
     rc, out, err = api(path)
     if rc != 0:
@@ -70,10 +74,33 @@ def head(api: Api, repository: str, ref: str = "main") -> tuple[str, str]:
         raise SyncError(f"repos/{repository}/commits/{ref}: no commit id")
     if not isinstance(tree, str) or not fleet_source.COMMIT.fullmatch(tree):
         raise SyncError(f"repos/{repository}/commits/{ref}: no tree id")
-    if fleet_source.COMMIT.fullmatch(ref) and commit != ref:
-        # A commit was asked for by id: never export a different one.
-        raise SyncError(f"repos/{repository}/commits/{ref[:12]} answered {commit[:12]}")
+    if fleet_source.COMMIT.fullmatch(ref):
+        if commit != ref:
+            # A commit was asked for by id: never export a different one.
+            raise SyncError(f"repos/{repository}/commits/{ref[:12]} answered {commit[:12]}")
+        # A commit asked for by id (the one the canary reports, or the one this
+        # host was installed from) is any object the repository holds, a
+        # commit on an unmerged branch included: only one main reached counts.
+        require_on_main(api, repository, commit)
     return commit, tree
+
+
+def require_on_main(api: Api, repository: str, commit: str) -> None:
+    """Refuse unless `commit` is main's head or an ancestor of it.
+
+    GitHub's compare of ``commit...main`` is "identical" or "ahead" with
+    nothing behind exactly when main contains the commit. An answer that
+    cannot be read proves nothing, so it refuses too (fail closed): the
+    caller stays on the generation it has installed.
+    """
+    path = f"repos/{repository}/compare/{commit}...main?per_page=1"
+    value = _json(api, path)
+    merge_base = value.get("merge_base_commit")
+    if (value.get("status") not in ("identical", "ahead") or value.get("behind_by") != 0
+            or not isinstance(merge_base, dict) or merge_base.get("sha") != commit):
+        raise NotOnMain(f"{repository}@{commit[:12]} is not on main "
+                        f"(compare: {str(value.get('status'))[:20]}); "
+                        "staying on the installed commit")
 
 
 def _make_writable(root: Path) -> None:

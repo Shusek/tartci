@@ -641,9 +641,15 @@ def peer_resolver(
     def read(peer: str, target: str) -> PeerEvidence:
         from bounded_subprocess import ObservationError, run_bounded
 
+        if fleet_source.ssh_destination(target) is None:
+            # A published ssh such as "-oProxyCommand=…" would run locally as
+            # an ssh option: refuse it, and leave the peer uncounted.
+            return PeerEvidence(peer, False, f"refused ssh destination {target[:64]!r}: "
+                                "not a host alias or user@host")
+        # "--" ends ssh's options, so the destination can never be read as one.
         argv = [ssh, "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                target, PEER_STATUS_COMMAND]
+                "--", target, PEER_STATUS_COMMAND]
         try:
             proc = run_bounded(argv, timeout=timeout, operation="peer_status")
         except (ObservationError, OSError) as exc:

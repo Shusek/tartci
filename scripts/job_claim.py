@@ -83,6 +83,8 @@ DEFAULT_TTL_SECS = 1800
 DEFAULT_REMOTE_MAX_AGE_SECS = 900
 PEER_CONNECT_TIMEOUT_SECS = 2
 DEFAULT_PEER_READ_SECS = 5.0
+# The one command a peer is asked to run (tartci_peer_read allows it verbatim).
+PEER_STATUS_COMMAND = "cd ~ && ~/.local/bin/tartci job-claim status --publish"
 
 
 def default_dir() -> pathlib.Path:
@@ -398,13 +400,20 @@ def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     me = args.self_host
     targets = peer_targets(peer_supply(args.supply), me)
     procs: dict[str, subprocess.Popen] = {}
+    invalid: list[str] = []
     ssh = args.ssh
     for host, target in targets.items():
+        if target is None:
+            # A published ssh that is not a plain alias (e.g. "-oProxyCommand=…")
+            # would run locally as an ssh option: never dial it.
+            invalid.append(host)
+            continue
         # -n and a null stdin: the caller runs inside the supervisor's loops,
         # and an ssh that inherits their stdin drains the rest of the list.
+        # "--" ends ssh's options, so the destination can never be read as one.
         argv = [ssh, "-n", "-o", "BatchMode=yes", "-o",
-                f"ConnectTimeout={PEER_CONNECT_TIMEOUT_SECS}", target,
-                "cd ~ && ~/.local/bin/tartci job-claim status --publish"]
+                f"ConnectTimeout={PEER_CONNECT_TIMEOUT_SECS}", "--", target,
+                PEER_STATUS_COMMAND]
         try:
             # Own process group: a straggler is killed with everything it
             # started, so nothing can hold its pipe open past the budget.
@@ -415,7 +424,8 @@ def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         except OSError:
             procs[host] = None  # type: ignore[assignment]
     deadline = time.monotonic() + args.read_secs
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = [{"host": host, "ok": False, "reason": "invalid_ssh"}
+                                  for host in invalid]
     for host, proc in procs.items():
         if proc is None:
             rows.append({"host": host, "ok": False, "reason": "spawn_failed"})
@@ -448,8 +458,12 @@ def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     return {"peers": sorted(targets), "unread": [r["host"] for r in rows if not r["ok"]]}, 0
 
 
-def peer_targets(supply: pathlib.Path, me: str) -> dict[str, str]:
-    """host_id -> SSH target for every published host except this one."""
+def peer_targets(supply: pathlib.Path, me: str) -> dict[str, str | None]:
+    """host_id -> SSH target for every published host except this one.
+
+    None marks a host whose target is not a safe SSH destination
+    (fleet_source.SSH_DESTINATION); it is reported unread, never dialled.
+    """
     try:
         value = json.loads(supply.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -462,7 +476,8 @@ def peer_targets(supply: pathlib.Path, me: str) -> dict[str, str]:
         if host == me:
             continue
         ssh = row.get("ssh")
-        targets[host] = ssh if isinstance(ssh, str) and ssh else f"tartci-{host}"
+        targets[host] = fleet_source.ssh_destination(
+            ssh if isinstance(ssh, str) and ssh else f"tartci-{host}")
     return targets
 
 

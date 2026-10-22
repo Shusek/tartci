@@ -64,7 +64,8 @@ class Fleet:
         # hand-building a replacement stdout would miss PEER_READ regressions.
         if argv[-1] != psa.PEER_READ:
             raise AssertionError("fixture did not receive the production PEER_READ command")
-        target = argv[argv.index("ConnectTimeout=10") + 1]
+        # "--" ends ssh's options; the destination follows it.
+        target = argv[argv.index("--") + 1]
         self.calls.append(target)
         return self.answers.get(target, (255, "", "ssh: connect to host: Operation timed out"))
 
@@ -459,6 +460,25 @@ class ConfiguredFleetSourceTests(unittest.TestCase):
                                  peers=None, me=None, run=lambda argv: (1, "", ""))
         peers.assert_called_once()
         self.assertNotEqual("no self-update checkout", out.get("reason"))
+
+
+class PeerSshDestinationTests(unittest.TestCase):
+    """A published supply's `ssh` reaches ssh argv only as a plain destination."""
+
+    def test_a_hostile_target_is_never_dialled(self) -> None:
+        fleet = Fleet()
+        info = psa.read_peer("-oProxyCommand=touch /tmp/x", run=fleet.run)
+        self.assertFalse(info["readable"])
+        self.assertIn("refused ssh destination", info["error"])
+        self.assertEqual([], fleet.calls)
+
+    def test_a_plain_alias_is_read_after_the_option_terminator(self) -> None:
+        fleet = Fleet()
+        fleet.healthy("m1")
+        seen: list[list[str]] = []
+        info = psa.read_peer("m1", run=lambda argv: (seen.append(argv), fleet.run(argv))[1])
+        self.assertTrue(info["readable"], info)
+        self.assertEqual(["--", "m1", psa.PEER_READ], seen[0][-3:])
 
 
 if __name__ == "__main__":

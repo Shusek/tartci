@@ -31,6 +31,18 @@ MARKER_SCHEMA = "tartci.fleet-source/v1"
 PUBLISHED_SUPPLY = "fleet/advertised-labels.json"
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# An SSH destination a peer is dialled by: a Host alias or user@host. The same
+# pattern macos_fleet_lanes enforces on a profile's host.ssh. A published
+# supply's host rows are not bound by profiles_sha256, so every reader checks
+# them again: a value starting with "-" would be read by ssh as an option.
+SSH_DESTINATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}")
+
+
+def ssh_destination(value: object) -> str | None:
+    """`value` when it is a safe SSH destination, else None."""
+    if isinstance(value, str) and SSH_DESTINATION.fullmatch(value):
+        return value
+    return None
 
 
 @dataclass(frozen=True)

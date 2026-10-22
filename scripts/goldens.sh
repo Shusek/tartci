@@ -18,6 +18,8 @@
 # HOST is an ssh alias. The fastest link is auto-detected: a Thunderbolt
 # link-local peer (169.254.x on bridge0) that identifies as HOST is preferred,
 # else it falls back to whatever the ssh alias resolves to (LAN/Tailscale).
+# A raw-IP link (auto-detected or --via) must present the host key known_hosts
+# already holds for HOST (HostKeyAlias): an unknown key is refused, never added.
 # To seed a brand-new host, run `--from` on it once tartci is deployed; if no
 # peer has the golden yet, bake one from scratch (docs/runbook.md §4).
 set -euo pipefail
@@ -61,22 +63,39 @@ ensure_sha(){ # $1=golden path -> ensures a .sha256 sidecar exists locally
 # probing a raw Thunderbolt IP (which isn't in ~/.ssh/config).
 ssh_user_for(){ ssh -G "$1" 2>/dev/null | awk '/^user /{print $2; exit}'; }
 ssh_key_for(){  ssh -G "$1" 2>/dev/null | awk '/^identityfile /{print $2; exit}'; }
+# The known_hosts name the alias's own connections are checked against: its
+# HostKeyAlias when set, else its HostName. A raw IP is pinned to that entry.
+ssh_hostkey_alias_for(){
+  local name
+  name="$(ssh -G "$1" 2>/dev/null | awk '/^hostkeyalias /{a=$2} /^hostname /{h=$2} END{print (a != "" ? a : h)}')"
+  # It lands in rsync's -e string: plain host names and addresses only.
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._:%-]*$ ]] || die "no usable known_hosts name for '$1' (ssh -G gave '$name')"
+  echo "$name"
+}
+# ssh options that pin a raw-IP destination to HOST's known host key. Never
+# accept-new: a link-local or --via peer that is not HOST is refused.
+pin_opts_for(){
+  local name; name="$(ssh_hostkey_alias_for "$1")" || exit 1
+  echo "-o HostKeyAlias=$name -o StrictHostKeyChecking=yes"
+}
 
 # Pick the fastest link to HOST. Echoes an ssh destination (raw IP over TB, or
 # the alias). Sets global LINK to "thunderbolt"|"alias" for reporting.
 LINK="alias"
 resolve_link(){ # $1=host  $2=via_override
-  local host="$1" via="$2" want user key ip h
+  local host="$1" via="$2" want user key ip h pin
   if [ -n "$via" ]; then LINK="thunderbolt(--via)"; echo "$via"; return; fi
   # what hostname does the alias report? (short, lowercased for compare)
   want="$(ssh -n -o BatchMode=yes -o ConnectTimeout=6 "$host" 'scutil --get LocalHostName 2>/dev/null || hostname -s' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
   [ -n "$want" ] || { echo "$host"; return; }   # alias unreachable? let ssh error later
-  user="$(ssh_user_for "$host")"; key="$(ssh_key_for "$host")"
-  # candidate TB link-local peers: bridge0 neighbors in 169.254/16 (excluding our own)
+  user="$(ssh_user_for "$host")"; key="$(ssh_key_for "$host")"; pin="$(pin_opts_for "$host")" || exit 1
+  # candidate TB link-local peers: 169.254/16 neighbours on bridge0 only (the
+  # Thunderbolt bridge; never Wi-Fi/Ethernet link-local), excluding our own
   local mine; mine="$(ipconfig getifaddr bridge0 2>/dev/null || true)"
-  for ip in $(arp -an 2>/dev/null | grep -oE '169\.254\.[0-9]+\.[0-9]+' | sort -u); do
+  for ip in $(arp -an 2>/dev/null | awk '/ on bridge0( |$)/' | grep -oE '169\.254\.[0-9]+\.[0-9]+' | sort -u); do
     [ "$ip" = "$mine" ] && continue
-    h="$(ssh -n ${key:+-i "$key"} -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+    # shellcheck disable=SC2086 # $pin is two -o options
+    h="$(ssh -n ${key:+-i "$key"} $pin -o BatchMode=yes \
          -o ConnectTimeout=4 "${user:+$user@}$ip" 'scutil --get LocalHostName 2>/dev/null || hostname -s' 2>/dev/null | tr '[:upper:]' '[:lower:]')" || continue
     if [ "$h" = "$want" ]; then LINK="thunderbolt"; echo "$ip"; return; fi
   done
@@ -86,10 +105,10 @@ resolve_link(){ # $1=host  $2=via_override
 # Build the ssh command array for a resolved destination of HOST.
 # Uses the alias's key/user when the destination is a raw IP.
 _rsh(){ # $1=host_alias $2=dest -> prints an -e ssh string
-  local host="$1" dest="$2" key
+  local host="$1" dest="$2" key pin
   if [ "$dest" = "$host" ]; then echo "ssh -o BatchMode=yes -o ConnectTimeout=10"; return; fi
-  key="$(ssh_key_for "$host")"
-  echo "ssh ${key:+-i $key} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"
+  key="$(ssh_key_for "$host")"; pin="$(pin_opts_for "$host")" || exit 1
+  echo "ssh ${key:+-i $key} $pin -o BatchMode=yes -o ConnectTimeout=10"
 }
 _dest_prefix(){ # $1=host_alias $2=dest -> user@ip for raw IP, or alias
   local host="$1" dest="$2" user
@@ -224,6 +243,8 @@ cmd_sync(){
   esac; done
   [ -n "$TO" ] || [ -n "$FROM" ] || die "usage: tartci goldens sync (--to HOST | --from HOST) [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]"
   [ -n "$TO" ] && [ -n "$FROM" ] && die "--to and --from are mutually exclusive"
+  # --via lands in ssh and rsync argv: an address, never something read as an option.
+  [ -z "$VIA" ] || [[ "$VIA" =~ ^[A-Za-z0-9][A-Za-z0-9._:%-]*$ ]] || die "--via must be an IP address or host name (got '$VIA')"
 
   local HOST flags="-a --partial --progress"
   [ "$DRY" = 1 ] && flags="$flags -n"

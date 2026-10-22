@@ -379,5 +379,22 @@ class SelectedSupplyTests(unittest.TestCase):
             fleet_source.selected_published_supply()
 
 
+class SshDestinationTests(unittest.TestCase):
+    """The one rule for a peer's SSH destination, shared with the profile validator."""
+
+    def test_plain_aliases_and_user_at_host_are_accepted(self):
+        for value in ("m1", "tartci-m5", "m5s", "ci@m5studio.local", "a" * 128):
+            self.assertEqual(value, fleet_source.ssh_destination(value))
+
+    def test_options_and_shell_text_are_refused(self):
+        for value in ("-oProxyCommand=touch /tmp/x", "-p22", "--", "", " m1", "m1 id",
+                      "m1;id", "m1\nid", "$(id)", "a" * 129, None, 7, ["m1"]):
+            self.assertIsNone(fleet_source.ssh_destination(value), value)
+
+    def test_the_profile_validator_uses_the_same_pattern(self):
+        source = (Path(__file__).resolve().parent / "macos_fleet_lanes.py").read_text()
+        self.assertIn(f'r"{fleet_source.SSH_DESTINATION.pattern}", ssh', source)
+
+
 if __name__ == "__main__":
     unittest.main()
