@@ -84,6 +84,8 @@ DEFAULT_SOAK_SECONDS = 1800
 DEFAULT_RATE_HOURS = 6
 DEFAULT_STALE_HOURS = 24
 DEFAULT_WAIT_SECONDS = 90 * 60
+# While the drain waits on the same lanes, a receipt step at least this often.
+WAIT_IDLE_NOTE_SECONDS = 5 * 60
 DEFAULT_POLL_SECONDS = 45
 INSTALL_ATTEMPTS = 4
 # `shipyard writer-domain-exec` exits this, naming WRITER_DOMAIN_OVERLAP, when a
@@ -250,6 +252,25 @@ class Result:
         return (self.err or self.out).strip()
 
 
+# The pre-drain store check (store_volume_slow): one small create/write/remove
+# in tart_home, run by a child (System.store_write) and abandoned after this.
+STORE_WRITE_TIMEOUT_SECONDS = 10.0
+STORE_WRITE_CHILD = """
+import json, os, sys, tempfile, time
+started = time.monotonic()
+try:
+    fd, name = tempfile.mkstemp(prefix=".tartci-probe-control.", dir=sys.argv[1])
+    try:
+        os.write(fd, b"tartci probe control\\n")
+    finally:
+        os.close(fd)
+        os.unlink(name)
+    print(json.dumps({"ms": (time.monotonic() - started) * 1000}))
+except OSError as error:
+    print(json.dumps({"error": f"{type(error).__name__}: {error}"}))
+"""
+
+
 class System:
     """Every side effect. Tests replace it."""
 
@@ -268,6 +289,61 @@ class System:
         except (OSError, subprocess.TimeoutExpired) as exc:
             return Result(127, "", f"{type(exc).__name__}: {exc}")
         return Result(proc.returncode, proc.stdout, proc.stderr)
+
+    def store_write(self, directory: str, timeout: float = STORE_WRITE_TIMEOUT_SECONDS) -> dict:
+        """Time one small create/write/remove in the Tart store, made by a
+        child in its own session: {"ms"}, {"timed_out"} or {"error"}.
+
+        Never from this process: a write into a wedged volume blocks in an
+        uninterruptible wait, and a process with such a thread cannot exit, so
+        self-update would never end. On a timeout the child's group is killed
+        and abandoned (storage_health.run_probe_bounded does the same).
+        """
+        import storage_health  # noqa: PLC0415 - sibling module; owns the bounded reaping
+        try:
+            # -I: the child imports nothing from the environment, the user
+            # site or the current directory.
+            child = subprocess.Popen([child_python(), "-I", "-c", STORE_WRITE_CHILD, directory],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     text=True, start_new_session=True)
+        except (OSError, RuntimeError) as exc:
+            # No interpreter (child_python raises RuntimeError) or no process:
+            # nothing was written, and the caller refuses on an error.
+            return {"error": f"store write child could not start: {exc}"}
+        try:
+            out, _ = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            storage_health.reap_after_kill(child)
+            if child.stdout is not None:
+                child.stdout.close()
+            return {"timed_out": True, "timeout": timeout}
+        try:
+            value = json.loads(out)
+        except ValueError:
+            return {"error": f"store write child exited {child.returncode} with no result"}
+        return value if isinstance(value, dict) else {"error": "store write child: bad result"}
+
+    def store_health(self, directory: str) -> tuple[str, str, str]:
+        """(status, reason, checked_at) the storage-health gate last recorded
+        for the Tart store: "healthy", "degraded", "quarantined" or "unknown".
+        Reads only its state files under the home folder, never the volume."""
+        import storage_health  # noqa: PLC0415 - sibling module; owns the state format
+        target = Path(directory)
+        state_path = storage_health.default_state(target)
+        if not storage_health.state_path_is_safe(state_path, target, resolve_target=False):
+            return "unknown", f"its state path {state_path} is unsafe", ""
+        if Path(str(state_path) + ".quarantine").exists():
+            return "quarantined", "a quarantine marker is present", ""
+        try:
+            state = storage_health.load_state(state_path, target)
+        except Exception as exc:  # noqa: BLE001 - any unreadable state is "unknown"
+            return "unknown", f"its state is unreadable ({exc})", ""
+        if not state:
+            return "unknown", f"no storage-health record at {state_path}", ""
+        if state.get("state_unreadable"):
+            return "unknown", "its state is unreadable", ""
+        return (str(state.get("status")), str(state.get("reason") or ""),
+                str(state.get("checked_at") or ""))
 
     def process_start(self, pid: int) -> str | None:
         """The process's start time (identity across pid reuse), or None if gone."""
@@ -1955,6 +2031,92 @@ def probe_slow_volume(probe: str) -> bool:
     return bool(LAUNCH_PROBE_SLOW_VOLUME.search(probe or ""))
 
 
+# The probe calls a control write this slow a slow volume (macos_launcher_probe).
+STORE_SLOW_MS = 1000.0
+# How old a "healthy" storage-health record may be. Each idle lane rewrites
+# it on every loop (runner.sh, TARTCI_VM_POLL, 20 s), but a lane mid-job does
+# not, so twice that would refuse whenever every lane is busy. No lane
+# having looked at the store for this long means the record says nothing
+# about the store now.
+STORAGE_HEALTH_MAX_AGE_SECONDS = 10 * 60
+
+
+def previous_store_timeout(cfg: Config, current: Path | None = None) -> str | None:
+    """When the most recent apply that actually ran a store write saw it
+    time out: that receipt's name; None otherwise.
+
+    Receipts that ran no write (a deferral, a pause, a rate limit, or the
+    stale-record refusal this guards) are skipped, so the guard stays on
+    until a write is seen to finish.
+    """
+    for path, value in reversed(_attempts(cfg.state_dir)):
+        if path == current or value.get("mode") != "apply" or "store_write" not in value:
+            continue
+        return path.name if value["store_write"] == "timed_out" else None
+    return None
+
+
+def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True,
+                      receipt: Receipt | None = None) -> str | None:
+    """Why the Tart store is not fit to change the launcher now, or None.
+
+    m5studio, 2026-10-18: the store volume was slow, the NEW launcher's
+    volume probe timed out after the install, and since a rollback replaces
+    the launcher again the host was left OFF until a person turned it on.
+    Before the drain, while nothing has changed and the host is still
+    serving: the storage-health gate's record must say healthy (read from
+    the home folder, so a quarantined or unknown store is never written
+    to), then, unless `write` is False (a plan writes nothing), the same
+    control write the probe makes, from a bounded child.
+
+    A healthy record older than STORAGE_HEALTH_MAX_AGE_SECONDS is normal on
+    a busy host (only a lane at its loop top rewrites it), so it does not
+    refuse by itself; the write decides. It refuses only when the previous
+    attempt's write timed out, so a wedged store is not written to again on
+    the strength of an old record.
+    """
+    # tart_home from the INSTALLED profile: that is the store the running
+    # launcher, and so the post-install volume probe, uses. A target profile
+    # that moves tart_home is checked against the old store; the move itself
+    # is checked when the new profile's lanes first run.
+    try:
+        store = (_toml(cfg.installed_profile).get("host") or {}).get("tart_home")
+    except (OSError, ValueError):
+        store = None
+    if not isinstance(store, str) or not store:
+        return None
+    status, reason, checked_at = sys_.store_health(store)
+    if status != "healthy":
+        return f"storage health for {store} is {status}" + (f" ({reason})" if reason else "")
+    try:
+        checked = dt.datetime.strptime(checked_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return f"storage health for {store} is healthy but its record has no check time"
+    age = sys_.now() - checked
+    if age > STORAGE_HEALTH_MAX_AGE_SECONDS:
+        timed_out = previous_store_timeout(cfg, receipt.path if receipt else None)
+        if timed_out:
+            return (f"storage health for {store} is stale: its healthy record is {age / 60:.0f} "
+                    f"min old (checked {checked_at}; at most "
+                    f"{STORAGE_HEALTH_MAX_AGE_SECONDS // 60} min), and the last store write "
+                    f"timed out ({timed_out})")
+    if not write:
+        return None
+    result = sys_.store_write(store)
+    if receipt is not None:
+        # What the write did, for the next attempt's previous_store_timeout.
+        receipt.value["store_write"] = ("ms" if "ms" in result else
+                                        "timed_out" if result.get("timed_out") else "error")
+    if "ms" in result:
+        if result["ms"] < STORE_SLOW_MS:
+            return None
+        return f"a small write to {store} took {result['ms']:.0f} ms"
+    if result.get("timed_out"):
+        return f"a small write to {store} did not finish within {result.get('timeout', 0):g}s"
+    return f"a small write to {store} failed: {result.get('error', 'unknown')}"
+
+
 def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float) -> None:
     """One issue when a new launcher's volume probe fails and the host is left
     OFF without a rollback. Best effort: never raises."""
@@ -3250,6 +3412,24 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 raise
             refusals.append(str(exc))
             receipt.step("capacity-floor", str(exc), ok=False)
+        if (helper is not None and (not refresh or layout == "v2")
+                and (layout != "v2" or change.changed)):
+            # A new launcher must pass its volume probe after the install, and
+            # a failed probe leaves the host OFF; check the volume first.
+            slow = store_volume_slow(cfg, sys_, write=apply, receipt=receipt if apply else None)
+            if slow:
+                refusal = (f"Tart store volume slow before a launcher change: {slow}; "
+                           "refused before drain, the host keeps serving; retried on the "
+                           "next attempt")
+                if apply:
+                    raise HostFault(refusal)
+                refusals.append(refusal)
+                receipt.step("store-volume", refusal, ok=False)
+            elif apply:
+                receipt.step("store-volume", "fast enough for the new launcher's volume probe")
+            else:
+                receipt.step("store-volume", "storage health is healthy; an apply also times a "
+                             "small write before drain (a plan writes nothing)")
         if refusals:
             raise Refused(" | ".join(refusals))
         # A v2 refresh (a [fleet_source] move) builds too when the app's
@@ -3533,6 +3713,14 @@ class Run:
         self.receipt.step("drain", drain.text[:300])
         self.phase = "wait-idle"
         self._wait_idle()
+        if "--launch-helper-source" in self.install_args:
+            # The drain can take an hour; check the store again right before
+            # anything stops. A Refused here undoes the drain with nothing
+            # installed.
+            slow = store_volume_slow(cfg, sys_, receipt=self.receipt)
+            if slow:
+                raise Refused(f"Tart store volume slow after the drain, before pool off: {slow}")
+            self.receipt.step("store-volume", "still fast enough after the drain")
         self.phase = "off"
         off = tartci(cfg, sys_, "pool", "off", *self.flag)
         if off.rc in POOL_OFF_REFUSALS:
@@ -3606,6 +3794,7 @@ class Run:
         started = self.sys.now()
         deadline = started + self.cfg.wait_seconds
         waiting_on: list[str] | None = None
+        noted = started
         while True:
             plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
             if plan.rc == 0:
@@ -3623,10 +3812,18 @@ class Run:
             # reads only "drain" for half an hour looks stuck (m1, 2026-10-16,
             # waiting on one Forge gate job).
             busy = mid_job_lanes(f"{plan.out}\n{plan.err}")
+            lanes = "; ".join(busy) or "an owned lane (not named)"
             if busy != waiting_on:
                 waiting_on = busy
-                self.receipt.step("wait-idle", "waiting on " + ("; ".join(busy) or
-                                                                 "an owned lane (not named)"))
+                noted = self.sys.now()
+                self.receipt.step("wait-idle", "waiting on " + lanes)
+            elif self.sys.now() - noted >= WAIT_IDLE_NOTE_SECONDS:
+                # Unchanged, but say so: m1 on 2026-10-22 waited on one job
+                # with steps at 08:00 and 08:55 and nothing between, which
+                # reads as a hung update.
+                noted = self.sys.now()
+                self.receipt.step("wait-idle", f"still waiting on {lanes}, "
+                                  f"{int((noted - started) // 60)} min")
             if self.sys.now() >= deadline:
                 drain_timeout_alert(self.cfg, self.me, busy, self.sys.now() - started,
                                     self.sys.now())
@@ -4174,11 +4371,40 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
 
 
-def status_lines(state_dir: Path) -> list[str]:
-    """For pool status / doctor / watchdog: skew and the last attempt."""
+def running_line(state_dir: Path, sys_: System | None = None) -> str | None:
+    """The self-update running on this host now, with its latest step.
+
+    m1, 2026-10-22: an apply sat 20 min waiting for its VMs to drain, and
+    neither --status nor pool status said one was running; it was found
+    only by searching the process list.
+    """
+    sys_ = sys_ or System()
+    for path, value in reversed(_attempts(state_dir)):
+        if value.get("mode") != "apply" or value.get("status") != "running":
+            continue
+        steps = value.get("steps") or []
+        last = steps[-1] if steps and isinstance(steps[-1], dict) else {}
+        where = (f"; last step {last.get('step')} at {last.get('at')}"
+                 + (f": {str(last.get('detail'))[:160]}" if last.get("detail") else "")
+                 if last else "")
+        if _alive(sys_, value.get("pid"), value.get("pid_start")):
+            return (f"self-update: IN PROGRESS to {str(value.get('target'))[:12]} since "
+                    f"{value.get('started_at')} (pid {value.get('pid')}){where}")
+        return (f"self-update: INTERRUPTED to {str(value.get('target'))[:12]} (started "
+                f"{value.get('started_at')}, pid {value.get('pid')} gone){where}; the next "
+                f"attempt recovers it (receipt {path.name})")
+    return None
+
+
+def status_lines(state_dir: Path, sys_: System | None = None) -> list[str]:
+    """For pool status / doctor / watchdog: skew, a running update, and the
+    last attempt."""
     skew = _read_json(state_dir / "skew.json")
     aged = skew_stale_note(skew)
     lines = [render_skew(skew) + (f" {aged}" if aged else "")]
+    running = running_line(state_dir, sys_)
+    if running:
+        lines.append(running)
     paused = paused_line(state_dir)
     if paused:
         lines.append(paused)
