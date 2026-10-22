@@ -299,11 +299,23 @@ def is_manifest_header(path: Path) -> bool:
     return len(header) == 4 and header[:2] == MAGIC and header[3] == ENTRY_TYPE_MANIFEST
 
 
+# Host-side ccache never reads the shared cache's own ccache.conf. Every gate
+# VM mounts that directory read-write, so a guest can write it, and ccache
+# would otherwise act on keys such as `prefix_command`. The host's calls only
+# read entries and counters, so they take no configuration at all.
+HOST_CCACHE_CONFIG = os.devnull
+
+
+def host_ccache_env(**overrides: str) -> dict[str, str]:
+    """The environment for a host ccache call against a guest-writable cache."""
+    return {**os.environ, **overrides, "CCACHE_CONFIGPATH": HOST_CCACHE_CONFIG}
+
+
 def inspect_manifest(ccache: str, path: Path) -> dict | None:
     """Parse ccache --inspect for a manifest. None when unreadable."""
     try:
         proc = subprocess.run([ccache, "--inspect", str(path)], capture_output=True,
-                              text=True, timeout=INSPECT_TIMEOUT)
+                              text=True, timeout=INSPECT_TIMEOUT, env=host_ccache_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
@@ -351,7 +363,8 @@ def result_verdict(ccache: str, cache: Path, key: str) -> str:
     with tempfile.TemporaryDirectory(prefix="ccache-guard-") as tmp:
         try:
             proc = subprocess.run([ccache, "--extract-result", str(path.resolve())], cwd=tmp,
-                                  capture_output=True, text=True, timeout=INSPECT_TIMEOUT)
+                                  capture_output=True, text=True, timeout=INSPECT_TIMEOUT,
+                                  env=host_ccache_env())
         except (OSError, subprocess.TimeoutExpired):
             return "unverifiable"
         if proc.returncode != 0:

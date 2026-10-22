@@ -370,7 +370,9 @@ def layer_stats(layer: Path, ccache: str | None) -> dict[str, int] | None:
     """Hit/miss counters from the job's own stats, when a host ccache exists."""
     if not ccache:
         return None
-    env = dict(os.environ, CCACHE_DIR=str(layer / "local"))
+    # The layer sits inside the guest-writable mount, so read no ccache.conf
+    # from it (ccache_guard.HOST_CCACHE_CONFIG).
+    env = dict(os.environ, CCACHE_DIR=str(layer / "local"), CCACHE_CONFIGPATH=os.devnull)
     try:
         output = subprocess.run([ccache, "--print-stats"], env=env, text=True,
                                 capture_output=True, timeout=30, check=False)
