@@ -3941,6 +3941,17 @@ class ReinstallCurrentTests(FleetSourceFixture):
         attempt = json.loads(Path(self.last()["receipt"]).read_text())
         self.assertIn("--reinstall-current", attempt["refresh"])
 
+    def test_an_inherited_source_does_not_survive_a_removed_setting(self) -> None:
+        # The caller's shell (or an agent plist) still exports the old source.
+        os.environ.update({
+            "TARTCI_FLEET_SOURCE_ROOT": str(self.cfg.fleet_source_store / self.OLDER),
+            "TARTCI_FLEET_SOURCE_COMMIT": self.OLDER,
+            "TARTCI_FLEET_SOURCE_REPOSITORY": self.fixture.PRIVATE,
+        })
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual([None], self.sys.installed_sources)
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+
     def test_a_plan_changes_nothing(self) -> None:
         self.assertEqual(su.EXIT_OK, self.reinstall(apply=False))
         self.assertEqual([], self.sys.mutations())
@@ -4081,13 +4092,29 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         }
         receipt_path.write_text(json.dumps(receipt))
         self.sys.log_lines = ""
-        self.sys.on_rc = 1               # target pool-on fails; rollback must run
+        # The target's pool on fails every attempt; the rollback's succeeds.
+        self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
         self.assertNotEqual(su.EXIT_OK, self.apply())
         self.assertEqual([self.fixture.COMMIT, self.OLDER], self.sys.installed_sources)
         restored = json.loads(receipt_path.read_text())["fleet_source"]
         self.assertEqual(self.OLDER, restored["commit"])
         self.assertEqual(self.fixture.PRIVATE, restored["repository"])
         self.assertEqual(str(previous_root), restored["root"])
+
+    def test_a_source_move_that_fails_verification_after_pool_on_is_rolled_back(self) -> None:
+        # Same generation, new source: pool on succeeds, then the host is not
+        # ready while the moved profiles are live.
+        def hook(argv: list[str]) -> None:
+            moved = su.installed_fleet_source_commit(self.cfg) == self.fixture.COMMIT
+            self.sys.status_problems = ["broken"] if moved else []
+        self.sys.hook = hook
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual([self.fixture.COMMIT, None], self.sys.installed_sources)
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+        self.assertIsNone(self.verified())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(step["step"] == "rollback-install" for step in receipt["steps"]))
 
     def test_failed_previous_reinstall_keeps_the_target_source_selected(self) -> None:
         self.sys.log_lines = ""

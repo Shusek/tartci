@@ -781,6 +781,11 @@ def sync_fleet_source(cfg: Config, sys_: System, *, write: bool = True) -> dict 
     installer read the same commit. With `write` false (a plan) nothing is
     exported or pruned.
     """
+    # self-update.toml alone selects the source. A source inherited from the
+    # caller's shell or the agent's plist would otherwise survive a removed
+    # [fleet_source] and reinstall private profiles while going "public".
+    for name in FLEET_SOURCE_ENV:
+        os.environ.pop(name, None)
     repository = cfg.fleet_source_repository
     if repository is None:
         return None
@@ -3920,7 +3925,10 @@ class Run:
                                   f"{_state_words(state)} running {str(running)[:12]}; run "
                                   "tartci fleet-macos self-update --verify to check it",
                                   pool_state=state)
-        if running == self.previous:
+        # A source move reinstalls the same generation, so the generation alone
+        # cannot say whether the moved profiles are live.
+        source_moved = installed_fleet_source_record(self.cfg) != self.previous_fleet_source
+        if running == self.previous and not source_moved:
             # Nothing new is installed (the installer rolls its own failure
             # back), so putting the host back is: pin, then pool on.
             failed_previous_source_env = fleet_source_env_snapshot()
