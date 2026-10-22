@@ -52,7 +52,9 @@ class FakeSystem(su.System):
         self.pool_state = "on"
         self.store_result = {"ms": 4.0}  # the pre-drain write into the Tart store
         self.store_writes: list[str] = []
-        self.store_health_result = ("healthy", "directory_metadata_ok")
+        # None: healthy, checked a minute before the fake clock (as idle
+        # lanes keep it); a test sets a tuple to pin the record.
+        self.store_health_result = None
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -144,6 +146,8 @@ class FakeSystem(su.System):
         return dict(self.store_result)
 
     def store_health(self, directory):
+        if self.store_health_result is None:
+            return "healthy", "directory_metadata_ok", su._iso(self.clock - 60)
         return self.store_health_result
 
     def process_start(self, pid):
@@ -2688,12 +2692,26 @@ class LauncherProbeStopTests(Base):
     def test_an_unhealthy_store_refuses_without_a_write(self) -> None:
         for status in ("quarantined", "degraded", "unknown"):
             self.sys.store_writes.clear()
-            self.sys.store_health_result = (status, "probe_timeout")
+            self.sys.store_health_result = (status, "probe_timeout", su._iso(NOW - 60))
             self.assertEqual(su.EXIT_REFUSED, self.apply(), status)
             self.assertEqual([], self.sys.store_writes, status)
             self.assertEqual([], self.sys.mutations(), status)
             self.assertIn(f"storage health for", self.latest_receipt()["error"])
             self.assertIn(status, self.latest_receipt()["error"])
+
+    def test_a_stale_healthy_record_refuses_without_a_write(self) -> None:
+        self.sys.store_health_result = ("healthy", "directory_metadata_ok", su._iso(NOW - 3 * 3600))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.store_writes)
+        self.assertEqual([], self.sys.mutations())
+        error = self.latest_receipt()["error"]
+        self.assertIn("is stale: its healthy record is 180 min old", error)
+
+    def test_a_fresh_healthy_record_proceeds_to_the_write(self) -> None:
+        self.sys.store_health_result = ("healthy", "directory_metadata_ok", su._iso(NOW - 9 * 60))
+        self.apply()
+        self.assertTrue(self.sys.store_writes)
+        self.assertNotIn("stale", str(self.latest_receipt().get("error")))
 
     def test_a_store_write_that_hangs_also_refuses_before_drain(self) -> None:
         self.sys.store_result = {"timed_out": True, "timeout": 10.0}

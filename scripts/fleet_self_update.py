@@ -312,26 +312,27 @@ class System:
             return {"error": f"store write child exited {child.returncode} with no result"}
         return value if isinstance(value, dict) else {"error": "store write child: bad result"}
 
-    def store_health(self, directory: str) -> tuple[str, str]:
-        """(status, reason) the storage-health gate last recorded for the
-        Tart store: "healthy", "degraded", "quarantined" or "unknown". Reads
-        only its state files under the home folder, never the volume."""
+    def store_health(self, directory: str) -> tuple[str, str, str]:
+        """(status, reason, checked_at) the storage-health gate last recorded
+        for the Tart store: "healthy", "degraded", "quarantined" or "unknown".
+        Reads only its state files under the home folder, never the volume."""
         import storage_health  # noqa: PLC0415 - sibling module; owns the state format
         target = Path(directory)
         state_path = storage_health.default_state(target)
         if not storage_health.state_path_is_safe(state_path, target, resolve_target=False):
-            return "unknown", f"its state path {state_path} is unsafe"
+            return "unknown", f"its state path {state_path} is unsafe", ""
         if Path(str(state_path) + ".quarantine").exists():
-            return "quarantined", "a quarantine marker is present"
+            return "quarantined", "a quarantine marker is present", ""
         try:
             state = storage_health.load_state(state_path, target)
         except Exception as exc:  # noqa: BLE001 - any unreadable state is "unknown"
-            return "unknown", f"its state is unreadable ({exc})"
+            return "unknown", f"its state is unreadable ({exc})", ""
         if not state:
-            return "unknown", f"no storage-health record at {state_path}"
+            return "unknown", f"no storage-health record at {state_path}", ""
         if state.get("state_unreadable"):
-            return "unknown", "its state is unreadable"
-        return str(state.get("status")), str(state.get("reason") or "")
+            return "unknown", "its state is unreadable", ""
+        return (str(state.get("status")), str(state.get("reason") or ""),
+                str(state.get("checked_at") or ""))
 
     def process_start(self, pid: int) -> str | None:
         """The process's start time (identity across pid reuse), or None if gone."""
@@ -2021,6 +2022,12 @@ def probe_slow_volume(probe: str) -> bool:
 
 # The probe calls a control write this slow a slow volume (macos_launcher_probe).
 STORE_SLOW_MS = 1000.0
+# How old a "healthy" storage-health record may be. Each idle lane rewrites
+# it on every loop (runner.sh, TARTCI_VM_POLL, 20 s), but a lane mid-job does
+# not, so twice that would refuse whenever every lane is busy. No lane
+# having looked at the store for this long means the record says nothing
+# about the store now.
+STORAGE_HEALTH_MAX_AGE_SECONDS = 10 * 60
 
 
 def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True) -> str | None:
@@ -2041,9 +2048,18 @@ def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True) -> str |
         store = None
     if not isinstance(store, str) or not store:
         return None
-    status, reason = sys_.store_health(store)
+    status, reason, checked_at = sys_.store_health(store)
     if status != "healthy":
         return f"storage health for {store} is {status}" + (f" ({reason})" if reason else "")
+    try:
+        checked = dt.datetime.strptime(checked_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return f"storage health for {store} is healthy but its record has no check time"
+    age = sys_.now() - checked
+    if age > STORAGE_HEALTH_MAX_AGE_SECONDS:
+        return (f"storage health for {store} is stale: its healthy record is {age / 60:.0f} min "
+                f"old (checked {checked_at}; at most {STORAGE_HEALTH_MAX_AGE_SECONDS // 60} min)")
     if not write:
         return None
     result = sys_.store_write(store)
