@@ -40,7 +40,10 @@
   a healthy disk cannot certify a full one. Pressure is scoped the other way,
   per volume: only build directories that live on a volume under
   TARTCI_RECLAIM_PRESSURE_FREE_GB get the shorter
-  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate. Failing more is the safe
+  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate, and so do those on a volume at
+  least TARTCI_RECLAIM_PRESSURE_USED_PERCENT used (90, under readiness's 92%
+  disk_pressure limit, so a large volume reclaims before the host leaves the
+  fleet). Failing more is the safe
   direction; deleting more is not, and a boot disk dipping below the threshold
   is not a reason to reclaim week-old builds off a volume with terabytes free.
 
@@ -149,6 +152,8 @@
         <string>200</string>
         <key>TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS</key>
         <string>7</string>
+        <key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>
+        <string>90</string>
         <key>TARTCI_RECLAIM_FAIL_BELOW_GB</key>
         <string>60</string>
         <key>TARTCI_RECLAIM_LOG</key>
