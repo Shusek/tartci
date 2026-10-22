@@ -303,8 +303,31 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN)"
 FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -f "$c" ] && FW="$c" && break; done
 [ -n "$FW" ] || die "no edk2-aarch64-code.fd"
-VARS_TPL=""; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
-[ -n "$VARS_TPL" ] || die "no edk2 vars template"
+# A golden whose boot entry lives in its own UEFI variable store ships that
+# store beside it; TARTCI_WIN_VARS_TEMPLATE names it and TARTCI_WIN_VARS_SHA256
+# pins it. Every job copies it and verifies the copy before QEMU writes to it.
+# Without it, the stock edk2 template serves a golden that auto-boots
+# \EFI\BOOT\BOOTAA64.EFI.
+VARS_TPL="${TARTCI_WIN_VARS_TEMPLATE:-}"
+VARS_SHA256="${TARTCI_WIN_VARS_SHA256:-}"
+if [ -n "$VARS_TPL" ]; then
+  [ -n "$VARS_SHA256" ] || die "TARTCI_WIN_VARS_TEMPLATE requires TARTCI_WIN_VARS_SHA256"
+  "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/windows_efi_vars.py" \
+    --template "$VARS_TPL" --sha256 "$VARS_SHA256" --check >/dev/null \
+    || die "EFI vars template failed its pinned SHA-256: $VARS_TPL"
+else
+  [ -z "$VARS_SHA256" ] || die "TARTCI_WIN_VARS_SHA256 is set without TARTCI_WIN_VARS_TEMPLATE"
+  for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
+  [ -n "$VARS_TPL" ] || die "no edk2 vars template"
+fi
+copy_efi_vars(){ # $1=destination
+  if [ -n "$VARS_SHA256" ]; then
+    "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/windows_efi_vars.py" \
+      --template "$VARS_TPL" --sha256 "$VARS_SHA256" --dest "$1" >/dev/null
+  else
+    cp "$VARS_TPL" "$1"
+  fi
+}
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
 case "$WIN_CPUS" in ''|*[!0-9]*) die "invalid TARTCI_WIN_CPUS='$WIN_CPUS'";; esac
@@ -537,7 +560,7 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
     return 1
   fi
-  if ! cp "$VARS_TPL" "$efivars"; then
+  if ! copy_efi_vars "$efivars"; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     cleanup_active_windows_job
     return 1
