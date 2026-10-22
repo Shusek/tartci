@@ -2270,6 +2270,38 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
     return rows
 
 
+def _vm_reservation_owners(home: str) -> set[int]:
+    """Supervisor pids that hold a macOS VM reservation (macos-vm-cap.lib.sh)."""
+    owners: set[int] = set()
+    directory = Path(home or Path.home()) / ".config/tartci/macos-vm-reservations"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return owners
+    for name in names:
+        if not name.startswith("resv."):
+            continue
+        try:
+            first = (directory / name).read_text().split()[0]
+        except (OSError, IndexError):
+            continue
+        if first.isdigit():
+            owners.add(int(first))
+    return owners
+
+
+def _state_writers(state_dir: Path) -> list[int]:
+    """The supervisor pids recorded in a lane's heartbeat state files."""
+    writers: list[int] = []
+    for state_path in sorted(state_dir.glob("*.state.json")):
+        try:
+            writer = int(str(json.loads(state_path.read_text()).get("supervisor_pid")))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+        writers.append(writer)
+    return writers
+
+
 def fleet_readiness(
     receipt_path: Path,
     config: Path,
@@ -2416,6 +2448,7 @@ def fleet_readiness(
     process_starts: dict[int, str] = {}
     process_parents: dict[int, int] = {}
     managed_supervisor_pids: set[int] = set()
+    orphan_pids: set[int] = set()
     try:
         process_table = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,lstart=,command="],
@@ -2428,7 +2461,14 @@ def fleet_readiness(
             problems.append({"code": "process_table_probe_error"})
         else:
             home = next(iter(fleet_homes), "")
-            generation_prefix = f"{home}/.local/share/tartci-generations/"
+            # A sealed-launcher host runs its supervisors from inside the app
+            # (TartCILauncher.app/Contents/Resources/support), not from a
+            # generation directory. Matching only generations made this check
+            # blind there: m5studio, 2026-10-22, ran an orphaned slot2
+            # supervisor beside its replacement for hours, reported only as
+            # heartbeat_missing.
+            generation_prefixes = (f"{home}/.local/share/tartci-generations/",
+                                   f"{home}/.local/libexec/TartCILauncher.app/")
             provider_suffix = "/providers/tart-macos/runner.sh --loop"
             for line in process_table.stdout.splitlines():
                 match = re.match(
@@ -2443,18 +2483,27 @@ def fleet_readiness(
                 command = match.group(4)
                 if (
                     ppid == 1
-                    and generation_prefix in command
+                    and any(prefix in command for prefix in generation_prefixes)
                     and provider_suffix in command
                 ):
                     managed_supervisor_pids.add(pid)
             candidates = managed_supervisor_pids - expected_pids
             if candidates:
                 candidates -= launchd_managed_pids()
-            for orphan_pid in sorted(candidates):
-                problems.append({
-                    "code": "orphaned_supervisor", "label": str(orphan_pid),
-                    "detail": process_starts[orphan_pid],
-                })
+            # Reported after the lanes, against the lane an orphan still
+            # writes for when there is one (see orphan_problem below).
+            orphan_pids = set(candidates)
+    reservation_owners = _vm_reservation_owners(next(iter(fleet_homes), ""))
+    reported_orphans: set[int] = set()
+
+    def orphan_problem(pid: int, label: str) -> dict[str, str]:
+        reported_orphans.add(pid)
+        holds = "; it holds a VM reservation" if pid in reservation_owners else ""
+        lane = f" serving {label}" if label != str(pid) else ""
+        return {"code": "orphaned_supervisor", "label": label,
+                "detail": f"orphaned supervisor pid {pid} (started {process_starts.get(pid, '?')})"
+                          f"{lane}; its launcher exited{holds}. It steps aside between jobs; "
+                          f"if it does not, stop it after its job: kill -TERM {pid}"}
 
     verified_running = 0
     persistent_verified = 0
@@ -2499,7 +2548,18 @@ def fleet_readiness(
                         matching_state = candidate
                         break
                 if matching_state is None:
-                    problems.append({"code": "heartbeat_missing", "label": label})
+                    # Name the process that is writing this lane's heartbeat
+                    # instead, when it is not this lane's supervisor.
+                    writers = _state_writers(state_dir)
+                    orphan_writer = next((w for w in writers if w in orphan_pids), None)
+                    if orphan_writer is not None:
+                        problems.append(orphan_problem(orphan_writer, label))
+                    elif state_dir.is_dir() and any(state_dir.glob("*.handoff")):
+                        problems.append({"code": "supervisor_handoff_pending", "label": label,
+                                         "detail": "a replacement supervisor waits for the "
+                                                   "previous one to finish its job"})
+                    else:
+                        problems.append({"code": "heartbeat_missing", "label": label})
                     continue
                 try:
                     heartbeat_at = dt.datetime.fromisoformat(
@@ -2632,6 +2692,9 @@ def fleet_readiness(
                             "reason": ("admission failing" if blocked_cause == "admission failing" else ""),
                         })
                 verified_running += 1
+
+    for orphan_pid in sorted(orphan_pids - reported_orphans):
+        problems.append(orphan_problem(orphan_pid, str(orphan_pid)))
 
     if admission_open and len(persistent_loaded_outputs) == len(persistent_labels):
         for label, output in persistent_loaded_outputs.items():
