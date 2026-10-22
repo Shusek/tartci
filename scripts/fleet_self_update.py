@@ -927,11 +927,42 @@ def canonical_repository(cfg: Config, sys_: System) -> str:
     return configured_repository(cfg, sys_)
 
 
+# Workflow events that run the default branch's definition to judge a pull
+# request. Their check runs land on whatever commit main's tip was at the
+# time, but they say nothing about that commit: the review-verdict job, run
+# for every pull-request comment, sat in_progress on main's tip and held a
+# host's self-update as "not green" (m5s, 2026-10-22).
+PULL_REQUEST_EVENTS = frozenset({
+    "issue_comment", "pull_request_review", "pull_request_review_comment",
+    "pull_request_target", "workflow_run",
+})
+
+
+def pull_request_check_suites(cfg: Config, sys_: System, repository: str,
+                              binding: dict[str, str], sha: str) -> set[int]:
+    """The check suites on ``sha`` whose workflow ran for a pull-request event.
+    An unreadable answer names none, so every check run still counts."""
+    result = sys_.run([gh_cli(), "api",
+                       f"repos/{repository}/actions/runs?head_sha={sha}&per_page=100"],
+                      cwd=str(cfg.checkout), env=binding, timeout=60)
+    try:
+        runs = json.loads(result.out).get("workflow_runs")
+    except (json.JSONDecodeError, AttributeError):
+        return set()
+    if not isinstance(runs, list):
+        return set()
+    return {run["check_suite_id"] for run in runs
+            if isinstance(run, dict) and run.get("event") in PULL_REQUEST_EVENTS
+            and isinstance(run.get("check_suite_id"), int)}
+
+
 def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
     """Every check run on main's commit completed successfully (and there is one).
 
     Age alone is not evidence: a commit that broke main's CI soaks like any
-    other. An unreadable answer is not green.
+    other. An unreadable answer is not green. Check runs a workflow left
+    there while judging a pull request (PULL_REQUEST_EVENTS) are not the
+    commit's checks and are skipped.
     """
     repository = canonical_repository(cfg, sys_)
     binding = {"GH_REPO": repository, "SHIPYARD_GHAPP_REPO": repository,
@@ -944,6 +975,10 @@ def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
         runs = None
     if not isinstance(runs, list):
         return False, f"check runs unreadable (exit {result.rc}): {result.text[:160]}"
+    foreign = pull_request_check_suites(cfg, sys_, repository, binding, sha) if runs else set()
+    runs = [run for run in runs
+            if not (isinstance(run, dict)
+                    and (run.get("check_suite") or {}).get("id") in foreign)]
     if not runs:
         return False, "no check runs recorded"
     bad = [f"{run.get('name')}={run.get('conclusion') or run.get('status')}" for run in runs
