@@ -2038,18 +2038,22 @@ STORAGE_HEALTH_MAX_AGE_SECONDS = 10 * 60
 
 
 def previous_store_timeout(cfg: Config, current: Path | None = None) -> str | None:
-    """The previous apply's refusal, when it was a store write that timed
-    out; None otherwise."""
+    """When the most recent apply that actually ran a store write saw it
+    time out: that receipt's name; None otherwise.
+
+    Receipts that ran no write (a deferral, a pause, a rate limit, or the
+    stale-record refusal this guards) are skipped, so the guard stays on
+    until a write is seen to finish.
+    """
     for path, value in reversed(_attempts(cfg.state_dir)):
-        if path == current or value.get("mode") != "apply":
+        if path == current or value.get("mode") != "apply" or "store_write" not in value:
             continue
-        error = str(value.get("error") or "")
-        return error if "did not finish within" in error else None
+        return path.name if value["store_write"] == "timed_out" else None
     return None
 
 
 def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True,
-                      current: Path | None = None) -> str | None:
+                      receipt: Receipt | None = None) -> str | None:
     """Why the Tart store is not fit to change the launcher now, or None.
 
     m5studio, 2026-10-18: the store volume was slow, the NEW launcher's
@@ -2087,15 +2091,19 @@ def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True,
         return f"storage health for {store} is healthy but its record has no check time"
     age = sys_.now() - checked
     if age > STORAGE_HEALTH_MAX_AGE_SECONDS:
-        timed_out = previous_store_timeout(cfg, current)
+        timed_out = previous_store_timeout(cfg, receipt.path if receipt else None)
         if timed_out:
             return (f"storage health for {store} is stale: its healthy record is {age / 60:.0f} "
                     f"min old (checked {checked_at}; at most "
-                    f"{STORAGE_HEALTH_MAX_AGE_SECONDS // 60} min), and the previous attempt's "
-                    "store write timed out")
+                    f"{STORAGE_HEALTH_MAX_AGE_SECONDS // 60} min), and the last store write "
+                    f"timed out ({timed_out})")
     if not write:
         return None
     result = sys_.store_write(store)
+    if receipt is not None:
+        # What the write did, for the next attempt's previous_store_timeout.
+        receipt.value["store_write"] = ("ms" if "ms" in result else
+                                        "timed_out" if result.get("timed_out") else "error")
     if "ms" in result:
         if result["ms"] < STORE_SLOW_MS:
             return None
@@ -3404,7 +3412,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 and (layout != "v2" or change.changed)):
             # A new launcher must pass its volume probe after the install, and
             # a failed probe leaves the host OFF; check the volume first.
-            slow = store_volume_slow(cfg, sys_, write=apply, current=receipt.path)
+            slow = store_volume_slow(cfg, sys_, write=apply, receipt=receipt if apply else None)
             if slow:
                 refusal = (f"Tart store volume slow before a launcher change: {slow}; "
                            "refused before drain, the host keeps serving; retried on the "
@@ -3705,7 +3713,7 @@ class Run:
             # The drain can take an hour; check the store again right before
             # anything stops. A Refused here undoes the drain with nothing
             # installed.
-            slow = store_volume_slow(cfg, sys_, current=self.receipt.path)
+            slow = store_volume_slow(cfg, sys_, receipt=self.receipt)
             if slow:
                 raise Refused(f"Tart store volume slow after the drain, before pool off: {slow}")
             self.receipt.step("store-volume", "still fast enough after the drain")

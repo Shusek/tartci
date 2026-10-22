@@ -2804,7 +2804,33 @@ class LauncherProbeStopTests(Base):
         self.assertEqual([], self.sys.mutations())
         error = self.latest_receipt()["error"]
         self.assertIn("is stale: its healthy record is 180 min old", error)
-        self.assertIn("previous attempt's store write timed out", error)
+        self.assertIn("the last store write timed out", error)
+
+    def test_a_wedged_store_is_written_once_however_many_attempts_follow(self) -> None:
+        # Re-review: the stale refusal ran no write and reset the guard, so a
+        # hanging write was retried every other attempt (writes 1,1,2,2,3),
+        # each stranding a child in an uninterruptible wait.
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        for attempt in range(3):
+            self.record_aged(180)
+            self.assertEqual(su.EXIT_REFUSED, self.apply(), attempt)
+            self.sys.clock += 1800
+        self.assertEqual(1, len(self.sys.store_writes))
+
+    def test_a_deferral_between_attempts_does_not_reset_the_guard(self) -> None:
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.sys.clock += 1800
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(su.EXIT_DEFERRED, self.apply())
+        self.assertTrue(self.latest_receipt().get("deferred"))
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.sys.clock += 1800
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(1, len(self.sys.store_writes))
+        self.assertIn("the last store write timed out", self.latest_receipt()["error"])
 
     def test_the_stale_bound_is_ten_minutes(self) -> None:
         self.a_store_write_timed_out_last_attempt()
@@ -2822,6 +2848,7 @@ class LauncherProbeStopTests(Base):
         self.assertEqual([], self.installs(), "nothing installed")
         self.assertEqual("on", self.sys.pool_state)
         self.assertIn("slow after the drain", self.latest_receipt()["error"])
+        self.assertEqual("refused", self.latest_receipt()["status"])
 
     def test_a_store_write_that_hangs_also_refuses_before_drain(self) -> None:
         self.sys.store_result = {"timed_out": True, "timeout": 10.0}
