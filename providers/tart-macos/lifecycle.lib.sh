@@ -108,8 +108,8 @@ tartci_lifecycle_emit(){
   while IFS= read -r line; do
     [ -n "$line" ] && pairs+=("$line")
   done < <(tartci_lifecycle_pairs "${1%.*}" "${2%.*}" "${3%.*}")
-  event vm_lifecycle "served=$served warm=$LC_WARM rc=$4 ${pairs[*]}" \
-    "served=$served" "warm=$LC_WARM" "rc=$4" "${pairs[@]}"
+  event vm_lifecycle "served=$served warm=$LC_WARM rc=$4 ${pairs[*]+"${pairs[*]}"}" \
+    "served=$served" "warm=$LC_WARM" "rc=$4" ${pairs[@]+"${pairs[@]}"}
 }
 
 # The same phases as timing.tsv rows (phase<TAB>seconds), for runtime_measure.
