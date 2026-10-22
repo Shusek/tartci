@@ -161,6 +161,25 @@ class TamperRefusalTests(unittest.TestCase):
         # Control: the writer-format file beside them is accepted.
         self.assertEqual(self.refusal().returncode, 0)
 
+    def test_a_seed_with_an_upper_case_extension_is_refused(self) -> None:
+        # The cache volume is case-insensitive APFS: Pulp's include() of
+        # <name>-<key>.cmake opens SDL3-<key>.CMAKE as well.
+        for name in ("SDL3-cccccccccccccccccccccccc.CMAKE", "SDL3-dddddddddddddddddddddddd.Cmake"):
+            with self.subTest(name=name):
+                planted = self.root / "configure-checks" / name
+                planted.write_text(HEADER + "execute_process(COMMAND touch /tmp/pwned)\n")
+                result = self.refusal()
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"{planted} holds a line that is not a configure-check seed",
+                              result.stdout)
+                quarantined = self.refusal("quarantine")
+                self.assertEqual(quarantined.returncode, 0, quarantined.stdout + quarantined.stderr)
+                self.assertFalse(planted.exists())
+                self.assertTrue(self.seed.exists(), "a clean seed must stay in place")
+        # Control: a writer-format seed under an upper-case name still boots.
+        (self.root / "configure-checks" / "SDL3-eeeeeeeeeeeeeeeeeeeeeeee.CMAKE").write_text(GOOD_SEED)
+        self.assertEqual(self.refusal().returncode, 0)
+
     def test_a_symlinked_seed_is_refused(self) -> None:
         # Read in the guest, a link resolves to whatever that guest (or the
         # other shared mount) holds.
@@ -448,7 +467,7 @@ class GuestCommandTests(unittest.TestCase):
                 self.assertIn('export CCACHE_CONFIGPATH="$HOME/.config/ccache/tartci.conf"', command)
                 self.assertIn("printf 'CCACHE_CONFIGPATH=%s\\n' \"$HOME/.config/ccache/tartci.conf\""
                               " >> .env.tartci", command)
-                self.assertRegex(command, r"awk -F= .*\|CCACHE_CONFIGPATH\)\$/. \.env > \.env\.tartci")
+                self.assertRegex(command, r"awk -F= .*\|CCACHE_COMPILERCHECK\|CCACHE_CONFIGPATH\|.*\)\$/. \.env > \.env\.tartci")
 
     def test_a_shared_boot_links_the_mounts(self) -> None:
         command = self.guest_command("1")
@@ -481,6 +500,72 @@ class GuestCommandTests(unittest.TestCase):
         guarded = subprocess.run(
             [ccache, "-p"], text=True, capture_output=True,
             env={**env, "CCACHE_CONFIGPATH": f"{home}/.config/ccache/tartci.conf"})
+        self.assertNotIn("/usr/bin/false", guarded.stdout)
+
+
+LINUX_RUNNER = ROOT / "providers" / "tart-linux" / "runner.sh"
+
+
+class LinuxGuestCommandTests(unittest.TestCase):
+    """The Linux guest links ~/.ccache to the RW host share, so it too reads a
+    guest-local CCACHE_CONFIGPATH instead of $CCACHE_DIR/ccache.conf."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(os.path.realpath(tmp.name))
+        self.home = self.base / "home"
+        (self.home / "actions-runner").mkdir(parents=True)
+
+    def guest_command(self) -> str:
+        source = LINUX_RUNNER.read_text(encoding="utf-8")
+        match = re.search(r'"\$VM_USER@\$ip" \\\n    ("printf \'%s\' \'\$jit\'.*?run\.sh --jitconfig .*?")\s*\\\n',
+                          source, re.DOTALL)
+        self.assertIsNotNone(match, "Linux guest command not found")
+        # Let bash expand the double-quoted host-side literal, as runner.sh does.
+        result = subprocess.run(
+            ["/bin/bash", "-c", "jit=JIT; build_parallel_effective=4; printf '%s' " + match.group(1)],
+            text=True, capture_output=True, check=True, env={"PATH": "/usr/bin:/bin"})
+        return result.stdout
+
+    def run_prefix(self, env_file: str) -> subprocess.CompletedProcess[str]:
+        command = self.guest_command()
+        cut = command.index('export CCACHE_DIR=')
+        (self.home / "actions-runner" / ".env").write_text(env_file)
+        return subprocess.run(
+            ["/bin/bash", "-c", command[:cut] + 'printf "%s" "$CCACHE_CONFIGPATH"'],
+            text=True, capture_output=True, check=False,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)})
+
+    def test_the_guest_reads_a_guest_local_ccache_config(self) -> None:
+        conf = f"{self.home}/.config/ccache/tartci.conf"
+        # A preserved .env cannot name a config of its own; other settings stay.
+        result = self.run_prefix("CCACHE_CONFIGPATH=/mnt/host/ccache/ccache.conf\nKEEP=1\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], conf)
+        self.assertTrue(Path(conf).is_file())
+        env_lines = (self.home / "actions-runner" / ".env").read_text().splitlines()
+        self.assertIn(f"CCACHE_CONFIGPATH={conf}", env_lines)
+        self.assertNotIn("CCACHE_CONFIGPATH=/mnt/host/ccache/ccache.conf", env_lines)
+        self.assertIn("KEEP=1", env_lines)
+        self.assertIn("CCACHE_COMPILERCHECK=content", env_lines)
+        self.assertIn('export CCACHE_DIR=\\"\\$HOME/.ccache\\"',
+                      LINUX_RUNNER.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(ccache_guard.resolve_ccache(), "needs a ccache binary")
+    def test_ccache_with_the_guest_configpath_ignores_a_planted_conf(self) -> None:
+        ccache = ccache_guard.resolve_ccache()
+        self.assertEqual(self.run_prefix("").returncode, 0)
+        cache = self.base / "shared-ccache"
+        cache.mkdir()
+        (cache / "ccache.conf").write_text("prefix_command = /usr/bin/false\n")
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "CCACHE_DIR": str(cache)}
+        # Control: without CCACHE_CONFIGPATH ccache reads the planted file.
+        planted = subprocess.run([ccache, "-p"], env=env, text=True, capture_output=True)
+        self.assertIn("prefix_command = /usr/bin/false", planted.stdout)
+        guarded = subprocess.run(
+            [ccache, "-p"], text=True, capture_output=True,
+            env={**env, "CCACHE_CONFIGPATH": f"{self.home}/.config/ccache/tartci.conf"})
         self.assertNotIn("/usr/bin/false", guarded.stdout)
 
 

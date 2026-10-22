@@ -1717,7 +1717,7 @@ run_runner_until_done(){
   local layer_rc=0
   # The layer lives inside the shared ccache mount; a VM booted without that
   # mount (a release tier) has none to attach.
-  if [ "$CURRENT_SHARED_CACHE" = 1 ]; then
+  if [ "${CURRENT_SHARED_CACHE:-1}" = 1 ]; then
     tartci_ccache_layer_attach "$1" || return 1
   else
     tartci_ccache_layer_guest_fragments_clear
@@ -1748,7 +1748,7 @@ run_runner_until_done_unlayered(){
   # dangle; the guest replaces them with its own empty directories.
   local guest_cache_prep=""
   # shellcheck disable=SC2016 # $HOME expands in the guest
-  [ "$CURRENT_SHARED_CACHE" = 1 ] \
+  [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] \
     || guest_cache_prep='rm -f ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && mkdir -p ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && printf "TARTCI_DIAG shared-cache=off\n" && '
   # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
   # cache directory any guest can write (see lane-cache-root.lib.sh).
@@ -1764,7 +1764,7 @@ run_runner_until_done_unlayered(){
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE|CCACHE_CONFIGPATH)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
@@ -2112,7 +2112,7 @@ retarget_after_pre_mint_denial(){
       reason="runner_group_differs"
     elif jit_admission_denied "$group_id" "$labels"; then
       reason="jit_admission_denied"
-    elif [ "$CURRENT_SHARED_CACHE" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
+    elif [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
       # Booted with the shared cache mounted; a release tier boots cold.
       reason="release_tier_no_shared_cache"
     else

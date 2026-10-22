@@ -102,7 +102,7 @@ tartci_shared_cache_tamper_finding(){
     printf '%q is a ccache config with a setting beyond size and hashing\n' "$file"
     return 0
   fi
-  for file in "$root/configure-checks"/*.cmake; do
+  for file in "$root/configure-checks"/*.[cC][mM][aA][kK][eE]; do
     if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
       printf '%q is not a regular file\n' "$file"
       return 0
@@ -143,7 +143,7 @@ tartci_shared_cache_tamper_refusal(){
     refuse) ;;
     quarantine)
       stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-      for file in "$root/ccache/ccache.conf" "$root/configure-checks"/*.cmake; do
+      for file in "$root/ccache/ccache.conf" "$root/configure-checks"/*.[cC][mM][aA][kK][eE]; do
         [ -e "$file" ] || [ -L "$file" ] || continue
         if [ ! -L "$file" ] && [ -f "$file" ]; then
           case "$file" in

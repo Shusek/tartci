@@ -264,12 +264,13 @@ source's object into every gate build on one host; see `docs/gotchas.md`.
 `tartci ccache scan|quarantine|reset` is the operator surface.
 Every guest writes the shared `ccache` and `configure-checks` directories, so
 the guest and tartci's host ccache runs read no `ccache.conf` from them
-(`CCACHE_CONFIGPATH` points at a guest-local file in the guest and at
-`/dev/null` on the host). Before each boot that mounts them, the runner also
+(`CCACHE_CONFIGPATH` points at a guest-local file in the macOS and Linux
+guests and at `/dev/null` on the host). Before each boot that mounts them, the runner also
 refuses (event `cache_setup_failed`, the path in the note) when
 `<cache>/ccache/ccache.conf` holds anything beyond size and hashing settings
 (`max_size`, `compression`, `compiler_check = content`, ...) or a
-`configure-checks/*.cmake` file holds any line Pulp's
+`configure-checks/*.cmake` file (any case of the extension; the cache volume
+is case-insensitive) holds any line Pulp's
 `PulpConfigureCheckCache.cmake` writer would not produce. Inspect and remove
 the file, or set `TARTCI_CACHE_TAMPER=quarantine` to move it into
 `<dir>-quarantine/<UTC stamp>-tamper/` and boot. A boot for a release class
@@ -277,6 +278,13 @@ the file, or set `TARTCI_CACHE_TAMPER=quarantine` to move it into
 directory and builds with an empty guest-local cache; a parked warm VM or a
 pre-mint retarget never carries those mounts into such a class.
 `TARTCI_RELEASE_TIER_NO_SHARED_CACHE=0` restores the mounts.
+Limits: the check runs once before boot, and lanes sharing one `CACHE_ROOT`
+run concurrently, so a guest on one lane can still plant a seed after another
+lane's check; only a strict reader in Pulp or a per-trust-tier cache closes
+that. A host build that sets `CCACHE_DIR` to the shared `ccache` directory
+(Pulp's `tools/ci/pulp-worktree.sh`) reads a planted `ccache.conf` until it is
+removed unless it sets its own `CCACHE_CONFIGPATH`. Release labels match
+exactly (case and whitespace) and must be ones the lane actually advertises.
 
 Pulp's merge-group/PR-head gate can use the staged event-class assignment V2
 mode. It removes the legacy `pulp-gate-fast` selector from JIT advertisements,
