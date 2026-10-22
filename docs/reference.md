@@ -262,6 +262,21 @@ quarantine root and the next run resumes there, so a cache too large for one
 budget is still covered across boots). Such a manifest matches every lookup and once linked another
 source's object into every gate build on one host; see `docs/gotchas.md`.
 `tartci ccache scan|quarantine|reset` is the operator surface.
+Every guest writes the shared `ccache` and `configure-checks` directories, so
+the guest and tartci's host ccache runs read no `ccache.conf` from them
+(`CCACHE_CONFIGPATH` points at a guest-local file in the guest and at
+`/dev/null` on the host). Before each boot that mounts them, the runner also
+refuses (event `cache_setup_failed`, the path in the note) when
+`<cache>/ccache/ccache.conf` holds anything beyond size and hashing settings
+(`max_size`, `compression`, `compiler_check = content`, ...) or a
+`configure-checks/*.cmake` file holds any line Pulp's
+`PulpConfigureCheckCache.cmake` writer would not produce. Inspect and remove
+the file, or set `TARTCI_CACHE_TAMPER=quarantine` to move it into
+`<dir>-quarantine/<UTC stamp>-tamper/` and boot. A boot for a release class
+(`TARTCI_RELEASE_TIER_LABELS`, default `pulp-release-tagged`) mounts neither
+directory and builds with an empty guest-local cache; a parked warm VM or a
+pre-mint retarget never carries those mounts into such a class.
+`TARTCI_RELEASE_TIER_NO_SHARED_CACHE=0` restores the mounts.
 
 Pulp's merge-group/PR-head gate can use the staged event-class assignment V2
 mode. It removes the legacy `pulp-gate-fast` selector from JIT advertisements,

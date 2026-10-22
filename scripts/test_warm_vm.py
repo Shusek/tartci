@@ -252,6 +252,7 @@ tartci_resize_vm_lease(){{
   return 0
 }}
 source "$TARTCI_ROOT/providers/tart-macos/macos-vm-cap.lib.sh"
+source "$TARTCI_ROOT/providers/tart-macos/lane-cache-root.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/warm-vm.lib.sh"
 '''
 
@@ -347,6 +348,29 @@ class WarmLibTests(unittest.TestCase):
         self.assertIn("resize cores=12 mem=16384 priority=110 labels=self-hosted,pulp-build-merge-group",
                       self._log())
         self.assertIn("event warm_handoff parked_seconds=", self._log())
+
+    def test_a_release_tier_discards_the_parked_vm_and_boots_cold(self) -> None:
+        # The VM was parked with the shared cache mounted, before any class
+        # was known; a release class must not inherit those mounts.
+        result = self._bash('''
+            tartci_warm_try_park || exit 3
+            [ "$WARM_SHARED_CACHE" = 1 ] || exit 4
+            rc=0; tartci_warm_handoff 7 "self-hosted,pulp-build-vm,pulp-release-tagged" 120 api || rc=$?
+            [ "$rc" = 1 ] && [ -z "$WARM_VM" ] && [ -z "$CURRENT_VM" ] || exit 5
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr + self._log())
+        self.assertIn("event warm_expired reason=release_tier_no_shared_cache", self._log())
+        self.assertNotIn("resize", self._log())
+        # Control: the knob off hands the same VM to the same class.
+        self.log.write_text("")
+        result = self._bash('''
+            tartci_warm_try_park || exit 3
+            tartci_warm_handoff 7 "self-hosted,pulp-build-vm,pulp-release-tagged" 120 api || exit 4
+            [ "$CURRENT_SHARED_CACHE" = 1 ] || exit 5
+            kill "$CURRENT_RPID"
+        ''', TARTCI_RELEASE_TIER_NO_SHARED_CACHE="0")
+        self.assertEqual(result.returncode, 0, result.stderr + self._log())
+        self.assertIn("event warm_handoff ", self._log())
 
     def test_a_denied_upgrade_keeps_the_vm_parked(self) -> None:
         (self.home / "resize-denied").touch()

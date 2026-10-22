@@ -127,6 +127,9 @@ done
 }
 
 export CCACHE_DIR="$HOME/ccache"
+# The guest reads a local ccache config, never one planted in the shared cache.
+mkdir -p "$HOME/.config/ccache" && touch "$HOME/.config/ccache/tartci.conf"
+export CCACHE_CONFIGPATH="$HOME/.config/ccache/tartci.conf"
 export CCACHE_TEMPDIR="$HOME/.ccache-tmp"
 mkdir -p "$CCACHE_TEMPDIR"
 export CCACHE_BASEDIR="$HOME/src"
@@ -161,5 +164,5 @@ set -e
 
 note "in-guest exit=$RC"
 echo "=== host ccache after job (durable across clones) ==="
-CCACHE_DIR="$CACHE_ROOT/ccache" ccache --show-stats 2>/dev/null | grep -iE 'cache size|hits|misses|hit rate' || true
+CCACHE_DIR="$CACHE_ROOT/ccache" CCACHE_CONFIGPATH=/dev/null ccache --show-stats 2>/dev/null | grep -iE 'cache size|hits|misses|hit rate' || true
 exit "$RC"
