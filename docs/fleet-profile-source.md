@@ -72,7 +72,10 @@ Each self-update run then:
 3. selects it by setting the three variables above for itself and for the
    installer it runs;
 4. reinstalls the current generation when the installed receipt was built from
-   a different source commit.
+   a different source commit, unless that commit's profiles and published supply
+   are the bytes already installed (the receipt's `tree_sha256`). A commit that
+   changes only other files in the private repository, such as a backup, then
+   drains nothing; the host stays pinned to the commit it was installed from.
 
 The install receipt records the source commit and the SHA-256 digests of the
 published supply and the complete source tree; the attempt receipt also records

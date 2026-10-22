@@ -4101,6 +4101,33 @@ class FleetSourceCanaryHostTests(FleetSourceFixture):
         self.assertEqual(self.fixture.PRIVATE, restored["repository"])
         self.assertEqual(str(previous_root), restored["root"])
 
+    def installed_from_older(self, tree_sha256: str) -> None:
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER, "repository": self.fixture.PRIVATE,
+            "root": str(self.cfg.fleet_source_store / self.OLDER), "tree_sha256": tree_sha256,
+        }
+        receipt_path.write_text(json.dumps(receipt))
+
+    def test_a_new_commit_with_the_installed_bytes_is_not_reinstalled(self) -> None:
+        # main moved (a backup, say) but its profiles and supply are the bytes
+        # the host already runs: no drain.
+        selected = su.sync_fleet_source(self.cfg, self.sys)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        self.installed_from_older(selected["tree_sha256"])
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_new_commit_with_other_bytes_is_reinstalled(self) -> None:
+        self.installed_from_older("0" * 64)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+
     def test_a_source_move_that_fails_verification_after_pool_on_is_rolled_back(self) -> None:
         # Same generation, new source: pool on succeeds, then the host is not
         # ready while the moved profiles are live.
