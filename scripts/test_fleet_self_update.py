@@ -50,6 +50,8 @@ class FakeSystem(su.System):
         self.clock = NOW
         self.calls: list[tuple[list[str], str | None]] = []
         self.pool_state = "on"
+        self.store_result = {"ms": 4.0}  # the pre-drain write into the Tart store
+        self.store_writes: list[str] = []
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -135,6 +137,10 @@ class FakeSystem(su.System):
     def run_critical(self, argv, *, cwd=None, env=None, timeout=900, record=None):
         self.critical.append(list(argv))
         return self.run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def store_write(self, directory):
+        self.store_writes.append(directory)
+        return dict(self.store_result)
 
     def process_start(self, pid):
         if pid in self.procs:
@@ -2609,6 +2615,29 @@ class LauncherProbeStopTests(Base):
         self.assertNotIn("Files and Folders", body)
         self.assertIn("tartci pool on", body)
 
+    def test_a_slow_store_refuses_a_launcher_change_before_drain(self) -> None:
+        # m5studio, 2026-10-18: the probe failed after the install and the
+        # host stayed OFF for days. Checked first, nothing changes.
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.installs())
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertTrue(self.sys.store_writes, "the store was checked")
+        receipt = self.latest_receipt()
+        self.assertIn("Tart store volume slow before a launcher change", receipt["error"])
+        self.assertIn("4200 ms", receipt["error"])
+
+    def test_a_store_write_that_hangs_also_refuses_before_drain(self) -> None:
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("did not finish within 10s", self.latest_receipt()["error"])
+
+    def latest_receipt(self) -> dict:
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(receipts[-1].read_text())
+
     def test_any_other_pool_on_failure_still_rolls_back(self) -> None:
         # pool on fails every attempt after the install, then serves the rollback.
         self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
@@ -2828,6 +2857,24 @@ class SealedRollbackTests(Base):
                     if "--apply" in a and "install" in a]
         self.assertEqual(installs[-1].get("TARTCI_ROLLBACK_PYTHON"), "/old/lane-python3.15")
         self.assertEqual(pin.read_text().strip(), "/old/lane-python3.15")
+
+    def test_a_running_update_shows_in_status_with_its_step(self) -> None:
+        # m1, 2026-10-22: a 20 min drain wait was invisible in --status.
+        receipt = self.cfg.state_dir / "attempts" / "20261022T074900Z-afd9b8171459.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({
+            "mode": "apply", "status": "running", "target": "afd9b817" * 5,
+            "started_at": "2026-10-22T07:49:00Z", "pid": 4242, "pid_start": "Thu 07:49",
+            "steps": [{"at": "2026-10-22T07:50:00Z", "step": "drain", "ok": True,
+                       "detail": "waiting for 2 VMs"}]}))
+        self.sys.procs[4242] = "Thu 07:49"
+        line = su.running_line(self.cfg.state_dir, self.sys)
+        self.assertIn("IN PROGRESS to afd9b817afd9", line)
+        self.assertIn("pid 4242", line)
+        self.assertIn("last step drain at 2026-10-22T07:50:00Z: waiting for 2 VMs", line)
+        self.assertIn(line, su.status_lines(self.cfg.state_dir, self.sys))
+        del self.sys.procs[4242]
+        self.assertIn("INTERRUPTED", su.running_line(self.cfg.state_dir, self.sys))
 
     def test_signing_probe_failure_refuses_before_drain(self) -> None:
         self.sys.signing_rc = 1

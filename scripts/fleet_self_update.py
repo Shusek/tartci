@@ -265,6 +265,13 @@ class System:
             return Result(127, "", f"{type(exc).__name__}: {exc}")
         return Result(proc.returncode, proc.stdout, proc.stderr)
 
+    def store_write(self, directory: str) -> dict:
+        """Time one small write into the Tart store from this process
+        (macos_launcher_probe's control write): {"ms"}, {"timed_out"} or
+        {"error"}."""
+        import macos_launcher_probe  # noqa: PLC0415 - sibling module; owns the probe
+        return macos_launcher_probe.parent_write_ms(directory)
+
     def process_start(self, pid: int) -> str | None:
         """The process's start time (identity across pid reuse), or None if gone."""
         try:
@@ -1951,6 +1958,35 @@ def probe_slow_volume(probe: str) -> bool:
     return bool(LAUNCH_PROBE_SLOW_VOLUME.search(probe or ""))
 
 
+# The probe calls a control write this slow a slow volume (macos_launcher_probe).
+STORE_SLOW_MS = 1000.0
+
+
+def store_volume_slow(cfg: Config, sys_: System) -> str | None:
+    """Why the Tart store is too slow to change the launcher now, or None.
+
+    m5studio, 2026-10-18: the store volume was slow, the NEW launcher's
+    volume probe timed out after the install, and since a rollback replaces
+    the launcher again the host was left OFF until a person turned it on.
+    The same control write, made before the drain, refuses instead while
+    nothing has changed and the host is still serving.
+    """
+    try:
+        store = (_toml(cfg.installed_profile).get("host") or {}).get("tart_home")
+    except (OSError, ValueError):
+        store = None
+    if not isinstance(store, str) or not store:
+        return None
+    result = sys_.store_write(store)
+    if "ms" in result:
+        if result["ms"] < STORE_SLOW_MS:
+            return None
+        return f"a small write to {store} took {result['ms']:.0f} ms"
+    if result.get("timed_out"):
+        return f"a small write to {store} did not finish within {result.get('timeout', 0):g}s"
+    return f"a small write to {store} failed: {result.get('error', 'unknown')}"
+
+
 def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float) -> None:
     """One issue when a new launcher's volume probe fails and the host is left
     OFF without a rollback. Best effort: never raises."""
@@ -3246,6 +3282,21 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 raise
             refusals.append(str(exc))
             receipt.step("capacity-floor", str(exc), ok=False)
+        if (helper is not None and (not refresh or layout == "v2")
+                and (layout != "v2" or change.changed)):
+            # A new launcher must pass its volume probe after the install, and
+            # a failed probe leaves the host OFF; check the volume first.
+            slow = store_volume_slow(cfg, sys_)
+            if slow:
+                refusal = (f"Tart store volume slow before a launcher change: {slow}; "
+                           "refused before drain, the host keeps serving; retried on the "
+                           "next attempt")
+                if apply:
+                    raise HostFault(refusal)
+                refusals.append(refusal)
+                receipt.step("store-volume", refusal, ok=False)
+            else:
+                receipt.step("store-volume", "fast enough for the new launcher's volume probe")
         if refusals:
             raise Refused(" | ".join(refusals))
         # A v2 refresh (a [fleet_source] move) builds too when the app's
@@ -4170,11 +4221,40 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
 
 
-def status_lines(state_dir: Path) -> list[str]:
-    """For pool status / doctor / watchdog: skew and the last attempt."""
+def running_line(state_dir: Path, sys_: System | None = None) -> str | None:
+    """The self-update running on this host now, with its latest step.
+
+    m1, 2026-10-22: an apply sat 20 min waiting for its VMs to drain, and
+    neither --status nor pool status said one was running; it was found
+    only by searching the process list.
+    """
+    sys_ = sys_ or System()
+    for path, value in reversed(_attempts(state_dir)):
+        if value.get("mode") != "apply" or value.get("status") != "running":
+            continue
+        steps = value.get("steps") or []
+        last = steps[-1] if steps and isinstance(steps[-1], dict) else {}
+        where = (f"; last step {last.get('step')} at {last.get('at')}"
+                 + (f": {str(last.get('detail'))[:160]}" if last.get("detail") else "")
+                 if last else "")
+        if _alive(sys_, value.get("pid"), value.get("pid_start")):
+            return (f"self-update: IN PROGRESS to {str(value.get('target'))[:12]} since "
+                    f"{value.get('started_at')} (pid {value.get('pid')}){where}")
+        return (f"self-update: INTERRUPTED to {str(value.get('target'))[:12]} (started "
+                f"{value.get('started_at')}, pid {value.get('pid')} gone){where}; the next "
+                f"attempt recovers it (receipt {path.name})")
+    return None
+
+
+def status_lines(state_dir: Path, sys_: System | None = None) -> list[str]:
+    """For pool status / doctor / watchdog: skew, a running update, and the
+    last attempt."""
     skew = _read_json(state_dir / "skew.json")
     aged = skew_stale_note(skew)
     lines = [render_skew(skew) + (f" {aged}" if aged else "")]
+    running = running_line(state_dir, sys_)
+    if running:
+        lines.append(running)
     paused = paused_line(state_dir)
     if paused:
         lines.append(paused)
