@@ -246,6 +246,25 @@ class Result:
         return (self.err or self.out).strip()
 
 
+# The pre-drain store check (store_volume_slow): one small create/write/remove
+# in tart_home, run by a child (System.store_write) and abandoned after this.
+STORE_WRITE_TIMEOUT_SECONDS = 10.0
+STORE_WRITE_CHILD = """
+import json, os, sys, tempfile, time
+started = time.monotonic()
+try:
+    fd, name = tempfile.mkstemp(prefix=".tartci-probe-control.", dir=sys.argv[1])
+    try:
+        os.write(fd, b"tartci probe control\\n")
+    finally:
+        os.close(fd)
+        os.unlink(name)
+    print(json.dumps({"ms": (time.monotonic() - started) * 1000}))
+except OSError as error:
+    print(json.dumps({"error": f"{type(error).__name__}: {error}"}))
+"""
+
+
 class System:
     """Every side effect. Tests replace it."""
 
@@ -265,12 +284,52 @@ class System:
             return Result(127, "", f"{type(exc).__name__}: {exc}")
         return Result(proc.returncode, proc.stdout, proc.stderr)
 
-    def store_write(self, directory: str) -> dict:
-        """Time one small write into the Tart store from this process
-        (macos_launcher_probe's control write): {"ms"}, {"timed_out"} or
-        {"error"}."""
-        import macos_launcher_probe  # noqa: PLC0415 - sibling module; owns the probe
-        return macos_launcher_probe.parent_write_ms(directory)
+    def store_write(self, directory: str, timeout: float = STORE_WRITE_TIMEOUT_SECONDS) -> dict:
+        """Time one small create/write/remove in the Tart store, made by a
+        child in its own session: {"ms"}, {"timed_out"} or {"error"}.
+
+        Never from this process: a write into a wedged volume blocks in an
+        uninterruptible wait, and a process with such a thread cannot exit, so
+        self-update would never end. On a timeout the child's group is killed
+        and abandoned (storage_health.run_probe_bounded does the same).
+        """
+        import storage_health  # noqa: PLC0415 - sibling module; owns the bounded reaping
+        child = subprocess.Popen([child_python(), "-c", STORE_WRITE_CHILD, directory],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                 start_new_session=True)
+        try:
+            out, _ = child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            storage_health.reap_after_kill(child)
+            if child.stdout is not None:
+                child.stdout.close()
+            return {"timed_out": True, "timeout": timeout}
+        try:
+            value = json.loads(out)
+        except ValueError:
+            return {"error": f"store write child exited {child.returncode} with no result"}
+        return value if isinstance(value, dict) else {"error": "store write child: bad result"}
+
+    def store_health(self, directory: str) -> tuple[str, str]:
+        """(status, reason) the storage-health gate last recorded for the
+        Tart store: "healthy", "degraded", "quarantined" or "unknown". Reads
+        only its state files under the home folder, never the volume."""
+        import storage_health  # noqa: PLC0415 - sibling module; owns the state format
+        target = Path(directory)
+        state_path = storage_health.default_state(target)
+        if not storage_health.state_path_is_safe(state_path, target, resolve_target=False):
+            return "unknown", f"its state path {state_path} is unsafe"
+        if Path(str(state_path) + ".quarantine").exists():
+            return "quarantined", "a quarantine marker is present"
+        try:
+            state = storage_health.load_state(state_path, target)
+        except Exception as exc:  # noqa: BLE001 - any unreadable state is "unknown"
+            return "unknown", f"its state is unreadable ({exc})"
+        if not state:
+            return "unknown", f"no storage-health record at {state_path}"
+        if state.get("state_unreadable"):
+            return "unknown", "its state is unreadable"
+        return str(state.get("status")), str(state.get("reason") or "")
 
     def process_start(self, pid: int) -> str | None:
         """The process's start time (identity across pid reuse), or None if gone."""
@@ -1962,20 +2021,28 @@ def probe_slow_volume(probe: str) -> bool:
 STORE_SLOW_MS = 1000.0
 
 
-def store_volume_slow(cfg: Config, sys_: System) -> str | None:
-    """Why the Tart store is too slow to change the launcher now, or None.
+def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True) -> str | None:
+    """Why the Tart store is not fit to change the launcher now, or None.
 
     m5studio, 2026-10-18: the store volume was slow, the NEW launcher's
     volume probe timed out after the install, and since a rollback replaces
     the launcher again the host was left OFF until a person turned it on.
-    The same control write, made before the drain, refuses instead while
-    nothing has changed and the host is still serving.
+    Before the drain, while nothing has changed and the host is still
+    serving: the storage-health gate's record must say healthy (read from
+    the home folder, so a quarantined or unknown store is never written
+    to), then, unless `write` is False (a plan writes nothing), the same
+    control write the probe makes, from a bounded child.
     """
     try:
         store = (_toml(cfg.installed_profile).get("host") or {}).get("tart_home")
     except (OSError, ValueError):
         store = None
     if not isinstance(store, str) or not store:
+        return None
+    status, reason = sys_.store_health(store)
+    if status != "healthy":
+        return f"storage health for {store} is {status}" + (f" ({reason})" if reason else "")
+    if not write:
         return None
     result = sys_.store_write(store)
     if "ms" in result:
@@ -3286,7 +3353,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 and (layout != "v2" or change.changed)):
             # A new launcher must pass its volume probe after the install, and
             # a failed probe leaves the host OFF; check the volume first.
-            slow = store_volume_slow(cfg, sys_)
+            slow = store_volume_slow(cfg, sys_, write=apply)
             if slow:
                 refusal = (f"Tart store volume slow before a launcher change: {slow}; "
                            "refused before drain, the host keeps serving; retried on the "
@@ -3295,8 +3362,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                     raise HostFault(refusal)
                 refusals.append(refusal)
                 receipt.step("store-volume", refusal, ok=False)
-            else:
+            elif apply:
                 receipt.step("store-volume", "fast enough for the new launcher's volume probe")
+            else:
+                receipt.step("store-volume", "storage health is healthy; an apply also times a "
+                             "small write before drain (a plan writes nothing)")
         if refusals:
             raise Refused(" | ".join(refusals))
         # A v2 refresh (a [fleet_source] move) builds too when the app's

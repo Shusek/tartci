@@ -52,6 +52,7 @@ class FakeSystem(su.System):
         self.pool_state = "on"
         self.store_result = {"ms": 4.0}  # the pre-drain write into the Tart store
         self.store_writes: list[str] = []
+        self.store_health_result = ("healthy", "directory_metadata_ok")
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -138,9 +139,12 @@ class FakeSystem(su.System):
         self.critical.append(list(argv))
         return self.run(argv, cwd=cwd, env=env, timeout=timeout)
 
-    def store_write(self, directory):
+    def store_write(self, directory, timeout=10.0):
         self.store_writes.append(directory)
         return dict(self.store_result)
+
+    def store_health(self, directory):
+        return self.store_health_result
 
     def process_start(self, pid):
         if pid in self.procs:
@@ -2561,6 +2565,34 @@ class RelayRollbackTests(Base):
         self.assertIn("relay", self.last()["error"])
 
 
+class StoreWriteChildTests(unittest.TestCase):
+    """System.store_write runs the write in a child it can abandon: a write
+    stuck in a wedged volume must never hold the self-update process."""
+
+    def test_the_write_is_made_by_a_child_not_this_process(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            child = ("import json, os, sys, time; t = time.monotonic(); "
+                     "open(os.path.join(sys.argv[1], 'pid'), 'w').write(str(os.getpid())); "
+                     "print(json.dumps({'ms': 1.0}))")
+            with mock.patch.object(su, "STORE_WRITE_CHILD", child):
+                self.assertEqual({"ms": 1.0}, su.System().store_write(store))
+            self.assertNotEqual(str(os.getpid()), Path(store, "pid").read_text())
+
+    def test_a_write_that_never_returns_is_abandoned_on_time(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            with mock.patch.object(su, "STORE_WRITE_CHILD", "import time; time.sleep(60)"):
+                started = time.monotonic()
+                result = su.System().store_write(store, timeout=0.5)
+            self.assertEqual({"timed_out": True, "timeout": 0.5}, result)
+            self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_real_write_reports_milliseconds_and_leaves_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            result = su.System().store_write(store)
+            self.assertIn("ms", result)
+            self.assertEqual([], os.listdir(store))
+
+
 class LauncherProbeStopTests(Base):
     """After installing a NEW sealed launcher, a failed volume probe stops the
     update with the host OFF instead of rolling back: a rollback replaces the
@@ -2627,6 +2659,30 @@ class LauncherProbeStopTests(Base):
         receipt = self.latest_receipt()
         self.assertIn("Tart store volume slow before a launcher change", receipt["error"])
         self.assertIn("4200 ms", receipt["error"])
+
+    def test_a_slow_store_on_apply_releases_the_queue_ticket(self) -> None:
+        # HostFault, not a plain refusal: the turn goes to the next host.
+        (self.cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        (self.cfg.state_dir / "waiting.json").write_text(json.dumps({"since": su.time.time() - 60}))
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+
+    def test_a_plan_never_writes_to_the_store(self) -> None:
+        self.plan()
+        self.assertEqual([], self.sys.store_writes)
+        steps = [s for s in self.latest_receipt()["steps"] if s["step"] == "store-volume"]
+        self.assertTrue(steps and "a plan writes nothing" in steps[-1]["detail"], steps)
+
+    def test_an_unhealthy_store_refuses_without_a_write(self) -> None:
+        for status in ("quarantined", "degraded", "unknown"):
+            self.sys.store_writes.clear()
+            self.sys.store_health_result = (status, "probe_timeout")
+            self.assertEqual(su.EXIT_REFUSED, self.apply(), status)
+            self.assertEqual([], self.sys.store_writes, status)
+            self.assertEqual([], self.sys.mutations(), status)
+            self.assertIn(f"storage health for", self.latest_receipt()["error"])
+            self.assertIn(status, self.latest_receipt()["error"])
 
     def test_a_store_write_that_hangs_also_refuses_before_drain(self) -> None:
         self.sys.store_result = {"timed_out": True, "timeout": 10.0}
