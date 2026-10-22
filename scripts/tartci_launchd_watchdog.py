@@ -1467,6 +1467,33 @@ def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | N
     return None
 
 
+def lane_handoff_pass(status_only: bool = False, now: float | None = None) -> str | None:
+    """Raise one GitHub issue per episode in which a lane's replacement
+    supervisor has waited past its limit for the old one to exit
+    (scripts/lane_handoff_alert.py). Prints a WARN every pass while one is
+    stuck. Never raises.
+    """
+    try:
+        import lane_handoff_alert  # noqa: PLC0415 - sibling module
+        now = utcnow() if now is None else now
+        if status_only:
+            stuck = lane_handoff_alert.stuck_handoffs(
+                Path.home() / ".tartci" / "state", now,
+                float(os.environ.get("TARTCI_LANE_HANDOFF_MAX_WAIT",
+                                     lane_handoff_alert.MAX_WAIT_SECONDS)))
+        else:
+            stuck = lane_handoff_alert.alert_pass(now=now)["stuck"]
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN lane-handoff check FAILED "
+                f"({type(exc).__name__}: {exc}); a stuck supervisor handoff would not be "
+                "reported")
+    if stuck:
+        lanes = ", ".join(f"{i['lane']} (waiting {i['waited_s'] // 3600} h on pid "
+                          f"{i['incumbent']})" for i in stuck)
+        return f"{_iso(now)} launchd-watchdog: WARN lane handoff stuck: {lanes}"
+    return None
+
+
 def debug_hold_pass() -> str | None:
     """Expire failed gate VMs kept for debugging (scripts/debug_hold.py): stop
     an inspection left running, delete at TTL or once their PR is merged or
@@ -1948,6 +1975,9 @@ def main(argv: list[str] | None = None) -> int:
     vm_boot_line = vm_boot_pass(status_only=args.status or args.dry_run)
     if vm_boot_line:
         print(vm_boot_line)
+    handoff_line = lane_handoff_pass(status_only=args.status or args.dry_run)
+    if handoff_line:
+        print(handoff_line)
 
     agents = discover_agents(args.launch_agents_dir)
     participating = pool_participating(args.participation_file)

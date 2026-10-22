@@ -734,7 +734,8 @@ class MacosFleetLaneTests(unittest.TestCase):
         heartbeat_ts = dt.datetime.now(dt.timezone.utc).isoformat()
 
         def scenario(two_writer: int, *, orphan_alive: bool = True,
-                     handoff: bool = False, reservation: bool = True):
+                     handoff: bool = False, reservation: bool = True,
+                     zombie: bool = False):
             td = tempfile.TemporaryDirectory()
             self.addCleanup(td.cleanup)
             root = Path(td.name)
@@ -766,7 +767,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 f"202 102 {started} bash {app}/providers/tart-macos/runner.sh --loop\n"
                 f"888 555 {started} bash {app}/providers/tart-macos/runner.sh --loop\n"
             )
-            if orphan_alive:
+            if zombie:
+                # macOS shows a zombie's command as <defunct>.
+                table += f"777 1 {orphan_start} <defunct>\n"
+            elif orphan_alive:
                 table += (f"777 1 {orphan_start} bash "
                           f"{app}/providers/tart-macos/runner.sh --loop\n")
             calls = [
@@ -805,9 +809,18 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertIn("heartbeat_missing", {p["code"] for p in value["problems"]})
         self.assertNotIn("orphaned_supervisor", {p["code"] for p in value["problems"]})
 
+        # A zombie can be neither signalled nor served by: it is never named as
+        # an orphan, so pool status never tells anyone to kill it.
+        value = scenario(777, orphan_alive=False, zombie=True)
+        self.assertNotIn("orphaned_supervisor", {p["code"] for p in value["problems"]})
+        self.assertFalse(any("kill -TERM 777" in str(p.get("detail")) for p in value["problems"]))
+
         # A replacement waiting for the previous supervisor's job is a handoff.
         value = scenario(888, orphan_alive=False, handoff=True)
-        self.assertIn("supervisor_handoff_pending", {p["code"] for p in value["problems"]})
+        pending = [p for p in value["problems"] if p["code"] == "supervisor_handoff_pending"]
+        self.assertEqual(1, len(pending), value["problems"])
+        self.assertIn("supervisor pid 888 still serves this lane", pending[0]["detail"])
+        self.assertIn("kill -TERM 888", pending[0]["detail"])
 
     def test_heartbeat_identity_spans_wrapper_and_direct_topologies(self) -> None:
         """A lane on an external volume runs through a signed launch_helper, so

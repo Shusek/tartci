@@ -2558,8 +2558,10 @@ def fleet_readiness(
                         writer = writers[0] if writers else None
                         problems.append({"code": "supervisor_handoff_pending", "label": label,
                                          "detail": f"supervisor pid {writer} still serves "
-                                                   "this lane; its replacement waits for "
-                                                   "it to exit"})
+                                                   "this lane; its replacement takes over "
+                                                   "when it exits after its current job. If "
+                                                   "that job is stuck: kill -TERM "
+                                                   f"{writer} (tears down its VM)"})
                     else:
                         problems.append({"code": "heartbeat_missing", "label": label})
                     continue

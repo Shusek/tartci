@@ -82,6 +82,24 @@ printf '%s %s\n' "$other" "Mon Sep  1 00:00:00 2026" >"$claim"
 "$BASH" -c "source '$fns'; tartci_lane_claim"
 refute grep -q supervisor_handoff_wait "$tmp/events"
 
+# (f) A zombie (exited, not yet reaped) answers kill -0 but is no incumbent:
+# its claim is taken without waiting.
+python3 -c '
+import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+print(pid, flush=True)
+time.sleep(30)' >"$tmp/zombie" &
+zparent=$!; disown "$zparent"; pids="$pids $zparent"
+wait_for "[ -s '$tmp/zombie' ]"
+zombie="$(head -n 1 "$tmp/zombie")"
+wait_for "ps -o stat= -p $zombie | grep -q Z"
+printf '%s %s\n' "$zombie" "$(ps -o lstart= -p "$zombie" | sed 's/ *$//')" >"$claim"
+: >"$tmp/events"
+"$BASH" -c "source '$fns'; tartci_lane_claim"
+refute grep -q supervisor_handoff_wait "$tmp/events"
+
 # (e) Superseded only when the claim names another live supervisor.
 "$BASH" -c "source '$fns'; tartci_lane_claim
             if tartci_lane_superseded; then echo yes; else echo no; fi" >"$tmp/self"

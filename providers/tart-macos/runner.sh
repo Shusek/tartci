@@ -910,6 +910,8 @@ tartci_lane_other_supervisor(){
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ "$pid" != "$$" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
+  # A zombie answers kill -0 but has exited: it serves nothing.
+  case "$(ps -o stat= -p "$pid" 2>/dev/null)" in Z*) return 1 ;; esac
   [ -n "$start" ] && [ "$(tartci_proc_start "$pid")" = "$start" ] || return 1
   printf '%s' "$pid"
 }

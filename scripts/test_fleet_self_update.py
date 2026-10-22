@@ -2367,6 +2367,14 @@ class AgentTemplateTests(unittest.TestCase):
         self.assertIn(3, wd.APPLICATION_EXIT_CODES["com.danielraffel.tartci.self-update"])
 
 
+class HandoffSettlesTests(unittest.TestCase):
+    def test_a_handoff_in_progress_settles_instead_of_failing_verify(self) -> None:
+        # The previous supervisor finishing its job before it hands the lane
+        # over must be re-read, not rolled back.
+        self.assertIn("orphaned_supervisor", su.SETTLING_PROBLEM_CODES)
+        self.assertIn("supervisor_handoff_pending", su.SETTLING_PROBLEM_CODES)
+
+
 class VerifySettleTests(Base):
     def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
         self.assertEqual(
