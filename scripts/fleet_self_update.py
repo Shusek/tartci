@@ -296,9 +296,16 @@ class System:
         and abandoned (storage_health.run_probe_bounded does the same).
         """
         import storage_health  # noqa: PLC0415 - sibling module; owns the bounded reaping
-        child = subprocess.Popen([child_python(), "-c", STORE_WRITE_CHILD, directory],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                                 start_new_session=True)
+        try:
+            # -I: the child imports nothing from the environment, the user
+            # site or the current directory.
+            child = subprocess.Popen([child_python(), "-I", "-c", STORE_WRITE_CHILD, directory],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     text=True, start_new_session=True)
+        except (OSError, RuntimeError) as exc:
+            # No interpreter (child_python raises RuntimeError) or no process:
+            # nothing was written, and the caller refuses on an error.
+            return {"error": f"store write child could not start: {exc}"}
         try:
             out, _ = child.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -2030,7 +2037,19 @@ STORE_SLOW_MS = 1000.0
 STORAGE_HEALTH_MAX_AGE_SECONDS = 10 * 60
 
 
-def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True) -> str | None:
+def previous_store_timeout(cfg: Config, current: Path | None = None) -> str | None:
+    """The previous apply's refusal, when it was a store write that timed
+    out; None otherwise."""
+    for path, value in reversed(_attempts(cfg.state_dir)):
+        if path == current or value.get("mode") != "apply":
+            continue
+        error = str(value.get("error") or "")
+        return error if "did not finish within" in error else None
+    return None
+
+
+def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True,
+                      current: Path | None = None) -> str | None:
     """Why the Tart store is not fit to change the launcher now, or None.
 
     m5studio, 2026-10-18: the store volume was slow, the NEW launcher's
@@ -2041,7 +2060,17 @@ def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True) -> str |
     the home folder, so a quarantined or unknown store is never written
     to), then, unless `write` is False (a plan writes nothing), the same
     control write the probe makes, from a bounded child.
+
+    A healthy record older than STORAGE_HEALTH_MAX_AGE_SECONDS is normal on
+    a busy host (only a lane at its loop top rewrites it), so it does not
+    refuse by itself; the write decides. It refuses only when the previous
+    attempt's write timed out, so a wedged store is not written to again on
+    the strength of an old record.
     """
+    # tart_home from the INSTALLED profile: that is the store the running
+    # launcher, and so the post-install volume probe, uses. A target profile
+    # that moves tart_home is checked against the old store; the move itself
+    # is checked when the new profile's lanes first run.
     try:
         store = (_toml(cfg.installed_profile).get("host") or {}).get("tart_home")
     except (OSError, ValueError):
@@ -2058,8 +2087,12 @@ def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True) -> str |
         return f"storage health for {store} is healthy but its record has no check time"
     age = sys_.now() - checked
     if age > STORAGE_HEALTH_MAX_AGE_SECONDS:
-        return (f"storage health for {store} is stale: its healthy record is {age / 60:.0f} min "
-                f"old (checked {checked_at}; at most {STORAGE_HEALTH_MAX_AGE_SECONDS // 60} min)")
+        timed_out = previous_store_timeout(cfg, current)
+        if timed_out:
+            return (f"storage health for {store} is stale: its healthy record is {age / 60:.0f} "
+                    f"min old (checked {checked_at}; at most "
+                    f"{STORAGE_HEALTH_MAX_AGE_SECONDS // 60} min), and the previous attempt's "
+                    "store write timed out")
     if not write:
         return None
     result = sys_.store_write(store)
@@ -3371,7 +3404,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 and (layout != "v2" or change.changed)):
             # A new launcher must pass its volume probe after the install, and
             # a failed probe leaves the host OFF; check the volume first.
-            slow = store_volume_slow(cfg, sys_, write=apply)
+            slow = store_volume_slow(cfg, sys_, write=apply, current=receipt.path)
             if slow:
                 refusal = (f"Tart store volume slow before a launcher change: {slow}; "
                            "refused before drain, the host keeps serving; retried on the "
@@ -3668,6 +3701,14 @@ class Run:
         self.receipt.step("drain", drain.text[:300])
         self.phase = "wait-idle"
         self._wait_idle()
+        if "--launch-helper-source" in self.install_args:
+            # The drain can take an hour; check the store again right before
+            # anything stops. A Refused here undoes the drain with nothing
+            # installed.
+            slow = store_volume_slow(cfg, sys_, current=self.receipt.path)
+            if slow:
+                raise Refused(f"Tart store volume slow after the drain, before pool off: {slow}")
+            self.receipt.step("store-volume", "still fast enough after the drain")
         self.phase = "off"
         off = tartci(cfg, sys_, "pool", "off", *self.flag)
         if off.rc in POOL_OFF_REFUSALS:
