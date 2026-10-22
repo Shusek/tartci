@@ -29,6 +29,9 @@
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci governor [show|set K=V|unset K|explain|fleet|keys] # one per-host governor config
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
+#   tartci update [--yes|--plan|--status|--wait] [--json]
+#                              # bring THIS host's tartci current (asks y/N; hosts
+#                              # take turns); --status one line, --wait until done
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
 #   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
@@ -1627,6 +1630,7 @@ case "${1:-help}" in
   governor) shift; cmd_governor "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;
+  update) shift; tartci_toml_python_exec "$HERE/scripts/tartci_update.py" "$@" ;;
   support-manifest) shift; cmd_support_manifest "$@" ;;
   gate-slot2) shift; cmd_gate_slot2 "$@" ;;
   tart-image-sync) shift; cmd_tart_image_sync "$@" ;;

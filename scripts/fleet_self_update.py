@@ -4190,6 +4190,9 @@ def status_lines(state_dir: Path) -> list[str]:
         lines.append(f"self-update: THIS HOST WAS LEFT {str(last.get('pool_state') or 'off').upper()} "
                      "(pool on failed after a failed update); check tartci pool status, "
                      "then tartci pool on")
+    progress = progress_line(state_dir)
+    if progress:
+        lines.append(progress)
     waiting = waiting_line(state_dir)
     if waiting:
         lines.append(waiting)
@@ -4223,6 +4226,77 @@ def signing_blocked(state_dir: Path) -> str | None:
     return (f"self-update: SIGNING KEYCHAIN LOCKED: {len(run)} refusal(s) in a row since "
             f"{run[-1].get('started_at')}; run `pulp ship doctor` on this host "
             f"(last: {str(run[0].get('error'))[:160]})")
+
+
+# The steps of an update after its preflight, in order, as Receipt.step names
+# them. A sealed-launcher host adds pin and install-dry-run before install.
+UPDATE_PHASES = ("snapshot", "drain", "wait-idle", "off", "install", "relay", "pool-on",
+                 "verify", "support-agents")
+
+
+def progress(state_dir: Path, now: float | None = None) -> dict | None:
+    """The update running on this host now, or None.
+
+    {"target", "stale", "started", "minutes", "step", "step_minutes",
+    "detail", "next"}. stale means active.json names a process that is gone.
+    """
+    active = _read_json(state_dir / "active.json")
+    if not isinstance(active, dict):
+        return None
+    now = time.time() if now is None else now
+    value: dict[str, Any] = {"target": str(active.get("target") or ""), "stale": False,
+                             "started": None, "minutes": 0, "step": None,
+                             "step_minutes": 0, "detail": "", "next": []}
+    pid = active.get("pid")
+    if isinstance(pid, int):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            value["stale"] = True
+            value["pid"] = pid
+            return value
+        except PermissionError:
+            pass
+    running = next((attempt for _, attempt in reversed(_attempts(state_dir))
+                    if attempt.get("mode") == "apply" and attempt.get("status") == "running"),
+                   None)
+    steps = (running or {}).get("steps") or []
+    if not steps:
+        return value
+    name = str(steps[-1].get("step"))
+    since = steps[-1].get("at")
+    for step in reversed(steps):  # a repeated step (wait-idle) counts from its first
+        if step.get("step") != name:
+            break
+        since = step.get("at")
+    value.update(
+        started=(running or {}).get("started_at"),
+        minutes=int(max(0.0, now - _ts((running or {}).get("started_at"))) // 60),
+        step=name, step_minutes=int(max(0.0, now - _ts(since)) // 60),
+        detail=str(steps[-1].get("detail") or ""),
+        next=[phase for phase in UPDATE_PHASES[UPDATE_PHASES.index(name) + 1:]
+              if phase in ("off", "install", "pool-on", "verify")]
+        if name in UPDATE_PHASES else [])
+    return value
+
+
+def progress_line(state_dir: Path, now: float | None = None) -> str | None:
+    """progress() as one status line. A drained host with 0 supervisors reads
+    as broken; this says which step it is in and what that step waits on.
+    """
+    value = progress(state_dir, now)
+    if value is None:
+        return None
+    target = value["target"][:12]
+    if value["stale"]:
+        return (f"self-update: STALE active.json: the update to {target} (pid {value['pid']}) "
+                "is not running; the next run recovers it")
+    if value["step"] is None:
+        return f"self-update: IN PROGRESS to {target}: starting"
+    return (f"self-update: IN PROGRESS to {target} (started {value['started']}, "
+            f"{value['minutes']} min): {value['step']} for {value['step_minutes']} min"
+            + (f": {value['detail'][:200]}" if value["detail"] else "")
+            + (f"; then {', '.join(value['next'])}" if value["next"] else ""))
 
 
 def waiting_line(state_dir: Path, now: float | None = None) -> str | None:

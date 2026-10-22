@@ -2367,6 +2367,47 @@ class AgentTemplateTests(unittest.TestCase):
         self.assertIn(3, wd.APPLICATION_EXIT_CODES["com.danielraffel.tartci.self-update"])
 
 
+class ProgressLineTests(Base):
+    """--status and pool status say which step a running update is in."""
+
+    def running(self, steps: list[tuple[str, str, str]], pid: int | None = None) -> None:
+        su._write_json(self.cfg.state_dir / "active.json",
+                       {"host_id": "m1", "pid": pid or os.getpid(), "target": T_NEW})
+        su._write_json(self.cfg.state_dir / "attempts" / "20270101T000000Z-x.json",
+                       {"mode": "apply", "status": "running", "target": T_NEW,
+                        "started_at": "2027-01-01T00:00:00Z",
+                        "steps": [{"at": at, "step": name, "ok": True, "detail": detail}
+                                  for at, name, detail in steps]})
+
+    def test_a_drain_waiting_on_a_job_says_so_and_what_is_left(self) -> None:
+        self.running([("2027-01-01T00:00:10Z", "snapshot", "snap"),
+                      ("2027-01-01T00:00:20Z", "drain", "keeps every label served"),
+                      ("2027-01-01T00:01:00Z", "wait-idle", "waiting on lane: busy"),
+                      ("2027-01-01T00:30:00Z", "wait-idle", "waiting on lane: busy")])
+        now = su._ts("2027-01-01T01:01:00Z")
+        self.assertEqual(
+            f"self-update: IN PROGRESS to {T_NEW[:12]} (started 2027-01-01T00:00:00Z, "
+            "61 min): wait-idle for 60 min: waiting on lane: busy; "
+            "then off, install, pool-on, verify",
+            su.progress_line(self.cfg.state_dir, now))
+
+    def test_the_line_reaches_status(self) -> None:
+        self.running([("2027-01-01T00:00:20Z", "install", "")])
+        self.assertTrue(any(line.startswith("self-update: IN PROGRESS")
+                            for line in su.status_lines(self.cfg.state_dir)))
+
+    def test_a_dead_update_is_reported_stale(self) -> None:
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.running([("2027-01-01T00:00:20Z", "drain", "")], pid=dead.pid)
+        self.assertIn("STALE active.json", su.progress_line(self.cfg.state_dir))
+
+    def test_no_update_running_adds_nothing(self) -> None:
+        self.assertIsNone(su.progress_line(self.cfg.state_dir))
+        self.assertFalse(any("IN PROGRESS" in line
+                             for line in su.status_lines(self.cfg.state_dir)))
+
+
 class VerifySettleTests(Base):
     def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
         self.assertEqual(
