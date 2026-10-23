@@ -3613,18 +3613,20 @@ _NOT_DUE = ("waiting for canary", "soaking for", "no canary")
 TART_RECOVERY = "to bring back the previous Tart: `ls /opt/homebrew/Cellar/tart` (and .../softnet); while it lists the failed version and /opt/homebrew/opt/tart points at it, `brew uninstall --ignore-dependencies openai/tools/tart`, then `brew link --overwrite openai/tools/tart` and `tart --version` (the same for openai/tools/softnet); then remove ~/.tartci/state/self-update/tart-broken.json and run `tartci pool on`"
 
 
-def tart_decision(cfg: Config, sys_: System, root: Path | None = None) -> TartDecision | None:
+def tart_decision(cfg: Config, sys_: System, root: Path | None = None,
+                  fresh: bool = False) -> TartDecision | None:
     """What this turn does to Tart, against the pin under `root`: by default
     cfg.checkout, the commit this turn installs; refresh_reason passes the
     installed generation (tart_pin.REPO_ROOT), which is checked out before
-    the drain on a same-generation turn.
+    the drain on a same-generation turn. `fresh` reads the tap itself instead
+    of the hour-long cache: for a decision to drain and right before brew.
 
     None when this host does not upgrade Tart, Tart is absent or already the
     pin (and, on the canary, already proven), so an unknown never starts a
     drain. Records whether the host is due (tart-gate.json). Read-only apart
     from that record and the tap cache.
     """
-    decision = _tart_decision(cfg, sys_, cfg.checkout if root is None else root)
+    decision = _tart_decision(cfg, sys_, cfg.checkout if root is None else root, fresh)
     due = bool(cfg.tart_upgrade and decision is not None
                and not (decision.refusal and decision.refusal.startswith(_NOT_DUE)))
     try:
@@ -3637,7 +3639,8 @@ def tart_decision(cfg: Config, sys_: System, root: Path | None = None) -> TartDe
     return decision
 
 
-def _tart_decision(cfg: Config, sys_: System, root: Path) -> TartDecision | None:
+def _tart_decision(cfg: Config, sys_: System, root: Path, fresh: bool = False
+                   ) -> TartDecision | None:
     if not cfg.tart_upgrade:
         return None
     run = _pin_run(sys_)
@@ -3691,7 +3694,7 @@ def _tart_decision(cfg: Config, sys_: System, root: Path) -> TartDecision | None
                                 f"{int(verified['age'] // 60)} min ago")
     try:
         refusal = tart_pin.tap_refusal(pin, tart_pin.tap_offer(run, pin, cfg.state_dir,
-                                                               sys_.now()))
+                                                               sys_.now(), fresh=fresh))
     except tart_pin.PinError as exc:
         refusal = f"tap unreadable: {exc}"
     return TartDecision(installed, pin, refusal)
@@ -3772,7 +3775,7 @@ def refresh_reason(cfg: Config, sys_: System) -> str | None:
     # Tart is replaced only while the pool is off, so a host whose TartCI is
     # current takes a drained turn of its own for the pinned Tart, once its
     # gates (canary, soak, tap) let it. The installed generation's pin counts.
-    decision = tart_decision(cfg, sys_, tart_pin.REPO_ROOT)
+    decision = tart_decision(cfg, sys_, tart_pin.REPO_ROOT, fresh=True)
     if decision and decision.refusal:
         print(f"self-update: {decision.describe()}")
     elif decision:
@@ -4045,7 +4048,8 @@ class Run:
         TartCI update goes on. When the previous Tart does not come back the
         host stays OFF (TartBroken).
         """
-        decision = tart_decision(self.cfg, self.sys)
+        # The tap read uncached: the plan's answer may be an hour old.
+        decision = tart_decision(self.cfg, self.sys, fresh=True)
         if decision is None:
             return
         if decision.refusal:
@@ -4071,7 +4075,7 @@ class Run:
         records = self.cfg.state_dir.parent / "scratch-vms"
         if decision.prove_only:
             failure, cleanup = tart_pin.boot_check(run, boot[0], boot[1], os.getpid(),
-                                                   self.sys.now(), records)
+                                                   self.sys.now(), records, self.sys.sleep)
             self._tart_cleanup_step(cleanup)
             self.receipt.step("tart-upgrade", f"canary boot check of Tart {decision.installed}: "
                               + (failure or "booted"), ok=failure is None)
@@ -4098,8 +4102,11 @@ class Run:
         elif not softnet.endswith("/" + pin.softnet_version):
             failure = f"Softnet links {softnet or 'nothing'}, not {pin.softnet_version}"
         else:
+            failure = self._tart_archive_failure(pin, softnet_moved=(
+                self.tart_before[1][names[1]] != softnet))
+        if failure is None:
             failure, cleanup = tart_pin.boot_check(run, boot[0], boot[1], os.getpid(),
-                                                   self.sys.now(), records)
+                                                   self.sys.now(), records, self.sys.sleep)
             self._tart_cleanup_step(cleanup)
         if failure is None:
             self._tart_settled()
@@ -4111,6 +4118,22 @@ class Run:
                           f"{failure}", ok=False)
         tart_pin.record_failure(self.cfg.state_dir, pin, self.sys.now(), failure)
         self._tart_roll_back()
+
+    def _tart_archive_failure(self, pin: tart_pin.Pin, softnet_moved: bool) -> str | None:
+        """The archives brew downloaded must be the pinned bytes: a re-cut
+        release under the same version has another sha256."""
+        run = _pin_run(self.sys)
+        checks = [(pin.formula, pin.sha256)]
+        if softnet_moved:
+            checks.append((pin.softnet_formula, pin.softnet_sha256))
+        for formula, want in checks:
+            digest, where = tart_pin.archive_sha256(run, formula)
+            if digest is None:
+                return f"could not hash the downloaded {formula} archive: {where}"
+            if digest != want:
+                return (f"the downloaded {formula} archive {where} has sha256 {digest[:12]}, "
+                        f"the pin is {want[:12]}")
+        return None
 
     def _tart_settled(self) -> None:
         self.tart_before = None

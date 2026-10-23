@@ -163,17 +163,25 @@ In the drained window, after `pool off`, self-update:
    offer exactly the
    pinned Tart and Softnet with the pinned checksums. brew runs with
    `HOMEBREW_NO_AUTO_UPDATE=1`; refresh the tap with `brew update` when it
-   lags. The tap's answer is cached for an hour per pin, so a refreshed tap
-   can take up to an hour to be seen;
+   lags. A plan uses an answer cached for an hour per pin; the decision to
+   drain for Tart and the check right before `brew upgrade` read the tap
+   itself;
 2. runs `brew upgrade openai/tools/tart` with `HOMEBREW_NO_INSTALL_CLEANUP=1`
    and `HOMEBREW_NO_AUTOREMOVE=1`, so the previous kegs stay installed and an
    uninstall removes nothing else. It writes `tart-rollback-pending.json`
    first;
-3. checks `tart --version` and the Softnet link against the pin;
+3. checks `tart --version` and the Softnet link against the pin, and hashes
+   the archives brew downloaded (`brew --cache openai/tools/tart`, and
+   Softnet's when it moved; the tap ships no bottles) against the pin's
+   sha256, so a release re-cut under the same version is refused;
 4. clones the first lane's golden as `scratch-tart-check-<pid>`, boots it
    headless and waits up to 180 s for `tart ip`, then stops and deletes it.
-   The clone is recorded as a scratch VM before it exists, so if the delete
-   fails or the process dies, the launchd watchdog deletes it after an hour;
+   A stop or delete that fails is retried three times, 10 s apart. A clone
+   still there after that fails the Tart step even after a good boot: the
+   upgrade is rolled back and the pin remembered, never reported as a
+   success. The clone is recorded as a scratch VM before it exists, so the
+   launchd watchdog deletes a leftover within an hour; until then it may hold
+   one of the host's VM slots;
 5. on any failure in steps 2 to 4, removes the new kegs so the previous ones
    are linked again. With `opt` still on the new keg it runs
    `brew uninstall --ignore-dependencies` (that removes only the new keg),

@@ -76,6 +76,9 @@ class FakeSystem(su.System):
         # HIGHEST installed version (Homebrew 7 latest_kegs), whatever opt says.
         self.kegs: dict[str, set[str]] = {"tart": set(), "softnet": set()}
         self.uninstall_rc = 0
+        # sha256 of the archive `brew --cache` names, per formula.
+        self.archive_sha = {"tart": TART_SHA, "softnet": SOFTNET_SHA}
+        self.tart_delete_rcs: list[int] = []        # successive delete results, then tart_delete_rc
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -234,7 +237,13 @@ class FakeSystem(su.System):
         if a[0] == tart_pin.TART and a[1] == "stop":
             return su.Result(self.tart_stop_rc, "", "" if not self.tart_stop_rc else "stop failed")
         if a[0] == tart_pin.TART and a[1] == "delete":
-            return su.Result(self.tart_delete_rc, "", "" if not self.tart_delete_rc else "busy")
+            rc = self.tart_delete_rcs.pop(0) if self.tart_delete_rcs else self.tart_delete_rc
+            return su.Result(rc, "", "" if not rc else "busy")
+        if a[:2] == [tart_pin.BREW, "--cache"]:
+            return ok(f"/fake/Caches/Homebrew/downloads/{a[-1].rsplit('/', 1)[-1]}.tar.gz\n")
+        if a[:3] == ["/usr/bin/shasum", "-a", "256"]:
+            name = a[-1].rsplit("/", 1)[-1].split(".tar.gz")[0]
+            return ok(f"{self.archive_sha[name]}  {a[-1]}\n")
         if a[0] == tart_pin.TART and a[1] == "ip":
             return ok(self.boot_ip) if self.boot_ok else su.Result(1, "", "no IP")
         if a[0] == "/bin/sh" and "--no-graphics" in joined:
@@ -4456,16 +4465,73 @@ class TartUpgradeTests(Base):
         for line in ("bash -c echo tart run", "/usr/bin/grep tart run", "vim notes-on-tart run"):
             self.assertFalse(pattern.search(line), line)
 
-    def test_a_clone_that_cannot_be_deleted_is_left_to_the_scratch_reaper(self) -> None:
+    def test_a_clone_that_cannot_be_deleted_fails_the_tart_step(self) -> None:
+        # A good boot whose clone survives three stop/delete tries must not
+        # end in a quiet pool on beside it: it is a failed Tart step.
         self.sys.tart_delete_rc = 1
         self.assertUpdated(self.apply())
         cleanup = self.steps("tart-check-cleanup")[0]
         self.assertFalse(cleanup["ok"])
-        self.assertIn("the watchdog deletes it after", cleanup["detail"])
+        self.assertIn("still there after 3 tries; the watchdog deletes it after", cleanup["detail"])
+        self.assertEqual(3, len(self.calls(tart_pin.TART, "delete")))
+        failed = self.steps("tart-upgrade")[0]
+        self.assertFalse(failed["ok"])
+        self.assertIn("could not be removed", failed["detail"])
+        self.assertEqual("2.36.0", self.sys.tart, "rolled back")
+        self.assertEqual("2.40.1", self.failed()["version"])
+        self.assertIsNone(self.verified())
         import scratch_vm_ttl
         names = [r["name"] for r in scratch_vm_ttl.records()]
         self.assertEqual([f"{tart_pin.CHECK_PREFIX}{os.getpid()}"], names)
         self.assertTrue(self.calls(tart_pin.TART, "stop"), "the clone is stopped")
+
+    def test_a_cleanup_that_succeeds_on_a_retry_is_fine(self) -> None:
+        self.sys.tart_delete_rcs = [1]
+        self.assertUpdated(self.apply())
+        self.assertEqual(2, len(self.calls(tart_pin.TART, "delete")))
+        self.assertEqual([], self.steps("tart-check-cleanup"))
+        self.assertTrue(self.steps("tart-upgrade")[0]["ok"])
+        self.assertEqual("2.40.1", self.sys.tart)
+
+    # ── the pinned bytes ────────────────────────────────────────────────
+
+    def test_the_downloaded_archives_are_checked_against_the_pin(self) -> None:
+        self.assertUpdated(self.apply())
+        hashed = [a[-1] for a in self.calls("/usr/bin/shasum", "-a", "256")]
+        self.assertEqual(2, len(hashed), "Tart and the Softnet that moved with it")
+        self.assertTrue(self.steps("tart-upgrade")[0]["ok"])
+
+    def test_a_re_cut_archive_under_the_pinned_version_is_rolled_back(self) -> None:
+        self.sys.archive_sha["tart"] = "e" * 64
+        self.assertUpdated(self.apply())
+        detail = self.steps("tart-upgrade")[0]["detail"]
+        self.assertIn("the downloaded openai/tools/tart archive", detail)
+        self.assertIn("has sha256 eeeeeeeeeeee, the pin is aaaaaaaaaaaa", detail)
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertTrue(self.steps("tart-rollback")[0]["ok"])
+        self.assertEqual([], self.calls(tart_pin.TART, "clone"), "no boot of unpinned bytes")
+
+    def test_a_re_cut_softnet_archive_is_rolled_back(self) -> None:
+        self.sys.archive_sha["softnet"] = "f" * 64
+        self.assertUpdated(self.apply())
+        self.assertIn("openai/tools/softnet archive", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual(("2.36.0", "0.23.0"), (self.sys.tart, self.sys.softnet))
+
+    def test_a_stale_cached_tap_is_reread_before_the_upgrade(self) -> None:
+        self.assertIsNone(self.decide().refusal)       # caches the matching answer
+        self.sys.tap["tart"] = ("2.40.1", "c" * 64)    # the tap re-cut the release since
+        self.assertIsNone(self.decide().refusal, "a plan may use the cached answer")
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("the tap offers tart 2.40.1 (cccccccccccc)",
+                      self.steps("tart-upgrade")[0]["detail"])
+
+    def test_a_stale_cached_tap_never_starts_a_tart_only_drain(self) -> None:
+        self.assertIsNone(self.decide().refusal)
+        self.sys.tap["tart"] = ("2.40.1", "c" * 64)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
 
     # ── turns of their own ──────────────────────────────────────────────
 

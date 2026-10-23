@@ -159,11 +159,14 @@ def _write_json(path: Path, value: dict) -> None:
     os.replace(tmp, path)
 
 
-def tap_offer(run: Run, pin: Pin, state_dir: Path, now: float) -> dict[str, Any]:
+def tap_offer(run: Run, pin: Pin, state_dir: Path, now: float,
+              fresh: bool = False) -> dict[str, Any]:
     """What the local tap offers for the pinned formulae: {"tart": (version,
-    sha256), "softnet": (...)}. Cached for an hour per pin, because a plan and
-    every scheduled turn ask. Raises PinError when brew cannot say."""
-    cache = _read_json(state_dir / TAP_CACHE)
+    sha256), "softnet": (...)}. Cached for an hour per pin, because a plan
+    asks; `fresh` reads the tap itself (right before a drain or an upgrade, a
+    cached answer could be an hour old). Raises PinError when brew cannot
+    say."""
+    cache = None if fresh else _read_json(state_dir / TAP_CACHE)
     # Keyed by the whole pin: a moved pin never reads the old pin's answer.
     key = (f"{pin.formula} {pin.version} {pin.sha256} "
            f"{pin.softnet_formula} {pin.softnet_version} {pin.softnet_sha256}")
@@ -205,6 +208,21 @@ def tap_refusal(pin: Pin, offered: dict[str, Any]) -> str | None:
     return None
 
 
+def archive_sha256(run: Run, formula: str) -> tuple[str | None, str]:
+    """(sha256, path) of the archive brew downloaded for `formula`
+    (`brew --cache`); (None, why) when it cannot say. The tap ships no
+    bottles, so this is the release tarball the pin's sha256 names."""
+    rc, out = run([BREW, "--cache", formula], timeout=60, env=BREW_ENV)
+    path = out.strip().splitlines()[-1].strip() if rc == 0 and out.strip() else ""
+    if not path:
+        return None, f"brew --cache {formula} exit {rc}: {out.strip()[-120:]}"
+    rc, out = run(["/usr/bin/shasum", "-a", "256", path], timeout=120)
+    digest = out.split()[0] if rc == 0 and out.split() else ""
+    if not SHA256.fullmatch(digest):
+        return None, f"shasum {path} exit {rc}: {out.strip()[-120:]}"
+    return digest, path
+
+
 def opt_links(names: tuple[str, ...]) -> dict[str, str | None]:
     """Where /opt/homebrew/opt/<name> points now: the linked keg to come back to."""
     links: dict[str, str | None] = {}
@@ -216,15 +234,22 @@ def opt_links(names: tuple[str, ...]) -> dict[str, str | None]:
     return links
 
 
+CLEANUP_TRIES = 3
+CLEANUP_RETRY_S = 10
+
+
 def boot_check(run: Run, golden: str, tart_home: str, pid: int, now: float,
-               records: Path) -> tuple[str | None, str | None]:
+               records: Path, sleep: Callable[[float], None] | None = None
+               ) -> tuple[str | None, str | None]:
     """Clone the golden, boot it headless and wait for its IP.
 
     (failure, cleanup): failure is None when it booted; cleanup names a stop
     or delete that did not succeed. The clone is recorded as a scratch VM
     under `records` before it exists, so a clone this process cannot delete
     (or never gets to) is reclaimed by the watchdog at its TTL; the record
-    goes only after the delete is confirmed.
+    goes only after the delete is confirmed. A stop or delete that fails is
+    retried CLEANUP_TRIES times; a clone still there after that is a failure
+    even when the boot was good, so the pool never comes back on beside it.
     """
     name = f"{CHECK_PREFIX}{pid}"
     env = {"TART_HOME": tart_home}
@@ -247,17 +272,28 @@ def boot_check(run: Run, golden: str, tart_home: str, pid: int, now: float,
             failure = (f"a clone of {golden} did not report an IP within {BOOT_WAIT_S}s "
                        f"(exit {rc})")
     finally:
-        cleanup = []
-        rc, out = run([TART, "stop", "--timeout", "30", name], timeout=90, env=env)
-        if rc != 0 and "does not exist" not in out.lower():
-            cleanup.append(f"tart stop {name} exit {rc}: {out.strip()[-120:]}")
-        rc, out = run([TART, "delete", name], timeout=120, env=env)
-        if rc != 0 and "does not exist" not in out.lower():
-            cleanup.append(f"tart delete {name} exit {rc}: {out.strip()[-120:]}; the watchdog "
-                           f"deletes it after {_iso_utc(now + CHECK_TTL_SECONDS)}")
-        else:
+        cleanup: list[str] = []
+        gone = False
+        for attempt in range(CLEANUP_TRIES):
+            if attempt and sleep is not None:
+                sleep(CLEANUP_RETRY_S)
+            cleanup = []
+            rc, out = run([TART, "stop", "--timeout", "30", name], timeout=90, env=env)
+            if rc != 0 and "does not exist" not in out.lower():
+                cleanup.append(f"tart stop {name} exit {rc}: {out.strip()[-120:]}")
+            rc, out = run([TART, "delete", name], timeout=120, env=env)
+            if rc == 0 or "does not exist" in out.lower():
+                gone = True
+                break
+            cleanup.append(f"tart delete {name} exit {rc}: {out.strip()[-120:]}")
+        if gone:
             record.unlink(missing_ok=True)
-    return failure, "; ".join(cleanup) or None
+        else:
+            cleanup.append(f"still there after {CLEANUP_TRIES} tries; the watchdog deletes it "
+                           f"after {_iso_utc(now + CHECK_TTL_SECONDS)}")
+            if failure is None:
+                failure = f"the boot-check clone {name} could not be removed"
+    return failure, ("; ".join(cleanup) if not gone else None)
 
 
 def _iso_utc(ts: float) -> str:
