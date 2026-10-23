@@ -648,6 +648,64 @@ def intent_actions(repo: str, prs: list[Any], classes: list[str]) -> list[dict[s
     return actions
 
 
+def base_health_advice(
+    shipyard: str,
+    row: dict[str, object],
+    tick: str,
+    mode: str,
+    plans: SchedulerLog,
+    timeout: int,
+    logger: SchedulerLog,
+) -> dict[str, Any]:
+    """Read one repository's base health and ledger any jump advice.
+
+    Read-only: never `--act`. Jumping a fix to the front of the merge queue is
+    not a scheduler class, so the ledger line is the dry-run receipt ("would
+    jump PR #n") whatever the repository's `base_health.auto_jump` says. A
+    failure here is reported but does not make the tick unhealthy: an older
+    Shipyard without `base-health` must not stop the carrier.
+    """
+    repo = str(row["repo"])
+    result = run_bounded(
+        [shipyard, "--json", "base-health", "--repo", repo],
+        row["checkout"],  # type: ignore[arg-type]
+        timeout,
+        quarantine_on_timeout=False,
+    )
+    value = result.get("json")
+    if (
+        "error" in result
+        or result.get("timed_out")
+        or result.get("exit_code") not in (0, 1)
+        or not isinstance(value, dict)
+    ):
+        error = result.get("error") or f"exit {result.get('exit_code')}"
+        logger.write(f"base health for {repo}: error ({error})")
+        return {"repo": repo, "status": "error", "error": error}
+    finding = value.get("finding") if isinstance(value.get("finding"), dict) else {}
+    signal = finding.get("signal") if isinstance(finding.get("signal"), dict) else {}
+    advice = value.get("advice") if isinstance(value.get("advice"), dict) else None
+    entry: dict[str, Any] = {
+        "repo": repo,
+        "status": "ok",
+        "base": signal.get("status"),
+        "signal_run_id": finding.get("run_id"),
+        "advice": advice is not None,
+    }
+    if advice is not None:
+        plans.write_json(
+            {
+                "tick": tick,
+                "mode": mode,
+                "repo": repo,
+                "base_health": {"advice": advice, "signal_run_id": finding.get("run_id")},
+            }
+        )
+    logger.write(f"base health for {repo}: {entry['base'] or 'unknown'}"
+                 f"{' (jump advice recorded)' if advice is not None else ''}")
+    return entry
+
+
 def scheduler(
     config: dict[str, Any],
     logger: SchedulerLog,
@@ -726,6 +784,13 @@ def scheduler(
         healthy &= valid
         report["repositories"].append(entry)
         logger.write(f"carrier plan for {repo}: {'ok' if valid else 'error'}")
+
+    report["base_health"] = [
+        base_health_advice(
+            shipyard, row, started, mode, plans, config["carrier_timeout_seconds"], logger
+        )
+        for row in repositories
+    ]
 
     if pending:
         intent = {
