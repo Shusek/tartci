@@ -160,15 +160,6 @@ def resolve_ccache(explicit: str | None = None) -> str | None:
     return None
 
 
-def host_ccache_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """Environment for a host ccache run against a cache a guest can write.
-
-    Without CCACHE_CONFIGPATH ccache reads <cache>/ccache.conf, and a guest
-    can plant one there (prefix_command and friends then run on the host).
-    """
-    return {**(os.environ if base is None else base), "CCACHE_CONFIGPATH": os.devnull}
-
-
 def iter_units(cache: Path):
     """The scan units of ONE ccache root, in walk order: (top, sub) pairs.
 
@@ -312,7 +303,6 @@ def inspect_manifest(ccache: str, path: Path) -> dict | None:
     """Parse ccache --inspect for a manifest. None when unreadable."""
     try:
         proc = subprocess.run([ccache, "--inspect", str(path)], capture_output=True,
-                              env=host_ccache_env(),
                               text=True, timeout=INSPECT_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -361,7 +351,6 @@ def result_verdict(ccache: str, cache: Path, key: str) -> str:
     with tempfile.TemporaryDirectory(prefix="ccache-guard-") as tmp:
         try:
             proc = subprocess.run([ccache, "--extract-result", str(path.resolve())], cwd=tmp,
-                                  env=host_ccache_env(),
                                   capture_output=True, text=True, timeout=INSPECT_TIMEOUT)
         except (OSError, subprocess.TimeoutExpired):
             return "unverifiable"

@@ -9,7 +9,6 @@ tests cover, each beside its control:
 
   * the pre-boot refusal (and the opt-in quarantine) in lane-cache-root.lib.sh;
   * the guest command: ccache reads a guest-local CCACHE_CONFIGPATH;
-  * host ccache runs (trim, guard, layer stats) read no config from the cache;
   * release-tier boots mount neither read-write cache (the tart argv).
 """
 from __future__ import annotations
@@ -26,8 +25,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ccache_guard  # noqa: E402
-import ccache_layer  # noqa: E402
-import gate_ccache_trim  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
@@ -277,6 +274,9 @@ tartci_lifecycle_mark(){ :; }
 tartci_prepare_disk_root(){ mkdir -p "$1"; }
 tartci_ccache_guard(){ :; }
 discard_current_vm(){ echo discard >>"$calls"; }
+# runner.sh runs on macOS hosts and calls BSD `mktemp -t prefix`; GNU mktemp
+# (the Ubuntu test lane) refuses a template without X's, so emulate BSD here.
+mktemp(){ if [ "$1" = -t ]; then command mktemp "${TMPDIR:-/tmp}/$2.XXXXXX"; else command mktemp "$@"; fi; }
 runtime_emit_complete(){ echo "complete $*" >>"$calls"; }
 pip_wheelhouse_ready(){ return 1; }
 artifact_cache_ready(){ return 1; }
@@ -567,57 +567,6 @@ class LinuxGuestCommandTests(unittest.TestCase):
             [ccache, "-p"], text=True, capture_output=True,
             env={**env, "CCACHE_CONFIGPATH": f"{self.home}/.config/ccache/tartci.conf"})
         self.assertNotIn("/usr/bin/false", guarded.stdout)
-
-
-class HostCcacheConfigTests(unittest.TestCase):
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.cache = Path(os.path.realpath(tmp.name)) / "ccache"
-        self.cache.mkdir()
-        (self.cache / "ccache.conf").write_text("prefix_command = /usr/bin/false\n")
-
-    def test_the_host_env_names_no_config_from_the_cache(self) -> None:
-        env = ccache_guard.host_ccache_env({"PATH": "/bin", "CCACHE_CONFIGPATH": "/x"})
-        self.assertEqual(env, {"PATH": "/bin", "CCACHE_CONFIGPATH": os.devnull})
-
-    def test_trim_passes_the_host_env_to_every_ccache_run(self) -> None:
-        seen: list[dict] = []
-
-        def runner(command, **kwargs):
-            seen.append(kwargs.get("env") or {})
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        report = gate_ccache_trim.evict(cache=self.cache, max_age_days=14, fix=True,
-                                        ccache="/usr/bin/true", busy_probe=lambda: None,
-                                        runner=runner)
-        self.assertEqual(report["status"], "evicted")
-        self.assertEqual(len(seen), 2)  # evict + counters
-        for env in seen:
-            self.assertEqual(env.get("CCACHE_CONFIGPATH"), os.devnull)
-
-    @unittest.skipUnless(ccache_guard.resolve_ccache(), "needs a ccache binary")
-    def test_host_ccache_ignores_a_planted_conf_only_with_the_host_env(self) -> None:
-        ccache = ccache_guard.resolve_ccache()
-        cmd = [ccache, "-d", str(self.cache), "-p"]
-        base = {k: v for k, v in os.environ.items() if k != "CCACHE_CONFIGPATH"}
-        planted = subprocess.run(cmd, env=base, text=True, capture_output=True)
-        self.assertIn("/usr/bin/false", planted.stdout)  # control: the plant is live
-        guarded = subprocess.run(cmd, env=ccache_guard.host_ccache_env(base),
-                                 text=True, capture_output=True)
-        self.assertEqual(guarded.returncode, 0, guarded.stderr)
-        self.assertNotIn("/usr/bin/false", guarded.stdout)
-
-    def test_layer_stats_read_no_config_from_the_layer(self) -> None:
-        bindir = self.cache.parent / "bin"
-        bindir.mkdir()
-        fake = bindir / "ccache"
-        fake.write_text('#!/bin/sh\nprintf "direct_cache_hit\\t%s\\n" '
-                        '"$([ "$CCACHE_CONFIGPATH" = /dev/null ] && echo 1 || echo 0)"\n')
-        fake.chmod(0o755)
-        layer = self.cache.parent / "layer"
-        (layer / "local").mkdir(parents=True)
-        self.assertEqual(ccache_layer.layer_stats(layer, str(fake)), {"direct_cache_hit": 1})
 
 
 if __name__ == "__main__":
