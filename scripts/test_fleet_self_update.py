@@ -22,10 +22,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_self_update as su
+import tart_pin
 import fleet_source
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED = "1" * 40
+TART_SHA, SOFTNET_SHA = "a" * 64, "b" * 64
 T_OLD = "a" * 40      # first-parent commit older than the soak
 T_NEW = "b" * 40      # newer, still soaking
 NOW = 1_800_000_000.0
@@ -55,6 +57,28 @@ class FakeSystem(su.System):
         # None: healthy, checked a minute before the fake clock (as idle
         # lanes keep it); a test sets a tuple to pin the record.
         self.store_health_result = None
+        # Tart: installed, what the tap offers, how `brew upgrade` ends, and
+        # whether a clone of the golden boots.
+        self.tart: str | None = "2.40.1"
+        self.softnet: str | None = "0.24.0"
+        self.tap = {"tart": ("2.40.1", TART_SHA), "softnet": ("0.24.0", SOFTNET_SHA)}
+        self.tap_ok = True
+        self.brew_upgrade_rc = 0
+        self.brew_upgrade_installs: str | None = None  # default: the tap version
+        self.tart_running = False                     # a `tart run` process exists
+        self.boot_ok = True                           # a booted clone reports an IP
+        self.boot_ip = "192.168.64.5\n"               # what `tart ip` prints when it boots
+        self.tart_stop_rc = self.tart_delete_rc = 0
+        self.peer_tart: dict[str, dict] = {}          # ssh target -> its tart-verified.json
+        self.peer_tart_clock: float | None = None     # the canary's clock, if not ours
+        self.peer_tart_rc = 0
+        # Installed kegs per formula, like the Cellar. `brew link` links the
+        # HIGHEST installed version (Homebrew 7 latest_kegs), whatever opt says.
+        self.kegs: dict[str, set[str]] = {"tart": set(), "softnet": set()}
+        self.uninstall_rc = 0
+        # sha256 of the archive `brew --cache` names, per formula.
+        self.archive_sha = {"tart": TART_SHA, "softnet": SOFTNET_SHA}
+        self.tart_delete_rcs: list[int] = []        # successive delete results, then tart_delete_rc
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
@@ -153,6 +177,23 @@ class FakeSystem(su.System):
             return "healthy", "directory_metadata_ok", su._iso(self.clock - 60)
         return self.store_health_result
 
+    def set_tart(self, version: str) -> None:
+        """Install and link this Tart keg; earlier kegs stay in the Cellar."""
+        self.tart = version
+        self._link("tart", version)
+
+    def set_softnet(self, version: str) -> None:
+        self.softnet = version
+        self._link("softnet", version)
+
+    def _link(self, name: str, version: str, keep: bool = False) -> None:
+        assert tart_pin.OPT != Path("/opt/homebrew/opt"), "tart_pin.OPT is not patched"
+        self.kegs[name].add(version)
+        if tart_pin.OPT.is_dir():
+            link = tart_pin.OPT / name
+            link.unlink(missing_ok=True)
+            link.symlink_to(f"../Cellar/{name}/{version}")
+
     def process_start(self, pid):
         if pid in self.procs:
             return self.procs[pid]
@@ -186,6 +227,68 @@ class FakeSystem(su.System):
             self.hook(a)
         if a[:2] == ["launchctl", "print"]:
             return self.launchd_print or su.Result(1, "", "not configured")
+        if a[0] in (tart_pin.TART, tart_pin.BREW, "/bin/ln"):
+            # A test must never reach the real /opt/homebrew/opt.
+            assert tart_pin.OPT != Path("/opt/homebrew/opt"), "tart_pin.OPT is not patched"
+        if a[0] == tart_pin.TART and a[1:] == ["--version"]:
+            return ok(self.tart + "\n") if self.tart else su.Result(127, "", "not installed")
+        if a[0] == tart_pin.TART and a[1] == "clone":
+            return ok()
+        if a[0] == tart_pin.TART and a[1] == "stop":
+            return su.Result(self.tart_stop_rc, "", "" if not self.tart_stop_rc else "stop failed")
+        if a[0] == tart_pin.TART and a[1] == "delete":
+            rc = self.tart_delete_rcs.pop(0) if self.tart_delete_rcs else self.tart_delete_rc
+            return su.Result(rc, "", "" if not rc else "busy")
+        if a[:2] == [tart_pin.BREW, "--cache"]:
+            return ok(f"/fake/Caches/Homebrew/downloads/{a[-1].rsplit('/', 1)[-1]}.tar.gz\n")
+        if a[:3] == ["/usr/bin/shasum", "-a", "256"]:
+            name = a[-1].rsplit("/", 1)[-1].split(".tar.gz")[0]
+            return ok(f"{self.archive_sha[name]}  {a[-1]}\n")
+        if a[0] == tart_pin.TART and a[1] == "ip":
+            return ok(self.boot_ip) if self.boot_ok else su.Result(1, "", "no IP")
+        if a[0] == "/bin/sh" and "--no-graphics" in joined:
+            return ok()
+        if a[:3] == [tart_pin.BREW, "info", "--json=v2"]:
+            if not self.tap_ok:
+                return su.Result(1, "", "Error: No available formula")
+            return ok(json.dumps({"casks": [], "formulae": [
+                {"full_name": f"openai/tools/{name}", "versions": {"stable": version},
+                 "urls": {"stable": {"checksum": sha}}}
+                for name, (version, sha) in self.tap.items()]}))
+        if a[:2] == [tart_pin.BREW, "upgrade"]:
+            if self.brew_upgrade_rc == 0:
+                self.set_tart(self.brew_upgrade_installs or self.tap["tart"][0])
+                self.set_softnet(self.tap["softnet"][0])
+            return su.Result(self.brew_upgrade_rc, "", "" if self.brew_upgrade_rc == 0
+                             else "Error: Failed to download resource")
+        if a[:2] == [tart_pin.BREW, "uninstall"]:
+            # Resolves the keg through opt (default_kegs) and removes only it.
+            name = a[-1].rsplit("/", 1)[-1]
+            if self.uninstall_rc:
+                return su.Result(self.uninstall_rc, "", "Error: uninstall failed")
+            keg = os.readlink(tart_pin.OPT / name).rsplit("/", 1)[-1]
+            self.kegs[name].discard(keg)
+            (tart_pin.OPT / name).unlink()
+            setattr(self, name, None)
+            return ok()
+        if a[:2] == [tart_pin.BREW, "link"]:
+            name = a[-1].rsplit("/", 1)[-1]
+            if not self.kegs[name]:
+                return su.Result(1, "", f"Error: No such keg: {name}")
+            latest = max(self.kegs[name], key=tart_pin.vkey)
+            self._link(name, latest, keep=True)
+            setattr(self, name, latest)
+            return ok()
+        if a[:2] == [tart_pin.BREW, "unlink"] or a[0] == "/bin/ln":
+            return ok()
+        if a[:2] == ["pgrep", "-f"] and a[2] == tart_pin.TART_RUN_PATTERN:
+            return su.Result(0, "4242 tart run m5-gate\n") if self.tart_running else su.Result(1)
+        if a[0] == "ssh" and a[-1] == su.TART_VERIFIED_SCRIPT:
+            if self.peer_tart_rc:
+                return su.Result(self.peer_tart_rc, "", "ssh: connect timed out")
+            value = self.peer_tart.get(a[-2])
+            clock = self.clock if self.peer_tart_clock is None else self.peer_tart_clock
+            return ok(f"{int(clock)}\n" + (json.dumps(value) if value else ""))
         if a[0] == FAKE_GH:
             repository = a[2].removeprefix("repos/").split("/commits/")[0]
             if self.repository_failures.get(repository):
@@ -3857,6 +3960,638 @@ class OsInterpreterRefreshTests(Base):
                                      "detail": "macOS build changed"}]
         self.assertEqual(self.apply(), su.EXIT_NOTHING)
         self.assertEqual(self.sys.mutations(), [])
+
+
+class TartUpgradeTests(Base):
+    """fleet/tart.toml pins Tart; a host that opts in moves to it while its pool
+    is off, the canary first, proven by booting a clone of the golden. On a
+    failure the new kegs are removed so the previous ones are linked again,
+    the pin is not retried here, and a rollback that does not bring the
+    previous Tart back leaves the host OFF."""
+
+    PIN = ('[tart]\nversion = "2.40.1"\nsha256 = "' + TART_SHA + '"\n'
+           '[softnet]\nversion = "0.24.0"\nsha256 = "' + SOFTNET_SHA + '"\n')
+    SOAK = 4 * 3600
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The commit this turn installs (checkout) and the installed generation
+        # (refresh_reason reads it) carry the same pin unless a test moves one.
+        self.installed_root = self.home / "installed-generation"
+        for root in (self.cfg.checkout, self.installed_root):
+            (root / "fleet").mkdir(parents=True, exist_ok=True)
+            (root / "fleet" / "tart.toml").write_text(self.PIN)
+        opt = self.home / "opt"
+        opt.mkdir()
+        for name, value in (("OPT", opt), ("REPO_ROOT", self.installed_root)):
+            patcher = mock.patch.object(tart_pin, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.sys.set_tart("2.36.0")
+        self.sys.set_softnet("0.23.0")
+        self.cfg.tart_upgrade, self.cfg.tart_canary = True, "m1"   # this host is m1
+
+    def receipt(self) -> dict:
+        return json.loads(Path(self.last()["receipt"]).read_text())
+
+    def steps(self, name: str) -> list[dict]:
+        return [step for step in self.receipt()["steps"] if step["step"] == name]
+
+    def index_of(self, predicate) -> int:
+        return next(i for i, (argv, _) in enumerate(self.sys.calls) if predicate(argv))
+
+    def calls(self, *prefix: str) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:len(prefix)] == list(prefix)]
+
+    def upgrades(self) -> list[list[str]]:
+        return self.calls(tart_pin.BREW, "upgrade")
+
+    def verified(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / tart_pin.VERIFIED)
+
+    def failed(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / tart_pin.FAILED)
+
+    def gate(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / tart_pin.GATE)
+
+    def decide(self):
+        return su.tart_decision(self.cfg, self.sys)
+
+    # ── off by default, canary first ────────────────────────────────────
+
+    def test_off_by_default(self) -> None:
+        self.cfg.tart_upgrade = False
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertEqual([], self.steps("tart-upgrade"))
+        self.assertIs(False, self.gate()["due"])
+
+    def test_the_canary_upgrades_while_off_boots_a_clone_and_publishes(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual(("2.40.1", "0.24.0"), (self.sys.tart, self.sys.softnet))
+        self.assertIn("Tart 2.36.0 -> 2.40.1, Softnet 0.24.0; a clone of pulp-build-runner:latest "
+                      "booted", self.steps("tart-upgrade")[0]["detail"])
+        upgrade = self.index_of(lambda a: a[:2] == [tart_pin.BREW, "upgrade"])
+        off = self.index_of(lambda a: a[:3] == ["./tartci", "pool", "off"] and "--plan" not in a)
+        install = self.index_of(lambda a: "install" in a and "--apply" in a)
+        boot = self.index_of(lambda a: a[:2] == [tart_pin.TART, "ip"])
+        self.assertLess(off, upgrade)
+        self.assertLess(upgrade, boot)
+        self.assertLess(boot, install)
+        env = self.sys.env_calls[upgrade]
+        self.assertEqual("1", env["HOMEBREW_NO_AUTO_UPDATE"])
+        self.assertEqual("1", env["HOMEBREW_NO_INSTALL_CLEANUP"])
+        self.assertEqual({"version": "2.40.1", "sha256": TART_SHA},
+                         {k: self.verified()[k] for k in ("version", "sha256")})
+        published = [s["step"] for s in self.receipt()["steps"]]
+        self.assertLess(published.index("verify"), published.index("tart-verified"))
+        self.assertEqual([], list((self.cfg.state_dir.parent / "scratch-vms").glob("*.json")),
+                         "the clone's scratch record goes once it is deleted")
+
+    def test_the_boot_check_runs_with_the_store_s_tart_home_and_stops_the_clone(self) -> None:
+        self.assertUpdated(self.apply())
+        profile_home = su.tart_boot_target(self.cfg)[1]
+        for verb in ("clone", "ip", "stop", "delete"):
+            index = self.index_of(lambda a, v=verb: a[:2] == [tart_pin.TART, v])
+            self.assertEqual(profile_home, self.sys.env_calls[index]["TART_HOME"], verb)
+
+    def test_another_host_waits_for_the_canary(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("waiting for canary studio to boot and serve Tart 2.40.1",
+                      self.steps("tart-upgrade")[0]["detail"])
+        self.assertIsNone(self.verified())
+        self.assertIs(False, self.gate()["due"], "waiting for the canary is not a problem")
+
+    def test_an_unreachable_canary_is_named_as_such(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.peer_tart_rc = 255
+        self.assertIn("waiting for canary studio: unreachable or unknown (ssh m3 exit 255)",
+                      self.decide().refusal)
+
+    def test_a_canary_record_for_another_version_or_sha_is_not_adoption(self) -> None:
+        self.cfg.tart_canary = "studio"
+        for record in ({"version": "2.39.0", "sha256": TART_SHA, "verified_at": NOW - 9 * 3600},
+                       {"version": "2.40.1", "sha256": "c" * 64, "verified_at": NOW - 9 * 3600},
+                       {"version": "2.40.1", "verified_at": NOW - 9 * 3600}):
+            with self.subTest(record=record):
+                self.sys.peer_tart["m3"] = record
+                self.assertIn("waiting for canary studio to boot", self.decide().refusal)
+
+    def test_adoption_waits_exactly_the_soak_on_the_canary_s_clock(self) -> None:
+        self.cfg.tart_canary = "studio"
+        # The canary's clock is 2 h ahead: its record is aged on its clock.
+        self.sys.peer_tart_clock = NOW + 7200
+        record = {"version": "2.40.1", "sha256": TART_SHA}
+        self.sys.peer_tart["m3"] = dict(record, verified_at=NOW + 7200 - (self.SOAK - 1))
+        self.assertIn("soaking for 240 min", self.decide().refusal)
+        self.sys.peer_tart["m3"] = dict(record, verified_at=NOW + 7200 - self.SOAK)
+        self.assertIsNone(self.decide().refusal)
+
+    def test_another_host_adopts_after_the_soak(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.peer_tart["m3"] = {"version": "2.40.1", "sha256": TART_SHA,
+                                    "verified_at": NOW - 5 * 3600}
+        self.assertUpdated(self.apply())
+        self.assertEqual("2.40.1", self.sys.tart)
+        self.assertIsNone(self.verified(), "only the canary publishes")
+
+    def test_a_non_canary_already_on_the_pin_does_nothing(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.set_tart("2.40.1")
+        self.assertIsNone(self.decide())
+
+    def test_a_newer_tart_than_the_pin_is_never_touched_and_never_drains(self) -> None:
+        self.sys.set_tart("2.41.1")
+        self.assertIn("Tart 2.41.1 is newer than the pin 2.40.1", self.decide().refusal)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    # ── the tap ─────────────────────────────────────────────────────────
+
+    def test_a_tap_that_does_not_offer_exactly_the_pin_is_refused(self) -> None:
+        for tap in ({"tart": ("2.41.1", TART_SHA), "softnet": ("0.24.0", SOFTNET_SHA)},
+                    {"tart": ("2.40.1", "c" * 64), "softnet": ("0.24.0", SOFTNET_SHA)},
+                    {"tart": ("2.40.1", TART_SHA), "softnet": ("0.25.0", SOFTNET_SHA)}):
+            with self.subTest(tap=tap):
+                (self.cfg.state_dir / tart_pin.TAP_CACHE).unlink(missing_ok=True)
+                self.sys.tap = tap
+                self.assertIn("the tap offers", self.decide().refusal)
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+
+    def test_the_tap_cache_is_per_pin_and_never_from_the_future(self) -> None:
+        self.assertIsNone(self.decide().refusal)
+        infos = lambda: len(self.calls(tart_pin.BREW, "info", "--json=v2"))  # noqa: E731
+        self.assertIsNone(self.decide().refusal)
+        self.assertEqual(1, infos(), "cached for an hour")
+        cache = su._read_json(self.cfg.state_dir / tart_pin.TAP_CACHE)
+        su._write_json(self.cfg.state_dir / tart_pin.TAP_CACHE, dict(cache, at=NOW + 600))
+        self.decide()
+        self.assertEqual(2, infos(), "a cache dated in the future is not trusted")
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(
+            self.PIN.replace("2.40.1", "2.40.2"))
+        self.sys.tap["tart"] = ("2.40.2", TART_SHA)
+        self.assertIsNone(self.decide().refusal, "a moved pin never reads the old answer")
+        self.assertEqual(3, infos())
+
+    # ── failure, rollback and memory ────────────────────────────────────
+
+    def test_a_clone_that_does_not_boot_restores_the_previous_kegs(self) -> None:
+        self.sys.boot_ok = False
+        self.assertUpdated(self.apply())
+        self.assertEqual(("2.36.0", "0.23.0"), (self.sys.tart, self.sys.softnet))
+        self.assertEqual("../Cellar/tart/2.36.0", os.readlink(tart_pin.OPT / "tart"))
+        self.assertEqual("../Cellar/softnet/0.23.0", os.readlink(tart_pin.OPT / "softnet"))
+        self.assertEqual({"2.36.0"}, self.sys.kegs["tart"], "only the new keg was removed")
+        uninstalls = self.calls(tart_pin.BREW, "uninstall")
+        self.assertEqual(["openai/tools/tart", "openai/tools/softnet"], [a[-1] for a in uninstalls])
+        self.assertIn("--ignore-dependencies", uninstalls[0])
+        failed = self.steps("tart-upgrade")[0]
+        self.assertFalse(failed["ok"])
+        self.assertIn("did not report an IP", failed["detail"])
+        rollback = self.steps("tart-rollback")[0]
+        self.assertTrue(rollback["ok"], rollback)
+        self.assertIn("restored tart ../Cellar/tart/2.36.0, softnet ../Cellar/softnet/0.23.0; "
+                      "Tart 2.36.0 answers", rollback["detail"])
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertIsNone(self.verified())
+
+    def test_an_empty_ip_is_not_a_boot(self) -> None:
+        self.sys.boot_ip = "\n"
+        self.assertUpdated(self.apply())
+        self.assertIn("did not report an IP", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.36.0", self.sys.tart)
+
+    def test_an_upgrade_that_lands_another_version_is_rolled_back(self) -> None:
+        self.sys.brew_upgrade_installs = "2.38.0"
+        self.assertUpdated(self.apply())
+        self.assertIn("brew installed Tart 2.38.0, not 2.40.1", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertTrue(self.steps("tart-rollback")[0]["ok"])
+
+    def test_a_softnet_left_on_another_version_is_rolled_back(self) -> None:
+        self.sys.tap["softnet"] = ("0.24.0", SOFTNET_SHA)
+        original = self.sys.set_softnet
+        self.sys.set_softnet = lambda version: original("0.23.5")
+        self.assertUpdated(self.apply())
+        self.assertIn("Softnet links ../Cellar/softnet/0.23.5, not 0.24.0",
+                      self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.36.0", self.sys.tart)
+
+    def test_a_failed_brew_upgrade_never_stops_the_update(self) -> None:
+        self.sys.brew_upgrade_rc = 1
+        self.assertUpdated(self.apply())
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertIn("brew upgrade exit 1", self.steps("tart-upgrade")[0]["detail"])
+        self.assertIn("nothing was relinked; Tart 2.36.0 answers",
+                      self.steps("tart-rollback")[0]["detail"])
+        self.assertEqual([], self.calls(tart_pin.BREW, "uninstall"),
+                         "the previous keg is never uninstalled")
+
+    def test_a_rollback_that_fails_leaves_the_host_off_and_counts(self) -> None:
+        self.sys.boot_ok = False
+        self.sys.uninstall_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("failed", last["status"])
+        self.assertIs(True, last["host_off"])
+        self.assertIn("Tart rollback failed", last["error"])
+        self.assertNotEqual("on", self.sys.pool_state)
+        self.assertFalse(self.steps("tart-rollback")[0]["ok"])
+        self.assertFalse(any("install" in a and "--apply" in a for a, _ in self.sys.calls),
+                         "nothing is installed after a broken Tart")
+
+    def test_a_rollback_whose_tart_does_not_answer_leaves_the_host_off(self) -> None:
+        self.sys.boot_ok = False
+        original = self.sys.run
+
+        def silent_after_rollback(argv, **kw):
+            if argv[:2] == [tart_pin.TART, "--version"] and self.calls(tart_pin.BREW, "link"):
+                return su.Result(127, "", "dyld: Library not loaded")
+            return original(argv, **kw)
+        self.sys.run = silent_after_rollback
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("Tart is NOT runnable now, expected 2.36.0", self.last()["error"])
+        self.assertIs(True, self.last()["host_off"])
+
+    def test_a_failed_pin_is_not_retried_until_the_pin_moves_or_is_cleared(self) -> None:
+        self.sys.boot_ok = False
+        self.assertUpdated(self.apply())
+        self.assertEqual({"version": "2.40.1", "sha256": TART_SHA},
+                         {k: self.failed()[k] for k in ("version", "sha256")})
+        self.sys.boot_ok = True
+        self.assertIn("failed here at", self.decide().refusal)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply(), "no drain every 6 h for a failed pin")
+        self.assertIs(True, self.gate()["due"], "a stuck pin past its gate stays a problem")
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(
+            self.PIN.replace(TART_SHA, "d" * 64))
+        self.sys.tap["tart"] = ("2.40.1", "d" * 64)
+        self.assertIsNone(self.decide().refusal, "a moved pin is tried")
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(self.PIN)
+        self.sys.tap["tart"] = ("2.40.1", TART_SHA)
+        (self.cfg.state_dir / tart_pin.FAILED).unlink()
+        self.assertIsNone(self.decide().refusal, "an operator clears it by removing the record")
+
+    def pool_ons(self) -> list[int]:
+        return [i for i, (a, _) in enumerate(self.sys.calls)
+                if a[-2:] == ["pool", "on"] or a[1:3] == ["pool", "on"]
+                or (a[-3:-1] == ["pool", "on"])]
+
+    def test_sigterm_mid_upgrade_holds_the_host_off_without_a_slow_rollback(self) -> None:
+        import signal
+
+        def term_during_boot(argv):
+            if argv[:2] == [tart_pin.TART, "ip"]:
+                self.sys.hook = None
+                os.kill(os.getpid(), signal.SIGTERM)
+        self.sys.hook = term_during_boot
+        before = len(self.sys.calls)
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIs(True, self.last()["host_off"])
+        self.assertIn("interrupted mid Tart upgrade, not rolled back", self.last()["error"])
+        self.assertEqual([], self.calls(tart_pin.BREW, "uninstall"), "no brew under a SIGTERM")
+        on_after = [i for i in self.pool_ons() if i >= before
+                    and self.index_of(lambda a: a[:2] == [tart_pin.TART, "ip"]) < i]
+        self.assertEqual([], on_after, "no pool on after the SIGTERM")
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).is_file())
+        self.assertFalse((self.cfg.state_dir / tart_pin.PENDING).exists(),
+                         "the hold takes over from the pending record")
+
+    def held_off(self) -> None:
+        """A TartBroken stop: the rollback's uninstall fails."""
+        self.sys.boot_ok = False
+        self.sys.uninstall_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIs(True, self.last()["host_off"])
+        self.sys.pool_state = "off"
+
+    def test_a_held_host_is_not_turned_on_by_the_next_self_update(self) -> None:
+        self.held_off()
+        ons = len(self.pool_ons())
+        outcome = su.recover_left_off(self.cfg, self.sys)
+        self.assertIs(False, outcome["attempted"])
+        self.assertIn("held OFF on purpose", outcome["reason"])
+        self.assertEqual(ons, len(self.pool_ons()))
+        self.assertEqual("off", self.sys.pool_state)
+
+    def test_a_held_host_is_not_turned_on_by_the_watchdog_and_keeps_alerting(self) -> None:
+        import host_off
+        self.held_off()
+        calls: list[str] = []
+        pool = host_off.pool_state_file(self.home)
+        pool.parent.mkdir(parents=True, exist_ok=True)
+        pool.write_text("off\n")
+        os.utime(pool, (NOW - 3600, NOW - 3600))
+        outcome = host_off.recover(self.cfg.state_dir, pool, lambda: calls.append("on") or (0, ""),
+                                   now=NOW + 600, who="launchd-watchdog")
+        self.assertEqual([], calls)
+        self.assertIs(False, outcome["attempted"])
+        current = host_off.status(self.cfg.state_dir, pool, NOW + 600)
+        self.assertIs(True, current["unexpected"], "it still alerts")
+        self.assertIn("HELD OFF on purpose", current["detail"])
+        import tartci_launchd_watchdog as watchdog
+        with mock.patch.object(watchdog, "_pool_on", lambda: calls.append("on") or (0, "")), \
+                mock.patch.object(host_off, "state_dir", lambda home=None: self.cfg.state_dir), \
+                mock.patch.object(host_off, "pool_state_file", lambda home=None: pool), \
+                mock.patch.object(host_off, "alert", lambda *a, **k: None):
+            line = watchdog.host_off_pass(now=NOW + 900)
+        self.assertEqual([], calls, "host_off_pass never turns a held host on")
+        self.assertIn("WARN", line)
+
+    def test_a_held_host_refuses_every_update_until_tart_is_fixed(self) -> None:
+        self.held_off()
+        self.sys.boot_ok, self.sys.uninstall_rc = True, 0
+        self.sys.clock += (self.cfg.rate_hours + 1) * 3600   # past the same-target guard
+        installs = len([a for a, _ in self.sys.calls if "install" in a and "--apply" in a])
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual("off", self.sys.pool_state)
+        self.assertEqual(installs, len([a for a, _ in self.sys.calls
+                                        if "install" in a and "--apply" in a]))
+        self.assertIs(True, self.last()["host_off"], "nothing cleared the OFF record")
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        error = json.loads(receipts[-1].read_text())["error"]
+        self.assertIn("host HELD OFF for Tart", error)
+        self.assertIn("brew uninstall --ignore-dependencies openai/tools/tart", error)
+
+    def test_a_hold_from_an_earlier_episode_is_ignored_and_removed(self) -> None:
+        import host_off
+        self.held_off()
+        # Months later an unrelated update leaves the host OFF: a new episode.
+        last = self.last()
+        su._write_json(self.cfg.state_dir / "last.json",
+                       dict(last, at="2027-06-01T00:00:00Z", error="pool on failed"))
+        self.assertIsNone(host_off.held(self.cfg.state_dir))
+        calls: list[str] = []
+        pool = host_off.pool_state_file(self.home)
+        pool.parent.mkdir(parents=True, exist_ok=True)
+        pool.write_text("off\n")
+        os.utime(pool, (NOW - 3600, NOW - 3600))
+        outcome = host_off.recover(self.cfg.state_dir, pool, lambda: calls.append("on") or (0, ""),
+                                   now=su._ts("2027-06-01T00:10:00Z"),
+                                   who="launchd-watchdog")
+        self.assertEqual(["on"], calls, "the unrelated OFF is recovered")
+        self.assertTrue(outcome["attempted"])
+        self.assertIsNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertFalse((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_hold_is_cleared_once_the_pool_is_on_with_a_working_tart(self) -> None:
+        self.held_off()
+        self.assertIsNotNone(su.tart_hold_refusal(self.cfg, self.sys))
+        # The operator relinked 2.36.0 by hand and turned the pool on.
+        self.sys.kegs["tart"].discard("2.40.1")
+        self.sys.set_tart("2.36.0")
+        self.sys.pool_state = "on"
+        self.assertIsNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertFalse((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_hold_stays_while_the_pool_is_off_whatever_tart_answers(self) -> None:
+        self.held_off()
+        self.sys.kegs["tart"].discard("2.40.1")
+        self.sys.set_tart("2.36.0")          # Tart fixed by hand, pool not on yet
+        self.assertEqual("off", self.sys.pool_state)
+        self.assertIsNotNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_hold_stays_while_the_pool_is_on_with_the_failed_tart(self) -> None:
+        self.held_off()
+        self.sys.pool_state = "on"           # someone forced the pool on
+        self.assertEqual("2.40.1", self.sys.tart)
+        self.assertIsNotNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_run_killed_mid_tart_upgrade_is_held_off_by_the_next_run(self) -> None:
+        def kill_during_boot(argv):
+            if argv[:2] == [tart_pin.TART, "ip"]:
+                raise SystemExit("SIGKILL stand-in")
+        self.sys.hook = kill_during_boot
+        with self.assertRaises(SystemExit):
+            self.apply()
+        self.sys.hook = None
+        self.assertTrue((self.cfg.state_dir / tart_pin.PENDING).is_file())
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        value = json.loads(receipts[-1].read_text())
+        value.update(status="running", pid=999999)
+        receipts[-1].write_text(json.dumps(value))
+        ons = len(self.pool_ons())
+        su.recover_interrupted(self.cfg, self.sys, [receipts[-1]])
+        self.assertEqual(ons, len(self.pool_ons()), "no pool on for a killed Tart upgrade")
+        self.assertIs(True, self.last()["host_off"])
+        self.assertIn("HOST HELD OFF: killed mid Tart upgrade", self.last()["error"])
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).is_file())
+        self.assertFalse((self.cfg.state_dir / tart_pin.PENDING).exists())
+
+    def test_the_recovery_text_removes_the_failed_keg_before_linking(self) -> None:
+        self.held_off()
+        error = self.last()["error"]
+        self.assertLess(error.index("brew uninstall --ignore-dependencies openai/tools/tart"),
+                        error.index("brew link --overwrite openai/tools/tart"))
+        self.assertIn("tart-broken.json", error)
+
+    def test_brew_never_autoremoves_in_a_rollback(self) -> None:
+        self.sys.boot_ok = False
+        self.assertUpdated(self.apply())
+        index = self.index_of(lambda a: a[:2] == [tart_pin.BREW, "uninstall"])
+        self.assertEqual("1", self.sys.env_calls[index]["HOMEBREW_NO_AUTOREMOVE"])
+
+    def test_a_link_that_lands_on_another_keg_is_a_failed_rollback(self) -> None:
+        # A stray newer keg in the Cellar: `brew link` picks it, not 2.36.0.
+        self.sys.kegs["tart"].add("2.39.0")
+        self.sys.boot_ok = False
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("tart links ../Cellar/tart/2.39.0 after the rollback, not "
+                      "../Cellar/tart/2.36.0", self.last()["error"])
+
+    def test_a_failed_canary_boot_check_is_remembered(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.set_tart("2.40.1")
+        self.sys.boot_ok = False
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertFalse(self.steps("tart-upgrade")[0]["ok"])
+        self.assertEqual("2.40.1", self.failed()["version"])
+        self.assertIsNone(self.verified())
+
+    def test_the_canary_s_own_record_must_match_the_pin_s_sha(self) -> None:
+        self.sys.set_tart("2.40.1")
+        su._write_json(self.cfg.state_dir / tart_pin.VERIFIED,
+                       {"version": "2.40.1", "sha256": "c" * 64, "verified_at": NOW - 99999})
+        self.assertTrue(self.decide().prove_only)
+        su._write_json(self.cfg.state_dir / tart_pin.VERIFIED,
+                       {"version": "2.40.1", "sha256": TART_SHA, "verified_at": NOW - 99999})
+        self.assertIsNone(self.decide())
+
+    def test_a_host_without_a_golden_refuses_before_the_drain(self) -> None:
+        self.sys.log_lines = ""
+        with mock.patch.object(su, "tart_boot_target", return_value=None):
+            self.assertIn("names no golden", self.decide().refusal)
+            self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_vm_left_after_pool_off_defers_the_pin_instead_of_draining_again(self) -> None:
+        self.sys.tart_running = True
+        self.assertUpdated(self.apply())
+        self.assertIn("deferred for 24 h", self.steps("tart-upgrade")[0]["detail"])
+        self.sys.tart_running = False
+        self.assertIn("deferred until", self.decide().refusal)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.sys.clock += tart_pin.DEFER_SECONDS
+        (self.cfg.state_dir / tart_pin.TAP_CACHE).unlink(missing_ok=True)
+        self.assertIsNone(self.decide().refusal, "tried again after the deferral")
+
+    def test_refresh_reads_the_installed_generation_s_pin(self) -> None:
+        self.sys.log_lines = ""
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(self.PIN.replace("2.40.1", "9.9.9"))
+        self.assertIn("upgrade Tart 2.36.0 -> 2.40.1", str(su.refresh_reason(self.cfg, self.sys)))
+
+    def test_a_running_tart_vm_is_never_replaced(self) -> None:
+        self.sys.tart_running = True
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("a Tart VM process was still running after pool off",
+                      self.steps("tart-upgrade")[0]["detail"])
+
+    def test_the_vm_process_pattern_matches_tart_itself_only(self) -> None:
+        import re
+        pattern = re.compile(tart_pin.TART_RUN_PATTERN)
+        for line in ("/opt/homebrew/Cellar/tart/2.38.0/tart.app/Contents/MacOS/tart run --no-graphics x",
+                     "tart run x"):
+            self.assertTrue(pattern.search(line), line)
+        for line in ("bash -c echo tart run", "/usr/bin/grep tart run", "vim notes-on-tart run"):
+            self.assertFalse(pattern.search(line), line)
+
+    def test_a_clone_that_cannot_be_deleted_fails_the_tart_step(self) -> None:
+        # A good boot whose clone survives three stop/delete tries must not
+        # end in a quiet pool on beside it: it is a failed Tart step.
+        self.sys.tart_delete_rc = 1
+        self.assertUpdated(self.apply())
+        cleanup = self.steps("tart-check-cleanup")[0]
+        self.assertFalse(cleanup["ok"])
+        self.assertIn("still there after 3 tries; the watchdog deletes it after", cleanup["detail"])
+        self.assertEqual(3, len(self.calls(tart_pin.TART, "delete")))
+        failed = self.steps("tart-upgrade")[0]
+        self.assertFalse(failed["ok"])
+        self.assertIn("could not be removed", failed["detail"])
+        self.assertEqual("2.36.0", self.sys.tart, "rolled back")
+        self.assertEqual("2.40.1", self.failed()["version"])
+        self.assertIsNone(self.verified())
+        import scratch_vm_ttl
+        names = [r["name"] for r in scratch_vm_ttl.records()]
+        self.assertEqual([f"{tart_pin.CHECK_PREFIX}{os.getpid()}"], names)
+        self.assertTrue(self.calls(tart_pin.TART, "stop"), "the clone is stopped")
+
+    def test_a_cleanup_that_succeeds_on_a_retry_is_fine(self) -> None:
+        self.sys.tart_delete_rcs = [1]
+        self.assertUpdated(self.apply())
+        self.assertEqual(2, len(self.calls(tart_pin.TART, "delete")))
+        self.assertEqual([], self.steps("tart-check-cleanup"))
+        self.assertTrue(self.steps("tart-upgrade")[0]["ok"])
+        self.assertEqual("2.40.1", self.sys.tart)
+
+    # ── the pinned bytes ────────────────────────────────────────────────
+
+    def test_the_downloaded_archives_are_checked_against_the_pin(self) -> None:
+        self.assertUpdated(self.apply())
+        hashed = [a[-1] for a in self.calls("/usr/bin/shasum", "-a", "256")]
+        self.assertEqual(2, len(hashed), "Tart and the Softnet that moved with it")
+        self.assertTrue(self.steps("tart-upgrade")[0]["ok"])
+
+    def test_a_re_cut_archive_under_the_pinned_version_is_rolled_back(self) -> None:
+        self.sys.archive_sha["tart"] = "e" * 64
+        self.assertUpdated(self.apply())
+        detail = self.steps("tart-upgrade")[0]["detail"]
+        self.assertIn("the downloaded openai/tools/tart archive", detail)
+        self.assertIn("has sha256 eeeeeeeeeeee, the pin is aaaaaaaaaaaa", detail)
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertTrue(self.steps("tart-rollback")[0]["ok"])
+        self.assertEqual([], self.calls(tart_pin.TART, "clone"), "no boot of unpinned bytes")
+
+    def test_a_re_cut_softnet_archive_is_rolled_back(self) -> None:
+        self.sys.archive_sha["softnet"] = "f" * 64
+        self.assertUpdated(self.apply())
+        self.assertIn("openai/tools/softnet archive", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual(("2.36.0", "0.23.0"), (self.sys.tart, self.sys.softnet))
+
+    def test_a_stale_cached_tap_is_reread_before_the_upgrade(self) -> None:
+        self.assertIsNone(self.decide().refusal)       # caches the matching answer
+        self.sys.tap["tart"] = ("2.40.1", "c" * 64)    # the tap re-cut the release since
+        self.assertIsNone(self.decide().refusal, "a plan may use the cached answer")
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("the tap offers tart 2.40.1 (cccccccccccc)",
+                      self.steps("tart-upgrade")[0]["detail"])
+
+    def test_a_stale_cached_tap_never_starts_a_tart_only_drain(self) -> None:
+        self.assertIsNone(self.decide().refusal)
+        self.sys.tap["tart"] = ("2.40.1", "c" * 64)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    # ── turns of their own ──────────────────────────────────────────────
+
+    def test_a_current_tartci_takes_a_drained_turn_for_the_pinned_tart(self) -> None:
+        self.sys.log_lines = ""   # TartCI current with main
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertIn("upgrade Tart 2.36.0 -> 2.40.1", str(self.receipt().get("refresh")))
+        self.assertEqual("2.40.1", self.sys.tart)
+        self.assertEqual("on", self.sys.pool_state)
+
+    def test_a_host_waiting_for_the_canary_does_not_drain_for_tart(self) -> None:
+        self.sys.log_lines = ""
+        self.cfg.tart_canary = "studio"
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_an_unreadable_tap_never_starts_a_drain(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.tap_ok = False
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_canary_already_on_the_pin_boot_checks_it_once_and_publishes(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.set_tart("2.40.1")
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("canary boot check of Tart 2.40.1: booted",
+                      self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.40.1", self.verified()["version"])
+        self.assertEqual(su.EXIT_NOTHING, self.apply(), "proven once, then nothing to do")
+
+    def test_the_plan_names_the_tart_upgrade(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.plan())
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        plan = json.loads(attempts[-1].read_text())
+        self.assertIn("upgrade Tart 2.36.0 -> 2.40.1 (boot-checked)", plan["steps"][-1]["detail"])
+        self.assertEqual([], self.upgrades())
+
+    def test_tart_settings_are_validated(self) -> None:
+        settings = self.home / "self-update.toml"
+        settings.write_text('[tart]\nupgrade = "yes"\n')
+        with self.assertRaises(su.ConfigError):
+            su.load_config(self.home, settings)
+        settings.write_text('[tart]\nupgrade = true\ncanary = "studio"\nsoak_seconds = 60\n')
+        cfg = su.load_config(self.home, settings)
+        self.assertEqual((True, "studio", 60), (cfg.tart_upgrade, cfg.tart_canary,
+                                                cfg.tart_soak_seconds))
+        self.assertFalse(su.load_config(self.home, self.home / "absent.toml").tart_upgrade)
+
+    def test_status_says_when_tart_is_behind_its_pin(self) -> None:
+        state = self.cfg.state_dir.parent / "tool-freshness" / "state.json"
+        su._write_json(state, {"tools": {"tart": {"state": "behind", "installed": "2.36.0",
+                                                  "latest_tag": "2.40.1", "stale": True}}})
+        self.assertIn("self-update: Tart 2.36.0 is behind its pin 2.40.1 (fleet/tart.toml); with "
+                      "[tart] upgrade = true a drained self-update moves it (STALE)",
+                      su.status_lines(self.cfg.state_dir))
+        su._write_json(state, {"tools": {"tart": {"state": "current"}}})
+        self.assertFalse(any("Tart" in line for line in su.status_lines(self.cfg.state_dir)))
 
 
 class PrivateSourceSystem(FakeSystem):

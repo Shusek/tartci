@@ -120,6 +120,12 @@ CCACHE_MAX_SIZE="${TARTCI_CCACHE_MAX_SIZE:-40G}"
 [[ "$CCACHE_MAX_SIZE" =~ ^[1-9][0-9]*[KMGT]$ ]] \
   || { printf 'invalid TARTCI_CCACHE_MAX_SIZE: expected a positive ccache size such as 40G\n' >&2; exit 1; }
 FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/Caches/Pulp/fetchcontent-src}"
+# Release-tier boots skip the read-write ccache and configure-checks mounts
+# (tartci_labels_mount_shared_cache in lane-cache-root.lib.sh).
+case "${TARTCI_RELEASE_TIER_NO_SHARED_CACHE:-1}" in
+  0|1) ;;
+  *) printf 'invalid TARTCI_RELEASE_TIER_NO_SHARED_CACHE: expected 0 or 1\n' >&2; exit 1 ;;
+esac
 # Optional read-only pip wheelhouse served to each guest. Opt-in by content: the
 # mount is added only while the directory holds at least one wheel, so a host
 # that never ran scripts/pip-wheelhouse.sh boots exactly as before.
@@ -289,6 +295,8 @@ CURRENT_GUEST_CORES=""
 CURRENT_GUEST_MEM_MB=""
 CURRENT_PIP_WHEELHOUSE=0
 CURRENT_ARTIFACT_CACHE=0
+# 1 when the VM mounts the shared ccache and configure-checks directories.
+CURRENT_SHARED_CACHE=1
 CLEANED_UP=0
 # Set when a work entry ends without serving a job, cleared when a job is
 # actually assigned or when the queue drains. Carries the START of the blocked
@@ -1781,7 +1789,13 @@ GUEST
 # hooks are no-ops unless TARTCI_CCACHE_WRITE_ISOLATION=1.
 run_runner_until_done(){
   local layer_rc=0
-  tartci_ccache_layer_attach "$1" || return 1
+  # The layer lives inside the shared ccache mount; a VM booted without that
+  # mount (a release tier) has none to attach.
+  if [ "${CURRENT_SHARED_CACHE:-1}" = 1 ]; then
+    tartci_ccache_layer_attach "$1" || return 1
+  else
+    tartci_ccache_layer_guest_fragments_clear
+  fi
   run_runner_until_done_unlayered "$@" || layer_rc=$?
   tartci_ccache_layer_settle "$1" "$layer_rc" "$STATE_DIR/$1.actions-runner.log"
   return "$layer_rc"
@@ -1804,18 +1818,29 @@ run_runner_until_done_unlayered(){
     return 1
   fi
   jit=""
+  # Without the shared mounts (a release tier) the links made below would
+  # dangle; the guest replaces them with its own empty directories.
+  local guest_cache_prep=""
+  # shellcheck disable=SC2016 # $HOME expands in the guest
+  [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] \
+    || guest_cache_prep='rm -f ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && mkdir -p ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && printf "TARTCI_DIAG shared-cache=off\n" && '
+  # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
+  # cache directory any guest can write (see lane-cache-root.lib.sh).
   ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
      mkdir -p \"\$HOME/Library/Caches/Pulp\" && ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
      ${CCACHE_LAYER_GUEST_PREP}export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
+     ${guest_cache_prep}mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
+     export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      fetchcontent_hydrated=false && \
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
+     printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      printf 'PULP_CONFIGURE_CHECK_CACHE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/configure-checks\" >> .env.tartci && \
      if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
@@ -2039,7 +2064,9 @@ boot_vm_to_ssh(){
   # Every directory the VM mounts from the cache root is checked and prepared
   # before boot (lane-cache-root.lib.sh); a refusal or a failed preparation
   # stops the boot.
-  if ! tartci_prepare_lane_cache_mounts "$CACHE_ROOT" "$HOST_CACHE_ROOT" "$FETCHCONTENT_SOURCE_ROOT"; then
+  CURRENT_SHARED_CACHE=1
+  tartci_labels_mount_shared_cache "$labels" || CURRENT_SHARED_CACHE=0
+  if ! tartci_prepare_lane_cache_mounts "$CACHE_ROOT" "$HOST_CACHE_ROOT" "$FETCHCONTENT_SOURCE_ROOT" "$CURRENT_SHARED_CACHE"; then
     [ -z "$TARTCI_LANE_CACHE_REFUSAL" ] || note "[$i] $TARTCI_LANE_CACHE_REFUSAL; refusing to boot"
     discard_current_vm
     tartci_release_vm_lease
@@ -2049,11 +2076,11 @@ boot_vm_to_ssh(){
   CURRENT_GUEST_CORES="$lease_cores"
   CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp -t "tart-run-$vm")"
-  local tart_dirs=(
-    --dir="ccache:$CACHE_ROOT/ccache"
-    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
-    --dir="configure-checks:$CACHE_ROOT/configure-checks"
-  )
+  local tart_dirs=()
+  [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")
+  tart_dirs+=(--dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro")
+  [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks")
+  [ "$CURRENT_SHARED_CACHE" = 1 ] || event shared_cache_skipped "labels=$labels"
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
   CURRENT_PIP_WHEELHOUSE=0
   if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
@@ -2159,6 +2186,9 @@ retarget_after_pre_mint_denial(){
       reason="runner_group_differs"
     elif jit_admission_denied "$group_id" "$labels"; then
       reason="jit_admission_denied"
+    elif [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
+      # Booted with the shared cache mounted; a release tier boots cold.
+      reason="release_tier_no_shared_cache"
     else
       reason=""
     fi

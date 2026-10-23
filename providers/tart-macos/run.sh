@@ -127,6 +127,9 @@ done
 }
 
 export CCACHE_DIR="$HOME/ccache"
+# The guest reads a local ccache config, never one planted in the shared cache.
+mkdir -p "$HOME/.config/ccache" && touch "$HOME/.config/ccache/tartci.conf"
+export CCACHE_CONFIGPATH="$HOME/.config/ccache/tartci.conf"
 export CCACHE_TEMPDIR="$HOME/.ccache-tmp"
 mkdir -p "$CCACHE_TEMPDIR"
 export CCACHE_BASEDIR="$HOME/src"

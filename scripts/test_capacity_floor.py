@@ -487,6 +487,40 @@ class ProtectedLabelTests(unittest.TestCase):
         self.assertIn(capacity_floor.Protected("o/r", "custom"), protected)
 
 
+class PeerSshDestinationTests(unittest.TestCase):
+    """A published supply's `ssh` reaches ssh argv only as a plain destination."""
+
+    def test_a_hostile_published_ssh_is_never_dialled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "pwned"
+            calls = root / "calls"
+            supply = published("m5", "m1")
+            supply["hosts"][1]["ssh"] = f"-oProxyCommand=touch {marker}"   # m5
+            supply_path = root / "advertised-labels.json"
+            supply_path.write_text(json.dumps(supply), encoding="utf-8")
+            ssh = root / "ssh"
+            ssh.write_text("#!/bin/bash\n"
+                           f"printf '%s\\n' \"$*\" >> {str(calls)!r}\n"
+                           f"echo {json.dumps(json.dumps(live_status()))}\n",
+                           encoding="utf-8")
+            ssh.chmod(0o755)
+            resolve = capacity_floor.peer_resolver(supply_path, host="studio", ssh=str(ssh),
+                                                   timeout=20)
+            evidence = {peer.host: peer for peer in resolve(REPO, GATE)}
+            argv = calls.read_text().splitlines()
+
+        # Negative: the hostile value is refused and never handed to ssh.
+        self.assertFalse(evidence["m5"].counted)
+        self.assertIn("refused ssh destination", evidence["m5"].why)
+        self.assertFalse(marker.exists())
+        self.assertFalse(any("ProxyCommand" in line for line in argv), argv)
+        # Positive: the plain alias is read, with "--" before it.
+        self.assertTrue(evidence["m1"].counted, evidence["m1"].why)
+        self.assertEqual(1, len(argv), argv)
+        self.assertIn("-- ssh-m1 " + capacity_floor.PEER_STATUS_COMMAND, argv[0])
+
+
 class CliTests(unittest.TestCase):
     """End-to-end through the process boundary: exit codes and stderr."""
 

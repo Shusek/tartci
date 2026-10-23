@@ -412,10 +412,16 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # Write the JIT config and run the agent once. A JIT runner processes exactly
   # one job and deregisters. The host cache binding above is mandatory so a
   # mount regression cannot silently turn every ephemeral job cold.
+  # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
+  # cache directory any guest can write (see tart-macos/lane-cache-root.lib.sh).
   ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
-     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
-     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \
+    "printf '%s' '$jit' > ~/jit.cfg && \
+     mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
+     export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
+     cd ~/actions-runner && \
+     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH)$/' .env > .env.tartci && \
+     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
+     printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && mv .env.tartci .env && \
      export CCACHE_DIR=\"\$HOME/.ccache\" && \
      export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content && unset CCACHE_DEPEND && \
      export CMAKE_BUILD_PARALLEL_LEVEL='$build_parallel_effective' && \
