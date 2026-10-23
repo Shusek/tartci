@@ -15,6 +15,7 @@ would do; **write** changes host state.
 | `tartci doctor fleet [--json] [--no-census]` | read | executed generation, drain capability, runner census across repo and org scopes. Exit 0 healthy, 1 problem, 2 undetermined. Reason codes are in `scripts/fleet_reasons.json` |
 | `tartci doctor --reap --json` | read | stale owned VM, overlay and runner residue. Exit 0 healthy, 1 stale or wedged, 2 unreadable |
 | `tartci doctor build-disagreement [--json]` | read | cross-host compile or link disagreement (cache poisoning). Off by default |
+| `tartci version [--json]` | read | the commit this copy runs: an installed generation's support manifest, or a checkout's HEAD (and whether it has uncommitted changes). Exit 1 when neither says |
 | `tartci status --json` | read | providers, capacity, role, janitor install state |
 | `tartci host-profile [--json]` | read | derived role and budget (`PULP_BUILD_JOBS`, `PULP_BUILD_MEM_BUDGET_MB`) |
 | `tartci host-profile --delivery [--json]` | read | how code reaches each lane, and staleness |
@@ -33,6 +34,9 @@ would do; **write** changes host state.
 | `tartci hooks print` | read | prints agent hook settings; never writes them |
 | `tartci launchd status` | read | serve LaunchAgent state |
 | `tartci fleet-macos tool-freshness [--json]` | read | Shipyard and pulp CLI versus latest release |
+| `tartci update --status [--json]` | read | one line: installed commit, skew, the live update step and how long it has run, last result |
+| `tartci update --wait [--json] [--timeout S]` | read | silent until this host's running update ends, then one line; exit 0 succeeded, 3 refused, 4 failed, 124 timed out. Run it in the background to be woken |
+| `tartci update [--yes]` | apply | update this host (same engine as `fleet-macos self-update --apply`): asks y/N on a terminal, never applies without one unless `--yes`; prints one line and keeps the full output in `~/.tartci/state/self-update/last-update-output.log` |
 | `tartci fleet-macos self-update --plan` | plan | default mode; steps 1 to 4 of the update, read-only |
 | `tartci pool <on\|drain\|off> --plan` | plan | prints the transition, writes nothing |
 | `tartci launchd reload <label> --dry-run` | plan | prints the plan or `REFUSE` (exit 0 or 3) |
