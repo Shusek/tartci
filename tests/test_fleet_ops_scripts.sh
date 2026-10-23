@@ -47,35 +47,44 @@ cat >"$bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 echo "stub sudo must not be called: $*" >&2; exit 98
 EOF
-# id: the real one, except `ci` exists only once the stub sysadminctl made it.
+# Account database stubs. `ci` exists once dscl gave it a UniqueID; markers
+# in $STUB_STATE make it an admin or a staff member.
 cat >"$bin/id" <<EOF
 #!/usr/bin/env bash
-if [ "\${1:-}" = ci ] || [ "\${2:-}" = ci ]; then
-  [ -e "\$STUB_STATE/ci-exists" ] || exit 1
-  echo 600; exit 0
-fi
+case " \$* " in
+  *" ci "*)
+    [ -e "\$STUB_STATE/ci-exists" ] || exit 1
+    case "\${1:-}" in
+      -gn) if [ -e "\$STUB_STATE/ci-in-staff" ]; then echo staff; else echo ci; fi ;;
+      *) echo 403 ;;
+    esac
+    exit 0 ;;
+esac
 exec "$REAL_ID" "\$@"
 EOF
 cat >"$bin/dseditgroup" <<'EOF'
 #!/usr/bin/env bash
-[ -e "$STUB_STATE/ci-admin" ]
-EOF
-cat >"$bin/sysadminctl" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$STUB_STATE/sysadminctl.log"
-touch "$STUB_STATE/ci-exists"
+printf '%s\n' "$*" >>"$STUB_STATE/dseditgroup.log"
+case "$*" in
+  "-o create "*) touch "$STUB_STATE/ci-group" ;;
+  *"checkmember -m ci admin") [ -e "$STUB_STATE/ci-admin" ] ;;
+  *"checkmember -m ci staff") [ -e "$STUB_STATE/ci-in-staff" ] ;;
+  *) exit 1 ;;
+esac
 EOF
 cat >"$bin/dscl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_STATE/dscl.log"
+case "$*" in
+  ". -list /Users UniqueID") printf 'root 0\nother 401\n' ;;
+  ". -list /Groups PrimaryGroupID") printf 'staff 20\nothergroup 402\n' ;;
+  ". -read /Groups/ci PrimaryGroupID") [ -e "$STUB_STATE/ci-group" ] ;;
+  ". -create /Users/ci UniqueID "*) touch "$STUB_STATE/ci-exists" ;;
+esac
 EOF
-cat >"$bin/createhomedir" <<'EOF'
+cat >"$bin/chown" <<'EOF'
 #!/usr/bin/env bash
-exit 0
-EOF
-cat >"$bin/openssl" <<'EOF'
-#!/usr/bin/env bash
-echo STUBSECRETPASSWORD
+printf '%s\n' "$*" >>"$STUB_STATE/chown.log"
 EOF
 cat >"$bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
@@ -126,7 +135,7 @@ has err "no non-empty $home/.ssh/authorized_keys"
 # Lockout guard: keys present but key login fails.
 echo "ssh-ed25519 AAAAtest test" >"$home/.ssh/authorized_keys"
 expect_rc 3 "apply with failing key login" -- env FLEET_OPS_TEST_EUID=0 SUDO_USER="$me" STUB_PUBKEY_OK=0 bash "$SSHD_OPS" --apply
-has err "key-only ssh to localhost as $me failed"
+has err "key-only login to localhost as $me failed"
 [ ! -e "$dropin" ] || fail "guard let the drop-in through (key login failed)"
 
 # sshd -t rejects: nothing left behind.
@@ -152,20 +161,30 @@ expect_rc 0 "rollback" -- env FLEET_OPS_TEST_EUID=0 bash "$SSHD_OPS" --rollback
 expect_rc 0 "rollback again" -- env FLEET_OPS_TEST_EUID=0 bash "$SSHD_OPS" --rollback
 has out "nothing to roll back"
 
+
 # ── create-ci-runner-user.sh ────────────────────────────────────────────────
 rhome="$tmp/runner-home"
 rdir="$rhome/actions-ci/Shipyard-test-01"
-mkdir -p "$rdir" "$rhome/Library/LaunchAgents"
+mkdir -p "$rdir" "$rhome/Library/LaunchAgents" "$rhome/.ssh" "$rhome/.config/pulp/secrets"
 printf '\357\273\277{\n  "agentId": 1,\n  "agentName": "Shipyard-test-01",\n  "gitHubUrl": "https://github.com/example/Shipyard",\n  "workFolder": "_work"\n}\n' >"$rdir/.runner"
 plist="$rhome/Library/LaunchAgents/actions.runner.example-Shipyard.Shipyard-test-01.plist"
 : >"$plist"
 printf '%s\n' "$plist" >"$rdir/.service"
 mkdir -p "$rhome/actions-ci/cache"   # no .runner: not a runner
-export FLEET_OPS_TEST_HOME="$rhome"
+# A stock macOS login home (750) and secret dirs: one right, one too open.
+chmod 750 "$rhome"
+chmod 700 "$rhome/.ssh"
+: >"$rhome/.ssh/id_test" && chmod 600 "$rhome/.ssh/id_test"
+chmod 755 "$rhome/.config/pulp/secrets"
+: >"$rhome/.config/pulp/secrets/token" && chmod 644 "$rhome/.config/pulp/secrets/token"
+cihome="$tmp/ci-home"
+export FLEET_OPS_TEST_HOME="$rhome" FLEET_OPS_TEST_CI_HOME="$cihome"
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 expect_rc 2 "ci: bad flag" -- bash "$CI_OPS" --bogus
 expect_rc 0 "ci: help" -- bash "$CI_OPS" --help
 has out "fleet SSH keys"
+has out "kept out of staff"
 
 expect_rc 0 "ci: plan" -- env FLEET_OPS_TEST_EUID=501 bash "$CI_OPS"
 has out "Shipyard-test-01"
@@ -173,39 +192,84 @@ has out "repo:        example/Shipyard"
 has out "labels:      shipyard,shipyard-macos"
 has out "actions.runner.example-Shipyard.Shipyard-test-01.plist (loaded)"
 has out "user 'ci': absent"
-has out "launchctl bootout gui/"
-has out "actions/runners/remove-token"
+# The home-mode check flags a 750 home; plan changes nothing.
+has out "home $rhome: 750, group/other-accessible; --apply sets it to 700"
+has out '  ~/.ssh: 700'
+has out "WARNING ~/.config/pulp/secrets: 755, want 700"
+has out "WARNING .config/pulp/secrets/token: 644, want 600"
+lacks out "WARNING .ssh/id_test"
+has out '  ~/.config/shipyard/github-apps: absent'
+[ "$(mode_of "$rhome")" = 750 ] || fail "plan changed the home mode"
+# Printed commands: quoted words, no values spliced into an sh -c script.
+has out "launchctl bootout 'gui/"
+has out "ghapp api -X POST 'repos/example/Shipyard/actions/runners/remove-token' --jq .token"
 has out "./config.sh remove --token"
-has out "ghapp api -X POST repos/example/Shipyard/actions/runners/registration-token"
-has out "--name Shipyard-test-01"
-has out "--labels shipyard,shipyard-macos"
+has out "ghapp api -X POST 'repos/example/Shipyard/actions/runners/registration-token'"
+has out "sh -c 'cd \"\$1\" && shift && exec ./config.sh \"\$@\"' sh '$cihome/actions-ci/Shipyard-test-01'"
+has out "--name 'Shipyard-test-01'"
+has out "--labels 'shipyard,shipyard-macos'"
 has out "<key>UserName</key><string>ci</string>"
+has out "sudo chown -R ci:ci"
+lacks out "ci:staff"
 lacks out "cache"
-[ ! -e "$STUB_STATE/sysadminctl.log" ] || fail "plan ran sysadminctl"
+[ ! -e "$STUB_STATE/dscl.log" ] || ! grep -q -- "-create" "$STUB_STATE/dscl.log" || fail "plan wrote to dscl"
+
+# A runner whose name could break out of a quoted word is skipped, not printed.
+evil="$rhome/actions-ci/evil"
+mkdir -p "$evil"
+printf '{\n  "agentName": "x'"'"'; touch pwned; #",\n  "gitHubUrl": "https://github.com/example/Shipyard"\n}\n' >"$evil/.runner"
+expect_rc 0 "ci: plan with unsafe runner name" -- env FLEET_OPS_TEST_EUID=501 bash "$CI_OPS"
+has out "name/repo has unexpected characters"
+lacks out "touch pwned"
+rm -rf "$evil"
 
 expect_rc 3 "ci: apply as non-root" -- env FLEET_OPS_TEST_EUID=501 bash "$CI_OPS" --apply
 has err "needs root; run: sudo $CI_OPS --apply"
-[ ! -e "$STUB_STATE/sysadminctl.log" ] || fail "non-root apply ran sysadminctl"
+[ ! -e "$STUB_STATE/dseditgroup.log" ] || ! grep -q -- "-o create" "$STUB_STATE/dseditgroup.log" || fail "non-root apply created a group"
 
-# Root (stubbed): creates a hidden standard user, never prints the password.
+# Root (stubbed): ci gets its own group (not staff), no password, hidden, a
+# 0700 home; the invoking user's 750 home is closed to 700.
 expect_rc 0 "ci: apply" -- env FLEET_OPS_TEST_EUID=0 bash "$CI_OPS" --apply
-has out "created standard user 'ci'"
-lacks out STUBSECRETPASSWORD
-lacks err STUBSECRETPASSWORD
-grep -q -- "-addUser ci " "$STUB_STATE/sysadminctl.log" || fail "sysadminctl not asked to add ci"
-! grep -q -- "-admin" "$STUB_STATE/sysadminctl.log" || fail "ci created as admin"
+has out "created user 'ci' (uid/gid 403, group ci not staff"
+grep -qx -- "-o create -r CI Runner -i 403 ci" "$STUB_STATE/dseditgroup.log" || fail "group ci not created with gid 403"
+grep -qx ". -create /Users/ci PrimaryGroupID 403" "$STUB_STATE/dscl.log" || fail "ci primary group is not its own"
+! grep -q "PrimaryGroupID 20$" "$STUB_STATE/dscl.log" || fail "ci given staff (20) as primary group"
+grep -qx ". -create /Users/ci Password \*" "$STUB_STATE/dscl.log" || fail "ci has a password"
 grep -qx ". -create /Users/ci IsHidden 1" "$STUB_STATE/dscl.log" || fail "ci not hidden"
-has out "./config.sh --unattended"
+grep -qx "ci:ci $cihome" "$STUB_STATE/chown.log" || fail "ci home not owned ci:ci"
+[ "$(mode_of "$cihome")" = 700 ] || fail "ci home not 700"
+[ "$(id -gn ci)" != staff ] || fail "ci primary group is staff"
+has out "home $rhome: was 750, group/other-accessible; set to 700"
+[ "$(mode_of "$rhome")" = 700 ] || fail "apply did not close the home"
+[ "$(mode_of "$rhome/.config/pulp/secrets")" = 755 ] || fail "apply changed a secret dir (report only)"
+has out "/bin/sh -c 'cd"
 
-# Idempotent: an existing standard ci is left alone.
-rm -f "$STUB_STATE/sysadminctl.log"
+# Idempotent: an existing standard ci and a 700 home are left alone.
+rm -f "$STUB_STATE/dseditgroup.log"
 expect_rc 0 "ci: apply again" -- env FLEET_OPS_TEST_EUID=0 bash "$CI_OPS" --apply
-has out "already exists and is a standard user"
-[ ! -e "$STUB_STATE/sysadminctl.log" ] || fail "second apply ran sysadminctl"
+has out "already exists, not admin, not in staff"
+has out "home $rhome: 700 (closed to group/other)"
+! grep -q -- "-o create" "$STUB_STATE/dseditgroup.log" || fail "second apply created a group"
+
+# A ci in staff is refused (it could read group-readable files in homes).
+touch "$STUB_STATE/ci-in-staff"
+expect_rc 3 "ci: apply with ci in staff" -- env FLEET_OPS_TEST_EUID=0 bash "$CI_OPS" --apply
+has err "is in staff"
+expect_rc 0 "ci: plan with ci in staff" -- env FLEET_OPS_TEST_EUID=501 bash "$CI_OPS"
+has out "IN STAFF (unsafe"
+rm -f "$STUB_STATE/ci-in-staff"
 
 # An existing admin ci is refused.
 touch "$STUB_STATE/ci-admin"
 expect_rc 3 "ci: apply with admin ci" -- env FLEET_OPS_TEST_EUID=0 bash "$CI_OPS" --apply
 has err "is an admin"
+rm -f "$STUB_STATE/ci-admin"
+
+# Creation that ends up in staff is reported as a failure, with the undo.
+rm -f "$STUB_STATE/ci-exists" "$STUB_STATE/ci-group"
+rm -rf "$cihome"
+touch "$STUB_STATE/ci-in-staff"
+expect_rc 4 "ci: apply where ci lands in staff" -- env FLEET_OPS_TEST_EUID=0 bash "$CI_OPS" --apply
+has err "came out in staff"
 
 echo 'fleet ops scripts: ok'

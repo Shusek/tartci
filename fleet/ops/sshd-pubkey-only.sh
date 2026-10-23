@@ -22,6 +22,12 @@
 # check uses that user's key files; a key that only lives in an agent fails
 # it, which is the safe direction.
 #
+# The guard proves ONE key path: SUDO_USER, from this host, to localhost. It
+# does not prove that any other account, or a key on another machine, still
+# gets in. Recovery if remote SSH is lost: sign in at the local console or
+# over Screen Sharing (neither uses sshd), then run
+#     sudo fleet/ops/sshd-pubkey-only.sh --rollback
+#
 # No restart: macOS runs sshd from launchd in inetd mode (com.openssh.sshd,
 # inetdCompatibility Wait=false), one sshd per connection, so every new
 # connection reads the new file. The script checks that this is still how
@@ -71,6 +77,11 @@ usage: $PROG.sh [--plan | --apply | --rollback]
   --apply      root: write $DROPIN_NAME after the lockout guard passes
   --rollback   root: remove $DROPIN_NAME
 
+The lockout guard proves only SUDO_USER's key login to localhost; other
+accounts and keys on other machines are not checked. If SSH access is lost,
+sign in at the local console or over Screen Sharing (neither uses sshd) and run:
+  sudo $SCRIPT_PATH --rollback
+
 Run --apply/--rollback with: sudo $SCRIPT_PATH --apply
 EOF
 }
@@ -92,10 +103,10 @@ refuse() { printf '%s: refused: %s\n' "$PROG" "$*" >&2; exit 3; }
 # "publickey,password,keyboard-interactive", from the denial line.
 probe_methods() {
   local err
-  err="$("$SSH" -o PreferredAuthentications=none -o PubkeyAuthentication=no \
+  err="$("$SSH" -n -o PreferredAuthentications=none -o PubkeyAuthentication=no \
     -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-    nobody@127.0.0.1 true 2>&1 >/dev/null || true)"
+    nobody@127.0.0.1 true 2>&1 >/dev/null </dev/null || true)"
   case "$err" in
     *"Permission denied ("*)
       printf '%s\n' "$err" | sed -n 's/.*Permission denied (\([^)]*\)).*/\1/p' | head -1 ;;
@@ -121,7 +132,7 @@ user_home() {
 # Key-only login to localhost as $1, run as $1 (not root) so their keys are used.
 pubkey_login_works() {
   local u="$1"
-  set -- "$SSH" -o BatchMode=yes -o PreferredAuthentications=publickey \
+  set -- "$SSH" -n -o BatchMode=yes -o PreferredAuthentications=publickey \
     -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR "$u@localhost" true
   if [ "$(id -un)" = "$u" ]; then
@@ -174,7 +185,7 @@ guard() {
   [ -n "$home" ] && [ -s "$keys" ] \
     || refuse "$u has no non-empty $keys; turning passwords off would lock $u out"
   pubkey_login_works "$u" \
-    || refuse "key-only ssh to localhost as $u failed; fix key login first (try: ssh -o BatchMode=yes -o PreferredAuthentications=publickey localhost true)"
+    || refuse "key-only login to localhost as $u failed; fix key login first (try: ssh -n -o BatchMode=yes -o PreferredAuthentications=publickey localhost true </dev/null)"
   say "lockout guard: $u has $keys and key-only login to localhost works"
 }
 
@@ -198,7 +209,8 @@ case "$MODE" in
     fi
     cat <<EOF
 $PROG: --apply would:
-  1. refuse unless SUDO_USER has a non-empty ~/.ssh/authorized_keys and key-only ssh to localhost works
+  1. refuse unless SUDO_USER has a non-empty ~/.ssh/authorized_keys and key-only login to localhost works
+     (this proves only SUDO_USER's key path; other accounts lose password login unchecked)
   2. write $DROPIN:
 $(printf '%s\n' "$DROPIN_BODY" | sed 's/^/       /')
   3. validate with sshd -t (on failure restore the previous state, exit 4)
