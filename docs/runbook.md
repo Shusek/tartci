@@ -118,7 +118,120 @@ currently requires macOS 15, as does the legacy tap's current Softnet formula.
 On Ventura/Sonoma, `tartci setup` preserves a working pre-existing Tart binary
 but refuses a fresh formula install; upgrade that host to macOS 15 or later
 before fresh onboarding or channel migration. Do not replace Tart while a VM or
-provider job is running. To migrate an existing host from the old tap, first prevent new
+provider job is running.
+
+The Tart the fleet runs is pinned in `fleet/tart.toml`. The pin covers Tart
+and its Softnet dependency (brew upgrades Softnet with Tart), each with the
+sha256 the tap's formula must carry. Moving it is a reviewed commit. A host
+reads the pin of the TartCI commit it is installing in that turn.
+
+`tartci fleet-macos tool-freshness` and `self-update --status` report a host
+whose Tart is behind the pin. That is information only, not a doctor problem,
+unless the host has opted in and is past the canary gate for that pin.
+
+A host moves to the pin only when its `~/.config/tartci/self-update.toml`
+opts in. It is off by default:
+
+```toml
+[tart]
+upgrade = true
+canary = "m5"          # host id that goes first
+soak_seconds = 14400   # how long others wait after the canary (default 4 h)
+```
+
+The canary moves first. It publishes `tart-verified.json` (version and
+sha256) only after its pool came back on and verified on the new Tart.
+
+Every other host waits until the canary's record names the pinned version and
+sha256 and is `soak_seconds` old, measured on the canary's clock. While it
+waits, the turn says so. It names the canary as unreachable or unknown when
+it cannot read the record.
+
+A host whose TartCI is already current takes a drained turn of its own for
+Tart, one host at a time like any update. That turn reads the pin of the
+installed generation; a turn installing a new commit reads that commit's pin.
+
+A host never drains just to wait. It never drains when the installed profile
+names no golden and `tart_home` to boot-check with, and it never downgrades a
+Tart newer than the pin.
+
+In the drained window, after `pool off`, self-update:
+
+1. refuses the Tart part if a Tart VM process is left (`pgrep -f` for the
+   `tart` binary running `run`). That pin then waits 24 h before it may drain
+   the host again (`tart-deferred.json`). It also refuses if the tap does not
+   offer exactly the
+   pinned Tart and Softnet with the pinned checksums. brew runs with
+   `HOMEBREW_NO_AUTO_UPDATE=1`; refresh the tap with `brew update` when it
+   lags. The tap's answer is cached for an hour per pin, so a refreshed tap
+   can take up to an hour to be seen;
+2. runs `brew upgrade openai/tools/tart` with `HOMEBREW_NO_INSTALL_CLEANUP=1`
+   and `HOMEBREW_NO_AUTOREMOVE=1`, so the previous kegs stay installed and an
+   uninstall removes nothing else. It writes `tart-rollback-pending.json`
+   first;
+3. checks `tart --version` and the Softnet link against the pin;
+4. clones the first lane's golden as `scratch-tart-check-<pid>`, boots it
+   headless and waits up to 180 s for `tart ip`, then stops and deletes it.
+   The clone is recorded as a scratch VM before it exists, so if the delete
+   fails or the process dies, the launchd watchdog deletes it after an hour;
+5. on any failure in steps 2 to 4, removes the new kegs so the previous ones
+   are linked again. With `opt` still on the new keg it runs
+   `brew uninstall --ignore-dependencies` (that removes only the new keg),
+   then `brew link --overwrite`, for Tart and then Softnet. It then checks
+   that the previous Tart answers.
+
+Steps 2 to 5 are recorded as `tart-upgrade`, `tart-check-cleanup` and
+`tart-rollback` receipt steps.
+
+A Tart failure that rolled back cleanly does not stop the TartCI update. The
+host does not retry that pin: `~/.tartci/state/self-update/tart-failed.json`
+records it, and the pin is tried again only when it moves, or after an
+operator runs `rm ~/.tartci/state/self-update/tart-failed.json`.
+
+The host is **held OFF** in three cases:
+
+- the rollback does not bring the previous Tart back;
+- the self-update is terminated (SIGTERM) during the Tart step. It does not
+  start a slow brew rollback that launchd's SIGKILL could cut short;
+- the next run finds `tart-rollback-pending.json` left by a run that was
+  killed mid upgrade.
+
+A held host has `~/.tartci/state/self-update/tart-broken.json`, and its pool
+stays off. It alerts like any host a failed update left OFF. While it is
+held:
+
+- neither the launchd watchdog's host-off pass nor the next self-update turns
+  its pool on;
+- every self-update apply refuses, for the same target or a new commit, so
+  nothing drains, installs or turns the pool on over a Tart that may not run.
+
+The hold belongs to the OFF episode that wrote it (it names that record's
+time in `last.json`). A hold left from an earlier episode is ignored and
+removed, so it never blocks recovery of an unrelated OFF. A hold whose host
+is on again with a Tart that answers and is not the failed pin is removed by
+the next self-update. A hold written because the run was terminated or
+killed mid upgrade records no `tart-failed.json`, so if an operator forces
+the pool on while the new, unproven Tart is still linked, that hold clears
+too: turning the pool on there is the operator's decision.
+
+To bring it back:
+
+1. `ls /opt/homebrew/Cellar/tart /opt/homebrew/Cellar/softnet` and
+   `readlink /opt/homebrew/opt/tart /opt/homebrew/opt/softnet`.
+2. While a Cellar still lists the failed version and its `opt` link points at
+   it, run `brew uninstall --ignore-dependencies openai/tools/tart`. That
+   removes only the keg `opt` points at. Then run
+   `brew link --overwrite openai/tools/tart`. Do the same for
+   `openai/tools/softnet`. (`brew link` alone links the highest installed
+   version, which is the failed one while it is still there.)
+3. Check `tart --version`.
+4. `rm ~/.tartci/state/self-update/tart-broken.json`, then `tartci pool on`.
+
+TartCI's own rollback never touches Tart. A canary that already runs the
+pinned Tart boot-checks it once and then publishes it. To stop all of this on
+one host, remove `[tart]` or set `upgrade = false`.
+
+To migrate an existing host from the old tap, first prevent new
 placement on that host in the scheduler and prove every runner belonging to it
 reports `busy=false`. Then prove the local provider has no guest or `tart run`
 process. The exact scheduler query depends on the repository and host labels;

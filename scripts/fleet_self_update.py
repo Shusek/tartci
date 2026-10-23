@@ -61,6 +61,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
 import gate_job_demand  # noqa: E402 - sibling module; queued self-hosted gate jobs
 import tartci_incident  # noqa: E402 - sibling module; the alert issue marker line
+import tart_pin  # noqa: E402 - sibling module; the pinned Tart and its drained upgrade
 import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 from python_child import child_python  # noqa: E402 - the interpreter children start with
 import fleet_source  # noqa: E402 - resolves the optional private fleet source
@@ -203,6 +204,11 @@ EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
 class ConfigError(ValueError):
     """self-update.toml cannot be used as written."""
+
+
+class TartBroken(Exception):
+    """A Tart upgrade failed and its rollback did not bring the previous Tart
+    back: the host must stay OFF, not serve on a Tart that may not run."""
 
 
 class LauncherConsent(Exception):
@@ -461,6 +467,11 @@ class Config:
     peers: dict[str, str] = dataclasses.field(default_factory=dict)
     fleet_source_repository: str | None = None
     fleet_source_canary: str | None = None
+    # [tart]: upgrade to fleet/tart.toml's pin in the drained window. Off
+    # unless set; the canary goes first, others after its soak.
+    tart_upgrade: bool = False
+    tart_canary: str | None = None
+    tart_soak_seconds: int = tart_pin.DEFAULT_SOAK_SECONDS
 
     @property
     def checkout(self) -> Path:
@@ -617,6 +628,22 @@ def load_config(home: Path, settings: Path | None = None) -> Config:
                                       "(keys: repository, canary)")
             cfg.fleet_source_repository = section.get("repository", "").strip() or None
             cfg.fleet_source_canary = section.get("canary", "").strip() or None
+        tart = data.get("tart")
+        if tart is not None:
+            if not isinstance(tart, dict):
+                raise ConfigError(f"{path}: [tart] must be a table, not {tart!r}")
+            for key, value in tart.items():
+                ok = ((key == "upgrade" and isinstance(value, bool))
+                      or (key == "canary" and isinstance(value, str) and value.strip())
+                      or (key == "soak_seconds" and isinstance(value, int)
+                          and not isinstance(value, bool) and value >= 0))
+                if not ok:
+                    raise ConfigError(f"{path}: [tart] {key} = {value!r} is not valid (keys: "
+                                      "upgrade = true|false, canary = \"<host id>\", "
+                                      "soak_seconds = <int>)")
+            cfg.tart_upgrade = tart.get("upgrade", False)
+            cfg.tart_canary = str(tart.get("canary", "")).strip() or None
+            cfg.tart_soak_seconds = tart.get("soak_seconds", tart_pin.DEFAULT_SOAK_SECONDS)
     return cfg
 
 
@@ -3090,8 +3117,16 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
                 os.chmod(tmp, 0o600)
                 os.replace(tmp, pin)
                 notes.append(f"pin re-matched to the live launcher ({str(running)[:12]})")
-        on = installed_tartci(cfg, sys_, "pool", "on")
-        notes.append("host is on" if on.rc == 0 else f"HOST LEFT OFF: pool on failed: {on.text[:200]}")
+        pending = _read_json(cfg.state_dir / tart_pin.PENDING)
+        if pending is not None:
+            # Killed mid Tart upgrade: which Tart is linked is unknown. Hold
+            # the host OFF rather than serve on it.
+            notes.append(f"HOST HELD OFF: killed mid Tart upgrade ({pending.get('installed')} -> "
+                         f"{pending.get('pin')}); {TART_RECOVERY}")
+        else:
+            on = installed_tartci(cfg, sys_, "pool", "on")
+            notes.append("host is on" if on.rc == 0
+                         else f"HOST LEFT OFF: pool on failed: {on.text[:200]}")
         message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
                    f"during {value['steps'][-1]['step'] if value.get('steps') else 'start'}; "
                    f"host runs {str(running)[:12]}; " + "; ".join(notes)
@@ -3102,7 +3137,11 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
         _write_json(path, value)
         _write_json(cfg.state_dir / "last.json", {"status": "failed", "target": target,
                                                   "error": message, "at": value["finished_at"],
-                                                  "receipt": str(path)})
+                                                  "receipt": str(path),
+                                                  **({"host_off": True, "pool_state": "off"}
+                                                     if pending is not None else {})})
+        if pending is not None:
+            tart_pin.hold(cfg.state_dir, sys_.now(), message)
         print(f"self-update: FAILED (recovered interrupted run): {message}", file=sys.stderr)
     marker = _read_json(cfg.state_dir / "active.json")
     if marker is not None and not _alive(sys_, marker.get("pid"), marker.get("pid_start")):
@@ -3301,6 +3340,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
+            tart_held = tart_hold_refusal(cfg, sys_)
+            if tart_held:
+                raise Refused(tart_held)
             # An operator's --reinstall-current is not a retry of an automatic
             # attempt, so the attempt rate does not hold it back.
             prior = None if reinstall else recent_attempt(cfg, target, now, selected_source)
@@ -3454,8 +3496,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             install_args += ["--launch-helper-source", str(bundle)]
             receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
         if not apply:
+            tart_plan = tart_decision(cfg, sys_)
             receipt.step("plan", "would snapshot the running generation, drain, wait for no "
                          "mid-job lane, pool off, " + ("pin approval, " if helper else "")
+                         + (tart_plan.describe() + ", " if tart_plan else "")
                          + "install --apply, " + ("relay reconcile, " if relay_enabled(cfg) else "")
                          + "pool on, verify; on any failure after install, roll back to "
                          f"{installed[:12]} and verify it")
@@ -3511,6 +3555,191 @@ def _same_source_bytes(cfg: Config) -> bool:
         return False
 
 
+# ── Tart ──────────────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class TartDecision:
+    """This host's Tart against the pin: move it now, or why not yet."""
+    installed: str
+    pin: tart_pin.Pin
+    refusal: str | None = None       # set: Tart stays as it is this turn
+    prove_only: bool = False         # the canary already runs the pin; boot it once
+
+    def describe(self) -> str:
+        if self.refusal:
+            return f"Tart {self.installed} stays ({self.refusal})"
+        if self.prove_only:
+            return f"boot-check Tart {self.installed} as the canary"
+        return f"upgrade Tart {self.installed} -> {self.pin.version} (boot-checked)"
+
+
+def _pin_run(sys_: System) -> tart_pin.Run:
+    def run(argv: list[str], timeout: float = 60, env: dict[str, str] | None = None
+            ) -> tuple[int, str]:
+        result = sys_.run(argv, env=env, timeout=timeout)
+        return result.rc, result.text
+    return run
+
+
+TART_VERIFIED_SCRIPT = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/'
+                        + tart_pin.VERIFIED + '" 2>/dev/null || true')
+
+
+def read_tart_verified(cfg: Config, sys_: System, canary: str) -> dict | None:
+    """The canary's verified Tart, aged on the canary's clock; {"unreachable":
+    reason} when the canary could not be read; None when it published none."""
+    if canary == self_host_id(cfg):
+        return tart_pin.read_verified(_read_json(cfg.state_dir / tart_pin.VERIFIED), sys_.now())
+    target = published_peers(cfg, sys_).get(canary)
+    if not target:
+        return {"unreachable": f"{canary} is not a published host"}
+    result = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+                       TART_VERIFIED_SCRIPT], timeout=60)
+    first, _, rest = result.out.partition("\n")
+    if result.rc != 0 or not first.strip().isdigit():
+        return {"unreachable": f"ssh {target} exit {result.rc}"}
+    try:
+        value = json.loads(rest) if rest.strip() else None
+    except json.JSONDecodeError:
+        return {"unreachable": f"{canary}'s {tart_pin.VERIFIED} is not JSON"}
+    return tart_pin.read_verified(value, float(first.strip()))
+
+
+# Refusals that only mean "not this host's turn yet": Tart behind its pin is
+# information, not a problem, while one of these holds.
+_NOT_DUE = ("waiting for canary", "soaking for", "no canary")
+
+
+TART_RECOVERY = "to bring back the previous Tart: `ls /opt/homebrew/Cellar/tart` (and .../softnet); while it lists the failed version and /opt/homebrew/opt/tart points at it, `brew uninstall --ignore-dependencies openai/tools/tart`, then `brew link --overwrite openai/tools/tart` and `tart --version` (the same for openai/tools/softnet); then remove ~/.tartci/state/self-update/tart-broken.json and run `tartci pool on`"
+
+
+def tart_decision(cfg: Config, sys_: System, root: Path | None = None) -> TartDecision | None:
+    """What this turn does to Tart, against the pin under `root`: by default
+    cfg.checkout, the commit this turn installs; refresh_reason passes the
+    installed generation (tart_pin.REPO_ROOT), which is checked out before
+    the drain on a same-generation turn.
+
+    None when this host does not upgrade Tart, Tart is absent or already the
+    pin (and, on the canary, already proven), so an unknown never starts a
+    drain. Records whether the host is due (tart-gate.json). Read-only apart
+    from that record and the tap cache.
+    """
+    decision = _tart_decision(cfg, sys_, cfg.checkout if root is None else root)
+    due = bool(cfg.tart_upgrade and decision is not None
+               and not (decision.refusal and decision.refusal.startswith(_NOT_DUE)))
+    try:
+        tart_pin.write_gate(cfg.state_dir, {
+            "upgrade": cfg.tart_upgrade, "due": due, "at": sys_.now(),
+            "pin": decision.pin.version if decision else None,
+            "refusal": decision.refusal if decision else None})
+    except OSError:
+        pass
+    return decision
+
+
+def _tart_decision(cfg: Config, sys_: System, root: Path) -> TartDecision | None:
+    if not cfg.tart_upgrade:
+        return None
+    run = _pin_run(sys_)
+    installed = tart_pin.installed_tart(run)
+    if installed is None:
+        return None
+    try:
+        pin = tart_pin.load_pin(root)
+    except tart_pin.PinError as exc:
+        return TartDecision(installed, tart_pin.Pin("?", "", "?", ""), f"pin unreadable: {exc}")
+    if tart_pin.vkey(installed) > tart_pin.vkey(pin.version):
+        return TartDecision(installed, pin, f"Tart {installed} is newer than the pin "
+                            f"{pin.version}; never downgraded here, move the pin or the host")
+    failed = tart_pin.failure_for(cfg.state_dir, pin)
+    if failed:
+        return TartDecision(installed, pin, f"Tart {pin.version} failed here at "
+                            f"{_iso(float(failed.get('at') or 0))}: "
+                            f"{str(failed.get('reason'))[:200]}; not retried until the pin moves "
+                            f"or {cfg.state_dir / tart_pin.FAILED} is removed")
+    deferred = tart_pin.deferral_for(cfg.state_dir, pin, sys_.now())
+    if deferred:
+        return TartDecision(installed, pin, f"Tart {pin.version} deferred until "
+                            f"{_iso(float(deferred['until']))}: {str(deferred.get('reason'))[:200]}")
+    if installed != pin.version and tart_boot_target(cfg) is None:
+        # Checked before the drain: a turn that could only refuse after it
+        # would drain the host for nothing every attempt.
+        return TartDecision(installed, pin, "the installed profile names no golden and "
+                            "tart_home to boot-check Tart with")
+    me = self_host_id(cfg)
+    if cfg.tart_canary is None:
+        refusal = "no canary: set [tart] canary in self-update.toml"
+        return None if installed == pin.version else TartDecision(installed, pin, refusal)
+    if installed == pin.version:
+        if me != cfg.tart_canary:
+            return None
+        proven = tart_pin.read_verified(_read_json(cfg.state_dir / tart_pin.VERIFIED), sys_.now())
+        if proven and (proven["version"], proven["sha256"]) == (pin.version, pin.sha256):
+            return None
+        return TartDecision(installed, pin, prove_only=True)
+    if me != cfg.tart_canary:
+        verified = read_tart_verified(cfg, sys_, cfg.tart_canary)
+        if verified and "unreachable" in verified:
+            return TartDecision(installed, pin, f"waiting for canary {cfg.tart_canary}: "
+                                f"unreachable or unknown ({verified['unreachable']})")
+        if not verified or (verified["version"], verified["sha256"]) != (pin.version, pin.sha256):
+            return TartDecision(installed, pin, f"waiting for canary {cfg.tart_canary} to boot "
+                                f"and serve Tart {pin.version}")
+        if verified["age"] < cfg.tart_soak_seconds:
+            return TartDecision(installed, pin, f"soaking for {cfg.tart_soak_seconds // 60} min: "
+                                f"canary {cfg.tart_canary} verified Tart {pin.version} "
+                                f"{int(verified['age'] // 60)} min ago")
+    try:
+        refusal = tart_pin.tap_refusal(pin, tart_pin.tap_offer(run, pin, cfg.state_dir,
+                                                               sys_.now()))
+    except tart_pin.PinError as exc:
+        refusal = f"tap unreadable: {exc}"
+    return TartDecision(installed, pin, refusal)
+
+
+def tart_hold_refusal(cfg: Config, sys_: System) -> str | None:
+    """Why no update may run while this host is held OFF for Tart, or None.
+
+    An update would drain, install, `pool on` and verify on a Tart that may
+    not run, and its success would clear host_off. A hold from an earlier
+    episode is removed. A hold whose host is on again with a Tart that answers
+    and is not the failed pin was fixed by hand: it is removed too.
+    """
+    import host_off  # noqa: PLC0415 - sibling module; owns the hold's validity
+    path = cfg.state_dir / tart_pin.HOLD
+    if not path.exists():
+        return None
+    if host_off.held(cfg.state_dir) is None:
+        path.unlink(missing_ok=True)
+        print("self-update: removed a Tart hold left from an earlier episode")
+        return None
+    status = installed_tartci(cfg, sys_, "pool", "status", "--json")
+    try:
+        pool_state = str(json.loads(status.out).get("state") or "unknown")
+    except (json.JSONDecodeError, AttributeError):
+        pool_state = "unknown"
+    version = tart_pin.installed_tart(_pin_run(sys_))
+    failed = (_read_json(cfg.state_dir / tart_pin.FAILED) or {}).get("version")
+    if pool_state == "on" and version is not None and version != failed:
+        path.unlink(missing_ok=True)
+        print(f"self-update: Tart hold cleared: the pool is on and Tart {version} answers")
+        return None
+    return (f"host HELD OFF for Tart ({path}); no update runs until Tart is fixed: "
+            f"{TART_RECOVERY}")
+
+
+def tart_boot_target(cfg: Config) -> tuple[str, str] | None:
+    """(golden, tart_home) to boot-check Tart with: the first lane's golden."""
+    try:
+        profile = _toml(cfg.installed_profile)
+    except (OSError, ValueError):
+        return None
+    home = (profile.get("host") or {}).get("tart_home")
+    goldens = [lane.get("golden") for lane in profile.get("lane") or [] if isinstance(lane, dict)]
+    golden = next((g for g in goldens if isinstance(g, str) and g), None)
+    return (golden, home) if golden and isinstance(home, str) and home else None
+
+
 def refresh_reason(cfg: Config, sys_: System) -> str | None:
     """Why a current host must reinstall its own generation, or None.
 
@@ -3540,6 +3769,14 @@ def refresh_reason(cfg: Config, sys_: System) -> str | None:
     for problem in problems:
         if isinstance(problem, dict) and problem.get("code") == "interpreter_changed_by_os_update":
             return str(problem.get("detail") or problem["code"])
+    # Tart is replaced only while the pool is off, so a host whose TartCI is
+    # current takes a drained turn of its own for the pinned Tart, once its
+    # gates (canary, soak, tap) let it. The installed generation's pin counts.
+    decision = tart_decision(cfg, sys_, tart_pin.REPO_ROOT)
+    if decision and decision.refusal:
+        print(f"self-update: {decision.describe()}")
+    elif decision:
+        return f"{decision.describe()} while the pool is off"
     return None
 
 
@@ -3573,6 +3810,8 @@ class Run:
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
+        self.tart_before: tuple[TartDecision, dict[str, str | None]] | None = None
+        self.tart_proven: tart_pin.Pin | None = None
         self.snapshot: Path | None = None
         self.phase = "announce"
         receipt.value.update(approval=str(approval) if approval else None,
@@ -3620,6 +3859,8 @@ class Run:
                 self._update()
             except LauncherConsent as exc:
                 return self._stop_for_consent(str(exc))
+            except TartBroken as exc:
+                return self._stop_tart_broken(str(exc))
             except Refused as exc:
                 return self._safe_recover(f"refused after drain: {exc}", refused=True)
             except Failed as exc:
@@ -3732,6 +3973,8 @@ class Run:
         if off.rc != 0:
             raise Failed(f"pool off failed: {off.text}")
         self.receipt.step("off")
+        self.phase = "tart-upgrade"
+        self._tart_upgrade()
         if self.pin_path is not None and self.approval is not None:
             self.phase = "pin"
             self._write_pin(self.approval.read_text())
@@ -3756,6 +3999,7 @@ class Run:
             raise Failed("pool on failed after install")
         self.phase = "verify"
         verify(cfg, sys_, self.target, self.receipt)
+        self._publish_tart()
         self.phase = "support-agents"
         self._support_agents()
         self._vm_dhcp_verify()
@@ -3789,6 +4033,130 @@ class Run:
             self.receipt.step("vm-dhcp-verify", f"{type(exc).__name__}: {exc}", ok=False)
             return
         self.receipt.step("vm-dhcp-verify", result.text.strip()[-500:], ok=result.rc == 0)
+
+    def _tart_upgrade(self) -> None:
+        """Move Tart to the pin while the pool is off, proven by a VM boot.
+
+        Tart must not be replaced while a VM runs; after `pool off` none can,
+        and a leftover Tart VM process refuses. The previous kegs stay
+        installed: if the upgrade, its version, its Softnet or the boot check
+        fails, the new kegs are removed so the previous ones are linked again,
+        the failure is recorded so this pin is not retried here, and the
+        TartCI update goes on. When the previous Tart does not come back the
+        host stays OFF (TartBroken).
+        """
+        decision = tart_decision(self.cfg, self.sys)
+        if decision is None:
+            return
+        if decision.refusal:
+            self.receipt.step("tart-upgrade", decision.describe(), ok=False)
+            return
+        run, pin = _pin_run(self.sys), decision.pin
+        running = self.sys.run(["pgrep", "-f", tart_pin.TART_RUN_PATTERN], timeout=10)
+        if running.rc == 0:
+            reason = (f"a Tart VM process was still running after pool off: "
+                      f"{running.out.strip()[:200]}")
+            # Found only after the drain: without a record the next turn
+            # would drain again for the same refusal.
+            tart_pin.record_deferral(self.cfg.state_dir, pin, self.sys.now(), reason)
+            self.receipt.step("tart-upgrade", f"Tart {decision.installed} stays: {reason}; "
+                              f"deferred for {tart_pin.DEFER_SECONDS // 3600} h", ok=False)
+            return
+        boot = tart_boot_target(self.cfg)
+        if boot is None:
+            self.receipt.step("tart-upgrade", f"Tart {decision.installed} stays: the installed "
+                              "profile names no golden and tart_home to boot-check it with",
+                              ok=False)
+            return
+        records = self.cfg.state_dir.parent / "scratch-vms"
+        if decision.prove_only:
+            failure, cleanup = tart_pin.boot_check(run, boot[0], boot[1], os.getpid(),
+                                                   self.sys.now(), records)
+            self._tart_cleanup_step(cleanup)
+            self.receipt.step("tart-upgrade", f"canary boot check of Tart {decision.installed}: "
+                              + (failure or "booted"), ok=failure is None)
+            if failure:
+                tart_pin.record_failure(self.cfg.state_dir, pin, self.sys.now(), failure)
+            else:
+                self.tart_proven = pin
+            return
+        names = (pin.formula.rsplit("/", 1)[-1], pin.softnet_formula.rsplit("/", 1)[-1])
+        self.tart_before = (decision, tart_pin.opt_links(names))
+        # On disk first: a SIGKILL from here on leaves a record that
+        # recover_interrupted holds the host OFF for, instead of pool on.
+        _write_json(self.cfg.state_dir / tart_pin.PENDING,
+                    {"installed": decision.installed, "pin": pin.version,
+                     "before": self.tart_before[1], "at": self.sys.now()})
+        upgrade = self.sys.run([tart_pin.BREW, "upgrade", pin.formula], env=tart_pin.BREW_ENV,
+                               timeout=tart_pin.UPGRADE_TIMEOUT_S)
+        after = tart_pin.installed_tart(run)
+        softnet = tart_pin.opt_links(names[1:])[names[1]] or ""
+        if upgrade.rc != 0:
+            failure = f"brew upgrade exit {upgrade.rc}: {upgrade.text.strip()[-200:]}"
+        elif after != pin.version:
+            failure = f"brew installed Tart {after}, not {pin.version}"
+        elif not softnet.endswith("/" + pin.softnet_version):
+            failure = f"Softnet links {softnet or 'nothing'}, not {pin.softnet_version}"
+        else:
+            failure, cleanup = tart_pin.boot_check(run, boot[0], boot[1], os.getpid(),
+                                                   self.sys.now(), records)
+            self._tart_cleanup_step(cleanup)
+        if failure is None:
+            self._tart_settled()
+            self.receipt.step("tart-upgrade", f"Tart {decision.installed} -> {pin.version}, "
+                              f"Softnet {pin.softnet_version}; a clone of {boot[0]} booted")
+            self.tart_proven = pin
+            return
+        self.receipt.step("tart-upgrade", f"Tart {decision.installed} -> {pin.version} failed: "
+                          f"{failure}", ok=False)
+        tart_pin.record_failure(self.cfg.state_dir, pin, self.sys.now(), failure)
+        self._tart_roll_back()
+
+    def _tart_settled(self) -> None:
+        self.tart_before = None
+        (self.cfg.state_dir / tart_pin.PENDING).unlink(missing_ok=True)
+
+    def _tart_cleanup_step(self, cleanup: str | None) -> None:
+        if cleanup:
+            self.receipt.step("tart-check-cleanup", cleanup, ok=False)
+
+    def _tart_roll_back(self) -> None:
+        """Bring back the Tart and Softnet linked before the upgrade, or raise
+        TartBroken. Tart first, then Softnet."""
+        decision, before = self.tart_before
+        pin = decision.pin
+        run = _pin_run(self.sys)
+        problems, restored = [], []
+        now = tart_pin.opt_links(tuple(before))
+        for formula in (pin.formula, pin.softnet_formula):
+            name = formula.rsplit("/", 1)[-1]
+            if before[name] and now[name] != before[name]:
+                problem = tart_pin.roll_back(run, formula)
+                if problem:
+                    problems.append(problem)
+                elif tart_pin.opt_links((name,))[name] != before[name]:
+                    problems.append(f"{name} links {tart_pin.opt_links((name,))[name]} after the "
+                                    f"rollback, not {before[name]}")
+                else:
+                    restored.append(f"{name} {before[name]}")
+        back = tart_pin.installed_tart(run)
+        self._tart_settled()
+        if problems or back != decision.installed:
+            detail = (f"Tart is {back or 'NOT runnable'} now, expected {decision.installed}"
+                      + (f": {'; '.join(problems)}" if problems else ""))
+            self.receipt.step("tart-rollback", detail, ok=False)
+            raise TartBroken(f"Tart rollback failed: {detail}")
+        self.receipt.step("tart-rollback",
+                          (f"restored {', '.join(restored)}; " if restored else
+                           "nothing was relinked; ") + f"Tart {back} answers")
+
+    def _publish_tart(self) -> None:
+        """On the canary, once the pool is verified on the proven Tart: tell
+        the fleet, which adopts it after the soak."""
+        pin = self.tart_proven
+        if pin and self.cfg.tart_canary == self.me:
+            tart_pin.published_verified(self.cfg.state_dir, pin, self.sys.now())
+            self.receipt.step("tart-verified", f"Tart {pin.version} published for the fleet")
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
         started = self.sys.now()
@@ -4133,8 +4501,34 @@ class Run:
             f"again and can reset its consent). {next_step} Probe: {probe[:300]}",
             pool_state=self._pool_state_quiet())
 
+    def _stop_tart_broken(self, reason: str) -> int:
+        """Stop with the pool OFF: the Tart upgrade failed and its rollback did
+        not bring the previous Tart back. No pool on, no TartCI rollback (it
+        never touches Tart); counted toward the halt, with an incident."""
+        self._repin_to_live()
+        message = f"{reason}; host HELD OFF: {TART_RECOVERY}"
+        rc = self._terminal("failed", message, pool_state=self._pool_state_quiet())
+        # After the terminal record, whose time names this episode. Without
+        # the hold, host_off's recovery (watchdog, next self-update) and the
+        # next update would turn the pool on within minutes on a Tart that
+        # may not run.
+        tart_pin.hold(self.cfg.state_dir, self.sys.now(), message)
+        return rc
+
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
         self.receipt.step("refused" if refused else "failed", reason, ok=False)
+        if self.tart_before and terminated:
+            # launchd may SIGKILL soon: a brew rollback can outlive that.
+            # Hold the host OFF quickly instead; the operator rolls back.
+            return self._stop_tart_broken(f"{reason}; interrupted mid Tart upgrade, not rolled "
+                                          "back (terminated)")
+        if self.tart_before:
+            # Interrupted mid Tart upgrade by an error: put the previous Tart
+            # back before anything turns the pool on, or stay OFF.
+            try:
+                self._tart_roll_back()
+            except TartBroken as exc:
+                return self._stop_tart_broken(f"{reason}; {exc}")
         running = self._running()
         if terminated:
             # launchd will SIGKILL soon: no reinstall, no rollback. Get the
@@ -4371,6 +4765,17 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
 
 
+def tart_status_line(state_dir: Path) -> str | None:
+    """Tart differing from its pin, from tool-freshness's cached measurement."""
+    tools = (_read_json(state_dir.parent / "tool-freshness" / "state.json") or {}).get("tools") or {}
+    row = tools.get("tart") if isinstance(tools, dict) else None
+    if not isinstance(row, dict) or row.get("state") != "behind":
+        return None
+    return (f"self-update: Tart {row.get('installed')} is behind its pin {row.get('latest_tag')} "
+            "(fleet/tart.toml); with [tart] upgrade = true a drained self-update moves it"
+            + (" (STALE)" if row.get("stale") else ""))
+
+
 def running_line(state_dir: Path, sys_: System | None = None) -> str | None:
     """The self-update running on this host now, with its latest step.
 
@@ -4405,6 +4810,9 @@ def status_lines(state_dir: Path, sys_: System | None = None) -> list[str]:
     running = running_line(state_dir, sys_)
     if running:
         lines.append(running)
+    tart = tart_status_line(state_dir)
+    if tart:
+        lines.append(tart)
     paused = paused_line(state_dir)
     if paused:
         lines.append(paused)
