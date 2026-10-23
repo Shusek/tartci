@@ -161,5 +161,7 @@ set -e
 
 note "in-guest exit=$RC"
 echo "=== host ccache after job (durable across clones) ==="
-CCACHE_DIR="$CACHE_ROOT/ccache" ccache --show-stats 2>/dev/null | grep -iE 'cache size|hits|misses|hit rate' || true
+# The guest can write $CACHE_ROOT/ccache/ccache.conf; read no config from it.
+CCACHE_DIR="$CACHE_ROOT/ccache" CCACHE_CONFIGPATH=/dev/null ccache --show-stats 2>/dev/null \
+  | grep -iE 'cache size|hits|misses|hit rate' || true
 exit "$RC"
