@@ -887,6 +887,76 @@ PY
   fi
 }
 
+# True when the parent this process started under has exited (it was
+# reparented). $PPID is fixed at startup; ps reports the parent now. A
+# supervisor launchd starts directly has parent 1 from the start, so it is
+# never reported.
+tartci_supervisor_orphaned(){
+  local now
+  now="$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')"
+  [ -n "$now" ] && [ "$now" != "$PPID" ]
+}
+
+# One supervisor per lane. A lane's claim file names the supervisor serving
+# it ("pid start"). A replacement that finds a live incumbent never takes the
+# lane from it: it records that it is waiting (.handoff, for pool status),
+# admits nothing and writes no heartbeat (the incumbent's state is the lane's),
+# and claims only once the incumbent has exited. An incumbent leaves only when
+# the lane is no longer its own, between jobs: its launcher exited (it is
+# orphaned) or the claim names another live supervisor. So two supervisors
+# never admit work for one lane, and two live managers of one lane settle on
+# the first instead of trading the lane back and forth.
+tartci_proc_start(){ ps -o lstart= -p "$1" 2>/dev/null | sed 's/ *$//'; }
+tartci_lane_claim_path(){ printf '%s/%s.supervisor' "$STATE_DIR" "$RUNNER_NAME"; }
+tartci_lane_handoff_path(){ printf '%s/%s.handoff' "$STATE_DIR" "$RUNNER_NAME"; }
+
+# The live supervisor named in file $1 ("pid start"), if it is not this one.
+tartci_lane_other_supervisor(){
+  local line pid start
+  line="$(head -n 1 "$1" 2>/dev/null)" || return 1
+  pid="${line%% *}"; start="${line#* }"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" != "$$" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # A zombie answers kill -0 but has exited: it serves nothing.
+  case "$(ps -o stat= -p "$pid" 2>/dev/null)" in Z*) return 1 ;; esac
+  [ -n "$start" ] && [ "$(tartci_proc_start "$pid")" = "$start" ] || return 1
+  printf '%s' "$pid"
+}
+
+# Take the lane once no other live supervisor holds it. After
+# TARTCI_LANE_HANDOFF_MAX_WAIT seconds (default 6 h, longer than any job) it
+# says so loudly, and keeps waiting: taking a lane from a live supervisor is
+# the duplicate this exists to prevent.
+tartci_lane_claim(){
+  local claim handoff incumbent me waited=0 warned=0
+  local max="${TARTCI_LANE_HANDOFF_MAX_WAIT:-21600}" poll="${TARTCI_LANE_HANDOFF_POLL:-$POLL}"
+  claim="$(tartci_lane_claim_path)"; handoff="$(tartci_lane_handoff_path)"
+  me="$$ $(tartci_proc_start "$$")"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if incumbent="$(tartci_lane_other_supervisor "$claim")"; then
+    printf '%s\n' "$me" >"$handoff" 2>/dev/null || true
+    event supervisor_handoff_wait "incumbent=$incumbent"
+    note "supervisor pid $incumbent still serves this lane; waiting for it to exit"
+    while tartci_lane_other_supervisor "$claim" >/dev/null; do
+      sleep "$poll"
+      waited=$((waited + poll))
+      if [ "$warned" = 0 ] && [ "$waited" -ge "$max" ]; then
+        warned=1
+        event supervisor_handoff_timeout "incumbent=$incumbent waited=${waited}s; still waiting"
+      fi
+    done
+    event supervisor_handoff_done "incumbent=$incumbent waited=${waited}s"
+  fi
+  printf '%s\n' "$me" >"$claim" 2>/dev/null || true
+  rm -f "$handoff" 2>/dev/null || true
+}
+
+# The lane's claim names another live supervisor: this one is not the lane's.
+tartci_lane_superseded(){
+  tartci_lane_other_supervisor "$(tartci_lane_claim_path)" >/dev/null
+}
+
 tartci_storage_health_check(){
   local path="${1:-$TART_HOME}" mode="${2:-state}" result="" rc=0 status="unknown" reason=""
   local -a probe_args=(
@@ -1370,7 +1440,11 @@ cleanup(){
     reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
     CURRENT_REGISTERED_RUNNER=""
   fi
-  reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
+  # The lane's runner name belongs to whichever supervisor holds the lane; one
+  # that has stepped aside must not deregister its replacement's runner.
+  if ! tartci_lane_superseded; then
+    reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
+  fi
   CLEANED_UP=1
   heartbeat stopped
 }
@@ -2665,6 +2739,7 @@ if [ "$LOOP" = 1 ]; then
   BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
   # Starts launchd timer jobs if launchd stops starting them (interval-guard.lib.sh).
   tartci_interval_guard_start
+  tartci_lane_claim
   heartbeat loop
   while true; do
     if [ -n "$CURRENT_VM" ]; then
@@ -2683,6 +2758,27 @@ if [ "$LOOP" = 1 ]; then
         continue
       fi
       heartbeat loop
+    fi
+    # Step aside, between jobs, when this supervisor is no longer the lane's:
+    # its parent (the TartCI Launcher, or launchd) has exited, so a
+    # replacement is coming, or the lane's claim names another supervisor.
+    # Two supervisors on one lane double-book its VM slot, and one cut off
+    # from the launcher loses its Removable Volumes grant, so its store probes
+    # hang and it yields forever (m5studio slot2, 2026-10-22, about 2 h).
+    if [ -z "$CURRENT_VM" ]; then
+      step_aside=""
+      if tartci_supervisor_orphaned; then
+        step_aside="parent $PPID exited"
+      elif tartci_lane_superseded; then
+        step_aside="another supervisor holds the lane"
+      fi
+      if [ -n "$step_aside" ]; then
+        [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null
+        CURRENT_RESV=""
+        event supervisor_step_aside "$step_aside; released the lane"
+        note "stepping aside ($step_aside) so the lane has one supervisor"
+        exit 0
+      fi
     fi
     # Prove the Tart store is usable before reconciling a parked warm VM. Warm
     # expiry/teardown can mutate the store, so it must not run while the
