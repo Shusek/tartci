@@ -32,6 +32,14 @@ if [ "$*" = "--json runner carrier --replay /dev/null" ]; then
   printf '{"schema_version":1,"command":"runner.carrier","apply":false,"replay":"/dev/null","plans":[]}\\n'
   exit 0
 fi
+if [ "$1 $2" = "--json base-health" ]; then
+  [ "$NO_BASE_HEALTH" = 1 ] && exit 2
+  key=$(printf '%s' "$4" | tr '/' '_')
+  if [ -f "$BASE_HEALTH/$key.json" ]; then cat "$BASE_HEALTH/$key.json"; else
+    printf '{"advice":null,"auto_jump":"off","decision":null,"finding":{"run_id":5,"signal":{"status":"healthy"}}}\\n'
+  fi
+  exit 0
+fi
 if [ "$1 $2 $3" = "--json runner carrier" ]; then
   repo="$5"
   key=$(printf '%s' "$repo" | tr '/' '_')
@@ -170,6 +178,8 @@ class StewardSchedulerTests(unittest.TestCase):
                 "DETACHED_REPOS": "",
                 "SLOW_APPLY": "0",
                 "NO_CARRIER": "0",
+                "NO_BASE_HEALTH": "0",
+                "BASE_HEALTH": str(self.root / "base-health"),
                 "DETACHED_PID_FILE": str(self.root / "detached.pid"),
                 "QUARANTINE_FILE": str(self.root / "scheduler.quarantine.json"),
                 "APPLY_SAW_INTENT": str(self.root / "apply-saw-intent.json"),
@@ -239,7 +249,7 @@ class StewardSchedulerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.call_lines()
         self.assertTrue(calls[0].startswith("--json runner carrier --replay /dev/null|"))
-        carrier = [line for line in calls if "--repo" in line]
+        carrier = [line for line in calls if line.startswith("--json runner carrier --repo")]
         self.assertEqual(len(carrier), 3)
         for line, (identity, checkout) in zip(carrier, self.repos):
             self.assertTrue(line.startswith(f"--json runner carrier --repo {identity}|"), line)
@@ -254,13 +264,47 @@ class StewardSchedulerTests(unittest.TestCase):
         self.assertEqual(health["status"], "healthy")
         self.assertEqual(health["mode"], "plan")
         self.assertFalse((self.root / "intent.json").exists())
-        rows = self.ledger()
+        rows = [row for row in self.ledger() if "plans" in row]
         self.assertEqual([row["repo"] for row in rows], [identity for identity, _ in self.repos])
         first = rows[0]["plans"]
         self.assertEqual(first[0]["action"], "rearm")
         self.assertIn("facts", first[0], "an action keeps the facts behind it")
         self.assertEqual(first[1]["hold"], "conflicting")
         self.assertNotIn("facts", first[1])
+
+    def test_base_health_is_read_only_and_ledgers_jump_advice(self) -> None:
+        advice = {"pr": 8933, "tests": ["t"], "message": "main red: t, fix PR #8933, jump it",
+                  "commands": ["..."], "signal_run_id": 77}
+        (self.root / "base-health").mkdir()
+        (self.root / "base-health" / "owner_two.json").write_text(json.dumps({
+            "advice": advice, "auto_jump": "dry_run", "decision": None,
+            "finding": {"run_id": 77, "signal": {"status": "poisoned"}}}))
+        result, report, health = self.run_scheduler(mode="plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reads = [line for line in self.call_lines() if line.startswith("--json base-health")]
+        self.assertEqual(len(reads), 3)
+        for line, (identity, checkout) in zip(reads, self.repos):
+            self.assertTrue(line.startswith(f"--json base-health --repo {identity}|"), line)
+            self.assertIn(f"cwd={checkout}", line)
+            self.assertIn("gh=unset|github=unset", line)
+        self.assertFalse(any("--act" in line for line in self.call_lines()))
+        self.assertEqual(
+            [(e["repo"], e["base"], e["advice"]) for e in report["base_health"]],
+            [("owner/one", "healthy", False), ("owner/two", "poisoned", True),
+             ("owner/three", "healthy", False)])
+        receipts = [row for row in self.ledger() if "base_health" in row]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["repo"], "owner/two")
+        self.assertEqual(receipts[0]["base_health"]["advice"]["pr"], 8933)
+        self.assertEqual(health["status"], "healthy")
+
+    def test_a_shipyard_without_base_health_keeps_the_tick_healthy(self) -> None:
+        self.plan_for("owner/one", [rearm(1)])
+        result, report, health = self.run_scheduler(mode="live", env={"NO_BASE_HEALTH": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({e["status"] for e in report["base_health"]}, {"error"})
+        self.assertEqual(health["status"], "healthy")
+        self.assertTrue(any("--apply" in line for line in self.call_lines()))
 
     def test_a_plan_pass_that_reports_a_mutation_is_unhealthy(self) -> None:
         row = rearm(1)
@@ -342,7 +386,10 @@ class StewardSchedulerTests(unittest.TestCase):
         self.assertIn("another tick holds the scheduler lock", second.stderr)
         self.assertTrue((self.root / "a-report.json").exists())
         self.assertFalse((self.root / "b-report.json").exists())
-        self.assertEqual(sum("--repo owner/one" in line for line in self.call_lines()), 1)
+        self.assertEqual(
+            sum(line.startswith("--json runner carrier --repo owner/one|") for line in self.call_lines()),
+            1,
+        )
 
     def test_a_missing_carrier_capability_runs_no_plan(self) -> None:
         result, report, health = self.run_scheduler(mode="plan", env={"NO_CARRIER": "1"})
