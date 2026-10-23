@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -53,6 +54,9 @@ class FakeRepository:
         self.unreadable = False
         self.corrupt: set[str] = set()   # paths whose served bytes differ from the tree
         self.extra: list[dict] = []        # raw tree entries served as listed
+        self.ancestors: set[str] = set()   # other commits main contains
+        self.off_main: set[str] = set()    # commits held, but not on main
+        self.compare_fails = False         # the compare read itself fails
 
     def entries(self) -> list[dict]:
         out = [{"path": "README.md", "type": "blob",
@@ -70,6 +74,22 @@ class FakeRepository:
         if path in (f"{base}/commits/main", f"{base}/commits/{self.commit}"):
             return 0, json.dumps({"sha": self.commit,
                                   "commit": {"tree": {"sha": self.tree}}}), ""
+        compare = re.fullmatch(re.escape(base) + r"/compare/([0-9a-f]{40})\.\.\.main\?per_page=1",
+                               path)
+        if compare:
+            asked = compare.group(1)
+            if self.compare_fails:
+                return 1, "", "error connecting to api.github.com"
+            if asked == self.commit:
+                status, ahead, behind, merge_base = "identical", 0, 0, asked
+            elif asked in self.ancestors:
+                status, ahead, behind, merge_base = "ahead", 1, 0, asked
+            elif asked in self.off_main:
+                status, ahead, behind, merge_base = "diverged", 1, 1, "f" * 40
+            else:
+                return 1, "", f"HTTP 404: {path}"
+            return 0, json.dumps({"status": status, "ahead_by": ahead, "behind_by": behind,
+                                  "merge_base_commit": {"sha": merge_base}}), ""
         if path == f"{base}/git/trees/{self.tree}?recursive=1":
             return 0, json.dumps({"tree": self.entries(), "truncated": self.truncated}), ""
         for item, data in self.files.items():
@@ -237,11 +257,43 @@ class ExportTests(unittest.TestCase):
 
     def test_a_commit_asked_for_by_id_must_be_the_commit_answered(self) -> None:
         other = {"sha": "d" * 40, "commit": {"tree": {"sha": "e" * 40}}}
-        api = lambda path: (0, json.dumps(other), "")
+        on_main = {"status": "identical", "behind_by": 0, "merge_base_commit": {"sha": "d" * 40}}
+        api = lambda path: (0, json.dumps(on_main if "/compare/" in path else other), "")
         with self.assertRaisesRegex(sync.SyncError, "answered dddddddddddd"):
             sync.head(api, PRIVATE, "c" * 40)
         self.assertEqual(("d" * 40, "e" * 40), sync.head(api, PRIVATE, "main"))
         self.assertEqual(("d" * 40, "e" * 40), sync.head(api, PRIVATE, "d" * 40))
+
+    def test_a_commit_asked_for_by_id_must_be_on_main(self) -> None:
+        # Positive: main's head, and an ancestor of it.
+        self.assertEqual((COMMIT, TREE), sync.head(self.repo, PRIVATE, COMMIT))
+        self.assertIn(f"repos/{PRIVATE}/compare/{COMMIT}...main?per_page=1", self.repo.calls)
+        ancestor = "a" * 40
+        self.repo.ancestors = {ancestor}
+        sync.require_on_main(self.repo, PRIVATE, ancestor)
+        # Negative: a commit on an unmerged branch, and one GitHub does not know.
+        self.repo.off_main = {"b" * 40}
+        with self.assertRaisesRegex(sync.NotOnMain, "is not on main.*staying on the installed"):
+            sync.require_on_main(self.repo, PRIVATE, "b" * 40)
+        with self.assertRaisesRegex(sync.SyncError, "HTTP 404"):
+            sync.require_on_main(self.repo, PRIVATE, "9" * 40)
+
+    def test_an_unreadable_compare_refuses_the_commit(self) -> None:
+        self.repo.compare_fails = True
+        with self.assertRaisesRegex(sync.SyncError, "error connecting"):
+            sync.head(self.repo, PRIVATE, COMMIT)
+        # main's own head needs no ancestry proof, so the canary still reads it.
+        self.assertEqual((COMMIT, TREE), sync.head(self.repo, PRIVATE))
+
+    def test_a_compare_answer_that_does_not_prove_ancestry_refuses(self) -> None:
+        commit = {"sha": COMMIT, "commit": {"tree": {"sha": TREE}}}
+        for answer in ({"status": "ahead", "behind_by": 2, "merge_base_commit": {"sha": COMMIT}},
+                       {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": "f" * 40}},
+                       {"status": "behind", "behind_by": 0, "merge_base_commit": {"sha": COMMIT}},
+                       {"status": "ahead"}):
+            api = lambda path, a=answer: (0, json.dumps(a if "/compare/" in path else commit), "")
+            with self.assertRaises(sync.NotOnMain, msg=answer):
+                sync.head(api, PRIVATE, COMMIT)
 
     def test_a_malformed_repository_name_is_refused_before_any_read(self) -> None:
         with self.assertRaisesRegex(sync.SyncError, "OWNER/REPO"):

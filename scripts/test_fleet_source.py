@@ -379,5 +379,47 @@ class SelectedSupplyTests(unittest.TestCase):
             fleet_source.selected_published_supply()
 
 
+class SshDestinationTests(unittest.TestCase):
+    """The one rule for a peer's SSH destination, shared with the profile validator."""
+
+    def test_plain_aliases_and_user_at_host_are_accepted(self):
+        for value in ("m1", "tartci-m5", "m5s", "ci@m5studio.local", "a" * 128):
+            self.assertEqual(value, fleet_source.ssh_destination(value))
+
+    def test_options_and_shell_text_are_refused(self):
+        for value in ("-oProxyCommand=touch /tmp/x", "-p22", "--", "", " m1", "m1 id",
+                      "m1;id", "m1\nid", "$(id)", "a" * 129, None, 7, ["m1"]):
+            self.assertIsNone(fleet_source.ssh_destination(value), value)
+
+    def test_a_configured_source_with_an_option_as_host_ssh_is_refused(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, configured_source(
+                Path(td), {"hosts": [{"host_id": "m3", "ssh": "-oProxyCommand=touch /tmp/x"}]})):
+            with self.assertRaisesRegex(ValueError, "invalid host ssh for 'm3'"):
+                fleet_source.resolve(Path("/public"))
+
+    def test_a_configured_source_with_valid_or_absent_host_ssh_resolves(self):
+        hosts = [{"host_id": "m3", "ssh": "m3"}, {"host_id": "m5", "ssh": None},
+                 {"host_id": "m1"}]
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ, configured_source(Path(td), {"hosts": hosts})):
+            self.assertTrue(fleet_source.resolve(Path("/public")).configured)
+
+    def test_self_update_peers_refuse_a_hostile_configured_host_ssh(self):
+        import fleet_self_update as su
+        cfg = su.Config(home=Path("/nonexistent-home"))
+        with tempfile.TemporaryDirectory() as td:
+            hostile = {"hosts": [{"host_id": "m3", "ssh": "-oProxyCommand=touch /tmp/x"}]}
+            with mock.patch.dict(os.environ, configured_source(Path(td) / "bad", hostile)):
+                with self.assertRaisesRegex(ValueError, "invalid host ssh"):
+                    su.published_peers(cfg, mock.Mock())
+            good = {"hosts": [{"host_id": "m3", "ssh": "m3"}]}
+            with mock.patch.dict(os.environ, configured_source(Path(td) / "good", good)):
+                self.assertEqual({"m3": "m3"}, su.published_peers(cfg, mock.Mock()))
+
+    def test_the_profile_validator_uses_the_same_pattern(self):
+        source = (Path(__file__).resolve().parent / "macos_fleet_lanes.py").read_text()
+        self.assertIn(f'r"{fleet_source.SSH_DESTINATION.pattern}", ssh', source)
+
+
 if __name__ == "__main__":
     unittest.main()

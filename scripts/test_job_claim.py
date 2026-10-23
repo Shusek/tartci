@@ -304,6 +304,25 @@ class PeerGatherTests(unittest.TestCase):
         self.assertNotIn(" m3 ", " " + self.calls.read_text().replace("\n", " ") + " ")
         self.assertLess(elapsed, 10, "a hung peer must not hold the gather past its budget")
 
+    def test_a_hostile_published_ssh_is_never_dialled(self) -> None:
+        marker = self.tmp / "pwned"
+        value = json.loads(self.supply.read_text())
+        value["hosts"] += [{"host_id": "evil", "ssh": f"-oProxyCommand=touch {marker}"},
+                           {"host_id": "-oProxyCommand=id"}]
+        self.supply.write_text(json.dumps(value))
+        rows, _ = self.gather("studio")
+        by = {row["host"]: row for row in rows}
+        # Negative: refused before ssh, for a hostile ssh and a hostile host id.
+        self.assertEqual(by["evil"]["reason"], "invalid_ssh")
+        self.assertEqual(by["-oProxyCommand=id"]["reason"], "invalid_ssh")
+        self.assertFalse(marker.exists())
+        self.assertNotIn("ProxyCommand", self.calls.read_text())
+        # Positive: plain aliases are still read, each after "--".
+        self.assertTrue(by["m1"]["ok"])
+        for line in self.calls.read_text().splitlines():
+            self.assertIn(" -- ", line)
+            self.assertTrue(line.endswith(" cd ~ && ~/.local/bin/tartci job-claim status --publish"), line)
+
     def test_a_hung_peer_is_killed_at_the_budget(self) -> None:
         rows, elapsed = self.gather("m1", read_secs=1.0)
         by = {row["host"]: row for row in rows}

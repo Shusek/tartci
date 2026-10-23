@@ -110,8 +110,14 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
     {"readable": bool, "clock": epoch | None, "guard": classify() | None,
      "error": str}."""
     import launchd_interval_guard  # noqa: PLC0415 - imports the watchdog
+    if fleet_source.ssh_destination(target) is None:
+        # A published ssh such as "-oProxyCommand=…" would run locally as an
+        # ssh option: never dial it.
+        return {"readable": False, "clock": None, "guard": None,
+                "error": f"refused ssh destination {target[:64]!r}: not a host alias or user@host"}
+    # "--" ends ssh's options, so the destination can never be read as one.
     rc, out, err = (run or _run)(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                                  target, PEER_READ])
+                                  "--", target, PEER_READ])
     first, _, rest = out.partition("\n")
     if rc != 0 or not first.strip().isdigit():
         return {"readable": False, "clock": None, "guard": None,

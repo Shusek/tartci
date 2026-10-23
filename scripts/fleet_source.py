@@ -31,6 +31,19 @@ MARKER_SCHEMA = "tartci.fleet-source/v1"
 PUBLISHED_SUPPLY = "fleet/advertised-labels.json"
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# An SSH destination a peer is dialled by: a Host alias or user@host. The same
+# pattern macos_fleet_lanes enforces on a profile's host.ssh. A published
+# supply's host rows are not bound by profiles_sha256, so resolve() checks a
+# configured source's rows and every reader checks them again: a value
+# starting with "-" would be read by ssh as an option.
+SSH_DESTINATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}")
+
+
+def ssh_destination(value: object) -> str | None:
+    """`value` when it is a safe SSH destination, else None."""
+    if isinstance(value, str) and SSH_DESTINATION.fullmatch(value):
+        return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -240,6 +253,16 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
             raise ValueError(
                 "configured fleet source published supply profile list does not match its files"
             )
+        # profiles_sha256 binds the profiles, not the supply's host rows, and
+        # fleet_self_update hands hosts[].ssh straight to ssh: refuse a bad one
+        # here, before any reader can dial it.
+        for row in published.get("hosts") or []:
+            if (isinstance(row, dict) and row.get("ssh") is not None
+                    and ssh_destination(row.get("ssh")) is None):
+                raise ValueError(
+                    "configured fleet source published supply has an invalid host ssh "
+                    f"for {str(row.get('host_id'))[:64]!r}"
+                )
         configured_commit = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
         if not COMMIT.fullmatch(configured_commit):
             raise ValueError(
