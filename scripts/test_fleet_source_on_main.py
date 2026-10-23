@@ -5,6 +5,7 @@ is on the source repository's main; otherwise it stays on what it installed."""
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -37,6 +38,12 @@ class CanaryCommitMustBeOnMain(fixtures.FleetSourceFixture):
     OFF_MAIN = "0f" * 20   # a commit the repository holds on an unmerged branch
 
     def setUp(self) -> None:
+        # Base.setUp writes TARTCI_HOME and TARTCI_GH_CLI before the fixture's
+        # own environ patch starts, so that patch restores them on cleanup.
+        # Patch first, so every test leaves os.environ as it found it.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         super().setUp()
         self.cfg.fleet_source_canary = "studio"
         # main's head (COMMIT) contains OLDER; OFF_MAIN is a branch commit
