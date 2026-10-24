@@ -3490,6 +3490,125 @@ class ScaleTests(Base):
                 fleet.load(root / "profiles/x9-macos-fleet.toml")
 
 
+
+class PeerSshDestinationTests(Base):
+    """A published hosts[].ssh is not bound by profiles_sha256: a value ssh
+    would read as an option is refused at every peer SSH site, the peer reads
+    as unreadable (fail closed), and every ssh argv ends options with "--"."""
+
+    HOSTILE = "-oProxyCommand=touch /tmp/x"
+
+    def publish_hostile_studio(self) -> None:
+        for row in self.sys.published["hosts"]:
+            if row["host_id"] == "studio":
+                row["ssh"] = self.HOSTILE
+
+    def ssh_calls(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:1] == ["ssh"]]
+
+    def assertNoHostileSsh(self) -> None:
+        self.assertFalse([a for a in self.ssh_calls() if any("ProxyCommand" in x for x in a)])
+
+    def test_peer_ssh_refuses_options_and_ends_options_before_the_destination(self) -> None:
+        for bad in (self.HOSTILE, "-p22", "", None, 7, "a b", "m3;id"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(su.peer_ssh(bad))
+        for good in ("m3", "tartci-x9", "admin@m5s.lan"):
+            with self.subTest(good=good):
+                argv = su.peer_ssh(good)
+                self.assertEqual(argv[-2:], ["--", good])
+
+    def test_published_peers_keeps_a_refused_host_so_it_still_counts(self) -> None:
+        self.publish_hostile_studio()
+        peers = su.published_peers(self.cfg, self.sys)
+        self.assertEqual(peers["studio"], self.HOSTILE)
+        self.assertEqual(peers["m5"], "m5")
+
+    def test_read_peer_refuses_a_hostile_destination_and_fails_closed(self) -> None:
+        peer = su.read_peer(self.cfg, self.sys, "studio", self.HOSTILE)
+        self.assertTrue(peer["busy"])
+        self.assertFalse(peer["readable"])
+        self.assertIn("ssh destination", peer["evidence"])
+        self.assertIn("refused", peer["evidence"])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_read_peer_still_reads_a_normal_alias_after_double_dash(self) -> None:
+        peer = su.read_peer(self.cfg, self.sys, "studio", "m3")
+        self.assertTrue(peer["readable"])
+        self.assertTrue(self.ssh_calls())
+        for argv in self.ssh_calls():
+            self.assertEqual(argv[argv.index("--") + 1], "m3")
+
+    def test_a_hostile_published_peer_never_lets_an_update_proceed(self) -> None:
+        self.publish_hostile_studio()
+        self.assertNotEqual(self.last_status_after_apply(), "succeeded")
+        self.assertNoHostileSsh()
+        for argv in self.ssh_calls():
+            self.assertIn("--", argv)
+
+    def last_status_after_apply(self) -> str | None:
+        self.apply()
+        path = self.cfg.state_dir / "last.json"
+        return json.loads(path.read_text()).get("status") if path.exists() else None
+
+    def test_a_normal_published_alias_still_updates(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertTrue(self.ssh_calls())
+        for argv in self.ssh_calls():
+            self.assertIn("--", argv)
+
+    def test_read_canary_verified_refuses_a_hostile_destination(self) -> None:
+        with mock.patch.object(su, "published_peers", return_value={"studio": self.HOSTILE}), \
+                mock.patch.object(self.sys, "run", side_effect=AssertionError("ssh ran")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertIsNone(su.read_canary_verified(self.cfg, self.sys, "studio"))
+        self.assertIn("refused", err.getvalue())
+
+    def test_read_canary_verified_reads_a_normal_alias_after_double_dash(self) -> None:
+        record = {"repository": "ORG/fleet", "commit": "a" * 40, "verified_at": 1000}
+        seen: list[list[str]] = []
+
+        def run(argv, **kw):
+            seen.append(argv)
+            return su.Result(0, "1600\n" + json.dumps(record) + "\n")
+        with mock.patch.object(su, "published_peers", return_value={"studio": "m3"}), \
+                mock.patch.object(self.sys, "run", side_effect=run):
+            self.assertEqual(su.read_canary_verified(self.cfg, self.sys, "studio")["age"], 600.0)
+        self.assertEqual(seen[0][seen[0].index("--") + 1], "m3")
+
+    def test_read_tart_verified_refuses_a_hostile_destination(self) -> None:
+        with mock.patch.object(su, "published_peers", return_value={"studio": self.HOSTILE}), \
+                mock.patch.object(self.sys, "run", side_effect=AssertionError("ssh ran")):
+            value = su.read_tart_verified(self.cfg, self.sys, "studio")
+        self.assertIn("refused", value["unreachable"])
+
+    def test_read_tart_verified_reads_a_normal_alias_after_double_dash(self) -> None:
+        self.sys.peer_tart["m3"] = {"version": "2.40.1", "sha256": TART_SHA, "verified_at": NOW}
+        value = su.read_tart_verified(self.cfg, self.sys, "studio")
+        self.assertNotIn("unreachable", value or {})
+        argv = [a for a in self.ssh_calls() if a[-1] == su.TART_VERIFIED_SCRIPT][0]
+        self.assertEqual(argv[argv.index("--") + 1], "m3")
+
+    def coverage(self, target: str) -> tuple[dict, list]:
+        supply = {"registrations": [{"host_id": "studio", "labels": ["mac"]}], "hosts": []}
+        with mock.patch.object(su, "published_supply", return_value=supply), \
+                mock.patch.object(su, "published_peers", return_value={"studio": target}), \
+                mock.patch.object(su, "peer_mints_on_demand", return_value=None):
+            return su.on_demand_supply(self.cfg, self.sys, "m1", [("mac", None)])
+
+    def test_coverage_probe_refuses_a_hostile_destination(self) -> None:
+        covered, missing = self.coverage(self.HOSTILE)
+        self.assertEqual(covered, {})
+        self.assertIn("refused", missing[0])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_coverage_probe_reads_a_normal_alias_after_double_dash(self) -> None:
+        covered, missing = self.coverage("m3")
+        self.assertEqual((covered, missing), ({"mac": ["studio"]}, []))
+        argv = self.ssh_calls()[0]
+        self.assertEqual(argv[argv.index("--") + 1], "m3")
+
+
 class AtomicCloneTests(Base):
     def test_a_failed_clone_leaves_no_checkout(self) -> None:
         shutil.rmtree(self.cfg.checkout)

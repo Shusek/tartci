@@ -164,6 +164,23 @@ SIGNING_PROBE_TIMEOUT = 60
 TARTCI_REPO = DEFAULT_REPOSITORY
 # A peer with no `ssh` in its profile is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
+
+
+def peer_ssh(target: object) -> list[str] | None:
+    """The ssh argv up to and including `target`, or None when `target` is not
+    a safe SSH destination. A published host row's `ssh` is not bound by
+    profiles_sha256, so a value like "-oProxyCommand=..." would otherwise be
+    read by ssh as an option; "--" ends option parsing as well. A refused
+    destination is treated by every caller as an unreadable peer: fail closed.
+    """
+    destination = fleet_source.ssh_destination(target)
+    if destination is None:
+        return None
+    return ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", destination]
+
+
+def refused_destination(host_id: str, target: object) -> str:
+    return f"peer {host_id} ssh destination {target!r} refused (not a safe SSH destination)"
 TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
 KEEP_BUILDS = 3
 KEEP_SNAPSHOTS = 5
@@ -842,7 +859,11 @@ def read_canary_verified(cfg: Config, sys_: System, canary: str) -> dict | None:
         target = published_peers(cfg, sys_).get(canary)
         if not target:
             return None
-        result = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+        ssh = peer_ssh(target)
+        if ssh is None:
+            print(f"self-update: {refused_destination(canary, target)}", file=sys.stderr)
+            return None
+        result = sys_.run([*ssh,
                            'date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/'
                            + FLEET_SOURCE_VERIFIED + '" 2>/dev/null || true'], timeout=60)
         first, _, rest = result.out.partition("\n")
@@ -1253,6 +1274,8 @@ def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
     A profile's `host.ssh` is published there; without it the alias
     convention tartci-<host_id> applies; [peers] only overrides. Adding a
     machine therefore needs its profile and nothing on other hosts.
+    Targets are returned as published; every SSH caller validates them
+    through peer_ssh before use.
     """
     value = published_supply(cfg, sys_)
     ssh = {row["host_id"]: row.get("ssh") for row in value.get("hosts", [])
@@ -1352,7 +1375,10 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     """
     out: dict[str, Any] = {"busy": True, "evidence": "", "active_age": None, "since": None,
                            "off": False, "readable": False, "clock": None, "unreadable": None}
-    ssh = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
+    ssh = peer_ssh(target)
+    if ssh is None:
+        out["evidence"] = refused_destination(host_id, target)
+        return out
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
         value = json.loads(status.out)
@@ -2483,8 +2509,11 @@ def on_demand_supply(cfg: Config, sys_: System, me: str,
     def healthy(host_id: str) -> str | None:
         if host_id not in health:
             target = peers.get(host_id) or SSH_ALIAS_CONVENTION.format(host_id=host_id)
-            status = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
-                               "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
+            ssh = peer_ssh(target)
+            if ssh is None:
+                health[host_id] = refused_destination(host_id, target)
+                return health[host_id]
+            status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
             try:
                 value = json.loads(status.out)
             except json.JSONDecodeError:
@@ -3605,8 +3634,10 @@ def read_tart_verified(cfg: Config, sys_: System, canary: str) -> dict | None:
     target = published_peers(cfg, sys_).get(canary)
     if not target:
         return {"unreachable": f"{canary} is not a published host"}
-    result = sys_.run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
-                       TART_VERIFIED_SCRIPT], timeout=60)
+    ssh = peer_ssh(target)
+    if ssh is None:
+        return {"unreachable": refused_destination(canary, target)}
+    result = sys_.run([*ssh, TART_VERIFIED_SCRIPT], timeout=60)
     first, _, rest = result.out.partition("\n")
     if result.rc != 0 or not first.strip().isdigit():
         return {"unreachable": f"ssh {target} exit {result.rc}"}
@@ -5062,7 +5093,9 @@ def main(argv: list[str] | None = None) -> int:
             refresh_checkout(cfg, sys_)
             me = self_host_id(cfg)
             for peer, target in published_peers(cfg, sys_).items():
-                print(f"{peer}\t{target}{'  (this host)' if peer == me else ''}")
+                note = ("  (this host)" if peer == me else
+                        "" if peer_ssh(target) else "  (refused: not a safe SSH destination)")
+                print(f"{peer}\t{target}{note}")
         except Refused as exc:
             print(f"self-update: {exc}", file=sys.stderr)
             return EXIT_REFUSED
