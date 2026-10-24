@@ -441,8 +441,31 @@ had rotated before anyone looked (outage O10). Each pass:
   row. `TARTCI_DISK_WATCH_ISSUE=0` keeps the evidence and the event but opens
   no issue.
 
-`tartci disk status [--json]` prints each path's last probe, its open episode
-and its evidence directory. The agent is a support agent: declare
+The same pass checks Xcode's device filesystem. CoreDevice mounts a
+network-paired iPhone at `~/Library/Developer/CoreDevice/DeviceFS` (type
+`devicefs`); when its DeviceFS helper wedges, every stat of the mount blocks in
+the kernel for good, so `rg`/`find` over `$HOME`, `lsof` with a path and `du`
+leak unkillable processes (m3 from 2026-10-18; m5studio on 2026-10-22, where it
+read as an external-volume failure). Each pass lists devicefs mounts from the
+kernel mount table and stats each in a bounded child probe. A wedge is
+confirmed by a probe the kernel keeps past SIGKILL, or by no answer on two
+passes in a row; one slow listing is never acted on. On a confirmed wedge the
+pass saves evidence first, then SIGKILLs only the DeviceFS helpers `ps` shows
+stuck in the kernel (state U), force-unmounts the wedged mount (never starting
+a second `umount -f` while an earlier one is stuck), and opens one
+`devicefs_wedged` episode, closed after three healthy passes. Processes
+blocked on the mount are released once the stuck helper is killed (a SIGKILL
+to its pid freed a 19 h `rg` on m5studio with no reboot); any still stuck after
+that need a reboot, and the issue counts them. Once three probes
+are stuck the pass stops probing: it takes no action, keeps the episode open
+and says a reboot is needed. A `mount` that does not answer counts as unknown,
+never healthy. `TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
+
+`tartci disk status [--json]` prints each path's last probe stamped with its
+own time, its open episode and its evidence directory, and the device
+filesystem's last check. A last probe older than 10 minutes
+(`TARTCI_DISK_STALE_S`) is marked STALE: the agent is not running, and the
+reading is history, not a current fault. The agent is a support agent: declare
 `disk-watchdog` in the host profile's `[support_agents] declared` list to
 install it through `support_agents`.
 
