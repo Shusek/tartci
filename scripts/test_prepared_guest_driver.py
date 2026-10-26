@@ -228,7 +228,7 @@ class GuestListenerTests(unittest.TestCase):
             with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as directory:
                 receipt=Path(directory)/'receipt.json'
                 child="import time;print('Running job: fixture',flush=True);time.sleep(10)"
-                code="import sys;sys.path.insert(0,sys.argv[1]);import guest_driver_listener as m;m.assignment_observation=lambda *a,v=sys.argv[2]:v;sys.argv=['listener','--idle-timeout','2','--job-timeout','20','--receipt',sys.argv[3],'--assignment-policy','fixture.json','--repo','owner/repo','--runner','fixture','--',sys.executable,'-c',sys.argv[4]];raise SystemExit(m.main())"
+                code="import sys;sys.path.insert(0,sys.argv[1]);import guest_driver_listener as m;m.assignment_observation=lambda *a,v=sys.argv[2]:{'kind':v};sys.argv=['listener','--idle-timeout','2','--job-timeout','20','--receipt',sys.argv[3],'--assignment-policy','fixture.json','--repo','owner/repo','--runner','fixture','--',sys.executable,'-c',sys.argv[4]];raise SystemExit(m.main())"
                 result=subprocess.run([sys.executable,'-c',code,str(ROOT/'scripts'),verdict,str(receipt),child],capture_output=True,timeout=5)
                 self.assertEqual(result.returncode,126,result.stderr)
                 proof=json.loads(receipt.read_text())
