@@ -246,6 +246,7 @@ PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
+CURRENT_JOB_REPOSITORY=""
 # Set only by handle_supervisor_signal, and only when a run was still in flight
 # when the signal arrived. A signal is not proof the job is over: launchd
 # delivers SIGTERM for any bootout, including one the launchd watchdog issues on
@@ -1452,7 +1453,7 @@ capture_current_job(){
   )
   if [ "$scan_mode" = revalidate ]; then
     [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ] || return 1
-    args+=(--run-id "$CURRENT_RUN_ID" --job-id "$CURRENT_JOB_ID")
+    args+=(--run-id "$CURRENT_RUN_ID" --job-id "$CURRENT_JOB_ID" --assigned-repo "${CURRENT_JOB_REPOSITORY:-$REPO}")
   fi
   while IFS= read -r workflow; do
     [ -n "$workflow" ] && args+=(--workflow "$workflow")
@@ -1496,6 +1497,7 @@ capture_current_job(){
     active)
       CURRENT_RUN_ID="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')"
       CURRENT_JOB_ID="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')"
+      CURRENT_JOB_REPOSITORY="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("repository",sys.argv[1]))' "$REPO")"
       CURRENT_WORKFLOW_NAME="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workflow_name"])')"
       CURRENT_JOB_SCAN_FAILURES=0
       return 0 ;;
@@ -1542,7 +1544,7 @@ cancel_current_run(){
     event run_cancel_suppressed "run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} observation=$CURRENT_JOB_CAPTURE_STATUS scanner_rc=$rc rerun_eligible=false receipt=$receipt"
     return 1
   }
-  if ! "$GH_CLI" api -X POST "repos/$REPO/actions/runs/$CURRENT_RUN_ID/cancel" >/dev/null 2>&1; then
+  if ! "$GH_CLI" api -X POST "repos/${CURRENT_JOB_REPOSITORY:-$REPO}/actions/runs/$CURRENT_RUN_ID/cancel" >/dev/null 2>&1; then
     event run_cancel_failed "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID rerun_eligible=false"
     CURRENT_ASSIGNMENT_QUARANTINE="cancel_post_failed"
     return 1
@@ -2238,6 +2240,7 @@ run_one(){
   CLEANED_UP=0
   CURRENT_REGISTERED_RUNNER=""
   CURRENT_RUN_ID=""
+  CURRENT_JOB_REPOSITORY=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   CURRENT_JOB_CAPTURE_STATUS="not-attempted"
@@ -2555,6 +2558,7 @@ run_one(){
     fi
   fi
   CURRENT_RUN_ID=""
+  CURRENT_JOB_REPOSITORY=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   CURRENT_LABELS="$LABELS"

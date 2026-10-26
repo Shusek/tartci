@@ -28,6 +28,8 @@ run = {'id': 1, 'workflow_id': 3, 'name': 'Smoke', 'status': 'in_progress',
 job = {'id': 2, 'status': 'in_progress', 'runner_name': 'fixture'}
 if '/actions/workflows?' in path:
     result = {'total_count': 1, 'workflows': [{'id': 3, 'name': 'Smoke', 'path': '.github/workflows/smoke.yml'}]}
+elif '/actions/runs?status=queued' in path:
+    result = {'total_count': 0, 'workflow_runs': []}
 elif '/actions/runs?status=in_progress' in path:
     result = {'total_count': int(repo == expected), 'workflow_runs': [run] if repo == expected else []}
 elif '/actions/runs/1/jobs?' in path:
@@ -46,7 +48,7 @@ print(json.dumps(result))
                    'TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE': str(root / 'backoff.json')}
             for mode, verdict in [('valid', 'active'), ('foreign', 'unexpected_assignment'), ('fork', 'policy_violation')]:
                 with self.subTest(mode=mode), patch.dict(os.environ, {**env, 'VERDICT': mode}):
-                    self.assertEqual(assignment_observation('owner/repo', 'fixture', policy), verdict)
+                    self.assertEqual(assignment_observation('owner/repo', 'fixture', policy)['kind'], verdict)
 
 
 if __name__ == '__main__':

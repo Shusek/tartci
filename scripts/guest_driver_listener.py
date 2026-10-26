@@ -15,17 +15,21 @@ import time
 from bounded_subprocess import run_bounded
 
 
-def assignment_observation(repo, runner, policy):
+def assignment_observation(repo, runner, policy, binding=None):
     """Read the exact assigned job across the declared repository scope."""
-    result = run_bounded([sys.executable, str(Path(__file__).with_name('current_job_scan.py')),
+    command = [sys.executable, str(Path(__file__).with_name('current_job_scan.py')),
                              '--repo', repo, '--runner', runner, '--policy-file', str(policy),
-                             '--scan-timeout', '120', '--parallelism', '1'],
+                             '--scan-timeout', '120', '--parallelism', '1']
+    if binding:
+        command += ['--mode', 'revalidate', '--run-id', str(binding['run_id']),
+                    '--job-id', str(binding['job_id']), '--assigned-repo', binding['repository']]
+    result = run_bounded(command,
                             timeout=130, operation='prepared_guest_assignment')
     try:
         value = json.loads(result.stdout)
     except (TypeError, ValueError):
-        return 'observation_error'
-    return value.get('kind', 'observation_error')
+        return {'kind': 'observation_error'}
+    return value if isinstance(value, dict) else {'kind': 'observation_error'}
 
 
 def main():
@@ -73,11 +77,12 @@ def main():
     observing = False
     next_observation = 0
     observation_errors = 0
+    binding = None
     def observe():
         try:
-            observations.put(assignment_observation(args.repo, args.runner, args.assignment_policy))
+            observations.put(assignment_observation(args.repo, args.runner, args.assignment_policy, binding))
         except Exception:
-            observations.put('observation_error')
+            observations.put({'kind': 'observation_error'})
     try:
         while selector.get_map() or process.poll() is None:
             for key, _ in selector.select(0.5):
@@ -92,13 +97,18 @@ def main():
                     receipt['assigned'] = True; save()
             if assigned and args.assignment_policy:
                 try:
-                    verdict = observations.get_nowait()
+                    observation = observations.get_nowait()
+                    verdict = observation.get('kind', 'observation_error')
                 except queue.Empty:
                     verdict = None
                 if verdict is not None:
                     observing = False
                     next_observation = time.monotonic() + 30
                     receipt['assignment_observation'] = verdict
+                    if verdict == 'active':
+                        binding = {key: observation[key] for key in ('run_id', 'job_id')}
+                        binding['repository'] = observation.get('repository', args.repo)
+                        receipt['assignment'] = binding
                     observation_errors = observation_errors + 1 if verdict == 'observation_error' else 0
                     save()
                     if verdict in ('unexpected_assignment', 'policy_violation', 'assignment_changed') or observation_errors >= 3:

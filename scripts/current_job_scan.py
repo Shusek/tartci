@@ -46,6 +46,26 @@ class CurrentJobScanner:
             except (OSError, ValueError) as error:
                 raise ScanError(f"invalid queue policy: {error}") from error
         self.repositories = tuple(dict.fromkeys([args.repo, *getattr(args, "assignment_repo", [])]))
+        self.assignment_policies: dict[str, list[QueuePolicy]] = {}
+        if self.policy:
+            self.assignment_policies[args.repo.lower()] = [self.policy]
+        mapping = getattr(args, 'assignment_policy_map', {})
+        try:
+            mapping = json.loads(mapping) if isinstance(mapping, str) else mapping
+            if not isinstance(mapping, dict):
+                raise ValueError('assignment policy map must be an object')
+            for repository, files in mapping.items():
+                if not isinstance(repository, str) or repository.lower() not in {r.lower() for r in self.repositories}:
+                    raise ValueError('assignment policy repository is outside the observed scope')
+                if not isinstance(files, list) or not files or any(not isinstance(f, str) or not f for f in files):
+                    raise ValueError('assignment policies must be a nonempty list of paths')
+                policies = self.assignment_policies.setdefault(repository.lower(), [])
+                for filename in files:
+                    candidate = QueuePolicy.load(filename, repository)
+                    if candidate.fingerprint not in {p.fingerprint for p in policies}:
+                        policies.append(candidate)
+        except (OSError, ValueError) as error:
+            raise ScanError(f'invalid assignment policy map: {error}') from error
         self.deadline = time.monotonic() + args.scan_timeout
         self.api_calls = 0
         self.api_lock = threading.Lock()
@@ -148,19 +168,24 @@ class CurrentJobScanner:
                 raise ScanError(f"pagination inconsistent for {prefix} ({len(result)} of {total})")
         raise ScanError(f"pagination truncated at {self.args.max_pages} pages for {prefix}")
 
-    def _workflow_contract(self) -> dict[int, str]:
-        workflows = self._pages(f"repos/{self.args.repo}/actions/workflows", "workflows")
-        if self.policy:
+    def _workflow_contract(self, repository: str | None = None) -> dict[int, str]:
+        repository = repository or self.args.repo
+        workflows = self._pages(f"repos/{repository}/actions/workflows", "workflows")
+        policies = getattr(self, 'assignment_policies', {}).get(repository.lower(), [])
+        if not policies and repository.lower() == self.args.repo.lower() and self.policy:
+            policies = [self.policy]
+        if policies:
+            paths = set().union(*(policy.paths for policy in policies))
             contract = {}
             matched = set()
             for workflow in workflows:
                 path = workflow.get("path")
-                if path in self.policy.paths:
+                if path in paths:
                     if path in matched or type(workflow.get("id")) is not int or not workflow.get("name"):
                         raise ScanError("policy workflow path did not resolve uniquely")
                     matched.add(path)
                     contract[workflow["id"]] = workflow["name"]
-            if matched != self.policy.paths:
+            if matched != paths:
                 raise ScanError("policy workflow path is missing")
             return contract
         by_name: dict[str, list[int]] = {name: [] for name in self.configured_names}
@@ -206,13 +231,26 @@ class CurrentJobScanner:
             return self._receipt("terminal", conclusion=job.get("conclusion"), **base)
         if status != "in_progress":
             return self._receipt("assignment_changed", **base)
-        if repository != self.args.repo:
-            return self._receipt("unexpected_assignment", **base)
-        if self.policy and not self.policy.allows(run):
-            # The policy only decided to boot a VM; GitHub then assigned this
-            # runner a run the policy refuses (e.g. a fork pull request). The
-            # supervisor stops the job rather than merely recording it.
-            return self._receipt("policy_violation", **base)
+        policies = self.assignment_policies.get(repository.lower(), [])
+        if not policies and repository.lower() == self.args.repo.lower() and self.policy:
+            policies = [self.policy]
+        if repository.lower() != self.args.repo.lower():
+            if not policies:
+                return self._receipt('unexpected_assignment', **base)
+            contract = self._workflow_contract(repository)
+        if policies:
+            directory = getattr(self.args, 'assignment_approval_dir', None)
+            now = int(time.time())
+            approved = [policy for policy in policies if policy.allows(run)]
+            if approved and directory:
+                for policy in approved:
+                    try:
+                        if policy.remember(run, directory, now):
+                            policy.prune_approvals(directory, now)
+                    except (OSError, ValueError) as error:
+                        raise ScanError(f'cannot retain assignment approval: {error}') from error
+            elif not approved and (not directory or not any(policy.approved(run, directory, now) for policy in policies)):
+                return self._receipt('policy_violation', **base)
         if not isinstance(workflow_id, int) or contract.get(workflow_id) != workflow_name:
             return self._receipt("unexpected_assignment", **base)
         return self._receipt("active", **base)
@@ -224,9 +262,12 @@ class CurrentJobScanner:
         def observe():
             result = []
             for repository in self.repositories:
-                runs = self._pages(
-                    f"repos/{repository}/actions/runs?status=in_progress", "workflow_runs"
-                )
+                runs = []
+                for status in ('queued', 'in_progress'):
+                    runs.extend(self._pages(f"repos/{repository}/actions/runs?status={status}", "workflow_runs"))
+                # A parent can move between the two pages while its assigned
+                # job already runs; confirm each immutable run ID just once.
+                runs = list({run.get('id'): run for run in runs}.values())
                 result.extend(self._matches(runs, repository))
             return result
         matches = observe()
@@ -269,7 +310,8 @@ class CurrentJobScanner:
         return matches
 
     def revalidate(self) -> dict[str, Any]:
-        return self._confirm(self.args.run_id, self.args.job_id, self._workflow_contract())
+        repository = getattr(self.args, 'assigned_repo', None) or self.args.repo
+        return self._confirm(self.args.run_id, self.args.job_id, self._workflow_contract(), repository)
 
 
 def parse_args() -> argparse.Namespace:
@@ -277,6 +319,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--runner", required=True)
     parser.add_argument("--assignment-repo", action="append", default=[r for r in os.environ.get("TARTCI_ASSIGNMENT_REPOSITORIES", "").splitlines() if r])
+    parser.add_argument('--assignment-policy-map', default=os.environ.get('TARTCI_ASSIGNMENT_POLICY_FILES', '{}'))
+    parser.add_argument('--assignment-approval-dir', default=os.environ.get('TARTCI_ASSIGNMENT_APPROVAL_DIR'))
+    parser.add_argument('--assigned-repo')
     parser.add_argument("--workflow", action="append", default=[])
     parser.add_argument("--policy-file", default=os.environ.get("TARTCI_QUEUE_POLICY_FILE"))
     parser.add_argument("--mode", choices=("discover", "revalidate"), default="discover")
@@ -305,6 +350,8 @@ def parse_args() -> argparse.Namespace:
     import re
     if any(not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r) or r.split("/")[0].lower() != args.repo.split("/")[0].lower() for r in args.assignment_repo):
         parser.error("assignment repositories must belong to the configured organization")
+    if args.assigned_repo and args.assigned_repo.lower() not in {r.lower() for r in [args.repo, *args.assignment_repo]}:
+        parser.error('assigned repository is outside the observed scope')
     if not args.workflow and not args.policy_file:
         parser.error("--workflow or --policy-file is required")
     for field in ("gh_timeout", "max_pages", "scan_timeout", "result_cap", "max_api_calls", "parallelism"):

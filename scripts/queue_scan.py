@@ -527,6 +527,13 @@ class QueueScanner:
                 # budgeted and bounded exactly like every other call.
                 self._preflight_identity()
                 runs = self._runs(discovery)
+                if self.policy:
+                    directory = getattr(self.args, 'assignment_approval_dir', None)
+                    recorded = False
+                    for run in runs:
+                        recorded = self.policy.remember(run, directory, self.now) or recorded
+                    if recorded:
+                        self.policy.prune_approvals(directory, self.now)
                 candidates, backlog_ids = self._candidate_runs(runs, discovery)
                 discovered: list[dict[str, Any]] = []
                 for run in candidates[: self.args.max_job_fetches]:
@@ -657,6 +664,7 @@ def parse_args() -> argparse.Namespace:
         help="repository-bound JSON policy; selects exact paths instead of display names",
     )
     parser.add_argument("--labels", required=True)
+    parser.add_argument('--assignment-approval-dir', default=os.environ.get('TARTCI_ASSIGNMENT_APPROVAL_DIR'))
     parser.add_argument("--job-statuses", default="queued")
     parser.add_argument("--state-file", required=True)
     parser.add_argument(

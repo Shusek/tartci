@@ -61,6 +61,8 @@ elif path.endswith("/actions/runs/333"):
     print(json.dumps({"id":333,"workflow_id":99,"name":"Build and Test",
                       "status":"completed" if terminal else "in_progress",
                       "conclusion":"cancelled" if terminal else None}))
+elif "/actions/runs?status=queued" in path:
+    print(json.dumps({"total_count":0,"workflow_runs":[]}))
 elif "/actions/runs?status=in_progress" in path:
     print(json.dumps({"total_count":1,"workflow_runs":[
         {"id":333,"workflow_id":99,"name":"Build and Test","status":"in_progress"}]}))

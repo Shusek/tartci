@@ -933,3 +933,26 @@ Bring-up proven on a Mac Studio (2026-06): Linux build+test+cache green; Windows
 24H2-ARM build green + tests pass. See `docs/runbook.md` for the recipe and the
 hard-won gotchas (ISO 512-byte alignment, ramfb vs virtio-gpu, all-USB install
 media, MSVC partial-install nuke, BOOTAA64 auto-boot, …).
+
+### Shared-group assignment authorization
+
+Queue admission remains repository-bound. A host serving a shared runner group
+can additionally set `TARTCI_ASSIGNMENT_POLICY_FILES` to a JSON object mapping
+explicitly observed repositories to lists of reviewed policy file paths. These
+policies authorize assignments; they do not create demand or grant a repository
+access to the group. Unmapped repositories, unreviewed workflows and fork PRs
+remain refused. Exact revalidation uses `--assigned-repo` with the discovered
+repository/job/run binding; the prepared Linux listener retains that binding.
+
+`TARTCI_ASSIGNMENT_APPROVAL_DIR` enables private host-side records of fresh,
+successful same-repository PR authorization. Queue scans retain this evidence
+before starting a VM, and assignment confirmation can also retain it. If GitHub
+later omits a merged PR association, only the same run, attempt, head commit,
+repository IDs, workflow and unchanged policy can use its prior approval, for
+at most 24 hours. Missing, expired, conflicting or unsafe files fail closed;
+this does not authorize a new attempt of a closed PR or require PR-read scopes.
+The directory must be private to the trusted host observer, outside guest shares.
+
+Linux teardown confirms a runner's exact absence after DELETE. Busy runners and
+unfiltered/incomplete API pages are never treated as successful deletion. API
+adapters must serialize GET fields (`name`, `per_page`) as URL query parameters.
