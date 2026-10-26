@@ -72,7 +72,8 @@ jobs:
     # tomllib) on the lint job's OS, and puts it first on PATH so subprocesses
     # that call `python3` get it too. A test that genuinely needs tomllib says
     # so (scripts/testing_support.py) and is skipped rather than failing.
-    runs-on: ubuntu-latest
+    # setup-python has no Python 3.9 build for Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

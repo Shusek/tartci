@@ -97,6 +97,9 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
 ''');shipyard.chmod(0o700)
                 env.update(TARTCI_ADMISSION_CLEAN_MODE='required',TARTCI_SHIPYARD_CLI=str(shipyard),ADMISSION_VERDICT=admission)
             if lease_budget:
+                # This fixture creates no VM disk. Keep its disk demand explicit
+                # instead of requiring 24 GiB free on the CI host's /tmp.
+                env['TARTCI_VM_DISK_GROWTH_GB']='1'
                 env.update(TARTCI_VM_LEASES='1',TARTCI_LEASE_DIR=str(root/'leases'),TARTCI_LEASE_CAPACITY_CORES='10',TARTCI_LEASE_CAPACITY_MEM_MB='24576',TARTCI_GATE_RESERVED_CORES='6',TARTCI_GATE_RESERVED_MEM_MB='12288',TARTCI_NON_GATE_CAPACITY_CORES='4',TARTCI_MACOS_VM_MEM_MB='12288')
             if delayed_delete:env.update(DELAY_DELETE='1',TARTCI_PENDING_DELETE_RETRY_SECS='1',TARTCI_PENDING_DELETE_MAX_ATTEMPTS='3')
             if fail:env['FAIL_JOB']='1'
@@ -228,7 +231,7 @@ class GuestListenerTests(unittest.TestCase):
             with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as directory:
                 receipt=Path(directory)/'receipt.json'
                 child="import time;print('Running job: fixture',flush=True);time.sleep(10)"
-                code="import sys;sys.path.insert(0,sys.argv[1]);import guest_driver_listener as m;m.assignment_observation=lambda *a,v=sys.argv[2]:v;sys.argv=['listener','--idle-timeout','2','--job-timeout','20','--receipt',sys.argv[3],'--assignment-policy','fixture.json','--repo','owner/repo','--runner','fixture','--',sys.executable,'-c',sys.argv[4]];raise SystemExit(m.main())"
+                code="import sys;sys.path.insert(0,sys.argv[1]);import guest_driver_listener as m;m.assignment_observation=lambda *a,v=sys.argv[2]:{'kind':v};sys.argv=['listener','--idle-timeout','2','--job-timeout','20','--receipt',sys.argv[3],'--assignment-policy','fixture.json','--repo','owner/repo','--runner','fixture','--',sys.executable,'-c',sys.argv[4]];raise SystemExit(m.main())"
                 result=subprocess.run([sys.executable,'-c',code,str(ROOT/'scripts'),verdict,str(receipt),child],capture_output=True,timeout=5)
                 self.assertEqual(result.returncode,126,result.stderr)
                 proof=json.loads(receipt.read_text())

@@ -176,18 +176,19 @@ PY
 }
 
 delete_linux_runner_registration(){
-  local name="$1" ids id attempt delete_failed
+  local name="$1" state attempt query
+  # An unfiltered/incomplete page is not proof that this exact runner vanished.
+  query="if .total_count==0 and (.runners|length)==0 then \"absent\" elif .total_count==1 and (.runners|length)==1 and .runners[0].name==\"$name\" then if .runners[0].busy==false and (.runners[0].id|type)==\"number\" and .runners[0].id>0 then (.runners[0].id|tostring) else \"busy\" end else \"incomplete\" end"
   for attempt in 1 2 3; do
-    if ids="$("$GH_CLI" api --method GET "$RUNNER_API_ROOT" \
-      -f per_page=10 -f "name=$name" \
-      --jq ".runners[] | select(.name==\"$name\" and .busy==false) | .id" \
-      2>/dev/null)"; then
-      delete_failed=0
-      for id in $ids; do
-        "$GH_CLI" api -X DELETE "$RUNNER_API_ROOT/$id" \
-          >/dev/null 2>&1 || delete_failed=1
-      done
-      if [ "$delete_failed" = 0 ]; then
+    if state="$("$GH_CLI" api --method GET "$RUNNER_API_ROOT" \
+      -f per_page=10 -f "name=$name" --jq "$query" 2>/dev/null)"; then
+      if [[ "$state" =~ ^[0-9]+$ ]]; then
+        if "$GH_CLI" api -X DELETE "$RUNNER_API_ROOT/$state" >/dev/null 2>&1; then
+          state="$("$GH_CLI" api --method GET "$RUNNER_API_ROOT" \
+            -f per_page=10 -f "name=$name" --jq "$query" 2>/dev/null)" || state=unknown
+        fi
+      fi
+      if [ "$state" = absent ]; then
         printf 'TARTCI_DIAG runner_registration_cleanup=confirmed name=%s attempt=%s\n' \
           "$name" "$attempt" >&2
         return 0
