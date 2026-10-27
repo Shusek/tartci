@@ -436,13 +436,13 @@ class GuestCommandTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.base = Path(os.path.realpath(tmp.name))
 
-    def guest_command(self, shared: str) -> str:
+    def guest_command(self, shared: str, access: str = "rw") -> str:
         body = function_body(RUNNER.read_text(encoding="utf-8"), "run_runner_until_done_unlayered")
         argv = self.base / f"argv-{shared}"
         script = GUEST_STUBS + body + '\nrun_runner_until_done_unlayered vm 192.0.2.7 jit 0 || true\n'
         result = subprocess.run(["/bin/bash", "-c", script, "_", str(argv), str(self.base), shared],
                                 text=True, capture_output=True, check=False,
-                                env={"PATH": "/usr/bin:/bin"})
+                                env={"PATH": "/usr/bin:/bin", "TARTCI_HOST_CACHE_ACCESS_MODE": access})
         self.assertTrue(argv.exists(), result.stderr)
         return argv.read_text()
 
@@ -485,6 +485,16 @@ class GuestCommandTests(unittest.TestCase):
                      home / "Library" / "Caches" / "Pulp" / "configure-checks"):
             self.assertFalse(path.is_symlink(), path)
             self.assertTrue(path.is_dir(), path)
+
+    def test_a_release_with_read_only_host_policy_needs_no_shared_mount(self) -> None:
+        command = self.guest_command("0", "ro")
+        home = self.run_prefix(command)
+        self.assertNotIn("rsync -a '/Volumes/My Shared Files/configure-checks/'", command)
+        self.assertNotIn("CCACHE_READONLY=true", command)
+        self.assertFalse((home / "Library/Caches/ccache").is_symlink())
+        shared = self.guest_command("1", "ro")
+        self.assertIn("rsync -a '/Volumes/My Shared Files/configure-checks/'", shared)
+        self.assertIn("CCACHE_READONLY=true", shared)
 
     @unittest.skipUnless(ccache_guard.resolve_ccache(), "needs a ccache binary")
     def test_ccache_with_the_guest_configpath_ignores_a_planted_conf(self) -> None:

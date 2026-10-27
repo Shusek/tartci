@@ -1856,7 +1856,7 @@ run_runner_until_done_unlayered(){
   # share, and configure checks run against a private copy that dies with the VM.
   local configure_checks_prep ccache_ro_env="" ccache_ro_dotenv=""
   configure_checks_prep="ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\""
-  if [ "$TARTCI_HOST_CACHE_ACCESS_MODE" = ro ]; then
+  if [ "$TARTCI_HOST_CACHE_ACCESS_MODE" = ro ] && [ "${CURRENT_SHARED_CACHE:-1}" = 1 ]; then
     configure_checks_prep="{ [ ! -L \"\$HOME/Library/Caches/Pulp/configure-checks\" ] || rm -f \"\$HOME/Library/Caches/Pulp/configure-checks\"; } && \
 mkdir -p \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
 rsync -a '/Volumes/My Shared Files/configure-checks/' \"\$HOME/Library/Caches/Pulp/configure-checks/\""
