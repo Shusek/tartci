@@ -162,6 +162,21 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(kept[gen_name(4)], "in use by a running process")
         self.assertEqual(self.names(plan), [gen_name(3)])
 
+    def test_the_launcher_pointer_keeps_its_current_and_rollback_generations(self) -> None:
+        h = self.h
+        (h.home / ".config/tartci/launcher-generation.json").write_text(json.dumps({
+            "schema": 1, "generation": f"{h.gens}/{gen_name(9)}",
+            "previous": f"{h.gens}/{gen_name(8)}"}))
+        plan = h.plan(keep_generations=3)
+        self.assertEqual("the launcher's current generation", plan.generations_kept[gen_name(9)])
+        self.assertEqual("the launcher's rollback generation", plan.generations_kept[gen_name(8)])
+        self.assertNotIn(h.gens / gen_name(9), plan.generations)
+        self.assertNotIn(h.gens / gen_name(8), plan.generations)
+        self.assertEqual(self.names(plan), sorted(gen_name(i) for i in range(3, 8)))
+        # Control: without the pointer both are old enough to go.
+        (h.home / ".config/tartci/launcher-generation.json").unlink()
+        self.assertIn(gen_name(9), self.names(h.plan(keep_generations=3)))
+
     def test_a_live_self_update_leaves_every_generation_alone(self) -> None:
         marker = self.h.home / ".tartci/state/self-update/active.json"
         marker.parent.mkdir(parents=True)

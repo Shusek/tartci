@@ -44,6 +44,10 @@
 # the clone when the selected class is proven empty or a preferred class
 # waits; an uncertain scan clones as before. `--print-pre-clone-selection
 # <tier>` reports that decision as a safe preflight.
+# Pre-mint hold (V2 only): a booted VM whose class lost its job, with no other
+# class waiting, is held for one more demand scan after
+# TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS (default 25, 0-60, 0 = off) and serves
+# whichever class then admits, instead of being discarded at once.
 # Per-slot class preference (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_TIER_ORDER
 # is a comma-separated permutation of the configured class labels. Selection,
 # pre-mint admission, and idle retarget consult classes in that order instead
@@ -94,6 +98,8 @@ TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
 # shellcheck source=providers/tart-macos/lifecycle.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/lifecycle.lib.sh"
+# shellcheck source=providers/tart-macos/lane-cache-root.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/lane-cache-root.lib.sh"
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
 # GitHub CLI used for every API call (queue polling, JIT mint, runner reclaim,
 # job/run polling, cancel). Default `gh` (the personal/host auth) keeps generic
@@ -111,10 +117,19 @@ JIT_GH_CLI="${TARTCI_JIT_GH_CLI:-$GH_CLI}"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
+# Set by the fleet renderer only for a lane that owns its cache root; the
+# boot refuses when that root resolves into, or around, this host root.
+HOST_CACHE_ROOT="${TARTCI_HOST_CI_CACHE:-}"
 CCACHE_MAX_SIZE="${TARTCI_CCACHE_MAX_SIZE:-40G}"
 [[ "$CCACHE_MAX_SIZE" =~ ^[1-9][0-9]*[KMGT]$ ]] \
   || { printf 'invalid TARTCI_CCACHE_MAX_SIZE: expected a positive ccache size such as 40G\n' >&2; exit 1; }
 FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/Caches/Pulp/fetchcontent-src}"
+# Release-tier boots skip the read-write ccache and configure-checks mounts
+# (tartci_labels_mount_shared_cache in lane-cache-root.lib.sh).
+case "${TARTCI_RELEASE_TIER_NO_SHARED_CACHE:-1}" in
+  0|1) ;;
+  *) printf 'invalid TARTCI_RELEASE_TIER_NO_SHARED_CACHE: expected 0 or 1\n' >&2; exit 1 ;;
+esac
 # Optional read-only pip wheelhouse served to each guest. Opt-in by content: the
 # mount is added only while the directory holds at least one wheel, so a host
 # that never ran scripts/pip-wheelhouse.sh boots exactly as before.
@@ -193,6 +208,14 @@ GUEST_DRIVER="${TARTCI_GUEST_DRIVER:-}"
 LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
+# Read-only Tart-store liveness probe.  The helper owns a process-group
+# deadline, so a wedged APFS/USB path cannot strand this supervisor.  A probe
+# failure yields before any new VM clone; active guests are left alone.
+STORAGE_HEALTH_TIMEOUT="${TARTCI_STORAGE_HEALTH_TIMEOUT_SECS:-5}"
+case "$STORAGE_HEALTH_TIMEOUT" in
+  ''|*[!0-9]*|0) STORAGE_HEALTH_TIMEOUT=5 ;;
+esac
+[ "$STORAGE_HEALTH_TIMEOUT" -le 30 ] || STORAGE_HEALTH_TIMEOUT=30
 JOB_TIMEOUT="${TARTCI_JOB_TIMEOUT_SECS:-7200}"
 TEARDOWN_STEP_TIMEOUT="${TARTCI_TEARDOWN_STEP_TIMEOUT_SECS:-5}"
 case "$TEARDOWN_STEP_TIMEOUT" in
@@ -242,6 +265,7 @@ PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_YIELD_BOUND=0
 PRINT_HOST_HEALTH=0
+PRINT_STORAGE_HEALTH=0
 PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
@@ -280,6 +304,8 @@ CURRENT_GUEST_CORES=""
 CURRENT_GUEST_MEM_MB=""
 CURRENT_PIP_WHEELHOUSE=0
 CURRENT_ARTIFACT_CACHE=0
+# 1 when the VM mounts the shared ccache and configure-checks directories.
+CURRENT_SHARED_CACHE=1
 CLEANED_UP=0
 # Set when a work entry ends without serving a job, cleared when a job is
 # actually assigned or when the queue drains. Carries the START of the blocked
@@ -297,6 +323,7 @@ CLEANED_UP=0
 SERVING_BLOCKED_SINCE=""
 SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
+SERVING_BLOCKED_CAUSE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
 # 1 when the last work entry declined to clone because the opt-in pre-clone
@@ -305,6 +332,7 @@ PRE_CLONE_DEMAND_GONE=0
 # The queued count the loop selected with; the per-job claim reads it.
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
+STORAGE_HEALTH_STATE="unknown"
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -528,6 +556,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-yield-bound) PRINT_YIELD_BOUND=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-storage-health) PRINT_STORAGE_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   --print-runner-contract) PRINT_RUNNER_CONTRACT="$2"; shift 2;;
@@ -835,14 +864,141 @@ heartbeat(){
   find "$STATE_DIR" -type f -name "$RUNNER_NAME.state.json.tmp.*" -mtime +1 -delete 2>/dev/null || true
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","storage_health":"$(json_sanitize "$STORAGE_HEALTH_STATE")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","serving_blocked_cause":"$(json_sanitize "$SERVING_BLOCKED_CAUSE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
+    if ! python3 - "$tmp_file" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+    then
+      rm -f "$tmp_file"
+      return 1
+    fi
     mv -f "$tmp_file" "$state_file"
+    if ! python3 - "$STATE_DIR" <<'PY'
+import errno, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno != errno.EINVAL:
+            raise
+finally:
+    os.close(fd)
+PY
+    then
+      return 1
+    fi
   else
     rm -f "$tmp_file"
     return 1
   fi
+}
+
+# True when the parent this process started under has exited (it was
+# reparented). $PPID is fixed at startup; ps reports the parent now. A
+# supervisor launchd starts directly has parent 1 from the start, so it is
+# never reported.
+tartci_supervisor_orphaned(){
+  local now
+  now="$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')"
+  [ -n "$now" ] && [ "$now" != "$PPID" ]
+}
+
+# One supervisor per lane. A lane's claim file names the supervisor serving
+# it ("pid start"). A replacement that finds a live incumbent never takes the
+# lane from it: it records that it is waiting (.handoff, for pool status),
+# admits nothing and writes no heartbeat (the incumbent's state is the lane's),
+# and claims only once the incumbent has exited. An incumbent leaves only when
+# the lane is no longer its own, between jobs: its launcher exited (it is
+# orphaned) or the claim names another live supervisor. So two supervisors
+# never admit work for one lane, and two live managers of one lane settle on
+# the first instead of trading the lane back and forth.
+tartci_proc_start(){ ps -o lstart= -p "$1" 2>/dev/null | sed 's/ *$//'; }
+tartci_lane_claim_path(){ printf '%s/%s.supervisor' "$STATE_DIR" "$RUNNER_NAME"; }
+tartci_lane_handoff_path(){ printf '%s/%s.handoff' "$STATE_DIR" "$RUNNER_NAME"; }
+
+# The live supervisor named in file $1 ("pid start"), if it is not this one.
+tartci_lane_other_supervisor(){
+  local line pid start
+  line="$(head -n 1 "$1" 2>/dev/null)" || return 1
+  pid="${line%% *}"; start="${line#* }"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" != "$$" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # A zombie answers kill -0 but has exited: it serves nothing.
+  case "$(ps -o stat= -p "$pid" 2>/dev/null)" in Z*) return 1 ;; esac
+  [ -n "$start" ] && [ "$(tartci_proc_start "$pid")" = "$start" ] || return 1
+  printf '%s' "$pid"
+}
+
+# Take the lane once no other live supervisor holds it. After
+# TARTCI_LANE_HANDOFF_MAX_WAIT seconds (default 6 h, longer than any job) it
+# says so loudly, and keeps waiting: taking a lane from a live supervisor is
+# the duplicate this exists to prevent.
+tartci_lane_claim(){
+  local claim handoff incumbent me waited=0 warned=0
+  local max="${TARTCI_LANE_HANDOFF_MAX_WAIT:-21600}" poll="${TARTCI_LANE_HANDOFF_POLL:-$POLL}"
+  claim="$(tartci_lane_claim_path)"; handoff="$(tartci_lane_handoff_path)"
+  me="$$ $(tartci_proc_start "$$")"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if incumbent="$(tartci_lane_other_supervisor "$claim")"; then
+    printf '%s\n' "$me" >"$handoff" 2>/dev/null || true
+    event supervisor_handoff_wait "incumbent=$incumbent"
+    note "supervisor pid $incumbent still serves this lane; waiting for it to exit"
+    while tartci_lane_other_supervisor "$claim" >/dev/null; do
+      sleep "$poll"
+      waited=$((waited + poll))
+      if [ "$warned" = 0 ] && [ "$waited" -ge "$max" ]; then
+        warned=1
+        event supervisor_handoff_timeout "incumbent=$incumbent waited=${waited}s; still waiting"
+      fi
+    done
+    event supervisor_handoff_done "incumbent=$incumbent waited=${waited}s"
+  fi
+  printf '%s\n' "$me" >"$claim" 2>/dev/null || true
+  rm -f "$handoff" 2>/dev/null || true
+}
+
+# The lane's claim names another live supervisor: this one is not the lane's.
+tartci_lane_superseded(){
+  tartci_lane_other_supervisor "$(tartci_lane_claim_path)" >/dev/null
+}
+
+tartci_storage_health_check(){
+  local path="${1:-$TART_HOME}" mode="${2:-state}" result="" rc=0 status="unknown" reason=""
+  local -a probe_args=(
+    --path "$path"
+    --timeout "$STORAGE_HEALTH_TIMEOUT"
+    --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}"
+    --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}"
+  )
+  if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
+    probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")
+  fi
+  [ "$mode" = observe ] && probe_args+=(--observe-only)
+  result="$(python3 "$TARTCI_ROOT/scripts/storage_health.py" ${probe_args[@]+"${probe_args[@]}"} 2>&1)" || rc=$?
+  rc="${rc:-0}"
+  [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
+  if [ "$rc" -eq 0 ]; then
+    STORAGE_HEALTH_STATE=ok
+    event storage_health "Tart store probe succeeded" \
+      "state=ok" "path=$path"
+    return 0
+  fi
+  reason="$(printf '%s\n' "$result" | tail -1)"
+  STORAGE_HEALTH_STATE=unknown
+  event yielded_storage_health "Tart store probe failed" \
+    "state=unknown" "path=$path" "reason=$reason"
+  heartbeat yielded-storage-health
+  note "Tart store health is unknown — deferring new VM admission"
+  return 75
 }
 
 runtime_emit_complete(){
@@ -871,12 +1027,9 @@ runtime_emit_complete(){
 }
 
 # Running macOS guests per `tart list`, or `unknown` when the inventory cannot
-# be read. A slow or failed listing is NOT a full host: reporting the hard cap
-# here once made an empty host look 2/2 busy for as long as `tart list` stayed
-# slow. One bounded retry with a longer timeout rides out a transient stall;
-# after that the caller must treat occupancy as unknown and fall back to the
-# reservation files (tartci_claim_macos_slot), which every lane writes before
-# it boots and keeps until its VM is proved gone.
+# be read. A slow or failed listing is not a full host. One bounded retry with
+# a longer timeout rides out a transient stall; after that new clones wait for
+# inventory to recover. Reservations cannot prove Tart or storage is healthy.
 running_macos_vms(){
   local count inventory_timeout retry_timeout
   inventory_timeout="${TARTCI_TART_INVENTORY_TIMEOUT_SECS:-5}"
@@ -905,7 +1058,7 @@ queued_work(){
   fi
   run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
-    "${WORKFLOW_ARGS[@]}" \
+    ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} \
     --labels "$LABELS" \
     --provider tart-macos \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
@@ -943,7 +1096,7 @@ tier_queued_work(){
   [ "${#tier_args[@]}" -gt 0 ] || return 1
   scan_cmd=(python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
-    "${tier_args[@]}" \
+    ${tier_args[@]+"${tier_args[@]}"} \
     --labels "$LABELS,$tier_labels" \
     --provider tart-macos-tier \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-$tier_labels" \
@@ -952,7 +1105,7 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
-  run_scan_capture "${scan_cmd[@]}" --match-labels 1
+  run_scan_capture ${scan_cmd[@]+"${scan_cmd[@]}"} --match-labels 1
 }
 
 # Print `count|registration labels|zero-based tier`. A scan error at any tier is
@@ -1089,11 +1242,11 @@ yield_bound_reached(){
     done < <(tier_workflow_args "$tier_labels")
     [ "${#scan_args[@]}" -gt 0 ] || { printf '%s\n' 0; return 0; }
   else
-    scan_args=("${WORKFLOW_ARGS[@]}")
+    scan_args=(${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"})
   fi
   if ! count="$(run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
       --repo "$REPO" \
-      "${scan_args[@]}" \
+      ${scan_args[@]+"${scan_args[@]}"} \
       --labels "$selected_labels" \
       --provider tart-macos-yield-bound \
       --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-yield-bound" \
@@ -1156,7 +1309,7 @@ stop_current_aqua_runner(){
   fi
   if [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ]; then
     bounded_teardown_command aqua-stop \
-      ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
+      ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
       "\$HOME/.tartci/bin/guest-aqua-runner.sh stop '$CURRENT_AQUA_LABEL'" \
       >/dev/null 2>&1 || true
   fi
@@ -1306,7 +1459,11 @@ cleanup(){
     reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
     CURRENT_REGISTERED_RUNNER=""
   fi
-  reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
+  # The lane's runner name belongs to whichever supervisor holds the lane; one
+  # that has stepped aside must not deregister its replacement's runner.
+  if ! tartci_lane_superseded; then
+    reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
+  fi
   CLEANED_UP=1
   heartbeat stopped
 }
@@ -1467,7 +1624,7 @@ capture_current_job(){
     return 2
   fi
   started="$(date +%s)"
-  python3 "${args[@]}" >"$CURRENT_SCAN_TMP" 2>>"$EVENT_LOG" & CURRENT_SCAN_PID=$!
+  python3 ${args[@]+"${args[@]}"} >"$CURRENT_SCAN_TMP" 2>>"$EVENT_LOG" & CURRENT_SCAN_PID=$!
   while kill -0 "$CURRENT_SCAN_PID" 2>/dev/null; do
     heartbeat job-running
     sleep 1
@@ -1593,7 +1750,7 @@ ensure_runner_version(){
     return $?
   fi
   local ip="$1"
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY'" <<'GUEST'
 set -euo pipefail
 desired="$1"
@@ -1662,7 +1819,13 @@ GUEST
 run_runner_until_done(){
   local layer_rc=0
   if [ -n "${GUEST_DRIVER:-}" ]; then run_runner_until_done_unlayered "$@"; return $?; fi
-  tartci_ccache_layer_attach "$1" || return 1
+  # The layer lives inside the shared ccache mount; a VM booted without that
+  # mount (a release tier) has none to attach.
+  if [ "${CURRENT_SHARED_CACHE:-1}" = 1 ]; then
+    tartci_ccache_layer_attach "$1" || return 1
+  else
+    tartci_ccache_layer_guest_fragments_clear
+  fi
   run_runner_until_done_unlayered "$@" || layer_rc=$?
   tartci_ccache_layer_settle "$1" "$layer_rc" "$STATE_DIR/$1.actions-runner.log"
   return "$layer_rc"
@@ -1682,7 +1845,7 @@ run_runner_until_done_unlayered(){
     printf '%s' "$jit" | "$GUEST_DRIVER" run-jit "$vm" "$ip" >"$runner_log" 2>&1 & ssh_pid=$!
     jit=""
   else
-  if ! printf '%s' "$jit" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! printf '%s' "$jit" | ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "umask 077; root=\"\$HOME/.tartci/aqua-runner/$aqua_label\"; mkdir -p \"\$root\"; cat >\"\$root/jit.cfg\""; then
     note "[$vm] failed to stream JIT config into the guest"
     stop_current_aqua_runner
@@ -1693,25 +1856,36 @@ run_runner_until_done_unlayered(){
   # share, and configure checks run against a private copy that dies with the VM.
   local configure_checks_prep ccache_ro_env="" ccache_ro_dotenv=""
   configure_checks_prep="ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\""
-  if [ "$TARTCI_HOST_CACHE_ACCESS_MODE" = ro ]; then
+  if [ "$TARTCI_HOST_CACHE_ACCESS_MODE" = ro ] && [ "${CURRENT_SHARED_CACHE:-1}" = 1 ]; then
     configure_checks_prep="{ [ ! -L \"\$HOME/Library/Caches/Pulp/configure-checks\" ] || rm -f \"\$HOME/Library/Caches/Pulp/configure-checks\"; } && \
 mkdir -p \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
 rsync -a '/Volumes/My Shared Files/configure-checks/' \"\$HOME/Library/Caches/Pulp/configure-checks/\""
     ccache_ro_env="export CCACHE_READONLY=true CCACHE_TEMPDIR=\"\$HOME/.ccache-tmp\" && "
     ccache_ro_dotenv="printf '%s\n' 'CCACHE_READONLY=true' \"CCACHE_TEMPDIR=\$HOME/.ccache-tmp\" >> .env.tartci && "
   fi
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  # Without the shared mounts (a release tier) the links made below would
+  # dangle; the guest replaces them with its own empty directories.
+  local guest_cache_prep=""
+  # shellcheck disable=SC2016 # $HOME expands in the guest
+  [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] \
+    || guest_cache_prep='rm -f ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && mkdir -p ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && printf "TARTCI_DIAG shared-cache=off\n" && '
+  # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
+  # cache directory any guest can write (see lane-cache-root.lib.sh).
+  ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
      mkdir -p \"\$HOME/Library/Caches/Pulp\" && $configure_checks_prep && \
      ${ccache_ro_env}ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
      ${CCACHE_LAYER_GUEST_PREP}export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
+     ${guest_cache_prep}mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
+     export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      fetchcontent_hydrated=false && \
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|CCACHE_READONLY|CCACHE_TEMPDIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH|CCACHE_READONLY|CCACHE_TEMPDIR|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|PULP_CONFIGURE_CHECK_CACHE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE|TARTCI_ARTIFACT_CACHE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
+     printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && \
      ${ccache_ro_dotenv}\
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      printf 'PULP_CONFIGURE_CHECK_CACHE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/configure-checks\" >> .env.tartci && \
@@ -1856,13 +2030,13 @@ install_and_preflight_aqua_runner(){
   if [ -n "${GUEST_DRIVER:-}" ]; then return 0; fi
   local ip="$1" vm="$2" aqua_label
   aqua_label="com.tartci.aqua.$vm"
-  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     'umask 077; mkdir -p ~/.tartci/bin; cat > ~/.tartci/bin/guest-aqua-runner.sh; chmod 700 ~/.tartci/bin/guest-aqua-runner.sh' \
     <"$TARTCI_ROOT/providers/tart-macos/guest-aqua-runner.sh"; then
     note "[$vm] failed to install Aqua runner launcher"
     return 1
   fi
-  if ! ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "\$HOME/.tartci/bin/guest-aqua-runner.sh preflight '$aqua_label'"; then
     note "[$vm] console Aqua session preflight failed — refusing to mint JIT config"
     return 1
@@ -1878,8 +2052,24 @@ install_and_preflight_aqua_runner(){
 boot_vm_to_ssh(){
   local i="$1" vm="$2" labels="$3" lease_priority="$4" logdir="${5:-}" boot_phase="${6:-booting}"
   local proof_group="${7:-}"
-  local lease_cores lease_mem lease_rc boot_log rpid ip=""
+  local lease_cores lease_mem lease_rc boot_log rpid ip="" inventory
   BOOT_LEASE_DENIED=0
+  # This is the shared cold-boot boundary, including --once, warm parking and
+  # a cold fallback after warm handoff. The loop's pool check can be stale
+  # after a slow queue scan; refuse before touching Tart or taking a lease.
+  if ! tartci_pool_admission_open || ! tartci_pool_lock_absent; then
+    note "[$i] pool $(tartci_pool_read_state) — deferring new macOS VM clone"
+    heartbeat draining
+    return 75
+  fi
+  inventory="$(running_macos_vms)"
+  case "$inventory" in
+    ''|*[!0-9]*)
+      note "[$i] Tart inventory unavailable — deferring new macOS VM clone"
+      event inventory_unknown "phase=pre_clone"
+      heartbeat inventory-unavailable
+      return 75 ;;
+  esac
   if ! lease_cores="$(tartci_vm_lease_cores tart-macos)"; then
     note "[$i] VM size unavailable (gate-reserve rule could not be computed) — not booting"
     return 1
@@ -1901,12 +2091,23 @@ boot_vm_to_ssh(){
   # A warm-VM park has no job and no class yet, so it starts none.
   [ -z "$proof_group" ] || tartci_boundary_proof_start "$vm" "$labels" "$proof_group"
 
+  # Inventory and lease admission may have taken time. Drain can close while
+  # they run, so check again before a clone writer or VM ownership exists.
+  if ! tartci_pool_admission_open || ! tartci_pool_lock_absent; then
+    tartci_boundary_proof_abandon
+    tartci_release_vm_lease
+    note "[$i] pool $(tartci_pool_read_state) before clone — deferring new macOS VM"
+    heartbeat draining
+    return 75
+  fi
+
   if [ -n "${GUEST_DRIVER:-}" ]; then
     note "[$i] clone $GOLDEN → $vm (CoW) + boot prepared guest without host shares"
   else
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   fi
   event clone_start "golden=$GOLDEN"
+  heartbeat cloning
   CLONE_STARTED_AT="$(date +%s)"
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.
@@ -1947,25 +2148,13 @@ boot_vm_to_ssh(){
     tartci_lifecycle_mark ssh
     return 0
   fi
-  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  tartci_ccache_guard "$CACHE_ROOT/ccache"
-  if ! tartci_prepare_disk_root "$FETCHCONTENT_SOURCE_ROOT"; then
-    discard_current_vm
-    tartci_release_vm_lease
-    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
-    return 1
-  fi
-  # Pulp's configure-check replay (tools/cmake/PulpConfigureCheckCache.cmake)
-  # keys SDL3's ~180 try_compile results on the SDK, compiler and flags and
-  # writes them atomically (tmp + rename), so one host directory can serve
-  # every VM on the host. Without a mount the cache lives in the disposable
-  # guest and every gate configure re-runs all 192 try_compiles.
-  if ! tartci_prepare_disk_root "$CACHE_ROOT/configure-checks"; then
+  # Every directory the VM mounts from the cache root is checked and prepared
+  # before boot (lane-cache-root.lib.sh); a refusal or a failed preparation
+  # stops the boot.
+  CURRENT_SHARED_CACHE=1
+  tartci_labels_mount_shared_cache "$labels" || CURRENT_SHARED_CACHE=0
+  if ! tartci_prepare_lane_cache_mounts "$CACHE_ROOT" "$HOST_CACHE_ROOT" "$FETCHCONTENT_SOURCE_ROOT" "$CURRENT_SHARED_CACHE"; then
+    [ -z "$TARTCI_LANE_CACHE_REFUSAL" ] || note "[$i] $TARTCI_LANE_CACHE_REFUSAL; refusing to boot"
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
@@ -1975,11 +2164,11 @@ boot_vm_to_ssh(){
   CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp "${TMPDIR:-/tmp}/tart-run-$vm.XXXXXX")"
   local cache_ro; cache_ro="$(tartci_host_cache_mount_suffix)"
-  local tart_dirs=(
-    --dir="ccache:$CACHE_ROOT/ccache$cache_ro"
-    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
-    --dir="configure-checks:$CACHE_ROOT/configure-checks$cache_ro"
-  )
+  local tart_dirs=()
+  [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache$cache_ro")
+  tart_dirs+=(--dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro")
+  [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks$cache_ro")
+  [ "$CURRENT_SHARED_CACHE" = 1 ] || event shared_cache_skipped "labels=$labels"
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
   CURRENT_PIP_WHEELHOUSE=0
   if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
@@ -1991,7 +2180,7 @@ boot_vm_to_ssh(){
     tart_dirs+=(--dir="artifact-cache:$ARTIFACT_CACHE_ROOT:ro")
     CURRENT_ARTIFACT_CACHE=1
   fi
-  tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
+  tartci_vm_lease_guard_exec tart run --no-graphics ${tart_dirs[@]+"${tart_dirs[@]}"} \
     ${TARTCI_TART_NETWORK_ARGS[@]+"${TARTCI_TART_NETWORK_ARGS[@]}"} \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
@@ -2002,6 +2191,7 @@ boot_vm_to_ssh(){
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
     rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
     tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" no_ip "$vm"
+    VM_DHCP_PROBE_REPORTED=1
     discard_current_vm
     tartci_release_vm_lease
     return 1
@@ -2012,6 +2202,7 @@ boot_vm_to_ssh(){
   local clone_to_ip_s=$(( $(date +%s) - ${CLONE_STARTED_AT:-$(date +%s)} ))
   event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
+  VM_DHCP_PROBE_REPORTED=1
   tartci_lifecycle_mark ip
   rm -f "$boot_log"
   BOOT_SSH_HEARTBEAT_PHASE="$boot_phase"
@@ -2054,7 +2245,7 @@ tartci_vm_ssh_wait(){
     BOOT_SSH_ATTEMPTS=$((BOOT_SSH_ATTEMPTS + 1))
     if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "$bound" \
          --operation boot_ssh_probe -- \
-         ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$dest" true >/dev/null 2>&1; then
+         ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$dest" true >/dev/null 2>&1; then
       BOOT_SSH_WAITED_SECS=$(( SECONDS - started ))
       return 0
     fi
@@ -2074,19 +2265,62 @@ tartci_vm_ssh_wait(){
 # lease store treats alike, and releasing it would let another lane take the
 # slot. Runs inside run_one under the mint lock and rewrites its selected_tier
 # and selected_labels; returns 1 after discarding the VM.
+#
+# When no class is waiting at all, the VM is held for one more scan first. On
+# m3 slot 1 on 2026-10-25 five booted VMs were discarded for no_class_waiting,
+# each after a full clone and boot. The hold releases the host-global mint
+# lock while it waits, so it never stalls another lane's mint, and takes it
+# again before the rescan. That rescan is the same live pre-mint check, so the
+# hold can only delay a discard; it never admits what the check would refuse.
+# After a hold the lane's job claim moves to the class it will serve, and a
+# class another lane already covers is discarded (demand_covered).
 retarget_after_pre_mint_denial(){
   local i="$1" group_id="$2" tier="" label="" labels="" reason="no_class_waiting"
+  local hold="${TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS:-25}" held=0 pass claim_rc
   tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
-  if tier="$(tartci_assignment_v2_pre_mint_retarget)" \
-     && label="$(tartci_assignment_v2_tier_label_at "$tier")"; then
-    labels="$(tartci_assignment_v2_tier_labels "$label")"
-    if [ "$(runner_group_id_for_tier "$tier")" != "$group_id" ]; then
-      reason="runner_group_differs"
-    elif jit_admission_denied "$group_id" "$labels"; then
-      reason="jit_admission_denied"
-    else
-      reason=""
+  # The second pass runs only after one hold.
+  for pass in 1 2; do
+    reason="no_class_waiting"
+    if tier="$(tartci_assignment_v2_pre_mint_retarget)" \
+       && label="$(tartci_assignment_v2_tier_label_at "$tier")"; then
+      labels="$(tartci_assignment_v2_tier_labels "$label")"
+      if [ "$(runner_group_id_for_tier "$tier")" != "$group_id" ]; then
+        reason="runner_group_differs"
+      elif jit_admission_denied "$group_id" "$labels"; then
+        reason="jit_admission_denied"
+      elif [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
+        # Booted with the shared cache mounted; a release tier boots cold.
+        reason="release_tier_no_shared_cache"
+      else
+        reason=""
+      fi
     fi
+    if [ "$reason" != no_class_waiting ] || [ "$pass" = 2 ] || [ "$hold" -eq 0 ]; then
+      break
+    fi
+    held=1
+    tartci_pool_lock_release
+    note "[$i] V2 assignment demand gone before JIT mint — holding the booted VM ${hold}s for one more demand scan"
+    event assignment_v2_pre_mint_hold \
+      "selected_tier=$selected_tier labels=$selected_labels hold_seconds=$hold" \
+      "selected_tier=$selected_tier" "hold_seconds=$hold"
+    heartbeat pre-mint-hold
+    sleep "$hold"
+    if ! tartci_pool_lock_acquire; then
+      reason="pool_transition_busy"
+      break
+    fi
+  done
+  # Another lane may have booted or minted for the class that appeared while
+  # this VM was held. Move this lane's job claim to the class it now serves,
+  # so the claim store counts both, and discard when the other lane already
+  # covers every queued job of that class rather than mint a second runner.
+  if [ -z "$reason" ] && [ "$held" = 1 ]; then
+    tartci_job_claim_release
+    claim_rc=0
+    tartci_job_claim_acquire "$vm" "$labels" "$tier" 1 \
+      "${selected_runner_api_root:-$RUNNER_API_ROOT}" || claim_rc=$?
+    [ "$claim_rc" -ne 75 ] || reason="demand_covered"
   fi
   # The boundary proof above admitted the original labels. A different class
   # needs its own live Shipyard verdict; that cached proof cannot authorize it.
@@ -2116,16 +2350,22 @@ retarget_after_pre_mint_denial(){
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($reason)"
     event assignment_v2_pre_mint_discard \
-      "selected_tier=$selected_tier labels=$selected_labels reason=$reason" \
-      "selected_tier=$selected_tier" "reason=$reason"
+      "selected_tier=$selected_tier labels=$selected_labels reason=$reason held=$held" \
+      "selected_tier=$selected_tier" "reason=$reason" "held=$held"
     discard_current_vm || return 1
     tartci_release_vm_lease
     return 1
   fi
+  if [ "$tier" = "$selected_tier" ]; then
+    note "[$i] V2 assignment demand for tier $tier returned before JIT mint — keeping the booted VM ($label)"
+    event assignment_v2_pre_mint_kept \
+      "selected_tier=$tier labels=$labels held=$held" "selected_tier=$tier" "held=$held"
+    return 0
+  fi
   note "[$i] V2 assignment demand moved before JIT mint — retargeting the booted VM from tier $selected_tier to tier $tier ($label)"
   event assignment_v2_pre_mint_retarget \
-    "from_tier=$selected_tier to_tier=$tier labels=$labels" \
-    "from_tier=$selected_tier" "to_tier=$tier"
+    "from_tier=$selected_tier to_tier=$tier labels=$labels held=$held" \
+    "from_tier=$selected_tier" "to_tier=$tier" "held=$held"
   selected_tier="$tier"
   selected_labels="$labels"
   CURRENT_LABELS="$labels"
@@ -2136,6 +2376,11 @@ run_one(){
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
+  # Test harnesses can execute this function without sourcing the optional
+  # DHCP library. Production sources the real implementation before entering.
+  if ! declare -F tartci_vm_dhcp_cancel >/dev/null; then
+    tartci_vm_dhcp_cancel(){ :; }
+  fi
   # Before the first early return, not beside the other CURRENT_* resets: the
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
@@ -2162,6 +2407,10 @@ run_one(){
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
   fi
+  # Storage liveness is a separate admission axis.  A healthy SSH/control
+  # plane does not prove that Tart's store can answer open/fstat; unknown or
+  # timed-out storage yields before a job claim, clone, or VM lease is taken.
+  tartci_storage_health_check "$TART_HOME" observe || return $?
   # The host's VM DHCP breaker comes first: while the host's DHCP server is
   # not answering no boot can succeed, so nothing else is worth doing, and a
   # lane that backs off here has taken no job claim. Order of the pre-boot
@@ -2181,6 +2430,7 @@ run_one(){
   tartci_job_claim_acquire "$vm" "$selected_labels" "$selected_tier" \
     "${CURRENT_SELECTED_QUEUED:-}" "$selected_runner_api_root" || claim_rc=$?
   if [ "$claim_rc" -eq 75 ]; then
+    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" job_claim_covered
     heartbeat job-claim-covered
     return 75
   fi
@@ -2217,6 +2467,7 @@ run_one(){
     [ -z "$precheck_json" ] \
       || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
     tartci_admission_contention_event "$precheck_json" precheck
+    tartci_admission_reuse_event "$precheck_json" precheck
     if [ "$precheck_rc" -ne 0 ]; then
       local precheck_detail
       precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
@@ -2224,6 +2475,7 @@ run_one(){
       heartbeat "$([ "$precheck_rc" -eq 3 ] && printf admission-precheck-deferred || printf admission-precheck-error)"
       event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
         "rc=$precheck_rc pre_clone=true $precheck_detail"
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" admission_precheck
       note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
       return "$precheck_rc"
     fi
@@ -2268,6 +2520,7 @@ run_one(){
       LAST_RUN_LEASE_DENIED=1
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" warm_lease_denied
       heartbeat vm-lease-denied
       return 75
     fi
@@ -2287,6 +2540,7 @@ run_one(){
     if tartci_assignment_v2_pre_clone_check_enabled \
        && tartci_assignment_v2_pre_clone_skip "$selected_tier" "$selected_labels"; then
       PRE_CLONE_DEMAND_GONE=1
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" demand_gone
       note "[$i] selected class demand is gone or a preferred class is waiting (${ASSIGNMENT_V2_PRE_MINT_BLOCKER}) — not cloning"
       return 75
     fi
@@ -2304,11 +2558,15 @@ run_one(){
       # can only see heartbeat age has no choice but to call it stale.
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" lease_denied
       heartbeat vm-lease-denied
       tartci_warm_note_lease_denial
       return "$lease_rc"
     fi
-    [ "$lease_rc" -eq 0 ] || return "$lease_rc"
+    if [ "$lease_rc" -ne 0 ]; then
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" pre_clone_error
+      return "$lease_rc"
+    fi
   fi
   ip="$CURRENT_IP"
   t_booted="$(now_epoch)"
@@ -2396,6 +2654,7 @@ run_one(){
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     tartci_admission_contention_event "$admission_json" boundary
+    tartci_admission_reuse_event "$admission_json" boundary
     if [ "$admission_rc" -ne 0 ]; then
       local admission_detail
       admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
@@ -2485,11 +2744,11 @@ run_one(){
   # reclaim it even when a signal lands immediately after GitHub creates it.
   CURRENT_REGISTERED_RUNNER="$vm"
   IFS=',' read -r -a labels_split <<< "$selected_labels"
-  for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${labels_split[@]+"${labels_split[@]}"}; do label_args+=(-f "labels[]=$l"); done
   local jit_error="$STATE_DIR/$vm.jit-error"
   jit="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
         "$JIT_GH_CLI" api -X POST "$selected_runner_api_root/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$selected_group_id" "${label_args[@]}" \
+        -f "name=$vm" -F "runner_group_id=$selected_group_id" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release
     if grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$jit_error"; then
@@ -2633,6 +2892,7 @@ i=0
   exit 0
 }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+[ "$PRINT_STORAGE_HEALTH" = 1 ] && { tartci_storage_health_check "$TART_HOME"; exit $?; }
 trap 'handle_supervisor_signal' INT TERM
 trap 'cleanup' EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
@@ -2668,6 +2928,7 @@ if [ "$LOOP" = 1 ]; then
   BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
   # Starts launchd timer jobs if launchd stops starting them (interval-guard.lib.sh).
   tartci_interval_guard_start
+  tartci_lane_claim
   heartbeat loop
   while true; do
     if [ -n "$CURRENT_VM" ]; then
@@ -2687,9 +2948,39 @@ if [ "$LOOP" = 1 ]; then
       fi
       heartbeat loop
     fi
-    # A parked warm VM expires, yields or follows the pool before anything
-    # else. A warm teardown that did not complete is now CURRENT_VM, which the
-    # block above reconciles (pending delete) or exits on, on the next pass.
+    # Step aside, between jobs, when this supervisor is no longer the lane's:
+    # its parent (the TartCI Launcher, or launchd) has exited, so a
+    # replacement is coming, or the lane's claim names another supervisor.
+    # Two supervisors on one lane double-book its VM slot, and one cut off
+    # from the launcher loses its Removable Volumes grant, so its store probes
+    # hang and it yields forever (m5studio slot2, 2026-10-22, about 2 h).
+    if [ -z "$CURRENT_VM" ]; then
+      step_aside=""
+      if tartci_supervisor_orphaned; then
+        step_aside="parent $PPID exited"
+      elif tartci_lane_superseded; then
+        step_aside="another supervisor holds the lane"
+      fi
+      if [ -n "$step_aside" ]; then
+        [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null
+        CURRENT_RESV=""
+        event supervisor_step_aside "$step_aside; released the lane"
+        note "stepping aside ($step_aside) so the lane has one supervisor"
+        exit 0
+      fi
+    fi
+    # Prove the Tart store is usable before reconciling a parked warm VM. Warm
+    # expiry/teardown can mutate the store, so it must not run while the
+    # storage gate is degraded or quarantined. A pending delete from an
+    # already-active VM was reconciled above and remains the only exception.
+    if ! tartci_storage_health_check "$TART_HOME"; then
+      sleep "$POLL"
+      continue
+    fi
+    # A parked warm VM expires, yields or follows the pool after storage is
+    # proven healthy. A warm teardown that did not complete is now CURRENT_VM,
+    # which the block above reconciles (pending delete) or exits on, on the
+    # next pass.
     tartci_warm_tick || true
     [ -z "$CURRENT_VM" ] || continue
     if ! tartci_pool_admission_open; then
@@ -2698,6 +2989,7 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
       continue
     fi
+    heartbeat loop
     # A lane whose VM lease cannot be granted right now (or ever) has nothing
     # to boot, so it neither scans the queue nor asks Shipyard. Local and
     # read-only; fails open. See providers/tart-macos/lease-fit.lib.sh.
@@ -2774,6 +3066,16 @@ if [ "$LOOP" = 1 ]; then
     blind=0
     reset_blind_restarts
     clear_scan_error
+    if [ "$r" = unknown ]; then
+      tartci_vm_lease_waiter_withdraw
+      note "Tart inventory unavailable — deferring new macOS VM clones; retrying in ${POLL}s"
+      [ "${q:-0}" -le 0 ] || event demand_waiting \
+        "queued=$q running=unknown/$cap reason=inventory_unknown" \
+        queued="$q" running=unknown cap="$cap" poll="$POLL" reason=inventory_unknown
+      heartbeat inventory-unavailable
+      sleep "$POLL"
+      continue
+    fi
     # Only probe priority demand when THIS lane actually has work — no point
     # spending a gh round-trip (and the API quota the secondary-rate-limit cares
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0
@@ -2810,28 +3112,49 @@ if [ "$LOOP" = 1 ]; then
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       CURRENT_SELECTED_QUEUED="$q"
+      VM_DHCP_PROBE_REPORTED=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      # Release per-turn ownership proofs immediately after run_one, before
+      # the serving accounting grows. This keeps every early-return proof
+      # within the loop's bounded post-run window.
+      tartci_boundary_proof_abandon
+      tartci_job_claim_release
       # Every cause of clone-without-serve returns through here, so the streak
       # is counted here rather than at each cause. Counted per work ENTRY, not
       # per error: a lane that alternates a failure with a served job never
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
       if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
-         || [ "${VM_DHCP_BACKOFF:-0}" = 1 ] \
+         || { [ "${VM_DHCP_BACKOFF:-0}" = 1 ] && [ "${VM_DHCP_BREAKER_OPEN:-0}" != 1 ]; } \
          || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
+        SERVING_BLOCKED_CAUSE=""
+      elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then
+        SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
+        SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        SERVING_BLOCKED_CAUSE="dhcp_breaker"
+        [ -n "$SERVING_BLOCKED_SINCE" ] \
+          || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       else
         SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
         SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        case "$LAST_HEARTBEAT_PHASE" in
+          admission-precheck-error|admission-error) SERVING_BLOCKED_CAUSE="admission failing" ;;
+          admission-precheck-deferred|admission-deferred) SERVING_BLOCKED_CAUSE="admission deferred" ;;
+          *) SERVING_BLOCKED_CAUSE="unserved" ;;
+        esac
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       fi
-      # Early returns (boot failure, yield, admission refusal) leave a proof
-      # that nobody will consume.
-      tartci_boundary_proof_abandon
-      tartci_job_claim_release
+      if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
+        tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone
+      fi
+      # Publish the updated serving verdict immediately. The state write inside
+      # run_one predates this work-entry result and cannot carry the new
+      # cause or streak to readiness readers.
+      heartbeat "${LAST_HEARTBEAT_PHASE:-waiting}"
       # A lane denied its lease keeps waiting for it; any other outcome
       # (served, covered by a sibling, admission deferred) stops wanting one.
       [ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw
@@ -2890,6 +3213,7 @@ if [ "$LOOP" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
+        SERVING_BLOCKED_CAUSE=""
       else
         # Demand this lane could not place (no VM slot): a parked warm VM on
         # this host, if any, yields to it.
@@ -2914,7 +3238,22 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
+  tartci_storage_health_check "$TART_HOME" \
+    || die "storage health refused one-shot admission"
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
+  # Loop mode claims the host-wide Apple guest slot before calling run_one.
+  # --once enters run_one directly, so make the same atomic reservation here;
+  # the inventory value is bounded and must be numeric before it can be used.
+  # Without this reservation two manually started one-shot candidates could
+  # race the two-guest ceiling even though each sees a free slot.
+  cap="$(tartci_effective_cap)"
+  inventory="$(running_macos_vms)"
+  case "$inventory" in
+    ''|*[!0-9]*) die "Tart inventory unavailable: refusing one-shot admission" ;;
+  esac
+  resv="$(tartci_claim_macos_slot "$cap" "$inventory")"
+  [ -n "$resv" ] || die "macOS VM cap $cap is full: refusing one-shot admission"
+  CURRENT_RESV="$resv"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"
@@ -2927,5 +3266,12 @@ else
   jit_admission_denied "$selected_group_id" "$selected_labels" \
     && die "JIT admission is blocked for this exact repository/group/class contract; inspect $JIT_DENIAL_FILE"
   note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$selected_labels workflow_tier=$selected_tier"
-  run_one 1 "$selected_labels" "$selected_tier"
+  run_rc=0
+  run_one 1 "$selected_labels" "$selected_tier" || run_rc=$?
+  # --once has no loop-tail accounting pass. Release a granted probe when the
+  # one-shot turn returned before cloning, exactly as loop mode does.
+  if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
+    tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" once_pre_clone
+  fi
+  exit "$run_rc"
 fi

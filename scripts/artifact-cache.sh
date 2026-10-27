@@ -210,7 +210,7 @@ case "$cmd" in
     fi
     lock_cache
     failed=0
-    for mirror in "${mirrors[@]}"; do
+    for mirror in ${mirrors[@]+"${mirrors[@]}"}; do
       name="${mirror#"$dir"/git/}"
       name="${name%.git}"
       if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then

@@ -31,7 +31,16 @@ if [ "${TARTCI_SELF_UPDATE_SKIP_PEERS:-0}" != 1 ]; then
 fi
 rendered="$(mktemp)"
 trap 'rm -f "$rendered"' EXIT
-python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" --set "HOME=$HOME" >"$rendered"
+render_args=(--set "HOME=$HOME")
+for source_var in \
+  TARTCI_FLEET_SOURCE_ROOT TARTCI_FLEET_SOURCE_COMMIT \
+  TARTCI_FLEET_SOURCE_REPOSITORY TARTCI_ADVERTISED_LABELS \
+  TARTCI_JOB_CLAIM_SUPPLY; do
+  if [ -n "${!source_var:-}" ]; then
+    render_args+=(--environment "$source_var=${!source_var}")
+  fi
+done
+python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" ${render_args[@]+"${render_args[@]}"} >"$rendered"
 plutil -lint "$rendered" >/dev/null 2>&1 || python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$rendered"
 echo "plan: write $TARGET (StartInterval 1800, runs: tartci fleet-macos self-update --apply --scheduled)"
 echo "plan: launchctl bootstrap gui/$(id -u) $TARGET"

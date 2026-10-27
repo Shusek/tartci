@@ -29,9 +29,9 @@ runners. This page is the recipe today, and the design for making it one command
 
 | Host | alias | `TARTCI_GOLDENS` | Volume note |
 |------|-------|------------------|-------------|
-| Mac Studio | `macstudio` | `/Users/danielraffel/VMs/goldens` | primary / baker; internal data vol, runs hot — prune with care |
-| BlackBook (M5) | (local) | `/Users/danielraffel/VMs/goldens` | dev + overflow |
-| MacBook Pro (M1) | `m1` | `/Users/danielraffel/VMs/goldens` | travel; explicit `TARTCI_WIN_GOLDEN` pin (must re-point) |
+| Mac Studio | `macstudio` | `/Users/<you>/VMs/goldens` | primary / baker; internal data vol, runs hot — prune with care |
+| M5 laptop | (local) | `/Users/<you>/VMs/goldens` | dev + overflow |
+| MacBook Pro (M1) | `m1` | `/Users/<you>/VMs/goldens` | travel; explicit `TARTCI_WIN_GOLDEN` pin (must re-point) |
 
 All three use the same path today; confirm `$TARTCI_GOLDENS` per host rather than
 assuming — a host on an external/remote volume would differ.
@@ -50,14 +50,20 @@ assuming — a host on an external/remote volume would differ.
    `--partial --progress`, NOT `--info=progress2` which it lacks):
    ```bash
    rsync -a --partial --progress \
-     -e "ssh -i ~/.ssh/<key> -o StrictHostKeyChecking=accept-new" \
+     -e "ssh -i ~/.ssh/<key> -o HostKeyAlias=<peer-alias> -o StrictHostKeyChecking=yes" \
      $TARTCI_GOLDENS/<golden>.qcow2 $TARTCI_GOLDENS/<golden>.qcow2.sha256 \
-     danielraffel@<PEER_TB_IP>:$TARTCI_GOLDENS/
+     <user>@<PEER_TB_IP>:$TARTCI_GOLDENS/
    ```
 4. **Verify** on the destination: `cd $TARTCI_GOLDENS && shasum -a 256 -c <golden>.qcow2.sha256` → must print `OK`.
 5. **Re-point the runner** only if it has an explicit pin: set (or delete)
    `TARTCI_WIN_GOLDEN` in `~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist`
    (back up first). No pin → the provider default already points at the canonical name.
+   If the golden ships its own UEFI variable store (its boot entry lives there
+   rather than in `\EFI\BOOT\BOOTAA64.EFI`), copy that file with it and set
+   both `TARTCI_WIN_VARS_TEMPLATE` (its path) and `TARTCI_WIN_VARS_SHA256` (its
+   SHA-256). Each job copies the template and verifies the copy before QEMU
+   writes to it; a mismatch fails the job before boot. One without the other
+   is refused at startup.
 6. **Reload the agent only when idle** (log tail shows `waiting … queued=0`, no
    Windows build running — reloading mid-build kills the job). If you changed
    `TARTCI_WIN_GOLDEN` (or any plist env var), you MUST do a **full
@@ -106,9 +112,12 @@ golden yet, bake one from scratch (runbook §4), then the rest copy via `--from`
 
 `sync`:
 1. **Discovers the fastest link** to HOST — probes a Thunderbolt link-local peer
-   (`169.254.x` on `bridge0` that identifies as HOST, reusing the ssh alias's
-   user/key), falls back to the alias (LAN/Tailscale). `--via IP` overrides the
-   TB IP if auto-detect misses it.
+   (`169.254.x` neighbours on `bridge0` only, that identify as HOST, reusing
+   the ssh alias's user/key), falls back to the alias (LAN/Tailscale). `--via IP`
+   overrides the TB IP if auto-detect misses it. Every raw-IP connection (probe,
+   rsync, `--via`) uses `-o HostKeyAlias=<HOST's known_hosts name>
+   -o StrictHostKeyChecking=yes`, so a peer that cannot present HOST's existing
+   host key is refused; nothing is ever added to `known_hosts`.
 2. **rsyncs** the canonical golden + `.sha256` into the target's *own*
    `$TARTCI_GOLDENS` (read from its runner plist, not assumed); resumable
    (`--partial`), openrsync-safe flags. `--dry-run` stops here.

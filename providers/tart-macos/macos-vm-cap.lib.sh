@@ -79,19 +79,16 @@ tartci_unlock(){ rm -rf "$TARTCI_MACOS_LOCKDIR" 2>/dev/null || true; }
 #
 # The running count comes from the optional second argument (the caller's
 # inventory reading, taken before the lock so a slow `tart list` never holds the
-# host-wide mutex), else from `running_macos_vms` (runner.sh provides it), else
-# 0. A reading of `unknown` (inventory timed out or failed) is not "full": the
-# reservation files are the occupancy source then. Every lane reserves before
-# it boots and keeps the reservation until its VM is proved gone, so an empty
-# host with an unreadable inventory can still boot, and Apple's 2-guest limit
-# still backstops any VM booted outside this protocol.
+# host-wide mutex), else from `running_macos_vms` (runner.sh provides it).
+# Refuse an unreadable inventory. Reservations track our claims, but cannot
+# establish that Tart or the volume is healthy enough to start another clone.
 tartci_claim_macos_slot(){
   local cap="$1" running="${2:-}" reserv resv locked=0
   mkdir -p "$TARTCI_MACOS_RESV_DIR" 2>/dev/null || true
   if [ -z "$running" ]; then
-    if command -v running_macos_vms >/dev/null 2>&1; then running="$(running_macos_vms)"; else running=0; fi
+    if command -v running_macos_vms >/dev/null 2>&1; then running="$(running_macos_vms)"; else running=unknown; fi
   fi
-  case "$running" in ''|*[!0-9]*) running=0 ;; esac
+  case "$running" in ''|*[!0-9]*) return 0 ;; esac
   tartci_lock && locked=1
   reserv="$(tartci_active_reservations)"
   [ "${reserv:-0}" -gt "${running:-0}" ] && running="$reserv"

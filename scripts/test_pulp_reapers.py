@@ -23,7 +23,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
+import unittest.mock
 from typing import Optional
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -220,13 +222,79 @@ class Validation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ok = pathlib.Path(td) / "ok.toml"
             ok.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n'
-                          'repo = "/Volumes/Workshop/Code/pulp"\n'
-                          'worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"\n')
+                          'repo = "/Volumes/Example/Code/pulp"\n'
+                          'worktrees_root = "/Volumes/Example/Code/agent-worktrees"\n')
             self.assertIs(fleet.load(ok)["reclaim"]["pulp_worktree_builds"], True)
             bad = pathlib.Path(td) / "bad.toml"
             bad.write_text(base + '\n[reclaim]\npulp_worktree_builds = true\n')
             with self.assertRaisesRegex(ValueError, "reclaim.repo is required"):
                 fleet.load(bad)
+
+
+class VolumeStallGuards(Isolated):
+    """A wedged scan root must not start another potentially wedged Git walk."""
+
+    @testing_support.requires_tomllib
+    def test_scan_timeout_overlapping_configured_root_returns_a_skip_reason(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml")
+        reason = pr.skip_reason_for_scan_timeouts(
+            [str(repo.worktrees / "nested"), str(self.tmp / "unrelated")], profile)
+        self.assertIn("configured Pulp root overlaps timed-out scan path", reason)
+        self.assertIn(str(repo.worktrees / "nested"), reason)
+
+    @testing_support.requires_tomllib
+    def test_timeout_on_an_unrelated_root_does_not_skip_reapers(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml")
+        self.assertIsNone(pr.skip_reason_for_scan_timeouts([str(self.tmp / "other")], profile))
+
+    @testing_support.requires_tomllib
+    def test_explicit_skip_does_not_materialize_or_invoke_a_reaper(self):
+        repo = PulpRepo(self.tmp)
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append(script)
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+
+        out = pr.run(fix=True, profile=repo.profile(self.tmp / "p.toml"),
+                     state_dir=self.state, reaper=reaper,
+                     skip_reason="skipped: external volume scan timed out")
+        self.assertTrue(out["enabled"])
+        self.assertEqual(out["runs"], [])
+        self.assertEqual(calls, [])
+        self.assertEqual(out["skipped"]["all"],
+                         "skipped: external volume scan timed out")
+
+    def test_git_timeout_is_clamped_to_the_remaining_pass_budget(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 0, "origin", "")
+
+        pr._git(pathlib.Path("/repo"), "rev-parse", runner=runner,
+                deadline=time.monotonic() + 0.05)
+        self.assertEqual(len(calls), 1)
+        self.assertLess(calls[0], pr.GIT_TIMEOUT_S)
+
+    @testing_support.requires_tomllib
+    def test_expired_pass_deadline_skips_reapers_fail_closed(self):
+        repo = PulpRepo(self.tmp)
+        calls = []
+
+        def reaper(script, **kwargs):
+            calls.append(script)
+            return {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0}
+
+        out = pr.run(fix=True, profile=repo.profile(self.tmp / "p.toml"),
+                     state_dir=self.state, reaper=reaper,
+                     deadline=time.monotonic() - 1)
+        self.assertTrue(out["enabled"])
+        self.assertEqual(out["runs"], [])
+        self.assertEqual(calls, [])
+        self.assertIn("deadline", out["reason"])
 
 
 class Materialize(Isolated):
@@ -260,6 +328,75 @@ class Materialize(Isolated):
                      reaper=lambda script, **kw: calls.append(script) or {})
         self.assertIn("build_dir_lock.py", out["error"])
         self.assertEqual(calls, [])
+
+
+class UsedPercentPressure(Isolated):
+    """The worktree reaper's pressure is disk_reclaim's: free GiB OR used percent.
+
+    m3 and m5 sat at 91-92.5% used with ~280-300 GiB free, so a GiB-only test
+    never ran the worktree reaper while readiness had the host out on
+    disk_pressure. The threshold is the installed agent's own
+    (TARTCI_RECLAIM_PRESSURE_USED_PERCENT), handed over by disk_reclaim.
+    """
+
+    FLOOR_GB = 200.0
+    THRESHOLD = 90.0
+    CASES = (  # (GiB free, percent used, pressure?)
+        (280, 92.0, True),    # big volume over the percent: the m3/m5 case
+        (300, 80.0, False),   # neither measure is pressed
+        (150, 70.0, True),    # under the GiB floor alone
+    )
+
+    def test_pressure_is_free_gib_or_used_percent(self):
+        for free_gb, used, expected in self.CASES:
+            with self.subTest(free_gb=free_gb, used=used):
+                self.assertIs(pr.under_pressure(
+                    int(free_gb * pr.GIB), used, pressure_free_gb=self.FLOOR_GB,
+                    pressure_used_percent=self.THRESHOLD), expected)
+        # Control: with the percent trigger off, only the GiB floor counts.
+        self.assertFalse(pr.under_pressure(280 * pr.GIB, 92.0, pressure_free_gb=self.FLOOR_GB,
+                                           pressure_used_percent=0))
+        # Unknown free space is never pressure, whatever the percent says.
+        self.assertFalse(pr.under_pressure(None, 99.0, pressure_free_gb=self.FLOOR_GB,
+                                           pressure_used_percent=self.THRESHOLD))
+
+    def test_the_threshold_disk_reclaim_hands_over_is_the_installed_agents(self):
+        text = (HERE.parent / "launchd" / "com.danielraffel.tartci.reclaim.plist.template"
+                ).read_text()
+        match = re.search(r"<key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>\s*"
+                          r"<string>([0-9.]+)</string>", text)
+        self.assertIsNotNone(match)
+        self.assertEqual(float(match.group(1)), self.THRESHOLD)
+
+    @testing_support.requires_tomllib
+    def test_run_takes_the_worktree_reaper_by_either_measure(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml", pressure_free_gb=self.FLOOR_GB)
+        real = shutil.disk_usage
+        for free_gb, used, expected in self.CASES:
+            total = int(free_gb * pr.GIB * 100 / (100 - used))
+            fake = types.SimpleNamespace(total=total, used=total * used / 100,
+                                         free=int(free_gb * pr.GIB))
+
+            def usage(path, fake=fake):
+                same = pathlib.Path(path).resolve() == repo.worktrees.resolve()
+                return fake if same else real(path)
+            calls = []
+            with self.subTest(free_gb=free_gb, used=used), \
+                    unittest.mock.patch.object(pr.shutil, "disk_usage", usage):
+                out = pr.run(fix=False, profile=profile, state_dir=self.state,
+                             pressure_used_percent=self.THRESHOLD,
+                             reaper=lambda script, **kw: calls.append(script.stem)
+                             or {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0})
+                self.assertIs(out["pressure"], expected, out)
+                self.assertAlmostEqual(out["used_percent_before"], used, places=3)
+                self.assertEqual(pr.WORKTREE_BUILDS in calls, expected, calls)
+                self.assertIn(pr.BUILD_COV, calls)  # control: the cheap one always runs
+                if not expected:
+                    reason = out["skipped"][pr.WORKTREE_BUILDS]
+                    # The log line names both measures, not only the GiB floor.
+                    self.assertIn("300.0 GiB free, at or above 200 GiB", reason)
+                    self.assertIn("80.0% used, below 90%", reason)
 
 
 class EndToEnd(Isolated):
@@ -591,7 +728,7 @@ class DiscoveredPulpRoots(Isolated):
 
     @testing_support.requires_tomllib
     def test_the_configured_clones_agent_worktrees_run_once_when_also_discovered(self):
-        # m3: every matching child of /Volumes/Workshop/Code is a worktree of
+        # m3: every matching child of /Volumes/Example/Code is a worktree of
         # the CONFIGURED clone, so discovery finds that clone too. Its
         # .claude/worktrees must still be reaped exactly once, as configured.
         repo = PulpRepo(self.tmp)
@@ -638,7 +775,7 @@ class DiscoveredPulpRoots(Isolated):
         self.assertNotIn("worktrees_outside_profile_root", log)
 
     def test_the_primary_checkout_is_not_a_worktree_outside_the_profile(self):
-        # m3 keeps its primary checkout in /Volumes/Workshop/Code beside
+        # m3 keeps its primary checkout in /Volumes/Example/Code beside
         # agent-worktrees; that root holds the repository itself, not worktrees.
         repo = PulpRepo(self.tmp)
         calls, out, log = self.run_with(repo, [repo.root])
@@ -695,6 +832,26 @@ class DiscoveredPulpRoots(Isolated):
 
 
 class DiskReclaimIntegration(Isolated):
+    @testing_support.requires_tomllib
+    def test_scan_timeout_skips_pulp_reapers_and_is_recorded(self):
+        repo = PulpRepo(self.tmp)
+        os.environ["TARTCI_FLEET_PROFILE"] = str(repo.profile(self.tmp / "p.toml"))
+        scan = self.tmp / "scan"
+        scan.mkdir()
+        state = self.tmp / "reclaim-state"
+        out = io.StringIO()
+        with unittest.mock.patch.object(dr, "SCAN_TIMEOUTS", [str(repo.worktrees)]), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(scan), "--json", "--state-dir", str(state),
+                            "--boot-floor-gb", "0"])
+        self.assertEqual(code, 0)
+        report = json.loads(out.getvalue())
+        reason = report["pulp_reapers"]["reason"]
+        self.assertIn("configured Pulp root overlaps timed-out scan path", reason)
+        self.assertEqual(report["pulp_reapers"]["runs"], [])
+        receipt = json.loads((state / "last-run.json").read_text())
+        self.assertEqual(receipt["pulp_reapers"]["reason"], reason)
+
     @testing_support.requires_tomllib
     def test_receipt_event_and_log_line_carry_the_pulp_result(self):
         repo = PulpRepo(self.tmp)

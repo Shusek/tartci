@@ -37,7 +37,10 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
-export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
+# shellcheck source=../common/tart-home.lib.sh
+. "$TARTCI_ROOT/providers/common/tart-home.lib.sh"
+TART_HOME="$(tartci_default_tart_home)" || exit 1
+export TART_HOME
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/tartci}}"
@@ -396,7 +399,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   write_state booted
   local sshok=0
-  for _ in $(seq 1 90); do ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
+  for _ in $(seq 1 90); do ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     discard_current_linux_vm
@@ -405,7 +408,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   t_booted="$(now_epoch)"
   write_state cache-setup
-  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "sudo mkdir -p /mnt/host && \
      (sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || mountpoint -q /mnt/host) && \
      bash -s -- /mnt/host/ccache '' '$TARTCI_HOST_CACHE_ACCESS_MODE'" \
@@ -460,13 +463,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${_ls[@]+"${_ls[@]}"}; do label_args+=(-f "labels[]=$l"); done
   # Claim uncertain-outcome cleanup before the state-creating POST. If GitHub
   # creates the registration but the response is lost, teardown still queries
   # and removes this exact non-busy name.
   CURRENT_JIT_REGISTERED=1
   jit="$("$GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
     note "[$i] JIT config mint failed — discarding VM"
@@ -496,7 +499,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # Stream the JIT config over stdin into an owner-only guest file. Embedding
   # it in the ssh command line exposed this runner credential to every local
   # user on the host (ps) for the whole job.
-  if ! printf '%s' "$jit" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! printf '%s' "$jit" | ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     'umask 077 && cat > ~/jit.cfg'; then
     tartci_pool_lock_release
     note "[$i] failed to stream JIT config into the guest — discarding VM"
@@ -508,10 +511,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # Run the agent once. A JIT runner processes exactly one job and
   # deregisters. The host cache binding above is mandatory so a mount
   # regression cannot silently turn every ephemeral job cold.
-  ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "cd ~/actions-runner && \
-     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_READONLY|CCACHE_TEMPDIR)$/' .env > .env.tartci && \
+  ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
+     export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
+     cd ~/actions-runner && \
+     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_READONLY|CCACHE_TEMPDIR|CCACHE_CONFIGPATH)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
+     printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && \
      if [ '$TARTCI_HOST_CACHE_ACCESS_MODE' = ro ]; then mkdir -p \"\$HOME/.ccache-tmp\" && \
        printf '%s\n' 'CCACHE_READONLY=true' \"CCACHE_TEMPDIR=\$HOME/.ccache-tmp\" >> .env.tartci && \
        export CCACHE_READONLY=true CCACHE_TEMPDIR=\"\$HOME/.ccache-tmp\"; fi && \

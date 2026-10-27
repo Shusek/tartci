@@ -2,22 +2,24 @@
 
 ## Serving fewer gate classes
 
-M1 temporarily omitted `pulp-build-merge-group` after #439 because its
-three-core gate guest measured 33–35 minutes while other hosts measured
-15–22 minutes. On 2026-10-11 Daniel reversed that decision: other hosts now
-have a 29-minute median and merge-group capacity is the scarce resource, with
-queue-head waits reaching 95 minutes. M1 therefore serves both gate classes
-again. Slot 1 orders merge-group before PR-head; slot 2 keeps release classes
-first, followed by merge-group and PR-head. The gate guest size is unchanged;
-`vm_cores_from` continues to govern admission.
+M1 omitted `pulp-build-merge-group` after #439, rejoined it on 2026-10-11 when
+merge-group capacity was scarce, and on 2026-10-16 left it again. Over 546
+native macOS gate jobs (2026-10-12..16) m1's success median was 32.7 minutes
+against 17.9 (m3), 18.7 (m5studio) and 21.9 (m5), and pairing two m1 jobs did
+not slow either, so the gap is the host. Each merge-group batch m1 took held the
+queue about 13 minutes longer, and a replay of the same arrivals without m1
+left median and p90 total time unchanged with merge-group p90 slightly better.
+M1 is now overflow-only: both slots serve PR-head work only once it has queued
+600 s (no `fallback_preferred_hosts`), plus release classes, and its spare
+capacity goes to non-latency-critical work.
 
-An event-class-v2 lane may serve fewer classes only by naming the classes it keeps with `v2_gate_classes`. M1 now declares both classes in canonical order:
+An event-class-v2 lane may serve fewer classes only by naming the classes it keeps with `v2_gate_classes`. M1 declares PR-head only:
 
 ```toml
-v2_gate_classes = ["pulp-build-merge-group", "pulp-build-pr-head"]
+v2_gate_classes = ["pulp-build-pr-head"]
 ```
 
-The list must be a non-empty subset of those two classes, and the lane's leading tiers must match it exactly. Dropping a tier without the key, or keeping a tier the key omits, fails validation. M1's published supply therefore includes merge-group again alongside the other gate hosts. Rollback is to restore the prior PR-head-only declaration and regenerate the published labels.
+The list must be a non-empty subset of those two classes, and the lane's leading tiers must match it exactly. Dropping a tier without the key, or keeping a tier the key omits, fails validation. M1's published supply therefore carries no merge-group registration. Rollback is to restore both classes, the merge-group tier and slot orders, and regenerate the published labels.
 
 V2 partitions Pulp's required macOS JIT capacity at GitHub's assignment
 boundary. A runner advertises the shared platform/base labels plus exactly one
@@ -280,10 +282,27 @@ treats them alike, and releasing it would let another lane take the slot between
 release and re-acquire. `--print-pre-mint-retarget <tier>` prints `keep`, the
 retarget tier, or `discard` as a safe preflight.
 
+**Hold before discarding.** When no class is waiting at all
+(`no_class_waiting`), the booted VM is held for one more scan first
+(`assignment_v2_pre_mint_hold hold_seconds=N`). The lane releases the
+host-global mint lock, waits `TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS`
+(default 25, range 0..60; 0 disables), takes the lock again and repeats the
+same live retarget scan. A class that now admits is served
+(`assignment_v2_pre_mint_retarget … held=1`, or `assignment_v2_pre_mint_kept`
+when it is the VM's own class); otherwise the VM is discarded as before with
+`held=1`. After a hold the lane's job claim moves to the class it will serve,
+and a class another lane already covers (it booted or minted for the job during
+the hold) is discarded with `demand_covered` instead of minting a second runner.
+A held lane heartbeats `pre-mint-hold`, which `tartci pool supply` counts in
+flight for every class, since the VM may serve any of them. The hold runs at
+most once per boot and never for the other discard reasons. On m3 slot 1 on 2026-10-25 five booted VMs were discarded for
+`no_class_waiting`.
+
 `tartci pre-mint-outcomes [--days N] [--json]` counts retargets and discards per
 lane per day from each lane's `events.jsonl`. Every pre-mint denial ends in one
 of the two, so discards are denials minus retargets, which keeps logs written
-before retargeting existed comparable.
+before retargeting existed comparable. A VM the hold kept for its own class
+counts with the retargets.
 
 **Canary: m3 `pulp-gate` (both slots).** m3 has the highest share of
 catchable denials (42 of 74 pre-mint discards in the baseline) and the most
@@ -625,8 +644,8 @@ age an idle lane's heartbeat past 120 s, and on m3 7 of 20 supply samples read
 heartbeat and exits within one interval of the supervisor dying, so a dead
 lane still goes stale. A
 Tart inventory that cannot be read (after the same retry the supervisor uses)
-is treated as the host's own slot claim treats it: the reservation files are
-the occupancy (`"inventory": "reservations"` in the report).
+blocks new clones on that host. Its supply report has `"inventory":
+"unavailable"` and `free: 0`, so fallback hosts do not count it as capacity.
 
 The fail-safe is structural: `unknown` and `hold` both fall through to the age
 rule, so the fallback lane never boots later than it does today, and never
@@ -653,7 +672,9 @@ is made when the knob is off or when there is no young demand.
 
 ### Enabling it (m1 `pulp-gate`, preferring m3 only)
 
-m1's `pulp-gate` lane sets `fallback_preferred_hosts = ["studio"]`. m5 is left
+m1's `pulp-gate` lane no longer sets the key (2026-10-16): as an overflow-only
+host it takes only work queued 600 s or more. Before that it set
+`fallback_preferred_hosts = ["studio"]`. m5 was left
 out on purpose: its `pool supply` report counts lease fit, not host load, so a
 starved m5 still reports free slots, and deferring to it keeps young work on the
 starved host. m5 is also unreachable over SSH at times while its runners still

@@ -2,7 +2,7 @@
 """Refuse a pool mutation that would take the last capacity for a required
 label offline.
 
-`tartci pool drain` and `tartci pool off` stop this host from serving. When
+tartci pool drain and tartci pool off stop this host from serving. When
 this host holds the only runners carrying a required gate label, that mutation
 takes the label to zero runners and every pull request waiting on that gate
 stalls until someone notices. Nothing about the mutation looks wrong while it
@@ -64,10 +64,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import runner_census
 from runner_census import RunnerCensus, RunnerRecord
+import fleet_source
 
 DEFAULT_PROFILE = "~/.config/tartci/macos-fleet-profile.toml"
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PUBLISHED_SUPPLY = ROOT / "fleet" / "advertised-labels.json"
+# Importing this module must remain safe for command help and argument
+# parsing.  Resolve the operator-selected source at the command boundary;
+# otherwise a malformed private source turns ``--help`` into a traceback.
+DEFAULT_PUBLISHED_SUPPLY = fleet_source.resolve(ROOT, allow_environment=False).published_supply
 # A peer with no `ssh` in the published supply is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 PEER_STATUS_COMMAND = "cd ~ && ~/.local/bin/tartci pool status --json"
@@ -637,9 +641,15 @@ def peer_resolver(
     def read(peer: str, target: str) -> PeerEvidence:
         from bounded_subprocess import ObservationError, run_bounded
 
+        if fleet_source.ssh_destination(target) is None:
+            # A published ssh such as "-oProxyCommand=…" would run locally as
+            # an ssh option: refuse it, and leave the peer uncounted.
+            return PeerEvidence(peer, False, f"refused ssh destination {target[:64]!r}: "
+                                "not a host alias or user@host")
+        # "--" ends ssh's options, so the destination can never be read as one.
         argv = [ssh, "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                target, PEER_STATUS_COMMAND]
+                "--", target, PEER_STATUS_COMMAND]
         try:
             proc = run_bounded(argv, timeout=timeout, operation="peer_status")
         except (ObservationError, OSError) as exc:
@@ -698,7 +708,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=15.0, help="per-scope API timeout")
     parser.add_argument(
         "--published-supply",
-        default=str(DEFAULT_PUBLISHED_SUPPLY),
+        default=None,
         help="published supply naming which hosts declare each label",
     )
     parser.add_argument("--ssh", default="ssh", help="SSH client used to read peers' pool status")
@@ -712,7 +722,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="proceed even when this host is the last one serving a required label",
     )
     parser.add_argument("--json", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.published_supply is None:
+        args.published_supply = str(fleet_source.resolve(ROOT).published_supply)
+    return args
 
 
 def run(args: argparse.Namespace) -> Decision:

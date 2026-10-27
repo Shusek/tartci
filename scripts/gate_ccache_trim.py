@@ -174,7 +174,8 @@ def counters(ccache: str, cache: pathlib.Path, runner: Runner) -> dict[str, int]
     """ccache's own files and size counters for the cache (read-only)."""
     try:
         proc = runner([ccache, "-d", str(cache), "--print-stats"],
-                      capture_output=True, text=True, timeout=120)
+                      capture_output=True, text=True, timeout=120,
+                      env=ccache_guard.host_ccache_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
@@ -209,7 +210,8 @@ def evict(*, cache: pathlib.Path, max_age_days: int, fix: bool, ccache: str | No
         report["before"] = measure(cache)
         started = time.monotonic()
         try:
-            proc = runner(command, capture_output=True, text=True, timeout=EVICT_TIMEOUT_S)
+            proc = runner(command, capture_output=True, text=True, timeout=EVICT_TIMEOUT_S,
+                          env=ccache_guard.host_ccache_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {**report, "status": "error", "reason": f"ccache eviction failed: {exc}"}
         report["elapsed_s"] = round(time.monotonic() - started, 1)

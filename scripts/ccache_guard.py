@@ -28,13 +28,13 @@ names:
 By default only suspects are quarantined; consistent ones stay and are
 counted. A proven-consistent manifest is remembered in
 <quarantine-root>/verdicts.json by (size, mtime), so it costs one
-`--extract-result` once rather than on every boot.
+--extract-result once rather than on every boot.
 
 Residual blind spot of the default: a poisoned manifest that names ANOTHER
 include-less TU's object is indistinguishable from a legitimate one (a
-real-ccache test reproduces it) and is kept. `--all-zero-include` closes that
+real-ccache test reproduces it) and is kept. --all-zero-include closes that
 by quarantining every zero-include manifest, at the cost of one
-preprocessor-mode lookup per include-less TU on the next build; `reset` always
+preprocessor-mode lookup per include-less TU on the next build; reset always
 runs that way.
 
 Which roots
@@ -63,18 +63,18 @@ one fan-out directory's own files or one of its subdirectories), and the next
 quarantine run starts there, walks to the end and wraps to the beginning. So
 on a cache too large to walk inside one budget, successive boots still check
 every directory in turn instead of rechecking the same head every time. A run
-that covers the whole cache removes the cursor. `scan` and `reset` always walk
+that covers the whole cache removes the cursor. scan and reset always walk
 the whole cache from the start and neither read nor move the cursor.
 
 Default-safe
 ------------
-The guard reads entries through the host's own `ccache --inspect` and
-`--extract-result`, so it never re-implements ccache's format. Anything it
-cannot read is left alone and counted as `uninspectable`. A run that cannot
+The guard reads entries through the host's own ccache --inspect and
+--extract-result, so it never re-implements ccache's format. Anything it
+cannot read is left alone and counted as uninspectable. A run that cannot
 take its lock (another guard on the same cache) skips, unless it was given
 --wait[=SECS]: then it waits up to SECS (bare --wait: 120) for the lock and
 skips only if it is still held. The runner never waits; the operator CLI
-(`tartci ccache ...`) waits 120 s by default, because an operator's quarantine
+(tartci ccache ...) waits 120 s by default, because an operator's quarantine
 that lands while a pre-boot guard holds the lock otherwise skips and has to be
 retried by hand. The runner calls it
 fail-open: a guard failure is logged and never blocks a job. It takes the
@@ -90,7 +90,7 @@ Commands
   ccache_guard.py reset      --cache DIR [--quarantine-root DIR] [--reset]
                              [--force] [--plan] [--json]
 
-`reset` is the operator command (`tartci ccache reset`). It refuses while a
+reset is the operator command (tartci ccache reset). It refuses while a
 Tart VM runs or a VM lease is held on the host (exit 3) unless --force.
 Without --reset it runs the quarantine in --all-zero-include mode; with --reset it also moves every
 remaining cache entry into the quarantine batch, leaving an empty cache
@@ -244,9 +244,9 @@ def unit_key(cache: Path, root: Path, top: str, sub: str) -> list[str]:
 
 
 def iter_from(cache: Path, start: list[str] | None):
-    """(unit key, root, entry) over every root, starting at the `start` unit.
+    """(unit key, root, entry) over every root, starting at the start unit.
 
-    Units from `start` to the end come first, then the units before it, so a
+    Units from start to the end come first, then the units before it, so a
     walk that resumes a cursor still covers the whole cache once. A cursor
     naming a unit that no longer exists starts at the next unit after it in
     walk order; one naming an unknown root starts at the beginning.
@@ -299,11 +299,23 @@ def is_manifest_header(path: Path) -> bool:
     return len(header) == 4 and header[:2] == MAGIC and header[3] == ENTRY_TYPE_MANIFEST
 
 
+# Host-side ccache never reads the shared cache's own ccache.conf. Every gate
+# VM mounts that directory read-write, so a guest can write it, and ccache
+# would otherwise act on keys such as `prefix_command`. The host's calls only
+# read entries and counters, so they take no configuration at all.
+HOST_CCACHE_CONFIG = os.devnull
+
+
+def host_ccache_env(**overrides: str) -> dict[str, str]:
+    """The environment for a host ccache call against a guest-writable cache."""
+    return {**os.environ, **overrides, "CCACHE_CONFIGPATH": HOST_CCACHE_CONFIG}
+
+
 def inspect_manifest(ccache: str, path: Path) -> dict | None:
-    """Parse `ccache --inspect` for a manifest. None when unreadable."""
+    """Parse ccache --inspect for a manifest. None when unreadable."""
     try:
         proc = subprocess.run([ccache, "--inspect", str(path)], capture_output=True,
-                              text=True, timeout=INSPECT_TIMEOUT)
+                              text=True, timeout=INSPECT_TIMEOUT, env=host_ccache_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
@@ -351,7 +363,8 @@ def result_verdict(ccache: str, cache: Path, key: str) -> str:
     with tempfile.TemporaryDirectory(prefix="ccache-guard-") as tmp:
         try:
             proc = subprocess.run([ccache, "--extract-result", str(path.resolve())], cwd=tmp,
-                                  capture_output=True, text=True, timeout=INSPECT_TIMEOUT)
+                                  capture_output=True, text=True, timeout=INSPECT_TIMEOUT,
+                                  env=host_ccache_env())
         except (OSError, subprocess.TimeoutExpired):
             return "unverifiable"
         if proc.returncode != 0:
@@ -391,10 +404,10 @@ class Lock:
         self.handle = None
 
     def acquire(self, wait_s: float = 0.0, poll_s: float = 0.25) -> bool:
-        """Take the lock, retrying for up to `wait_s` seconds (0: one try).
+        """Take the lock, retrying for up to wait_s seconds (0: one try).
 
         Bounded polling rather than a blocking flock, so a holder that never
-        lets go costs at most `wait_s` and the caller still reports a skip.
+        lets go costs at most wait_s and the caller still reports a skip.
         """
         import fcntl
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,13 +460,13 @@ def run_scan(cache: Path, ccache: str, *, all_zero: bool, size_cap: int,
              verdicts: dict | None = None, start: list[str] | None = None) -> dict:
     """Walk every readable root; quarantine what classify() flags.
 
-    `verdicts` (relative path -> [size, mtime_ns]) remembers manifests already
+    verdicts (relative path -> [size, mtime_ns]) remembers manifests already
     proven consistent, so a legitimate include-less TU's manifest is checked
     once, not on every boot. An entry is re-checked whenever its size or
     mtime changes. The dict is updated in place with what this run saw.
 
-    `start` is a cursor unit to begin at (iter_from). A run the deadline cuts
-    short reports the unit it was in as `cursor`, so the next run checks the
+    start is a cursor unit to begin at (iter_from). A run the deadline cuts
+    short reports the unit it was in as cursor, so the next run checks the
     rest of the cache first instead of rescanning the same head every time.
     """
     counts = {"entries": 0, "manifests_checked": 0, "zero_include": 0,

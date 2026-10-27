@@ -161,10 +161,10 @@ binding_command="$(python3 "$BINDING_COMMAND" \
 if [ -n "$SSH_KEY" ]; then
   SSH_OPTS+=(-i "$SSH_KEY")
 fi
-guest=("$SSH_BIN" "${SSH_OPTS[@]}" "$GUEST_USER@$GUEST_HOST")
+guest=("$SSH_BIN" ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$GUEST_USER@$GUEST_HOST")
 reachable=0
 for _ in $(seq 1 90); do
-  if "${guest[@]}" true >/dev/null 2>&1; then reachable=1; break; fi
+  if ${guest[@]+"${guest[@]}"} true >/dev/null 2>&1; then reachable=1; break; fi
   sleep 2
 done
 [ "$reachable" -eq 1 ] || die "candidate $NEW_VMID did not become reachable at $GUEST_HOST"
@@ -180,15 +180,15 @@ for _ in $(seq 1 30); do
 done
 [ "$binding_placed" -eq 1 ] \
   || die "could not place VMID binding nonce through the guest agent"
-ssh_binding="$("${guest[@]}" cat "$binding_path" 2>/dev/null || true)"
+ssh_binding="$(${guest[@]+"${guest[@]}"} cat "$binding_path" 2>/dev/null || true)"
 [ "$ssh_binding" = "$binding_nonce" ] \
   || die "SSH peer $GUEST_HOST does not match candidate VMID $NEW_VMID"
 
-"${guest[@]}" 'mkdir -p "$HOME/.local/lib/tartci" && cat >"$HOME/.local/lib/tartci/pulp-render-generation.py"' \
+${guest[@]+"${guest[@]}"} 'mkdir -p "$HOME/.local/lib/tartci" && cat >"$HOME/.local/lib/tartci/pulp-render-generation.py"' \
   <"$RENDER_VERIFIER"
 
 note "baking exact Pulp $PULP_SHA with deep m153 Skia/Dawn and V8 receipts"
-"${guest[@]}" env \
+${guest[@]+"${guest[@]}"} env \
   "PULP_REPOSITORY=$PULP_REPOSITORY" \
   "PULP_SHA=$PULP_SHA" \
   "PARENT_VMID=$PARENT_VMID" \
@@ -245,7 +245,7 @@ python3 "$HOME/.local/lib/tartci/pulp-render-generation.py" \
 GUEST
 
 receipt_tmp="$candidate_receipt.tmp"
-"${guest[@]}" 'cat "$HOME/.config/tartci/pulp-render-generation.json"' >"$receipt_tmp"
+${guest[@]+"${guest[@]}"} 'cat "$HOME/.config/tartci/pulp-render-generation.json"' >"$receipt_tmp"
 python3 - "$receipt_tmp" "$PULP_REPOSITORY" "$PULP_SHA" "$PARENT_VMID" "$parent_digest" <<'PY'
 import json, re, sys
 path, pulp_repository, pulp_sha, parent_vmid, parent_digest = sys.argv[1:]
@@ -300,7 +300,7 @@ note "host candidate receipt validated at $candidate_receipt"
 # Remove clone-specific identity only after the durable host receipt exists.
 # No credential is ever copied into the guest, and no runner registration may
 # survive templating.
-"${guest[@]}" env "PULP_GOLDEN_BINDING_PATH=$binding_path" bash -s <<'GUEST'
+${guest[@]+"${guest[@]}"} env "PULP_GOLDEN_BINDING_PATH=$binding_path" bash -s <<'GUEST'
 set -euo pipefail
 if [ -e "$HOME/.config/gh/hosts.yml" ]; then
   echo "refusing to template a guest containing GitHub CLI credentials" >&2

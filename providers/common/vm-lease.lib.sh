@@ -111,7 +111,9 @@ tartci_check_macos_disk_floor_with_cleanup_once(){
   local path="$1" lane="$2" runner="$3" rc=0
   tartci_check_disk_floor_observed "$path" tart-macos "$lane" "$runner" || rc=$?
   [ "$rc" -ne 0 ] || return 0
-  [ "$path" = /Volumes/Workshop/VMs ] || return "$rc"
+  # Only the Tart store the cleanup authority was rendered for (host.tart_home).
+  [ -n "${TARTCI_WORKTREE_CLEANUP_TART_HOME:-}" ] || return "$rc"
+  [ "$path" = "$TARTCI_WORKTREE_CLEANUP_TART_HOME" ] || return "$rc"
   [ -n "${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}" ] || return "$rc"
   tartci_try_worktree_cleanup "$TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON" || return "$rc"
   # One exact remeasurement only. A second denial remains authoritative.
@@ -138,7 +140,9 @@ import subprocess
 import sys
 
 root, key = sys.argv[1], sys.argv[2]
-profile = json.loads(subprocess.check_output([sys.executable, f"{root}/scripts/host_profile.py", "--json"], text=True))
+sys.path.insert(0, f"{root}/scripts")
+from python_child import child_python
+profile = json.loads(subprocess.check_output([child_python(), f"{root}/scripts/host_profile.py", "--json"], text=True))
 print(profile[key])
 PY
 }
@@ -595,7 +599,7 @@ tartci_vm_lease_waiter_register(){
     --id "waiter-$lane" --cores "$cores" --mem-mb "$mem_mb" --priority "$priority"
     --kind "$kind" --pid "$$" --lane "$lane" --label "$labels"
   )
-  if python3 "$TARTCI_ROOT/scripts/leases.py" wait "${_tartci_vm_waiter_args[@]}" \
+  if python3 "$TARTCI_ROOT/scripts/leases.py" wait ${_tartci_vm_waiter_args[@]+"${_tartci_vm_waiter_args[@]}"} \
        --json >/dev/null 2>&1; then
     [ "$TARTCI_VM_WAITER_ID" = "waiter-$lane" ] || TARTCI_VM_WAITER_SINCE="$(date +%s)"
     TARTCI_VM_WAITER_ID="waiter-$lane"
@@ -613,7 +617,7 @@ tartci_vm_lease_waiter_hold(){
     tartci_vm_lease_waiter_withdraw
     return 0
   fi
-  python3 "$TARTCI_ROOT/scripts/leases.py" wait "${_tartci_vm_waiter_args[@]}" \
+  python3 "$TARTCI_ROOT/scripts/leases.py" wait ${_tartci_vm_waiter_args[@]+"${_tartci_vm_waiter_args[@]}"} \
     --json >/dev/null 2>&1 || true
 }
 
@@ -757,7 +761,7 @@ tartci_acquire_vm_lease(){
   [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
     --id "$lease_id" \
-    "${core_args[@]}" \
+    ${core_args[@]+"${core_args[@]}"} \
     ${mem_args[@]+"${mem_args[@]}"} \
     ${disk_args[@]+"${disk_args[@]}"} \
     --priority "$priority" \

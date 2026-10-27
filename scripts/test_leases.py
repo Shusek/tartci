@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import leases
+import lease_disk
 
 
 SCRIPT = Path(__file__).with_name("leases.py")
@@ -1111,6 +1112,18 @@ class LeaseDiskAxisTests(LeaseCliTestCase):
             json.loads(denied_mount.stdout)["reason"],
             "disk_root_unavailable",
         )
+
+    def test_stalled_disk_probe_has_a_bounded_failure(self) -> None:
+        original = lease_disk._disk_probe_impl
+
+        def stalled(*args, **kwargs):
+            time.sleep(0.2)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(lease_disk, "_disk_probe_impl", side_effect=stalled), \
+             mock.patch.object(lease_disk, "DISK_PROBE_TIMEOUT_S", 0.01):
+            with self.assertRaises(TimeoutError):
+                lease_disk.disk_probe(self.tmp.name)
 
     def test_path_aliases_share_one_filesystem_reservation(self) -> None:
         real_store = Path(self.tmp.name) / "real-store"

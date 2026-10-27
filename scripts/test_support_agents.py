@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +32,21 @@ import support_agents as sa  # noqa: E402
 
 FOUR = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop"]
 THREE = FOUR[:3]
+# Owner-approved bootstrap beyond the VM janitor, per profile. Every profile
+# not named here bootstraps `reap` alone; adding one needs the owner's approval.
+APPROVED_BOOTSTRAP = {
+    # 2026-10-25, owner-approved for every host: converge the disk reclaimer.
+    # Plan-only reclaim never received its own fixes (#661's 90%-used pressure
+    # trigger stayed unrendered fleet-wide), and m3 then m5 left the fleet on
+    # disk_pressure with hundreds of GiB of idle build trees it would have
+    # removed.
+    "m1-macos-fleet.toml": ["reap", "reclaim"],
+    "m3-macos-fleet.toml": ["reap", "reclaim"],
+    "m5-macos-fleet.toml": ["reap", "reclaim"],
+    # 2026-10-22: m5studio only. A hand-installed disk watchdog is not
+    # reconciled, and m5studio ran none for days.
+    "m5studio-macos-fleet.toml": ["reap", "disk-watchdog", "reclaim"],
+}
 
 
 def table(declared: List[str], bootstrap: bool = False, backstop: str = "off") -> str:
@@ -126,7 +142,7 @@ class HostMaintenanceAgents(Case):
 
     def test_m5studio_without_a_watchdog_reads_missing(self):
         self.write_profile(table(["launchd-watchdog", "reap"]).replace(
-            '[host]\nid = "t"\n', '[host]\nid = "m5studio"\ntart_home = "/Volumes/Atelier/VMs"\n'))
+            '[host]\nid = "t"\n', '[host]\nid = "m5studio"\ntart_home = "/Volumes/Store/VMs"\n'))
         self.install_rendered("reap")
         self.assertEqual(self.run_pass("plan"), sa.EXIT_OK)
         agents = self.receipt()["agents"]
@@ -135,7 +151,7 @@ class HostMaintenanceAgents(Case):
         self.assertEqual(self.sys.mutations(), [])
 
     def test_each_render_carries_its_own_hosts_tart_home(self):
-        for host, store in (("m3", "/Volumes/Workshop/VMs"), ("m5studio", "/Volumes/Atelier/VMs")):
+        for host, store in (("m3", "/Volumes/Example/VMs"), ("m5studio", "/Volumes/Store/VMs")):
             profile = {"host": {"id": host, "tart_home": store}}
             for name in ("launchd-watchdog", "reap"):
                 rendered, err = sa.System.render(self.sys, sa.REGISTRY[name], profile)
@@ -214,12 +230,41 @@ class BootstrapOnly(Case):
         for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
             data, _ = sa.load_profile(path)
             with self.subTest(profile=path.name):
-                self.assertEqual(data["support_agents"]["bootstrap"], ["reap"])
+                self.assertEqual(data["support_agents"]["bootstrap"],
+                                 APPROVED_BOOTSTRAP.get(path.name, ["reap"]))
                 self.assertEqual(sa.validate(data), [])
 
 
 @unittest.skipIf(sa.tomllib is None, "needs tomllib")
 class Plan(Case):
+    def test_watchdog_carries_private_source_environment(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td)
+            (source / "profiles").mkdir()
+            (source / "profiles" / "canary-macos-fleet.toml").write_text("schema = 1\n")
+            (source / "fleet").mkdir()
+            digest = sa.fleet_source.FleetSource(
+                source, source / "profiles", source / "fleet" / "advertised-labels.json", True
+            ).profiles_sha256
+            (source / "fleet" / "advertised-labels.json").write_text(
+                '{"schema":"tartci.advertised-labels/v1",'
+                f'"generated_from":{{"repo":"ORG/private-fleet-authority",'
+                f'"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                f'"profiles":["profiles/canary-macos-fleet.toml"],'
+                f'"profiles_sha256":"{digest}"}},"registrations":[]}}\n')
+            sa.fleet_source.write_marker(source, "ORG/private-fleet-authority", "a" * 40)
+            values = {
+                "TARTCI_FLEET_SOURCE_ROOT": str(source),
+                "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+                "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
+            }
+            with mock.patch.dict(os.environ, values, clear=False):
+                environment = sa._watchdog_env({})
+            self.assertEqual(environment["TARTCI_FLEET_SOURCE_ROOT"], str(source.resolve()))
+            self.assertEqual(environment["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
+            self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"],
+                             "ORG/private-fleet-authority")
+
     def test_missing_matching_and_differing_are_named_and_nothing_is_written(self):
         self.write_profile(table(THREE))
         self.install_rendered("reclaim")
@@ -561,9 +606,11 @@ class Validate(unittest.TestCase):
                 data, why = sa.load_profile(path)
                 self.assertIsNotNone(data, why)
                 # Whole-table bootstrap stays off until approved; the VM
-                # janitor alone is converged everywhere.
-                self.assertEqual(data[sa.TABLE]["bootstrap"], ["reap"],
-                                 "only the VM janitor is bootstrapped")
+                # janitor is converged everywhere, plus each owner-approved
+                # addition (the disk reclaimer on every host, 2026-10-25).
+                self.assertEqual(data[sa.TABLE]["bootstrap"],
+                                 APPROVED_BOOTSTRAP.get(path.name, ["reap"]),
+                                 "only the VM janitor and approved agents are bootstrapped")
                 self.assertTrue(set(THREE) <= set(data[sa.TABLE]["declared"]))
                 canary = (data.get("reuse_canary") or {}).get("enabled") is True
                 self.assertEqual(canary, "reuse-canary" in data[sa.TABLE]["declared"])

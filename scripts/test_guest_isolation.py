@@ -64,7 +64,7 @@ class ProviderWiringTests(unittest.TestCase):
         body = MACOS.read_text(encoding="utf-8")
         self.assertIn('--dir="ccache:$CACHE_ROOT/ccache$cache_ro"', body)
         self.assertIn('--dir="configure-checks:$CACHE_ROOT/configure-checks$cache_ro"', body)
-        boot = body.index('tart run --no-graphics "${tart_dirs[@]}"')
+        boot = body.index('tart run --no-graphics ${tart_dirs[@]+"${tart_dirs[@]}"}')
         self.assertIn('${TARTCI_TART_NETWORK_ARGS[@]+"${TARTCI_TART_NETWORK_ARGS[@]}"}',
                       body[boot:boot + 200])
         # Read-only guests use a private configure-check copy and a read-only

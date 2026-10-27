@@ -73,6 +73,9 @@ path = sys.argv[-1]
 if path == "rate_limit":
     print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
     raise SystemExit(0)
+if path == "repos/Generous-Corp/pulp":
+    print(json.dumps({"visibility": "private", "private": True}))
+    raise SystemExit(0)
 if state.get("api_fail") and "/runs?" in path:
     raise SystemExit(9)
 parsed = urlparse("https://example.invalid/" + path)
@@ -150,6 +153,7 @@ if state.get("release_pr"):
 
 def runs_page(run_id, name):
     runs = ([{"id": run_id, "name": name, "status": status,
+              "head_repository": {"full_name": "Generous-Corp/pulp"},
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
     # The ghost: a merge_group run whose queue entry is long gone. Nothing in
@@ -159,6 +163,7 @@ def runs_page(run_id, name):
     if run_id == 101 and state.get("ghost") and status == "queued":
         runs.append({"id": 103, "name": name, "status": status,
                      "event": "merge_group",
+                     "head_repository": {"full_name": "Generous-Corp/pulp"},
                      "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
                      "created_at": "2026-08-18T00:00:00Z",
                      "updated_at": "2026-08-18T00:00:00Z"})
@@ -819,6 +824,7 @@ event(){ trace "event $*"; }
 heartbeat(){ trace "heartbeat $*"; }
 tartci_assignment_v2_pre_mint_denied_event(){ trace "denied $*"; }
 tartci_assignment_v2_pre_mint_retarget(){ printf '0\n'; return "${TEST_SELECTION_RC:-0}"; }
+tartci_labels_mount_shared_cache(){ return 0; }
 tartci_assignment_v2_tier_label_at(){ printf 'new-class\n'; }
 tartci_assignment_v2_tier_labels(){ printf 'base,new-class\n'; }
 runner_group_id_for_tier(){ printf '%s\n' "${TEST_GROUP:-11}"; }
@@ -848,7 +854,7 @@ exercise
             result = subprocess.run(
                 ["/bin/bash", "-c", script], text=True, capture_output=True, timeout=10,
                 env={**os.environ, "TRACE": str(trace), "STATE_DIR": str(root),
-                     "REPO": "fixture/repository", **settings})
+                     "REPO": "fixture/repository", "TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS": "0", **settings})
             self.assertEqual(result.returncode, 0, result.stderr)
             return (dict(line.split("=", 1) for line in result.stdout.splitlines()),
                     trace.read_text().splitlines())
@@ -910,6 +916,152 @@ exercise
                 self.assertIn("discard", trace)
                 self.assertNotIn("lease-release", trace)
                 self.assertEqual(result["current_labels"], "base,old-class")
+PRE_MINT_HOLD_STUBS = r"""
+calls="$1"; answers="$2"; shift 2
+tartci_assignment_v2_pre_mint_denied_event(){ :; }
+# One answer per pass, in order: a tier number, or "none" for no class waiting.
+tartci_assignment_v2_pre_mint_retarget(){
+  local answer
+  answer="$(head -n 1 "$answers")"; sed -i '' 1d "$answers" 2>/dev/null || sed -i 1d "$answers"
+  echo "scan $answer" >>"$calls"
+  [ "$answer" != none ] || return 1
+  echo "$answer"
+}
+tartci_assignment_v2_tier_label_at(){
+  case "$1" in 0) echo pulp-build-merge-group ;; *) echo pulp-build-pr-head ;; esac
+}
+tartci_assignment_v2_tier_labels(){ echo "self-hosted,macOS,ARM64,pulp-build-vm,$1"; }
+tartci_labels_mount_shared_cache(){ return 0; }
+tartci_admission_clean_enabled(){ return 1; }
+runner_group_id_for_tier(){ echo "${GROUP_FOR_TIER:-1}"; }
+jit_admission_denied(){ return 1; }
+tartci_pool_lock_release(){ echo unlock >>"$calls"; }
+tartci_pool_lock_acquire(){ echo lock >>"$calls"; [ "${LOCK_BUSY:-0}" = 0 ]; }
+# The claim store: CLAIM_RC 75 means another lane already covers the class.
+tartci_job_claim_release(){ echo "claim-release" >>"$calls"; }
+tartci_job_claim_acquire(){ echo "claim $2 tier=$3 queued=$4" >>"$calls"; return "${CLAIM_RC:-0}"; }
+vm=lane-vm-1
+discard_current_vm(){ echo discard >>"$calls"; }
+tartci_release_vm_lease(){ echo release >>"$calls"; }
+sleep(){ echo "sleep $1" >>"$calls"; }
+heartbeat(){ :; }
+note(){ :; }
+event(){ echo "event $*" >>"$calls"; }
+selected_tier=1; selected_labels="self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-pr-head"
+"""
+
+
+class PreMintHoldTests(unittest.TestCase):
+    """A booted VM with no class waiting gets one more scan before discard.
+
+    On m3 slot 1 on 2026-10-25 five booted VMs were discarded for
+    `no_class_waiting`, each after a full clone and boot. Drives the real
+    `retarget_after_pre_mint_denial` body against stubbed scans, so each test
+    names what every pass saw. Tier 0 is merge-group and tier 1 is PR-head,
+    and the VM was booted for tier 1.
+    """
+
+    def _deny(self, *answers: str, **env: str) -> tuple[str, list[str]]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        calls = Path(tmp.name) / "calls"
+        calls.touch()
+        script_answers = Path(tmp.name) / "answers"
+        script_answers.write_text("".join(f"{a}\n" for a in answers))
+        source = RUNNER.read_text(encoding="utf-8")
+        start = source.index("retarget_after_pre_mint_denial(){")
+        body = source[start:source.index("\n}\n", start) + 3]
+        script = (PRE_MINT_HOLD_STUBS + body
+                  + 'rc=0; retarget_after_pre_mint_denial 1 1 || rc=$?\n'
+                  'echo "rc=$rc tier=$selected_tier labels=$selected_labels"\n')
+        result = subprocess.run(
+            ["/bin/bash", "-c", script, "_", str(calls), str(script_answers)],
+            text=True, capture_output=True, check=False, stdin=subprocess.DEVNULL,
+            env={"PATH": "/usr/bin:/bin", **env},
+        )
+        self.assertEqual(result.stderr, "")
+        return result.stdout.strip(), calls.read_text().splitlines()
+
+    def test_a_class_arriving_during_the_hold_is_served(self) -> None:
+        out, calls = self._deny("none", "0")
+        self.assertEqual(out, "rc=0 tier=0 labels=self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-merge-group")
+        self.assertNotIn("discard", calls)
+        # The mint lock is released for the wait and taken again before the rescan.
+        self.assertEqual(calls[:5], ["scan none", "unlock", calls[2], "sleep 25", "lock"])
+        self.assertIn("assignment_v2_pre_mint_hold", calls[2])
+        self.assertEqual(calls[5], "scan 0")
+        self.assertIn("held=1", calls[-1])
+
+    def test_the_claim_moves_to_the_class_served_after_a_hold(self) -> None:
+        _, calls = self._deny("none", "0")
+        claims = [c for c in calls if c.startswith("claim")]
+        self.assertEqual(claims, ["claim-release",
+                                  "claim self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-merge-group tier=0 queued=1"])
+        # Taken after the rescan under the re-acquired lock, before any mint.
+        self.assertLess(calls.index("scan 0"), calls.index("claim-release"))
+
+    def test_a_class_another_lane_covered_during_the_hold_is_not_minted_twice(self) -> None:
+        """A fallback or sibling that booted for the arriving job while this VM
+        was held already holds the claim; this VM is discarded, not minted."""
+        out, calls = self._deny("none", "0", CLAIM_RC="75")
+        self.assertTrue(out.startswith("rc=1 tier=1 "), out)
+        self.assertIn("discard", calls)
+        self.assertTrue(any("reason=demand_covered" in c and "held=1" in c for c in calls), calls)
+        # Control: claim machinery failing open still serves the class.
+        out, calls = self._deny("none", "0", CLAIM_RC="1")
+        self.assertTrue(out.startswith("rc=0 tier=0 "), out)
+        self.assertNotIn("discard", calls)
+
+    def test_without_a_hold_the_claim_is_untouched(self) -> None:
+        # Control: a pass-one retarget keeps today's behaviour exactly.
+        _, calls = self._deny("0")
+        self.assertFalse(any(c.startswith("claim") for c in calls), calls)
+
+    def test_its_own_class_returning_keeps_the_vm(self) -> None:
+        out, calls = self._deny("none", "1")
+        self.assertEqual(out, "rc=0 tier=1 labels=self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-pr-head")
+        self.assertNotIn("discard", calls)
+        self.assertTrue(any("assignment_v2_pre_mint_kept" in c for c in calls), calls)
+
+    def test_still_nothing_after_one_hold_discards(self) -> None:
+        # Control, same instrument: the hold is bounded to one rescan.
+        out, calls = self._deny("none", "none", "0")
+        self.assertTrue(out.startswith("rc=1 tier=1 "), out)
+        self.assertEqual([c for c in calls if c.startswith("sleep")], ["sleep 25"])
+        self.assertEqual([c for c in calls if c.startswith("scan")], ["scan none", "scan none"])
+        self.assertIn("discard", calls)
+        self.assertTrue(any("reason=no_class_waiting" in c and "held=1" in c for c in calls), calls)
+
+    def test_zero_disables_the_hold(self) -> None:
+        out, calls = self._deny("none", "0", TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS="0")
+        self.assertTrue(out.startswith("rc=1 "), out)
+        self.assertFalse(any(c.startswith("sleep") for c in calls), calls)
+        self.assertTrue(any("reason=no_class_waiting" in c and "held=0" in c for c in calls), calls)
+
+    def test_the_hold_is_configurable(self) -> None:
+        _, calls = self._deny("none", "0", TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS="40")
+        self.assertIn("sleep 40", calls)
+
+    def test_a_busy_mint_lock_after_the_hold_discards(self) -> None:
+        out, calls = self._deny("none", "0", LOCK_BUSY="1")
+        self.assertTrue(out.startswith("rc=1 "), out)
+        self.assertNotIn("scan 0", calls)
+        self.assertTrue(any("reason=pool_transition_busy" in c for c in calls), calls)
+
+    def test_a_refusal_other_than_no_demand_is_never_held(self) -> None:
+        out, calls = self._deny("0", "0", GROUP_FOR_TIER="2")
+        self.assertTrue(out.startswith("rc=1 "), out)
+        self.assertFalse(any(c.startswith("sleep") for c in calls), calls)
+        self.assertTrue(any("reason=runner_group_differs" in c for c in calls), calls)
+
+    def test_the_hold_bound_is_validated(self) -> None:
+        fixture = RunnerFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        fixture.env["TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS"] = "61"
+        result = fixture._runner("--print-selection")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS", result.stderr)
 
 
 class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
@@ -1739,7 +1891,7 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         self.assertEqual(scanner.scan(), 6)
         self.assertEqual(peak, 3)
 
-    def test_cross_process_assignment_scans_share_host_observation_lock(self) -> None:
+    def test_slow_assignment_fetch_does_not_block_another_lane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "entered"
@@ -1748,11 +1900,14 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
             _write_exec(
                 fake,
                 """#!/usr/bin/env python3
-import json, os, time
+import json, os, sys, time
 from pathlib import Path
 Path(os.environ['ENTERED']).write_text('yes', encoding='utf-8')
 time.sleep(2)
-print(json.dumps({'total_count': 0, 'workflows': []}))
+if sys.argv[-1].startswith('repos/') and '/actions/workflows?' in sys.argv[-1]:
+    print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
+else:
+    print(json.dumps({'total_count': 0, 'workflow_runs': []}))
 """,
             )
             common = [
@@ -1770,12 +1925,11 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(marker.exists(), "first scanner never entered GitHub observation")
-            denied = subprocess.run(
-                [*common, "--observation-lock-timeout", "0.05"],
+            concurrent = subprocess.run(
+                [*common, "--observation-lock-timeout", "5"],
                 text=True, capture_output=True, check=False, env=env,
             )
-            self.assertEqual(denied.returncode, 2)
-            self.assertIn("observation lock timed out", denied.stderr)
+            self.assertEqual(concurrent.returncode, 0, concurrent.stderr)
             holder.terminate()
             holder.communicate(timeout=5)
 
@@ -1890,37 +2044,25 @@ else:
             assert match is not None
             return float(match.group(1)), elapsed
 
-    def test_scan_budget_is_measured_from_lock_acquisition(self) -> None:
+    def test_scan_budget_is_independent_of_host_lock(self) -> None:
         hold, scan_timeout = 2.0, 4
         budget, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
         # Control: a run where the scanner never actually queued would prove
         # nothing about what queueing costs it.
-        self.assertGreaterEqual(
-            elapsed, hold,
-            f"the scanner never waited for the lock ({elapsed:.2f}s < {hold}s), so this proved nothing",
-        )
-        self.assertGreater(
-            budget, scan_timeout - hold + 0.5,
-            f"the {hold}s lock wait was charged to the scan: it began work with only "
-            f"{budget:.2f}s of its {scan_timeout}s budget",
-        )
-        # A budget larger than the one configured would mean the deadline is
-        # being extended rather than rebased.
         self.assertLessEqual(
             budget, scan_timeout + 0.5,
-            f"the scan claimed {budget:.2f}s against a {scan_timeout}s budget",
+            f"the scan exceeded its {scan_timeout}s budget ({budget:.2f}s)",
         )
+        self.assertLess(elapsed, hold + scan_timeout + 1.0, "the host lock blocked API observation")
 
-    def test_waiting_longer_for_the_lock_does_not_shrink_the_scan(self) -> None:
-        """The same scan, queued twice as long, must get the same budget."""
+    def test_a_long_host_lock_does_not_delay_scan_start(self) -> None:
+        """A slow holder cannot make another lane wait before its API call."""
         scan_timeout = 4
         brief, _ = self._budget_after_waiting(1.0, scan_timeout, lock_timeout=20.0)
         patient, elapsed = self._budget_after_waiting(3.0, scan_timeout, lock_timeout=20.0)
-        self.assertGreaterEqual(elapsed, 3.0, "the long-wait case never queued")
-        self.assertAlmostEqual(
-            brief, patient, delta=0.75,
-            msg=f"budget tracks the lock wait: 1s wait -> {brief:.2f}s, 3s wait -> {patient:.2f}s",
-        )
+        self.assertLessEqual(brief, scan_timeout + 0.5)
+        self.assertLessEqual(patient, scan_timeout + 0.5)
+        self.assertLess(elapsed, 3.0 + scan_timeout + 1.0, "the host lock blocked API observation")
 
     def test_lock_wait_is_not_truncated_by_the_scan_budget(self) -> None:
         """--observation-lock-timeout means what it says, even when it exceeds --scan-timeout.
@@ -1977,8 +2119,8 @@ else:
         hold, scan_timeout = 2.0, 3
         _, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
         self.assertLess(
-            elapsed, hold + scan_timeout + 5.0,
-            f"the scan ran {elapsed:.2f}s, past its {hold}s wait plus {scan_timeout}s budget",
+            elapsed, scan_timeout + 5.0,
+            f"the scan ran {elapsed:.2f}s past its API budget",
         )
 
     def test_tests_never_contend_with_the_hosts_real_observation_lock(self) -> None:
@@ -2586,6 +2728,19 @@ class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
             f"{offenders}",
         )
 
+    def test_admission_scan_requires_first_party_head_repository(self) -> None:
+        source = self.LIB.read_text()
+        self.assertIn(
+            '--require-head-repo "$REPO"',
+            source,
+            "assignment admission must exclude fork head repositories",
+        )
+        self.assertIn(
+            "assignment_group_unservable",
+            source,
+            "unservable runner-group demand must not boot a VM",
+        )
+
     def test_arithmetic_on_the_count_only_happens_where_it_is_bought(self) -> None:
         """Summing counts is legitimate, but only with an exhaustive scan.
 
@@ -2871,6 +3026,55 @@ else:
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), "1")
                 self.assertEqual(census["workflows"], 1, census)
+
+    def test_a_repository_backoff_does_not_blind_a_cold_cache_scan(self) -> None:
+        """Publishing the ids never waits on the host observation lock.
+
+        On m3 on 2026-10-25 most SCAN BLIND lines read the workflow listing
+        successfully and then failed closed on `lock backoff active`, because
+        the publish took the host lock that carries the repository's timeout
+        backoff. The expired cache was never refreshed, so the next poll did
+        the same. The control is the same backoff against a scan whose queue
+        read itself fails: that scan still fails closed.
+        """
+        cache = self.root / "workflow-ids.json"
+        backoff = self.root / "queue-observation-backoff.json"
+        backoff.write_text(json.dumps({"Generous-Corp/pulp": time.time() + 600}))
+
+        cold, cold_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertEqual(cold.stdout.strip(), "1")
+        self.assertNotIn("lock_contention", cold.stderr)
+        self.assertEqual(cold_census["workflows"], 1, cold_census)
+        # Published despite the backoff, so the next lane reads it instead.
+        self.assertIn("Generous-Corp/pulp", json.loads(cache.read_text()))
+        warm, warm_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertEqual(warm_census["workflows"], 0, warm_census)
+
+        cache.unlink()
+        broken, _, _ = self._scan(cache=cache, ttl="300", MATCH="1", FAIL_ON="/jobs?")
+        self.assertEqual(broken.returncode, 2, broken.stdout)
+        self.assertNotEqual(broken.stdout.strip(), "0")
+
+    def test_a_held_cache_lock_skips_the_publish_and_never_blocks(self) -> None:
+        """The cache's own lock is taken with a bounded non-blocking retry."""
+        import fcntl  # noqa: PLC0415
+        cache = self.root / "workflow-ids.json"
+        with open(str(cache) + ".lock", "a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            started = time.monotonic()
+            blocked, census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+            elapsed = time.monotonic() - started
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(blocked.stdout.strip(), "1")
+        self.assertEqual(census["workflows"], 1, census)
+        self.assertFalse(cache.exists(), "a publish that could not lock must be skipped")
+        self.assertLess(elapsed, 30.0)
+        # Control: the lock released, the same scan publishes.
+        free, _, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(free.returncode, 0, free.stderr)
+        self.assertIn("Generous-Corp/pulp", json.loads(cache.read_text()))
 
     def test_a_cached_id_that_stops_resolving_fails_the_scan_closed(self) -> None:
         """The cache cannot turn a broken lookup into an empty queue.

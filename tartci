@@ -12,6 +12,8 @@
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
+#   tartci scratch-vm create --owner AGENT --ttl HOURS [--from IMAGE]
+#                                        # a test VM the watchdog deletes on its TTL
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
 #   tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
@@ -19,6 +21,7 @@
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
 #   tartci ccache reset [--reset] [--plan] [--force]  # operator reset; refuses
 #                              # while a VM runs or holds a lease (exit 3)
+#   tartci version [--json]    # the commit this copy runs (installed generation or checkout)
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
@@ -26,10 +29,14 @@
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci governor [show|set K=V|unset K|explain|fleet|keys] # one per-host governor config
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
+#   tartci update [--yes|--plan|--status|--wait] [--json]
+#                              # bring THIS host's tartci current (asks y/N; hosts
+#                              # take turns); --status one line, --wait until done
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
 #   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
 #   tartci vm-dhcp <status|probe-now>    # VM DHCP breaker; probe at once after a fix
+#   tartci runner-heal [--fix]           # keep declared persistent runners registered + listening
 #   tartci fleet-macos support-agents <plan|apply|auto|status> [--json] # declared support LaunchAgents
 #   tartci support-manifest <write|verify|stage-install> # bind/install runtime cohort
 #   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
@@ -45,19 +52,24 @@
 #   tartci pool status --usage [--range 24h] [--json] # slot occupancy, idle-with-demand, discards
 #   tartci held <list|inspect NAME|stop NAME|delete NAME|expire>  # failed gate VMs kept for debugging ([debug_hold])
 #                              # --plan: print the transition, write nothing;
-#                              # off refuses a mid-job lane (exit 12) unless --now
+#                              # off refuses a mid-job lane (exit 12) unless --force
+#                              # (or --now); every change is logged with its caller
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
 #   tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run]  # copy canonical golden to a host (fastest link) + verify + repoint
 #   tartci goldens doctor [--receipt FILE] [--promotion]                     # read-only receipt/freshness check
-#   tartci prepare <os>        # bake/provision a golden from the provider recipe
+#   tartci prepare <os>        # run the provider's image-preparation command; see docs/prepare.md
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
 #   tartci launchd <reload <label>|status|heal>  # heal a wedged serve LaunchAgent (full bootout+bootstrap)
-#                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
+#                              # reload refuses a mid-job lane (exit 3) unless --force;
 #                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
 #   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
+#   tartci disk <watch|status> [--json]  # write-latency watchdog for the cache/VM volumes
+#                              # (one pass; the disk-watchdog LaunchAgent runs it every 60 s)
+#   tartci pool log [--status] [--json]  # bounded history of this host's pool status
+#                              # (one pass; the pool-log LaunchAgent runs it every 300 s)
 #   tartci hooks print         # print (never write) Claude/Codex hook settings
 #   tartci help
 #
@@ -92,12 +104,52 @@ tartci_toml_exec() {
 # Like tartci_toml_exec, for a helper that still does useful work without
 # tomllib: the reclaim janitor and status read the fleet profile to find the
 # Tart store's volume, but without a TOML-capable interpreter they fall back to
-# judging every scanned volume rather than refusing to run at all.
+# judging every scanned volume rather than refusing to run at all. That
+# fallback is for an operator's shell only: under a tartci LaunchAgent a
+# refused pin stays refused, so the network relay and the other agents never
+# drift onto /usr/bin/python3, a binary with its own privacy grants.
 tartci_toml_exec_or_python3() {
   local python
-  python="$(tartci_toml_python_path 2>/dev/null)" || python=python3
+  if ! python="$(tartci_verified_python 2>/dev/null)"; then
+    if tartci_launchd_context; then
+      tartci_toml_python_path >/dev/null || true   # prints the refusal to the job's log
+      return 127
+    fi
+    python=/usr/bin/python3
+  fi
+  "$python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || return 127
   exec "$python" "$@"
 }
+
+# Resolve and validate the interpreter for every helper launched by pool status.
+# Never hand a helper to PATH python3: a shell named python3 can interpret
+# Python docstring backticks as commands and recurse.
+tartci_verified_python() {
+  local python
+  python="$(tartci_toml_python_path 2>/dev/null)" || return 127
+  local implementation
+  implementation="$("$python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null || true)"
+  if [ "$implementation" != cpython ]; then
+    echo "tartci: helper interpreter failed verification: $python (expected cpython, got ${implementation:-unavailable})" >&2
+    return 127
+  fi
+  printf '%s\n' "$python"
+}
+
+tartci_verified_python_run() {
+  local python
+  python="$(tartci_verified_python)" || return 127
+  "$python" "$@"
+}
+
+# Only install the PATH shim after the resolver has accepted the configured
+# interpreter. A rejected TARTCI_PYTHON must not hijack fallback diagnostics.
+if [ -n "${TARTCI_PYTHON:-}" ]; then
+  if _tartci_verified_pin="$(tartci_verified_python 2>/dev/null)"; then
+    TARTCI_PYTHON="$_tartci_verified_pin"
+    export TARTCI_PYTHON
+  fi
+fi
 
 # The Tart store a command reads. A LaunchAgent sets TART_HOME for its lane; a
 # shell over ssh has none, and `tart list` then reads Tart's default ~/.tart,
@@ -109,7 +161,8 @@ tartci_toml_exec_or_python3() {
 tartci_resolve_tart_home() {
   [ -z "${TARTCI_TART_HOME_SOURCE:-}" ] || return 0
   local python out path source
-  python="$(tartci_toml_python_path 2>/dev/null)" || python=python3
+  python="$(tartci_toml_python_path 2>/dev/null)" || python=/usr/bin/python3
+  "$python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || python=/usr/bin/python3
   out="$("$python" "$HERE/scripts/tart_home.py" --lines 2>/dev/null)" || return 0
   { IFS= read -r path; IFS= read -r source; } <<<"$out"
   case "$source" in env|profile|default) ;; *) return 0 ;; esac
@@ -151,7 +204,8 @@ cmd_doctor() {
   tartci_resolve_tart_home
   if [ "${1:-}" = "--reap" ]; then
     shift
-    exec python3 "$HERE/scripts/vm_reap.py" "$@"
+    tartci_verified_python_run "$HERE/scripts/vm_reap.py" "$@"
+    return $?
   fi
   if [ "${1:-}" = "cpu-pressure" ]; then
     shift
@@ -177,7 +231,7 @@ cmd_doctor() {
   # vncdotool + UTM are optional helpers.
   command -v vncdo >/dev/null 2>&1 && c_ok "vncdo (VNC drive)" || c_warn "vncdo (optional: headless VNC drive — pip install vncdotool)"
   local _store
-  _store="$("$(tartci_toml_python_path 2>/dev/null || echo python3)" "$HERE/scripts/tart_home.py" 2>/dev/null)" \
+  _store="$(tartci_toml_exec_or_python3 "$HERE/scripts/tart_home.py" 2>/dev/null)" \
     || _store="tart store: unresolved (scripts/tart_home.py failed)"
   case "$_store" in
     *WARNING*|*unresolved*) c_warn "$_store" ;;
@@ -217,7 +271,8 @@ cmd_doctor() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   echo "pool transition lock:"
-  tartci_pool_lock_health_json | python3 -c '
+  local lock_python; lock_python="$(tartci_verified_python)" || lock_python=/usr/bin/python3
+  tartci_pool_lock_health_json | "$lock_python" -c '
 import json, sys
 value = json.load(sys.stdin)
 print("  state: {}".format(value["state"]))
@@ -229,6 +284,39 @@ if value["present"]:
         value["inode"], value["mtime_ns"]
     ))
 '
+}
+
+# The commit this copy runs. An installed generation names it in its support
+# manifest; a checkout asks git. Plain bash and sed: it must answer on a host
+# whose Python or TOML tooling is what is broken.
+cmd_version() {
+  local json=0 commit="" source="" dirty=false
+  case "${1:-}" in
+    --json) json=1 ;;
+    "") ;;
+    -h|--help) echo "usage: tartci version [--json]"; return 0 ;;
+    *) echo "usage: tartci version [--json]" >&2; return 2 ;;
+  esac
+  if [ -f "$HERE/.tartci-support-manifest.json" ]; then
+    commit="$(sed -n 's/.*"source_commit": *"\([0-9a-f]\{40\}\)".*/\1/p' \
+      "$HERE/.tartci-support-manifest.json" | head -n 1)"
+    source=generation
+  elif git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    commit="$(git -C "$HERE" rev-parse HEAD 2>/dev/null)"
+    source=checkout
+    [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null)" ] || dirty=true
+  fi
+  if [ -z "$commit" ]; then
+    echo "tartci version: cannot tell which commit $HERE runs (no support manifest, not a git checkout)" >&2
+    return 1
+  fi
+  if [ "$json" = 1 ]; then
+    printf '{"commit": "%s", "source": "%s", "root": "%s", "dirty": %s}\n' \
+      "$commit" "$source" "$HERE" "$dirty"
+  else
+    printf 'tartci %s (%s %s%s)\n' "${commit:0:12}" "$source" "$HERE" \
+      "$([ "$dirty" = true ] && echo ', with uncommitted changes')"
+  fi
 }
 
 cmd_status() {
@@ -244,7 +332,7 @@ cmd_network_profile() {
 }
 
 cmd_leases() {
-  exec python3 "$HERE/scripts/leases.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/leases.py" "$@"
 }
 
 cmd_governor() {
@@ -259,32 +347,32 @@ cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift|verify-supply|config-verdicts)
-      tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
+      tartci_toml_python_exec "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
       ;;
     self-update)
-      tartci_toml_python "$HERE/scripts/fleet_self_update.py" "$@"
+      tartci_toml_python_exec "$HERE/scripts/fleet_self_update.py" "$@"
       ;;
     tool-freshness)
-      tartci_toml_python "$HERE/scripts/tool_freshness.py" "$@"
+      tartci_toml_python_exec "$HERE/scripts/tool_freshness.py" "$@"
       ;;
     support-agents)
-      tartci_toml_python "$HERE/scripts/support_agents.py" "$@"
+      tartci_toml_python_exec "$HERE/scripts/support_agents.py" "$@"
       ;;
     *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update|tool-freshness|support-agents> ..."; return 2 ;;
   esac
 }
 
 cmd_support_manifest() {
-  exec python3 "$HERE/scripts/tartci_support_manifest.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/tartci_support_manifest.py" "$@"
 }
 
 cmd_gate_slot2() {
   local sub="${1:-}"; shift || true
   case "$sub" in
-    render|validate) exec python3 "$HERE/scripts/macos_gate_slot2.py" "$sub" "$@" ;;
+    render|validate) tartci_verified_python_run "$HERE/scripts/macos_gate_slot2.py" "$sub" "$@" ;;
     install) exec "$HERE/scripts/install_macos_gate_slot2.sh" "$@" ;;
     *) echo "usage: tartci gate-slot2 <render|validate|install> [...]"; return 2 ;;
   esac
@@ -298,7 +386,7 @@ cmd_observe() {
   local os="${1:-macos}"; shift || true
   tartci_resolve_tart_home
   case "$os" in
-    macos) exec python3 "$HERE/scripts/macos_observe.py" "$@" ;;
+    macos) tartci_verified_python_run "$HERE/scripts/macos_observe.py" "$@" ;;
     *) echo "usage: tartci observe <macos> [--json] [--runner NAME] [--run-id ID]"; return 2 ;;
   esac
 }
@@ -376,22 +464,28 @@ cmd_metrics() {
   local mode="${1:-report}"; shift || true
   local file="${1:-$HERE/metrics/sample.jsonl}"
   case "$mode" in
-    report)    exec python3 "$HERE/metrics/report.py" "$file" ;;
-    dashboard) exec python3 "$HERE/metrics/dashboard.py" "$file" "${2:-$HERE/metrics/index.html}" ;;
+    report)    tartci_verified_python_run "$HERE/metrics/report.py" "$file" ;;
+    dashboard) tartci_verified_python_run "$HERE/metrics/dashboard.py" "$file" "${2:-$HERE/metrics/index.html}" ;;
     *) echo "usage: tartci metrics [report|dashboard] [file]"; return 2 ;;
   esac
 }
 
 cmd_timings() {
-  exec python3 "$HERE/scripts/timing_summary.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/timing_summary.py" "$@"
 }
 
 cmd_runtime() {
-  exec python3 "$HERE/scripts/runtime_measure.py" "$@"
+  tartci_verified_python_run "$HERE/scripts/runtime_measure.py" "$@"
 }
 
 cmd_reclaim() {
   tartci_toml_exec_or_python3 "$HERE/scripts/disk_reclaim.py" "$@"
+}
+
+# A create+fsync+unlink probe of each cache/VM volume, with evidence and an
+# issue when a write stalls. Runs without tomllib: the agent renders its paths.
+cmd_disk() {
+  tartci_toml_exec_or_python3 "$HERE/scripts/disk_watchdog.py" "$@"
 }
 
 # The host artifact cache macOS guests mount read-only; see scripts/artifact-cache.sh.
@@ -455,7 +549,7 @@ cmd_ccache() {
   if [ "$have_cache" = 0 ]; then
     args=(--cache "${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}/ccache" ${args[@]+"${args[@]}"})
   fi
-  exec python3 "$HERE/scripts/ccache_guard.py" "$sub" ${args[@]+"${args[@]}"}
+  tartci_verified_python_run "$HERE/scripts/ccache_guard.py" "$sub" ${args[@]+"${args[@]}"}
 }
 
 cmd_windows() {
@@ -517,9 +611,18 @@ cmd_launchd() {
     reload) tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" --reload "$@" ;;
     # PreToolUse classifier for agent shells: exit 2 blocks a raw launchctl
     # mutation of a lane (see scripts/launchctl_guard.py, `tartci hooks print`).
-    guard) exec python3 "$HERE/scripts/launchctl_guard.py" "$@" ;;
+    guard) tartci_verified_python_run "$HERE/scripts/launchctl_guard.py" "$@" ;;
     status) tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
     heal)
+      # A refused interpreter must not silence the alert about it: run only the
+      # interpreter alert under Apple's Python (stdlib, never replaced by
+      # Homebrew), then fail like the refusal did.
+      local heal_python_error
+      if ! heal_python_error="$(tartci_toml_python_path 2>&1 >/dev/null)"; then
+        printf '%s\n' "$heal_python_error" >&2
+        /usr/bin/python3 "$HERE/scripts/interpreter_alert.py" || true
+        return 127
+      fi
       # Reboot/offline rejoin convergence includes the optional per-host relay
       # profile. Keep the watchdog's JSON output singular and pass dry-run
       # through without forwarding unrelated watchdog flags.
@@ -536,7 +639,7 @@ cmd_launchd() {
           [ "$arg" = "--dry-run" ] && network_args+=(--dry-run)
         done
         local network_output
-        if ! network_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" "${network_args[@]}")"; then
+        if ! network_output="$(tartci_toml_python "$HERE/scripts/network_profile.py" ${network_args[@]+"${network_args[@]}"})"; then
           printf '%s\n' "$network_output"
           return 6
         fi
@@ -552,7 +655,7 @@ cmd_launchd() {
         # next pass, so it is printed but not reported as exit 6, which is
         # reserved for a reconcile or relay probe that actually failed.
         local network_rc=0 network_text
-        network_text="$(tartci_toml_python "$HERE/scripts/network_profile.py" "${network_args[@]}")" \
+        network_text="$(tartci_toml_python "$HERE/scripts/network_profile.py" ${network_args[@]+"${network_args[@]}"})" \
           || network_rc=$?
         if [ "$network_rc" -eq 3 ]; then
           printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -566,7 +669,7 @@ cmd_launchd() {
       fi
       tartci_toml_exec "$HERE/scripts/tartci_launchd_watchdog.py" "$@"
       ;;
-    *) echo "usage: tartci launchd <reload <label> [--dry-run] [--allow-mid-job] | status | heal [--dry-run] [--json] | guard <--hook|--command CMD>>"; return 2 ;;
+    *) echo "usage: tartci launchd <reload <label> [--dry-run] [--force|--allow-mid-job] | status | heal [--dry-run] [--json] | guard <--hook|--command CMD>>"; return 2 ;;
   esac
 }
 
@@ -625,7 +728,7 @@ tartci_pool_capacity_floor_preflight() {
   local action="$1" allow="$2" output rc=0
   local -a floor_args=(check --action "$action")
   [ "$allow" = 1 ] && floor_args+=(--allow-last-serving-host)
-  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" "${floor_args[@]}" 2>&1)" || rc=$?
+  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" ${floor_args[@]+"${floor_args[@]}"} 2>&1)" || rc=$?
   # The floor's own exit code (0 ok, 3 last serving host, 4 capacity unknown)
   # survives the collapse to 11 so callers can say which refusal it was.
   TARTCI_POOL_FLOOR_EXIT="$rc"
@@ -770,10 +873,12 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
+  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|log|repair-lock> [--plan] [--force|--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
-  --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  --force  off: stop immediately even though an owned lane is mid-job (kills it);
+           --now is the same. Every on/off/drain/undrain is recorded in
+           ~/Library/Logs/tartci/manual-changes.log with its caller
   --restore-receipt  on: restore the previously receipted serving set during
            self-update recovery without requiring a fresh relay probe
   status --usage [--range DUR] [--until TS] [--json] [--peer HOST=SSH_TARGET]: slot
@@ -781,6 +886,9 @@ cmd_pool() {
            lane event logs (read-only; see scripts/pool_usage.py)
   supply --repo OWNER/REPO --class LABEL [--json]: free, leasable gate slots
            for one event class on this host (read-only; see gate_supply.py)
+  log [--status] [--json]: one pool-log pass, appending this host's status to
+           ~/.tartci/state/pool-log/events.jsonl on a change or hourly (the
+           pool-log LaunchAgent runs it every 300 s; see scripts/pool_log.py)
   exit 11 capacity floor refused; 12 off refused because a lane is mid-job;
   13 off closed admission but a lane was still loaded after the unload wait"
   case "$sub" in
@@ -788,6 +896,8 @@ cmd_pool() {
     # Read-only: this host's free, leasable gate slots for one event class,
     # which a fallback lane on another host reads over SSH before booting.
     supply) tartci_toml_exec "$HERE/scripts/gate_supply.py" report "$@" ;;
+    # Read-only: a bounded history of this host's pool status. Needs no tomllib.
+    log) tartci_toml_exec_or_python3 "$HERE/scripts/pool_log.py" "$@" ;;
   esac
   local arg allow_last_serving_host=0 plan=0 now=0 restore_receipt=0
   for arg in "$@"; do
@@ -795,10 +905,17 @@ cmd_pool() {
       -h|--help) echo "$pool_usage"; return 0 ;;
       --allow-last-serving-host) allow_last_serving_host=1 ;;
       --plan) plan=1 ;;
-      --now) now=1 ;;
+      --now|--force) now=1 ;;
       --restore-receipt) restore_receipt=1 ;;
     esac
   done
+  # Who changed the pool, recorded before the change (or its refusal). The
+  # 2026-10-16 05:19Z m5 off/on that killed two jobs left no trace of its caller.
+  pool_change_log() {
+    local outcome="$1"; shift
+    "$(tartci_pool_python)" "$HERE/scripts/manual_change_log.py" "pool $sub" "$outcome" "$@" \
+      >/dev/null 2>&1 || true
+  }
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
   local agents_dir="$HOME/Library/LaunchAgents"
   if [ "$plan" = 1 ]; then
@@ -830,16 +947,24 @@ cmd_pool() {
               fi
               printf '%s\n' "$mid_job_rows" | awk -F '\t' '$2 == "busy" || $2 == "unknown" { printf "  %s: %s (%s)\n", $1, $2, $3; next } NF < 2 && NF > 0 { print "  " $0 }'
               echo "Use \`tartci pool drain\` to let running jobs finish, \`tartci pool off --plan\`"
-              echo "to see what off would stop, or \`tartci pool off --now\` to stop immediately anyway."
+              echo "to see what off would stop, or \`tartci pool off --force\` (or --now) to stop"
+              echo "immediately anyway."
             } >&2
+            pool_change_log "refused: a lane is mid-job or unknown" "$@"
             return 12
           fi
         fi
         tartci_pool_capacity_floor_preflight off "$allow_last_serving_host" || return $?
+        if [ "$now" = 1 ]; then
+          pool_change_log "forced: mid-job check skipped" "$@"
+        else
+          pool_change_log "proceeding: every owned lane idle" "$@"
+        fi
         # Emergency stop deliberately bypasses the cooperative JIT-start lock.
         tartci_pool_write_participation 0
         tartci_pool_write_state off
       else
+        pool_change_log "requested" "$@"
         tartci_pool_config_verdicts on
         tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
         local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
@@ -989,7 +1114,7 @@ EOF
           # Any failed bootstrap, kickstart, or loaded-spec verification closes
           # admission, attempts to stop every receipted activation agent, and
           # proves the disabled/absent postcondition before claiming rollback.
-          for label in "${activation_attempted[@]}"; do
+          for label in ${activation_attempted[@]+"${activation_attempted[@]}"}; do
             launchd_target="$(tartci_pool_launchd_target "$label")"
             launchctl disable "$launchd_target" >/dev/null 2>&1 \
               || launchctl disable "$launchd_target" >/dev/null 2>&1 \
@@ -1083,6 +1208,7 @@ EOF
       # had before the drain. Refused unless the pool is draining.
       [ "$(tartci_pool_read_state)" = draining ] \
         || { echo "pool undrain refused: pool is $(tartci_pool_read_state), not draining" >&2; return 5; }
+      pool_change_log "requested" "$@"
       tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
       local label launchd_target
       while IFS= read -r label; do
@@ -1099,6 +1225,7 @@ EOF
       ;;
     drain)
       tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
+      pool_change_log "requested" "$@"
       # Close both native and provider admission before waiting for a provider
       # already inside the serialized JIT-start boundary.
       local prior_participation drain_wait_until
@@ -1168,10 +1295,18 @@ EOF
       for usage_arg in "$@"; do [ "$usage_arg" = --usage ] && want_usage=1; done
       if [ "$want_usage" = 1 ]; then
         for usage_arg in "$@"; do [ "$usage_arg" = --usage ] || usage_args+=("$usage_arg"); done
-        python3 "$HERE/scripts/pool_usage.py" ${usage_args[@]+"${usage_args[@]}"}
+        tartci_verified_python_run "$HERE/scripts/pool_usage.py" ${usage_args[@]+"${usage_args[@]}"}
         return $?
       fi
       local status_json=0 require_ready=0 require_serving=0
+      local status_python
+      if ! status_python="$(tartci_verified_python)"; then
+        # TOML is unavailable, but the read-only helpers only need Python's
+        # base runtime. Use the fixed system interpreter after verifying it;
+        # never fall back to PATH python3.
+        status_python=/usr/bin/python3
+        "$status_python" -c 'import sys; print(sys.implementation.name)' >/dev/null 2>&1 || status_python=false
+      fi
       for arg in "$@"; do
         case "$arg" in
           --json) status_json=1 ;;
@@ -1186,6 +1321,9 @@ EOF
       lock_health_json="$(tartci_pool_lock_health_json)" \
         || lock_health_json='{"state":"unobservable","present":null}'
       local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
+      # launcher_layout.py reads the helper app from the installed profile
+      # (else the receipt), so a receipt-less v2 host still reports v2.
+      local launcher_args=(--home "$HOME")
       local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[]}'
       local managed_plists=""
       managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
@@ -1204,6 +1342,27 @@ EOF
           fi
         fi
       fi
+      # A scan-blind lane cannot prove serving capacity.  Keep pool status
+      # fail-closed while the lane has exceeded its bounded blind streak; the
+      # queue-backed supervisor will clear this on its next successful scan.
+      local blind_logs blind_threshold
+      blind_threshold="${TARTCI_SCAN_BLIND_STATUS_THRESHOLD:-3}"
+      blind_logs="$(find "$HOME/Library/Logs/tartci" -maxdepth 1 -name 'macos-fleet-*.log' -print 2>/dev/null || true)"
+      if [ -n "$blind_logs" ]; then
+        blind_log_list="$(mktemp "${TMPDIR:-/tmp}/tartci-scan-blind.XXXXXX")"
+        printf '%s\n' "$blind_logs" >"$blind_log_list"
+        blind_rows="$($status_python "$HERE/scripts/scan_blind_status.py" \
+          "$fleet_receipt" "$blind_threshold" "$blind_log_list" 2>/dev/null || printf '[]')"
+        rm -f "$blind_log_list"
+        fleet_readiness="$($status_python - "$blind_rows" "$fleet_readiness" <<'PY'
+import json, sys
+value=json.loads(sys.argv[2]); bad=json.loads(sys.argv[1])
+if bad:
+    value.setdefault("problems", []).extend(bad); value["fleet_ready"] = False
+print(json.dumps(value, separators=(",", ":")))
+PY
+)"
+      fi
       # A runner agent this host's pool receipt does not name is one no pool
       # transition starts or stops. Reporting that per runner is what makes a
       # lane outside the fleet's model visible here instead of only in a queue
@@ -1212,34 +1371,47 @@ EOF
       pool_owned_labels="$(tartci_pool_owned_runner_agents "$agents_dir")"
       # The parked warm gate VM, if this host opted into one (report-only).
       local warm_vm_json
-      warm_vm_json="$(python3 "$HERE/scripts/warm_vm_status.py" --json 2>/dev/null)" \
+      warm_vm_json="$("$status_python" "$HERE/scripts/warm_vm_status.py" --json 2>/dev/null)" \
         || warm_vm_json='{"state":"unreadable"}'
       # The disk reclaimer's last pass, from its own receipt rather than from
       # launchd: a shadowed or dead reclaim agent is still "loaded" there.
       local reclaim_json
-      reclaim_json="$(python3 "$HERE/scripts/reclaim_status.py" --json 2>/dev/null)" \
+      reclaim_json="$("$status_python" "$HERE/scripts/reclaim_status.py" --json 2>/dev/null)" \
         || reclaim_json='{"state":"unreadable"}'
       [ -n "$reclaim_json" ] || reclaim_json='{"state":"unreadable"}'
       # Whether the host is configured to stay awake on AC (report-only): a
       # Studio that sleeps with its display takes every lane with it while
       # launchd still reports them loaded.
       local power_json
-      power_json="$(python3 "$HERE/scripts/power_status.py" --json 2>/dev/null)" \
+      power_json="$("$status_python" "$HERE/scripts/power_status.py" --json 2>/dev/null)" \
         || power_json='{"state":"unknown"}'
       [ -n "$power_json" ] || power_json='{"state":"unknown"}'
       # Whether launchd still starts this host's timer jobs, from the receipt
       # the lane supervisors' interval guard writes every minute.
       local launchd_timers_json
-      launchd_timers_json="$(python3 "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
+      launchd_timers_json="$("$status_python" "$HERE/scripts/launchd_interval_guard.py" status --json 2>/dev/null)" \
         || launchd_timers_json='{"state":"unreadable"}'
       [ -n "$launchd_timers_json" ] || launchd_timers_json='{"state":"unreadable"}'
+      # Which launcher layout this host runs (v1 or v2) and its v2 opt-in file.
+      local launcher_json
+      launcher_json="$("$status_python" "$HERE/scripts/launcher_layout.py" --status ${launcher_args[@]+"${launcher_args[@]}"} --receipt "$fleet_receipt" 2>/dev/null)" \
+        || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
+      [ -n "$launcher_json" ] || launcher_json='{"layout":null,"opt_in":"unreadable","problem":"launcher layout unreadable"}'
+      # Whether the VM store and repository volumes answer at all: the last
+      # cached result of scripts/store_stall.py. Pool status runs from agents
+      # and peers every few minutes, so it never probes; doctor and the
+      # watchdog do.
+      local store_json
+      store_json="$("$status_python" "$HERE/scripts/store_stall.py" --cached --json 2>/dev/null)" \
+        || store_json='{"state":"unprobed","detail":"probe unavailable","stalled":[]}'
+      [ -n "$store_json" ] || store_json='{"state":"unprobed","detail":"probe unavailable","stalled":[]}'
       if [ "$status_json" = 1 ]; then
         local lease_fit_json
-        lease_fit_json="$(python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
+        lease_fit_json="$("$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
           || lease_fit_json='{"managed":null}'
         [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
-        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json" "$launchd_timers_json"
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"reclaim":%s,"power":%s,"launchd_timers":%s,"launcher":%s,"store":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json" "$reclaim_json" "$power_json" "$launchd_timers_json" "$launcher_json" "$store_json"
         local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -1255,16 +1427,20 @@ EOF
         echo "host: $host"
         echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
-        python3 "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
-        python3 "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
-        python3 "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
-        python3 "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
+        "$status_python" "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
+        "$status_python" "$HERE/scripts/reclaim_status.py" 2>/dev/null || echo "reclaim: UNREADABLE"
+        "$status_python" "$HERE/scripts/power_status.py" 2>/dev/null || echo "power: UNREADABLE"
+        "$status_python" "$HERE/scripts/launchd_interval_guard.py" status 2>/dev/null \
           || echo "launchd timers: UNREADABLE"
-        python3 "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
+        "$status_python" "$HERE/scripts/launcher_layout.py" --status-text ${launcher_args[@]+"${launcher_args[@]}"} --receipt "$fleet_receipt" 2>/dev/null \
+          || echo "launcher: UNREADABLE"
+        "$status_python" -c 'import json, sys; sys.path.insert(0, sys.argv[2]); import store_stall; print(store_stall.describe(json.loads(sys.argv[1])))' "$store_json" "$HERE/scripts" 2>/dev/null \
+          || echo "store: UNREADABLE"
+        "$status_python" "$HERE/scripts/signing_prompt_guard.py" 2>/dev/null \
           || echo "signing prompts: UNREADABLE"
         # The readiness payload is already computed above; JSON formatting does
         # not require tomllib, so legacy/unmanaged hosts can still report status.
-        python3 - "$lock_health_json" <<'PY'
+        "$status_python" - "$lock_health_json" <<'PY'
 import json, sys
 value = json.loads(sys.argv[1])
 print(f"pool transition lock: {value['state']}")
@@ -1274,8 +1450,8 @@ if value.get("present"):
 PY
         # A lane that can never lease its VM, or identical lanes the lease
         # budget cannot run together, is configuration and not load.
-        python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
-        python3 - "$fleet_readiness" <<'PY'
+        "$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
+        "$status_python" - "$fleet_readiness" <<'PY'
 import json, sys
 fleet = json.loads(sys.argv[1])
 if fleet["managed"]:
@@ -1285,6 +1461,15 @@ if fleet["managed"]:
         print("verified running supervisors: unknown (not checked from here)")
     else:
         print(f"verified running supervisors: {verified}/{fleet['expected_supervisors']}")
+    # Say why. Without this, "fleet ready: NO" sent every reader to --json.
+    if not fleet["fleet_ready"]:
+        for problem in (fleet.get("problems") or [])[:6]:
+            if isinstance(problem, dict):
+                where = f" {problem['label']}" if problem.get("label") else ""
+                detail = f": {problem['detail']}" if problem.get("detail") else ""
+                print(f"  problem: {problem.get('code')}{where}{detail}"[:300])
+            else:
+                print(f"  problem: {problem}"[:300])
     # Deliberately its own line and not folded into `fleet ready`. A supervisor
     # can be installed, loaded, running and freshly heartbeating while serving
     # nothing at all, and printing only the first four made a lane that cloned
@@ -1296,15 +1481,22 @@ if fleet["managed"]:
     if blocked is None:
         print("serving: unknown (not checked from here)")
     elif blocked:
+        dhcp = [lane for lane in lanes if lane.get("cause") == "dhcp_breaker"]
+        admission = [lane for lane in lanes if lane.get("cause") == "admission failing"]
         disk = [lane for lane in lanes if lane.get("cause") == "disk"]
-        if disk:
+        if dhcp:
+            print(f"serving: NOT SERVING (DHCP breaker open; {len(dhcp)} lane(s))")
+        elif admission:
+            print(f"serving: NOT SERVING (admission failing; {len(admission)} lane(s))")
+        elif disk:
             reasons = ",".join(sorted({str(lane.get("reason") or "denied") for lane in disk}))
             print(f"serving: BLOCKED (disk: {reasons}; {len(disk)} lane(s) refused a VM lease)")
         else:
             print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
         for lane in lanes:
             streak = lane.get("streak")
-            extra = f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk" else ""
+            extra = (f" cause=disk reason={lane.get('reason')}" if lane.get("cause") == "disk"
+                     else f" cause={lane.get('cause')}" if lane.get("cause") else "")
             print(
                 f"  lane {lane['label']}: blocked_seconds={lane['blocked_seconds']} "
                 f"streak={'unknown' if streak is None else streak} "
@@ -1376,9 +1568,9 @@ $(tartci_pool_runner_agents "$agents_dir")
 EOF
         [ "$any" = 1 ] || echo "  (no runner agents installed on this host)"
         # One line of the last 24h; `pool status --usage` has the breakdown.
-        python3 "$HERE/scripts/pool_usage.py" --summary 2>/dev/null || true
+        "$status_python" "$HERE/scripts/pool_usage.py" --summary 2>/dev/null || true
       fi
-      if [ "$require_ready" = 1 ] && ! python3 - "$fleet_readiness" <<'PY'
+      if [ "$require_ready" = 1 ] && ! "$status_python" - "$fleet_readiness" <<'PY'
 import json, sys
 raise SystemExit(0 if json.loads(sys.argv[1]).get("fleet_ready") is True else 1)
 PY
@@ -1389,7 +1581,7 @@ PY
       # "is this host installed and running" and one asking "is this host
       # actually serving" want different answers, and an upstream refusal
       # that blocks every lane at once must not fail the first question.
-      if [ "$require_serving" = 1 ] && ! python3 - "$fleet_readiness" <<'SERVINGPY'
+      if [ "$require_serving" = 1 ] && ! "$status_python" - "$fleet_readiness" <<'SERVINGPY'
 import json, sys
 serving = json.loads(sys.argv[1]).get("serving") or {}
 raise SystemExit(0 if serving.get("blocked") is False else 1)
@@ -1404,14 +1596,31 @@ SERVINGPY
 
 usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
+# These commands have no --help of their own: asked for help, they would run
+# (setup installs packages, up/serve/prepare/windows start VMs). Print their
+# lines from the usage above instead, and nothing else.
+case "${1:-}:${2:-}" in
+  doctor:-h|doctor:--help|setup:-h|setup:--help|up:-h|up:--help|serve:-h|serve:--help|\
+  prepare:-h|prepare:--help|windows:-h|windows:--help|goldens:-h|goldens:--help|\
+  hooks:-h|hooks:--help|tart-image-sync:-h|tart-image-sync:--help)
+    usage | awk -v cmd="tartci $1" '
+      index($0, cmd) && substr($0, index($0, cmd) + length(cmd), 1) ~ /^( |$)/ { on = 1; print; next }
+      on && /^ +#/ { print; next }
+      { on = 0 }'
+    exit 0 ;;
+esac
+
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
+  scratch-vm) shift; tartci_verified_python_run "$HERE/scripts/scratch_vm.py" "$@" ;;
+  disk)    shift; cmd_disk "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
-  retention) shift; exec python3 "$HERE/scripts/state_retention.py" "$@" ;;
-  vm-dhcp) shift; exec python3 "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
-  held) shift; tartci_toml_python "$HERE/scripts/debug_hold.py" "$@"; exit $? ;;
+  retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;
+  vm-dhcp) shift; tartci_verified_python_run "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
+  runner-heal) shift; tartci_verified_python_run "$HERE/scripts/persistent_runner_heal.py" "$@" ;;
+  held) shift; tartci_toml_python_exec "$HERE/scripts/debug_hold.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
   pre-mint-outcomes) shift; cmd_pre_mint_outcomes "$@" ;;
@@ -1422,6 +1631,7 @@ case "${1:-help}" in
   steward-scheduler) shift; cmd_steward_scheduler "$@" ;;
   queue-saturation) shift; cmd_queue_saturation "$@" ;;
   ccache)  shift; cmd_ccache "$@" ;;
+  version|--version|-V) shift; cmd_version "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
   network-profile) shift; cmd_network_profile "$@" ;;
@@ -1429,6 +1639,7 @@ case "${1:-help}" in
   governor) shift; cmd_governor "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;
+  update) shift; tartci_toml_exec "$HERE/scripts/tartci_update.py" "$@" ;;
   support-manifest) shift; cmd_support_manifest "$@" ;;
   gate-slot2) shift; cmd_gate_slot2 "$@" ;;
   tart-image-sync) shift; cmd_tart_image_sync "$@" ;;

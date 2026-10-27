@@ -64,7 +64,7 @@ render_args=(--set "HOME=$HOME")
 
 rendered="$(mktemp)"
 trap 'rm -f "$rendered"' EXIT
-python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" "${render_args[@]}" >"$rendered"
+python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" ${render_args[@]+"${render_args[@]}"} >"$rendered"
 plutil -lint "$rendered" >/dev/null 2>&1 ||
   python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$rendered"
 

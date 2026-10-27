@@ -12,8 +12,10 @@ Run:  python3 scripts/test_tartci_launchd_watchdog.py
 from __future__ import annotations
 
 import testing_support  # noqa: E402
+import json
 import os
 import plistlib
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -23,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
 
 FAILS: list[str] = []
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def check(cond: bool, msg: str) -> None:
@@ -264,6 +267,25 @@ with tempfile.TemporaryDirectory() as td:
     check(probe.tart_home == str(tart_home),
           f"probe must report the exact Tart store it inspected: {probe}")
 
+# A wedged Tart store must become an unavailable probe, not hang the watchdog.
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nsleep 2\n")
+    fake_tart.chmod(0o755)
+    with mock.patch.dict(
+        os.environ,
+        {
+            "PATH": "/usr/bin:/bin",
+            "TARTCI_TART_CLI": str(fake_tart),
+            "TART_HOME": str(tart_home),
+        },
+    ), mock.patch.object(wd, "TART_INVENTORY_TIMEOUT_S", 0.01):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None, f"timed-out Tart inventory must be unavailable: {probe}")
+    check("timed out" in probe.reason, f"timeout cause must survive the probe: {probe.reason}")
+
 # The installed profile names a custom Tart store; reading it needs tomllib.
 if testing_support.HAVE_TOMLLIB:
     with tempfile.TemporaryDirectory() as td:
@@ -294,6 +316,18 @@ if testing_support.HAVE_TOMLLIB:
         check("non-object entry" in probe.reason,
               f"malformed inventory cause must survive the probe: {probe.reason}")
 
+# A failed storage gate must short-circuit Tart inventory entirely. This keeps
+# the watchdog bounded when Tart itself is blocked inside a wedged mount.
+with mock.patch.object(wd, "probe_tart_vm_running") as inventory:
+    probe = wd.probe_tart_vm_running_after_storage({
+        "state": "draining", "path": "/Volumes/Example/VMs",
+        "last_result": {"reason": "timeout after 10s"},
+    })
+check(probe.running is None, f"unhealthy storage must be unavailable: {probe}")
+check("timeout after 10s" in probe.reason,
+      f"storage reason must survive inventory short-circuit: {probe.reason}")
+check(not inventory.called, "unhealthy storage must not invoke Tart inventory")
+
 with tempfile.TemporaryDirectory() as td:
     fake_tart = Path(td) / "tart"
     fake_tart.write_text("#!/bin/sh\nexit 99\n")
@@ -314,6 +348,46 @@ with tempfile.TemporaryDirectory() as td:
           f"malformed profile shape must be unavailable, not crash or idle: {probe}")
     check("Tart store unavailable" in probe.reason,
           f"malformed profile must preserve a typed store cause: {probe.reason}")
+
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nexit 0\n")
+    fake_tart.chmod(0o755)
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "TARTCI_TART_CLI": str(fake_tart),
+                "TART_HOME": str(tart_home),
+            },
+        ),
+        mock.patch.object(
+            wd,
+            "_run_tart_inventory",
+            side_effect=subprocess.TimeoutExpired([str(fake_tart), "list"], 30),
+        ),
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None,
+          f"timed out Tart inventory must be unavailable, not idle: {probe}")
+    check("timed out" in probe.reason.lower(),
+          f"timed out Tart inventory must preserve its cause: {probe.reason}")
+
+with tempfile.TemporaryDirectory() as td:
+    with mock.patch.object(
+        wd.store_health,
+        "run_bounded",
+        return_value=subprocess.CompletedProcess(["tart", "list", "--format", "json"], 0, "[]", ""),
+    ) as run:
+        wd._run_tart_inventory("/bin/tart", td)
+    check(run.call_args.kwargs.get("timeout") == 30,
+          f"Tart inventory must enforce a 30s subprocess timeout: {run.call_args}")
+    check(run.call_args.kwargs.get("operation") == "tart_inventory",
+          f"Tart inventory must identify its bounded operation: {run.call_args}")
+    check(run.call_args.kwargs["env"]["TART_HOME"] == td,
+          f"Tart inventory must pass the resolved Tart home: {run.call_args}")
 
 with (
     mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
@@ -835,6 +909,22 @@ check(wd.should_heal([NOW - 4000, NOW - 5000, NOW - 6000], NOW, WINDOW, MAXH),
 # heals_in_window prunes correctly.
 kept = wd.heals_in_window([NOW - 10, NOW - 4000], NOW, WINDOW)
 check(kept == [NOW - 10], f"heals_in_window prune: {kept}")
+
+# Smoke the real entrypoint on macOS after the serving-truth alert pass was
+# removed; Linux has no launchctl and cannot run this process-level path.
+if sys.platform == "darwin":
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "tartci_launchd_watchdog.py"),
+         "--status", "--json"], capture_output=True, text=True, check=False, timeout=30,
+    )
+    # ``--status`` is an attention report: a healthy process exits 0, while a
+    # real host condition intentionally exits 1 after still emitting JSON.
+    check(proc.returncode in (0, 1),
+          f"watchdog status entrypoint failed: {proc.stderr}")
+    try:
+        json.loads(proc.stdout)
+    except ValueError as exc:
+        check(False, f"watchdog status did not emit JSON: {exc}")
 
 
 if FAILS:

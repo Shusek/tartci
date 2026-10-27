@@ -35,6 +35,7 @@ M3_RECEIPT = {
     "ts": RECEIPT_TS,
 }
 TITLE = "[tartci] studio launchd stalled / self-update paused since 2026-10-05T05:41:27Z"
+VITALS_TITLE = "[tartci] studio host-vitals stalled since 2026-10-09T06:54:45Z"
 PEERS = {"m1": "m1", "m5": "m5", "studio": "m3"}
 
 
@@ -46,18 +47,25 @@ class Fleet:
         self.calls: list[str] = []
 
     def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
-              last: dict | None = None) -> None:
+              last: dict | None = None, vitals: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
         tail = json.dumps(last) if last is not None else ""
         self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
-                                   f"{psa.LAST_SEPARATOR}\n{tail}\n", "")
+                                   f"{psa.LAST_SEPARATOR}\n{tail}\n"
+                                   f"{psa.VITALS_SEPARATOR}\n"
+                                   f"{json.dumps(vitals) if vitals is not None else ''}\n", "")
 
     def healthy(self, target: str) -> None:
         self.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
                             "paused": []})
 
     def run(self, argv: list[str]) -> tuple[int, str, str]:
-        target = argv[argv.index("ConnectTimeout=10") + 1]
+        # The fixture must observe the exact production transport command;
+        # hand-building a replacement stdout would miss PEER_READ regressions.
+        if argv[-1] != psa.PEER_READ:
+            raise AssertionError("fixture did not receive the production PEER_READ command")
+        # "--" ends ssh's options; the destination follows it.
+        target = argv[argv.index("--") + 1]
         self.calls.append(target)
         return self.answers.get(target, (255, "", "ssh: connect to host: Operation timed out"))
 
@@ -86,6 +94,37 @@ class PeerStall(unittest.TestCase):
         return psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS, me=host,
                               run=self.fleet.run, close=self.close, **kw)
 
+    def test_configured_advertised_supply_is_used_without_checkout(self):
+        supply = self.tmp / "advertised-labels.json"
+        supply.write_text(json.dumps({
+            "schema": "tartci.advertised-labels/v1",
+            "registrations": [],
+            "hosts": [
+                {"host_id": "m1", "ssh": "m1"},
+                {"host_id": "studio", "ssh": "m3"},
+            ],
+        }) + "\n")
+        profile = self.tmp / "macos-fleet-profile.toml"
+        profile.write_text('[host]\nid = "m1"\nssh = "m1"\n')
+        with (
+            mock.patch.dict(os.environ, {
+                "TARTCI_ADVERTISED_LABELS": str(supply),
+                "TARTCI_FLEET_PROFILE": str(profile),
+            }, clear=False),
+            mock.patch.object(psa.pathlib.Path, "home", return_value=self.tmp),
+        ):
+            out = psa.alert_pass(
+                now=RECEIPT_TS + 60,
+                directory=self.tmp / "configured",
+                peers=None,
+                me=None,
+                run=self.fleet.run,
+                issue=self.issue,
+                close=self.close,
+            )
+        self.assertFalse(out["skipped"])
+        self.assertTrue(out["peers"]["studio"]["active"])
+
     def test_m3_stalled_97_h_is_one_issue_named_by_a_peer(self):
         out = self.run_pass(RECEIPT_TS + 60)
         self.assertTrue(out["peers"]["studio"]["active"])
@@ -108,6 +147,36 @@ class PeerStall(unittest.TestCase):
         self.assertFalse(out["peers"]["studio"]["active"])
         self.assertEqual(out["peers"]["studio"]["hours"], 2.0)
         self.assertEqual(self.opened, [])
+
+    def test_a_peer_tick_alerts_on_stale_host_vitals_with_heal_remedy(self):
+        sampled = RECEIPT_TS - 360
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": sampled})
+        out = self.run_pass(RECEIPT_TS + 60)
+        self.assertEqual(out["peers"]["studio"]["host_vitals"]["state"], "stale")
+        self.assertEqual([title for title, _ in self.opened], [VITALS_TITLE])
+        self.assertIn("tartci launchd heal", self.opened[0][1])
+
+    def test_fresh_host_vitals_is_the_negative_control(self):
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 30})
+        out = self.run_pass(RECEIPT_TS + 60)
+        self.assertEqual(out["peers"]["studio"]["host_vitals"]["state"], "ok")
+        self.assertEqual(self.opened, [])
+
+    def test_host_vitals_recovery_closes_the_peer_issue(self):
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(RECEIPT_TS + 60)
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS + psa.READ_SECS + 60,
+                         vitals={"sampled_at": RECEIPT_TS + psa.READ_SECS + 30})
+        out = self.run_pass(RECEIPT_TS + psa.READ_SECS + 60)
+        self.assertTrue(out["peers"]["studio"]["host_vitals"]["closed"])
 
     def test_the_peer_is_judged_on_its_own_clock(self):
         # This host's clock is a day ahead; the peer's receipt is fresh on its own.
@@ -304,7 +373,7 @@ class PeerStall(unittest.TestCase):
         self.assertEqual((peers, me), (expected, "m5"))
         # A node name that names no published host (no profile read): read every host.
         with mock.patch.object(vm_boot_alert, "_alert_host",
-                               return_value=("Daniels-Mac-Studio", "x")):
+                               return_value=("studio-host", "x")):
             self.assertIsNone(psa.published_peers(home=self.tmp, run=git)[1])
         cfg = fsu.Config(home=self.tmp)
         with mock.patch.object(fsu, "published_supply", return_value=supply):
@@ -347,6 +416,69 @@ class PeerStall(unittest.TestCase):
         main = main[main.index("def main("):]
         self.assertLess(main.index("for h in health:"), main.index("peer_stall_pass()"),
                         "the peer read runs after the heal work")
+
+
+
+class ConfiguredFleetSourceTests(unittest.TestCase):
+    """Peers come from a configured private source, validated, never a fallback."""
+
+    def setUp(self) -> None:
+        import test_fleet_source  # noqa: PLC0415 - owns what a valid source is
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = test_fleet_source.configured_source(self.tmp / "source", {
+            "hosts": [{"host_id": "m1", "ssh": "m1"}, {"host_id": "studio", "ssh": "m3"}]})
+        patcher = mock.patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("TARTCI_ADVERTISED_LABELS", None)
+
+    @staticmethod
+    def git(argv):
+        raise AssertionError(f"read the public supply: {argv}")
+
+    def test_a_configured_source_is_read_without_git(self):
+        import vm_boot_alert
+        with mock.patch.object(vm_boot_alert, "_alert_host", return_value=("m1", "m1")):
+            peers, me = psa.published_peers(home=self.tmp, run=self.git)
+        self.assertEqual(({"m1": "m1", "studio": "m3"}, "m1"), (peers, me))
+
+    def test_an_invalid_source_refuses_without_falling_back(self):
+        (self.tmp / "source" / "profiles" / "canary-macos-fleet.toml").write_text("schema = 2\n")
+        with self.assertRaisesRegex(RuntimeError, "published supply refused: .*stale"):
+            psa.published_peers(home=self.tmp, run=self.git)
+
+    def test_a_disagreeing_advertised_labels_refuses(self):
+        os.environ["TARTCI_ADVERTISED_LABELS"] = str(self.tmp / "public.json")
+        with self.assertRaisesRegex(RuntimeError, "configured fleet source publishes"):
+            psa.published_peers(home=self.tmp, run=self.git)
+
+    def test_a_configured_source_alone_is_not_skipped_as_unmanaged(self):
+        with mock.patch.object(psa.pathlib.Path, "home", return_value=self.tmp), \
+                mock.patch.object(psa, "published_peers", return_value=({}, "m1")) as peers:
+            out = psa.alert_pass(now=RECEIPT_TS, directory=self.tmp / "state",
+                                 peers=None, me=None, run=lambda argv: (1, "", ""))
+        peers.assert_called_once()
+        self.assertNotEqual("no self-update checkout", out.get("reason"))
+
+
+class PeerSshDestinationTests(unittest.TestCase):
+    """A published supply's `ssh` reaches ssh argv only as a plain destination."""
+
+    def test_a_hostile_target_is_never_dialled(self) -> None:
+        fleet = Fleet()
+        info = psa.read_peer("-oProxyCommand=touch /tmp/x", run=fleet.run)
+        self.assertFalse(info["readable"])
+        self.assertIn("refused ssh destination", info["error"])
+        self.assertEqual([], fleet.calls)
+
+    def test_a_plain_alias_is_read_after_the_option_terminator(self) -> None:
+        fleet = Fleet()
+        fleet.healthy("m1")
+        seen: list[list[str]] = []
+        info = psa.read_peer("m1", run=lambda argv: (seen.append(argv), fleet.run(argv))[1])
+        self.assertTrue(info["readable"], info)
+        self.assertEqual(["--", "m1", psa.PEER_READ], seen[0][-3:])
 
 
 if __name__ == "__main__":

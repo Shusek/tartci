@@ -52,8 +52,9 @@ class CacheRoutingTests(unittest.TestCase):
         symlinks the default cache path onto the mount, and the runner .env
         names it so the workflow's cmake finds it."""
         body = MAC_JIT.read_text(encoding="utf-8")
-        self.assertIn('tartci_prepare_disk_root "$CACHE_ROOT/configure-checks"', body)
-        # `$cache_ro` is empty unless TARTCI_HOST_CACHE_ACCESS=ro.
+        lib = (ROOT / "providers/tart-macos/lane-cache-root.lib.sh").read_text(encoding="utf-8")
+        self.assertIn('tartci_prepare_lane_cache_mounts "$CACHE_ROOT"', body)
+        self.assertIn('tartci_prepare_disk_root "$root/configure-checks"', lib)
         self.assertIn('--dir="configure-checks:$CACHE_ROOT/configure-checks$cache_ro"', body)
         self.assertIn("ln -sfn '/Volumes/My Shared Files/configure-checks'", body)
         self.assertIn("PULP_CONFIGURE_CHECK_CACHE_DIR=%s", body)

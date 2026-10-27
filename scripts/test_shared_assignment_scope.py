@@ -14,7 +14,7 @@ class SharedAssignmentScopeTests(unittest.TestCase):
         def api(cli,path,repo,timeout):
             if '/repositories?' in path:return {'total_count':len(selected),'repositories':[{'full_name':r} for r in selected]}
             if path.startswith('repos/'):return {'private':True,'visibility':'private'}
-            return {'visibility':visibility}
+            return {'visibility':visibility,'allows_public_repositories':False}
         with patch.dict(os.environ,{'TARTCI_ASSIGNMENT_REPOSITORIES':'\n'.join(declared),'TARTCI_RUNNER_SCOPE':'org'}),patch('runner_group_repository_access.api',side_effect=api) as calls:
             receipt=verify(PRIMARY,group,'fixture',5)
         return receipt,calls.call_count

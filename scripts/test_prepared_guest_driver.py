@@ -1,4 +1,5 @@
 """Whole provider local lifecycle with a fake VM and a real guest-driver ABI."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -63,13 +64,22 @@ elif a[0]=='list':
                 else:text='#!/bin/bash\nexit 0\n'
                 script.write_text(text);script.chmod(0o700)
             for file in ['golden.qcow2','firmware.fd','vars.fd']:(root/file).touch()
+            empty_digest=hashlib.sha256(b'').hexdigest()
+            (root/'golden.qcow2.sha256').write_text(empty_digest+'  golden.qcow2\n')
+            # Model APFS cloning/sealing for these empty fake disks on Linux.
+            # Native snapshot admission/sealing has its own real macOS tests.
+            for name,body in {
+                'cp':'#!/bin/sh\nif [ "$1" = -c ]; then shift; fi\nexec /bin/cp "$@"\n',
+                'chflags':'#!/bin/sh\nexit 0\n',
+            }.items():
+                (bin/name).write_text(body);(bin/name).chmod(0o700)
             env={'PATH':str(bin)+':'+os.environ['PATH'],'HOME':str(root),'FIXTURE':str(root),
                  'TARTCI_GUEST_DRIVER':str(driver),'TARTCI_VM_LEASES':'0',
                  'TART_HOME':str(root/'vms'),'TARTCI_VM_DISK_FREE_FLOOR_GB':'1','TARTCI_STATE_DIR':str(root/'state'),'TARTCI_MACOS_GOLDEN':'fixture-golden','TARTCI_LINUX_GOLDEN':'fixture-golden','TARTCI_LINUX_LOGS':str(root/'logs'),
                  'TARTCI_GH_CLI':str(bin/'fake-gh'),'TARTCI_JIT_GH_CLI':str(bin/'fake-gh'),
                  'TARTCI_WIN_WORK':str(root/'jobs'),'TARTCI_WIN_LOGS':str(root/'logs'),
                  'TARTCI_WIN_GOLDEN':str(root/'golden.qcow2'),'TARTCI_WIN_FIRMWARE':str(root/'firmware.fd'),
-                 'TARTCI_WIN_VARS_TEMPLATE':str(root/'vars.fd'),'TARTCI_RUNNER_NAME_PREFIX':'tc-fixture',
+                 'TARTCI_WIN_VARS_TEMPLATE':str(root/'vars.fd'),'TARTCI_WIN_VARS_SHA256':empty_digest,'TARTCI_RUNNER_NAME_PREFIX':'tc-fixture',
                  'TARTCI_MACOS_VM_CORES':'4','TARTCI_MACOS_VM_MEM_MB':'8192','TARTCI_WIN_CPUS':'2',
                  'TARTCI_WIN_PROXY_COMMAND':'/usr/bin/true','TARTCI_RUNNER_IDLE_TIMEOUT_SECS':'4','TARTCI_TEARDOWN_STEP_TIMEOUT_SECS':'1','TARTCI_JOB_TIMEOUT_SECS':'10'}
             if provider=='tart-macos':env['TARTCI_RUNNER_VERSION']='2.337.0'
@@ -220,7 +230,7 @@ raise SystemExit({'admit':0,'defer':3,'error':1}[verdict])
     def test_missing_driver_cannot_enable_local_mode(self):
         for provider in ('tart-macos','qemu-windows','tart-linux'):
             with tempfile.TemporaryDirectory() as directory:
-                env={'PATH':'/usr/bin:/bin','HOME':directory}
+                env={'PATH':'/usr/bin:/bin','HOME':directory,'TART_HOME':str(Path(directory)/'vms')}
                 r=subprocess.run(['/bin/bash',str(ROOT/'providers'/provider/'runner.sh'),'--once','--local-job','fixture'],env=env,capture_output=True,text=True,timeout=5)
                 self.assertNotEqual(r.returncode,0)
                 self.assertIn('requires',r.stderr)

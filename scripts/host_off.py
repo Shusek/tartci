@@ -96,6 +96,24 @@ def read_pool_state(path: Path) -> str:
     return value if value in ("on", "draining", "off") else "unknown"
 
 
+# A host deliberately held OFF because its Tart may not run (written by
+# fleet_self_update when a Tart rollback did not bring the previous Tart
+# back). It still alerts every pass, but nothing turns its pool on
+# automatically: an operator fixes Tart, removes this file, runs pool on.
+HOLD = "tart-broken.json"
+
+
+def held(sdir: Path) -> dict | None:
+    """The Tart hold, when it belongs to the episode last.json records now (the
+    same OFF). A hold left from an earlier episode is ignored: it must never
+    suppress recovery of an unrelated OFF months later."""
+    hold = _read_json(sdir / HOLD)
+    last = _read_json(sdir / "last.json") or {}
+    if hold is None or not last.get("host_off") or hold.get("episode") != last.get("at"):
+        return None
+    return hold
+
+
 def status(sdir: Path, pool_file: Path, now: float | None = None,
            pool_state: str | None = None) -> dict:
     """Whether a self-update left this host OFF and nobody has touched it since."""
@@ -125,11 +143,16 @@ def status(sdir: Path, pool_file: Path, now: float | None = None,
         out["reason"] = f"pool set {pool_state} deliberately at {_iso(changed)}"
         return out
     seconds = max(0.0, now - since)
+    hold = held(sdir)
+    if hold is not None:
+        out["held"] = str(hold.get("reason") or "Tart may not run")[:300]
     out.update(unexpected=True, loud=seconds >= LOUD_AFTER_SECONDS, since=_iso(since),
                minutes=int(seconds // 60),
                cause=str(last.get("error") or "")[:300],
                target=str(last.get("target") or "")[:12],
-               detail=(f"a failed self-update left this host {pool_state.upper()} for "
+               detail=(("HELD OFF on purpose (Tart may not run; never turned on "
+                        "automatically; see docs/runbook.md, Tart): " if hold is not None else "")
+                       + f"a failed self-update left this host {pool_state.upper()} for "
                        f"{int(seconds // 60)} min (since {_iso(since)}): "
                        f"{str(last.get('error') or '')[:200]}"))
     return out
@@ -174,6 +197,9 @@ def recover(sdir: Path, pool_file: Path, pool_on: Callable[[], tuple[int, str]],
     current = status(sdir, pool_file, now, pool_state=pool_state)
     if not current["unexpected"]:
         return {"attempted": False, "ok": None, "reason": current.get("reason") or "not left off"}
+    if current.get("held"):
+        return {"attempted": False, "ok": None,
+                "reason": f"held OFF on purpose, never turned on automatically: {current['held']}"}
     if _active_update(sdir):
         return {"attempted": False, "ok": None, "reason": "a self-update is running"}
     record = _read_json(sdir / "recovery.json") or {}
@@ -285,7 +311,8 @@ def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None
 
 def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
           issue: Callable[[str, str], tuple[int, str]] | None = None,
-          close: Callable[[str], tuple[int, str]] | None = None) -> dict:
+          close: Callable[[str], tuple[int, str]] | None = None,
+          immediate: bool = False) -> dict:
     """Once per episode: event + GitHub issue when loud; close it on recovery.
 
     `issue(title, body)` and `close(number)` default to ghapp; a failure is
@@ -294,17 +321,19 @@ def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
     now = time.time() if now is None else now
     current = status(sdir, pool_file, now)
     out = episode_alert(
-        sdir / "host-off-alert.json", active=current["loud"],
+        sdir / "host-off-alert.json", active=current["loud"] or immediate,
         resolved=not current["unexpected"], since=current.get("since"),
         raise_event=lambda: event(sdir, "host_off_unexpected", current["detail"],
                                   {"since": current["since"], "minutes": current["minutes"],
                                    "target": current.get("target")}, now),
         render=lambda: (
             f"[tartci] {host} left OFF by a failed self-update since {current['since']}",
-            f"{current['detail']}\n\nThe host's launchd watchdog and self-update agent "
+            f"{current['detail']}\n\nReason: the self-update could not restore pool service. "
+            "Remedy: inspect the named failure, then run `tartci pool status` and "
+            "`tartci pool on` after the underlying issue is repaired.\n\nThe host's launchd watchdog and self-update agent "
             "retry `pool on` every 5 min; this issue closes itself when the pool is on "
-            "again. Check `tartci pool status` and "
-            "`~/.tartci/state/self-update/last.json` on the host."),
+            "again. Check tartci pool status and "
+            "~/.tartci/state/self-update/last.json on the host."),
         issue=issue, close=close,
         issues_enabled=os.environ.get("TARTCI_HOST_OFF_ISSUE", "1") != "0")
     out.pop("closed", None)
@@ -334,6 +363,14 @@ def _open_issue(title: str, body: str) -> tuple[int, str]:
     # ghapp derives repository provenance from the working directory, so it
     # runs inside the tartci checkout the self-update agent keeps.
     return _ghapp(["api", "-X", "POST", f"repos/{ISSUE_REPO}/issues", "-f", f"title={title}",
+                   "-f", f"body={body}", "--jq", ".number"], _update_checkout())
+
+
+def _patch_issue_body(number: str, body: str) -> tuple[int, str]:
+    """Rewrite an issue's body, as when its incident marker gains fixed_at."""
+    if _scratch_home():
+        return 1, "refused: issue writes from a scratch TARTCI_HOME (a test run) never reach GitHub"
+    return _ghapp(["api", "-X", "PATCH", f"repos/{ISSUE_REPO}/issues/{number}",
                    "-f", f"body={body}", "--jq", ".number"], _update_checkout())
 
 

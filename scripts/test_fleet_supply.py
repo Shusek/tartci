@@ -29,6 +29,15 @@ def _cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PublishedSupplyTests(unittest.TestCase):
+    def test_publish_refuses_an_empty_source(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "profiles").mkdir()
+            (root / "fleet").mkdir()
+            (root / "fleet" / "advertised-labels.json").write_text("{}\n")
+            with self.assertRaisesRegex(ValueError, "no macOS fleet profiles"):
+                fleet.published_snapshot(root)
+
     def test_committed_file_is_current(self) -> None:
         """The CI gate: fleet/advertised-labels.json cannot go stale in-repo."""
         self.assertEqual(PUBLISHED.read_text(), fleet.render_published(fleet.published_snapshot()),
@@ -64,9 +73,9 @@ class PublishedSupplyTests(unittest.TestCase):
             root = Path(td)
             shutil.copytree(ROOT / "profiles", root / "profiles")
             before = fleet.published_snapshot(root)
-            m1 = ROOT / "profiles" / "m1-macos-fleet.toml"
-            text = m1.read_text().replace('name = "m1-macos-fleet"', 'name = "x9-macos-fleet"')
-            text = text.replace('id = "m1"', 'id = "x9"', 1)
+            source = ROOT / "profiles" / "m5-macos-fleet.toml"
+            text = source.read_text().replace('name = "m5-macos-fleet"', 'name = "x9-macos-fleet"')
+            text = text.replace('id = "m5"', 'id = "x9"', 1)
             (root / "profiles" / "x9-macos-fleet.toml").write_text(text)
             after = fleet.published_snapshot(root)
             self.assertFalse(any(p.endswith("x9-macos-fleet.toml")
@@ -135,11 +144,11 @@ class VerifySupplyTests(unittest.TestCase):
     def test_unknown_host_or_unreadable_is_never_match(self) -> None:
         # m1 loads with any host id (m3's worktree_cleanup is pinned to studio),
         # so this reaches the host_id lookup rather than failing validation.
-        m1 = (ROOT / "profiles" / "m1-macos-fleet.toml").read_text()
-        unknown = self.verdicts(m1.replace('id = "m1"', 'id = "nohost"', 1))
+        control = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
+        unknown = self.verdicts(control.replace('id = "m5"', 'id = "nohost"', 1))
         self.assertEqual(unknown["state"], "unknown")
         self.assertIn("declares no registrations", unknown["reason"])
-        self.assertEqual(self.verdicts(m1)["state"], "match")  # control
+        self.assertEqual(self.verdicts(control)["state"], "match")  # control
         self.assertEqual(fleet.verify_supply(Path(self.td.name) / "absent.toml",
                                              self.published)["state"], "unknown")
         self.assertEqual(fleet.verify_supply(self.installed, None, "boom")["state"], "unknown")

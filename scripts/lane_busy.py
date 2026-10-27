@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Is a launchd-supervised runner lane mid-job right now?
 
-A lane supervisor (a tartci fleet LaunchAgent, a legacy `tart-runner`, or a
+A lane supervisor (a tartci fleet LaunchAgent, a legacy tart-runner, or a
 persistent `actions.runner.*` service) is mid-job exactly when the process
 launchd started for it has a live descendant doing the work:
 
@@ -9,7 +9,7 @@ launchd started for it has a live descendant doing the work:
   * `qemu-system-*`  the Windows lane's VM (QEMU on the host)
   * `Runner.Worker`  a persistent Actions runner executing a job on the host
 
-Stopping the supervisor (`launchctl bootout`, `kickstart -k`, `tartci pool off`)
+Stopping the supervisor (launchctl bootout, kickstart -k, tartci pool off)
 kills that descendant with it. On 2026-09-22 a raw kickstart of a lane
 supervisor killed a healthy, just-recovered VM mid-job.
 
@@ -86,9 +86,12 @@ WORK_PATTERNS = (
 # providers/tart-macos/runner.sh `heartbeat` phases. Past waiting: the
 # supervisor has admitted work and owns (or is about to own) a VM or a runner.
 BUSY_PHASES = frozenset({
-    "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
+    "cloning", "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
     "admission-check", "admission-deferred", "admission-error",
     "minting-jit", "idle-wait", "idle-retarget-check",
+    # A booted VM held for one more demand scan before the pre-mint discard
+    # (retarget_after_pre_mint_denial); it still holds its lease.
+    "pre-mint-hold",
     "job-running", "cancel-pending-terminal",
     # A torn-down VM whose deletion is not yet proved; the lane still holds
     # its lease and reservation (reconcile_pending_delete).
@@ -101,6 +104,7 @@ IDLE_PHASES = frozenset({
     "waiting", "loop", "yielding", "draining", "stopped",
     "scan_blind", "scan_blind_escalated", "jit-admission-denied",
     "vm-lease-denied", "admission-precheck-deferred", "admission-precheck-error",
+    "yielded-storage-health",
     # Before the lease: no VM exists yet. The clone that follows is covered
     # by the VM lease and the `tart clone` descendant.
     "admission-precheck",
@@ -111,6 +115,7 @@ IDLE_PHASES = frozenset({
     "lease-wait", "lease-never-fits", "job-claim-covered",
     # The host's VM DHCP breaker is open (vm-dhcp.lib.sh): no VM is cloned.
     "vm-dhcp-breaker-open",
+    "inventory-unavailable",
     # A parked warm VM: booted, holding no job and no cores. Stopping the lane
     # discards it and loses nothing (see parked_warm_vm below).
     "warm-parked",

@@ -77,6 +77,9 @@ class Host:
             self.versions["pulp"] = installed
             return 0, "Extracting to ~/.pulp/bin..."
         name = Path(argv[0]).name
+        if name == "tart":
+            version = self.versions.get("tart")
+            return (0, version) if version else (127, "not installed")
         if "fleet-update" in argv:
             if self.fleet_update_results:
                 rc, out = self.fleet_update_results.pop(0)
@@ -127,6 +130,8 @@ class ToolFreshnessTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"TARTCI_HOME": str(self.home / ".tartci")})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Tests do not depend on the repository's real pin, which moves.
+        self.pin("2.40.1")
         self.state = tf.state_dir_for(self.home)
         # Status reads ages against this clock: just after the fixed NOW.
         clock = mock.patch.object(state_age, "clock", lambda: NOW + 60)
@@ -155,7 +160,7 @@ class ToolFreshnessTests(unittest.TestCase):
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def test_current_tools_raise_no_problem(self) -> None:
-        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2", "tart": "2.40.1"})
         value = self.refresh(host)
         self.assertEqual({row["state"] for row in value["tools"].values()}, {"current"})
         summary = tf.summary(self.home)
@@ -543,6 +548,89 @@ class ToolFreshnessTests(unittest.TestCase):
                           for e in self.events()],
                          [("pulp", "0.305.0", "0.877.2", "observed", "current")])
 
+    def pin(self, version: str) -> None:
+        root = self.home / "generation"
+        (root / "fleet").mkdir(parents=True, exist_ok=True)
+        (root / "fleet" / "tart.toml").write_text(
+            f'[tart]\nversion = "{version}"\nsha256 = "{"a" * 64}"\n'
+            f'[softnet]\nversion = "0.24.0"\nsha256 = "{"b" * 64}"\n')
+        patcher = mock.patch.object(tf, "SUPPORT_ROOT", root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_tart_is_measured_against_its_pin_not_releases_or_the_tap(self) -> None:
+        # openai/tart had released 2.41.1 and the tap offered 2.40.1; only the
+        # reviewed pin says what the fleet runs.
+        self.pin("2.40.1")
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2", "tart": "2.36.0"})
+        row = self.refresh(host)["tools"]["tart"]
+        self.assertEqual(row["state"], "behind")
+        self.assertEqual(row["latest_tag"], "2.40.1")
+        self.assertEqual(row["behind_since"], iso(NOW))
+        self.assertFalse(any("openai/tart" in str(call) or Path(call[0]).name == "brew"
+                             for call in host.calls))
+        host.versions["tart"] = "2.40.1"
+        self.assertEqual(self.refresh(host, NOW + HOUR)["tools"]["tart"]["state"], "current")
+
+    def gate(self, **value) -> None:
+        path = self.home / ".tartci" / "state" / "self-update" / "tart-gate.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value))
+
+    def test_tart_behind_its_pin_is_information_unless_the_host_is_due(self) -> None:
+        # Merged with every host opted out, Tart is behind the pin everywhere:
+        # that must not turn doctor red fleet-wide 12 h later.
+        self.pin("2.40.1")
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2", "tart": "2.36.0"})
+        for gate in (None, {"upgrade": False, "due": False, "pin": "2.40.1"},
+                     {"upgrade": True, "due": False, "pin": "2.40.1"},
+                     {"upgrade": True, "due": True, "pin": "2.39.0"}):
+            with self.subTest(gate=gate):
+                if gate is not None:
+                    self.gate(**gate)
+                row = self.refresh(host, NOW + 13 * HOUR)["tools"]["tart"]
+                self.assertEqual("behind", row["state"])
+                self.assertFalse(row["stale"])
+                self.assertIsNone(tf.summary(self.home)["problem"])
+                self.assertIn("information only", "; ".join(tf.summary(self.home)["lines"]))
+
+    def test_a_tart_behind_its_pin_is_timed_from_first_sight_and_goes_stale(self) -> None:
+        self.pin("2.40.1")
+        self.gate(upgrade=True, due=True, pin="2.40.1")
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2", "tart": "2.36.0"})
+        self.refresh(host)
+        later = self.refresh(host, NOW + 13 * HOUR)["tools"]["tart"]
+        self.assertEqual(later["behind_since"], iso(NOW))
+        self.assertTrue(later["stale"])
+        self.assertIn("tart 13 h behind 2.40.1", tf.summary(self.home)["problem"])
+
+    def test_tart_is_never_applied_by_tool_freshness(self) -> None:
+        self.pin("2.40.1")
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2", "tart": "2.36.0"})
+        self.refresh(host, NOW + 48 * HOUR)
+        self.assertFalse(any(Path(call[0]).name == "brew" for call in host.calls))
+        self.assertEqual(host.versions["tart"], "2.36.0")
+
+    def test_the_repository_pin_parses_without_tomllib_and_bad_lines_are_refused(self) -> None:
+        import tart_pin
+        pin = tart_pin.load_pin(Path(__file__).resolve().parent.parent)
+        self.assertRegex(pin.version, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(pin.sha256, r"^[0-9a-f]{64}$")
+        self.assertRegex(pin.softnet_sha256, r"^[0-9a-f]{64}$")
+        for bad in ('[tart]\nversion = 2.40.1\n', 'version = "2.40.1"\n',
+                    '[tart]\nversion = "2.40.1" trailing\n'):
+            with self.subTest(bad=bad), self.assertRaises(tart_pin.PinError):
+                tart_pin.parse_pin(bad)
+
+    def test_a_missing_pin_makes_tart_unknown_never_current(self) -> None:
+        patcher = mock.patch.object(tf, "SUPPORT_ROOT", self.home / "no-generation")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2", "tart": "2.36.0"})
+        row = self.refresh(host)["tools"]["tart"]
+        self.assertEqual(row["state"], "unknown")
+        self.assertIn("releases unreadable", row["reason"])
+
     def test_if_older_skips_a_fresh_cache_and_summary_never_runs_a_tool(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
         self.refresh(host)
@@ -553,7 +641,7 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertGreater(len(host.calls), before)
         with mock.patch.object(tf, "run_command", side_effect=AssertionError("ran a tool")), \
                 mock.patch.object(tf, "fetch_feed", side_effect=AssertionError("fetched")):
-            self.assertEqual(len(tf.summary(self.home)["lines"]), 2)
+            self.assertEqual(len(tf.summary(self.home)["lines"]), 3)
 
     def test_a_disabled_tool_is_neither_run_nor_reported(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.305.0"})
