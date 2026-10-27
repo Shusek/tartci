@@ -133,7 +133,7 @@ def _status(home: Path, run: Runner, now: float | None, dedicated: str,
     if rc != 0:
         risks.append(f"{dedicated} does not unlock with keychain.env's password "
                      f"({keychain_unlock._scrub(out, password, home).strip()[:120]}); "
-                     "run `pulp ship doctor`")
+                     "run pulp ship doctor")
     else:
         rc, out = call(["security", "show-keychain-info", dedicated])
         if rc == 0 and (re.search(r"timeout=\d+", out) or "lock-on-sleep" in out):

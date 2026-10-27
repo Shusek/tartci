@@ -118,7 +118,7 @@ class LauncherBuildTests(unittest.TestCase):
         staged = support_manifest.stage_install(source, manifest, root / "generations")
         self.support_root = Path(staged["root"])
         self.profile = source / "profiles/m3-macos-fleet.toml"
-        self.identity = "Developer ID Application: Daniel Raffel (95CX6P84C4)"
+        self.identity = os.environ.get("TARTCI_TEST_SIGNING_IDENTITY", "-")
 
     def run_builder(self, output: Path, approval: Path, *, python: Path | None = None,
                     extra: tuple[str, ...] = (), identity: str | None = None):

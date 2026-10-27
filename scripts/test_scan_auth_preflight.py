@@ -46,6 +46,9 @@ import sys
 from urllib.parse import urlparse
 
 path = sys.argv[-1]
+if path == "repos/Generous-Corp/pulp":
+    print(json.dumps({"visibility": "private", "private": True}))
+    raise SystemExit(0)
 with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as handle:
     handle.write(path + "\n")
 

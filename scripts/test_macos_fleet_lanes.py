@@ -2641,7 +2641,8 @@ class MacosFleetLaneTests(unittest.TestCase):
         # configure-check cache holds CMake that Pulp include()s, so neither
         # may come from anywhere else. Read-only mounts may.
         body = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text(encoding="utf-8")
-        mounts = re.findall(r'--dir="([^"]+)"', body)
+        mounts = [mount.removesuffix("$cache_ro")
+                  for mount in re.findall(r'--dir="([^"]+)"', body)]
         self.assertIn("ccache:$CACHE_ROOT/ccache", mounts)
         self.assertIn("configure-checks:$CACHE_ROOT/configure-checks", mounts)
         writable = [m for m in mounts if not m.endswith(":ro") and m != "$CHROME_MOUNT_ARG"]

@@ -304,6 +304,7 @@ class WatchdogIssue(unittest.TestCase):
         (self.home / ".config" / "tartci" / "python.pin").write_text(
             str(self.home / "gone" / "python3.12") + "\n")
         env = {"HOME": str(self.home), "TARTCI_HOME": str(self.home),
+               "TMPDIR": tempfile.gettempdir(),
                "PATH": "/usr/bin:/bin", "XPC_SERVICE_NAME":
                "com.danielraffel.tartci.launchd-watchdog",
                "TARTCI_FLEET_PROFILE": str(self.home / "profile.toml")}

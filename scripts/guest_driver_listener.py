@@ -13,11 +13,12 @@ import queue
 import threading
 import time
 from bounded_subprocess import run_bounded
+from python_child import child_python
 
 
 def assignment_observation(repo, runner, policy, binding=None):
     """Read the exact assigned job across the declared repository scope."""
-    command = [sys.executable, str(Path(__file__).with_name('current_job_scan.py')),
+    command = [child_python(), str(Path(__file__).with_name('current_job_scan.py')),
                              '--repo', repo, '--runner', runner, '--policy-file', str(policy),
                              '--scan-timeout', '120', '--parallelism', '1']
     if binding:

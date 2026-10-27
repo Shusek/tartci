@@ -76,6 +76,14 @@ class CallSiteTests(unittest.TestCase):
         os.environ.pop("TARTCI_DISK_PROBE_COMMAND", None)
         self.assertEqual(str(self.shim), disk_watchdog.probe_command("/tmp")[0])
 
+    def test_prepared_assignment_observer_uses_the_pinned_child_interpreter(self) -> None:
+        import guest_driver_listener
+        with mock.patch.object(guest_driver_listener, 'run_bounded',
+                               return_value=mock.Mock(stdout='{"kind":"no_assignment"}')) as run:
+            receipt = guest_driver_listener.assignment_observation('owner/repo', 'fixture', Path('public-policy.json'))
+        self.assertEqual(str(self.shim), run.call_args.args[0][0])
+        self.assertEqual(receipt, {'kind': 'no_assignment'})
+
 
 def executable_uses(tree: ast.AST) -> list[int]:
     """Lines that read sys.executable anywhere but inside child_python()."""
