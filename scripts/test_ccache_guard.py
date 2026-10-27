@@ -467,7 +467,8 @@ class RunnerWiringTests(unittest.TestCase):
         # (its order is executed in test_macos_lane_cache_root).
         self.assertIn('tartci_ccache_guard "$root/ccache"', lib)
         prepare = body.index('tartci_prepare_lane_cache_mounts "$CACHE_ROOT"')
-        boot = body.index('tartci_vm_lease_guard_exec tart run')
+        # Prepared drivers boot without shares before this native cache path.
+        boot = body.index('tartci_vm_lease_guard_exec tart run', prepare)
         self.assertLess(prepare, boot)
         self.assertIn('scripts/ccache_guard.py" quarantine', body)
 
