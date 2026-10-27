@@ -44,7 +44,7 @@
 
   PILOT: the default labels include the non-required shared pool label
   `pulp-build-windows` and a host-specific label. Use `pulp-host-macstudio` on
-  the primary Mac Studio and `pulp-host-m5` on the overflow M5/blackbook. Windows
+  the primary Mac Studio and `pulp-host-m5` on the overflow M5/laptop. Windows
   VMs are QEMU (not Tart) and uncapped; each job gets a throwaway qcow2 overlay.
   The serve loop scans queued and in-progress workflow runs for queued jobs and
   ignores queued jobs older than TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS (six hours
@@ -108,6 +108,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_GH_CLI</key>

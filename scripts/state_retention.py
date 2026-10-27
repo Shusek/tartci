@@ -19,7 +19,8 @@ those trees grows forever. This plans, and with --apply deletes, only:
 * generation directories outside the newest --keep-generations and older
   than --generation-grace-days, that nothing names: not the wrapper at
   ~/.local/bin/tartci, not any LaunchAgent plist, not an install receipt,
-  not a rollback snapshot's commit, not the generation running this script.
+  not a rollback snapshot's commit, not the generation running this script,
+  not the launcher pointer's current or rollback generation.
 
 Idle-safe: a file or generation that any running process names in its
 command line, or holds as its working directory, is kept. If the process
@@ -149,6 +150,18 @@ def protected_generations(home: Path, running_from: Path | None) -> dict[str, st
         for name in GENERATION_REF.findall(text):
             keep.setdefault(name, why)
 
+    # Launcher v2 runs the generation its pointer names and rolls back to the
+    # one before it; neither may go while the pointer names it.
+    try:
+        pointer = json.loads((home / ".config/tartci/launcher-generation.json").read_text())
+    except (OSError, ValueError):
+        pointer = None
+    if isinstance(pointer, dict):
+        for key, why in (("generation", "the launcher's current generation"),
+                         ("previous", "the launcher's rollback generation")):
+            match = GENERATION_REF.search(str(pointer.get(key) or ""))
+            if match:
+                keep.setdefault(match.group(1), why)
     scan(home / ".local/bin/tartci", "named by the tartci wrapper")
     agents = home / "Library/LaunchAgents"
     if agents.is_dir():

@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -209,7 +210,7 @@ else: raise SystemExit(4)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--parallelism must be 1", result.stderr)
 
-    def test_host_lock_timeout_fails_closed_before_api_call(self) -> None:
+    def test_host_lock_is_not_held_during_api_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "observation.lock"
             marker = Path(directory) / "called"
@@ -221,12 +222,42 @@ else: raise SystemExit(4)
                     ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
                      "--workflow", "w", "--gh-cli", str(fake),
                      "--observation-lock-file", str(lock),
-                     "--observation-lock-timeout", "0.1"],
+                     # Each call is capped at half the lock wait: 0.1 s
+                     # killed the fake before it started on a loaded host.
+                     "--observation-lock-timeout", "2"],
                     text=True, capture_output=True, check=False,
                 )
+            called = marker.exists()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("host queue observation lock timed out", result.stdout)
-        self.assertFalse(marker.exists())
+        self.assertIn("observation_error", result.stdout)
+        self.assertTrue(called, "the host lock blocked the API call")
+
+    def test_slow_api_observation_starts_while_host_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "observation.lock"
+            marker = root / "called"
+            fake = root / "slow-gh"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, time\n"
+                f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+                "time.sleep(2)\n"
+                "print('{\\\"total_count\\\":0,\\\"workflows\\\":[]}')\n"
+            )
+            fake.chmod(0o755)
+            with lock.open("a+") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                result = subprocess.run(
+                    [sys.executable, str(SCANNER), "--repo", "x/y", "--runner", "r",
+                     "--workflow", "Build and Test", "--gh-cli", str(fake),
+                     "--scan-timeout", "5", "--gh-timeout", "3",
+                     "--observation-lock-file", str(lock),
+                     "--observation-lock-timeout", "2"],
+                    text=True, capture_output=True, check=False,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(marker.exists(), "slow API call waited on the host lock")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -13,6 +13,11 @@ name = "m5studio-macos-fleet"
 id = "m5studio"
 # The SSH alias other fleet hosts reach this one by (self-update peers).
 ssh = "m5s"
+# The one interpreter every tartci LaunchAgent here runs (runbook: Pinned
+# interpreter). Homebrew python@3.12, held by `brew pin python@3.12`; Local
+# Network is granted to this binary once. Homebrew's 3.12.13_2, which m3 and
+# m5 run, is no longer installable, so this host runs 3.12.15.
+python = "/opt/homebrew/Cellar/python@3.12/3.12.15/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Atelier/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
@@ -46,6 +51,14 @@ agent_floor_qos = "utility"
 # below its computed floor. `refuse` denies the new clone instead; flip it only
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
+# The pinned mise binary (runbook: Pinned mise). Built from source at mise
+# v2026.10.17 and copied by digest. m5studio had no earlier pin, so the
+# rollback is deleting this table; the 2026.10.8 binary stays installed for the
+# interactive shell. It changes no PATH and no lane.
+[mise]
+version = "2026.10.17"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.17/bin/mise"
+sha256 = "284869e5b5f57211377f026309910bea91ef65b3a71b934295fa8bd712436dfc"
 [launch_helper]
 path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
 approval_sha256_path = "/Users/danielraffel/.config/tartci/m5studio-launcher-approved.sha256"
@@ -98,6 +111,8 @@ gate_ccache_trim = true
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
+runtime_measure = true
+runtime_tags = "pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
@@ -121,12 +136,12 @@ replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
 guest_heartbeat_stale_seconds = 600
-# The queue scan this supervisor runs is latency-sensitive: a Background
-# supervisor's GitHub API calls measured materially slower than the same calls
-# at normal priority, and every observed scan failure on this lane is a
-# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
-# promote the supervisor out of the background band. Gate lanes only.
-process_type = "Adaptive"
+# Standard, never Background or Adaptive: every lane's queue scan holds the
+# host-global observation lock, and a supervisor launchd leaves in the
+# darwinbg band (Adaptive without an XPC transaction is in that band) makes
+# each GitHub call several times slower while it holds the lock, starving
+# every other lane on the host. The validator refuses both values.
+process_type = "Standard"
 # Work-conserving idle retarget (trial, both slots): a runner unassigned for
 # 120 s re-observes both classes and is discarded only when its own class has
 # no queued job and the other class has admissible demand. It composes with the
@@ -207,10 +222,12 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
-priority = "gate"
+supervisors = 1
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5studio"]
-workflows = ["Locked macOS GPU proof", "README clean release proof"]
+priority = "vm"
+workflows = ["Locked macOS GPU proof"]
+runner_idle_timeout_seconds = 60
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
@@ -226,6 +243,9 @@ guest_heartbeat_stale_seconds = 600
 stale_log_seconds = 4500
 
 [support_agents]
-declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
-# Converge only the VM janitor; every other declared agent stays plan-only.
-bootstrap = ["reap"]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap", "disk-watchdog"]
+# Converge the VM janitor, the disk watchdog and the disk reclaimer (so reclaim
+# fixes such as the 90%-used pressure trigger reach the host); every other
+# declared agent stays plan-only. disk-watchdog bootstrap is owner-approved for m5studio only
+# (2026-10-22): a hand install is not reconciled, and m5studio ran none for days.
+bootstrap = ["reap", "disk-watchdog", "reclaim"]

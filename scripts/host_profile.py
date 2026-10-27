@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -240,13 +241,13 @@ def resolve_role(
 # --- governor: one per-host config surface --------------------------------
 #
 # Every tuning knob of the build governor lives in ONE host-local file,
-# ~/.config/tartci/governor.toml, flat `[governor]` table. `tartci governor
-# show|set|explain` reads and edits it; `tartci host-profile` derives every
+# ~/.config/tartci/governor.toml, flat [governor] table. tartci governor
+# show|set|explain reads and edits it; tartci host-profile derives every
 # exported number from it. Precedence per key: CLI flag > TARTCI_GOV_<KEY>
 # environment > governor.toml > legacy source (role file; fleet profile
 # `[host] agent_floor_cores`) > role default. The TARTCI_GOV_ prefix keeps the
 # overrides apart from host-profile's own exported names, so a shell that
-# evaluated `tartci host-profile` cannot feed its outputs back in as inputs.
+# evaluated tartci host-profile cannot feed its outputs back in as inputs.
 #
 # A malformed value is ignored (with a note in `problems`), never raised: this
 # runs on every lease admission, and a typo in an optional knob must never
@@ -285,7 +286,7 @@ GOVERNOR_HELP: dict[str, str] = {
     "agent_floor_cores": "background-QoS floor lease for a denied background build (0 = off)",
     "agent_floor_pool_cores": "host-wide cap on concurrent floor-lease cores",
     "dynamic_lending": "lend idle gate-reserved cores to interactive builds (preemptible)",
-    "fleet_hosts": "comma-separated SSH aliases `tartci governor fleet` reads",
+    "fleet_hosts": "comma-separated SSH aliases tartci governor fleet reads",
 }
 
 
@@ -1028,6 +1029,36 @@ GENERATION_MANIFEST = ".tartci-support-manifest.json"
 SEALED_BUNDLE_MARKER = "Contents/Resources/bundle.json"
 
 
+LAUNCHER_V2_POLICY = "Contents/Resources/policy.json"
+LAUNCH_SET_NAME = ".tartci-launch-set.json"
+
+
+def launcher_v2_identity(policy: dict) -> dict:
+    """A v2 lane runs the generation its pointer names; read the version there."""
+    pointer = _read_json(Path(str(policy.get("pointer", ""))))
+    generation = (pointer or {}).get("generation")
+    if not isinstance(generation, str) or not generation:
+        return {"source_commit": None, "layout": "v2",
+                "detail": f"no readable launcher pointer at {policy.get('pointer')}"}
+    root = Path(generation)
+    try:
+        manifest_bytes = (root / GENERATION_MANIFEST).read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, ValueError):
+        return {"source_commit": None, "layout": "v2", "generation": root.name,
+                "detail": f"unreadable generation manifest at {root / GENERATION_MANIFEST}"}
+    launch = _read_json(root / LAUNCH_SET_NAME) or {}
+    return {
+        "source_commit": manifest.get("source_commit") if isinstance(manifest, dict) else None,
+        "support_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "layout": "v2",
+        "generation": root.name,
+        "launch_set_sequence": launch.get("sequence"),
+        "sealed_lane_ids": sorted((launch.get("lanes") or {}).keys()) or None,
+        "detail": None,
+    }
+
+
 def agents_dir() -> Path:
     return Path(os.environ.get("TARTCI_AGENTS_DIR") or Path.home() / "Library/LaunchAgents")
 
@@ -1044,8 +1075,8 @@ def classify_delivery(arguments: list[str]) -> dict:
     """Name the delivery mechanism from a plist's ProgramArguments alone.
 
     The two shapes are structurally distinct, so neither needs a hostname:
-    a sealed lane execs `<bundle>.app/Contents/MacOS/tartci-launcher`, a
-    generation lane execs `<generations-root>/<GEN>/.tartci-launch`.
+    a sealed lane execs <bundle>.app/Contents/MacOS/tartci-launcher, a
+    generation lane execs <generations-root>/<GEN>/.tartci-launch.
     """
     for argument in arguments:
         if argument.endswith(LAUNCHER_SUFFIX):
@@ -1071,6 +1102,9 @@ def in_force_identity(classified: dict) -> dict:
         return {"source_commit": None, "detail": "no recognised launch entrypoint"}
     root_path = Path(root)
     if classified["delivery"] == "sealed-bundle":
+        policy = _read_json(root_path / LAUNCHER_V2_POLICY)
+        if policy is not None and policy.get("schema") == 2:
+            return launcher_v2_identity(policy)
         bundle = _read_json(root_path / SEALED_BUNDLE_MARKER)
         if bundle is None:
             return {
@@ -1155,7 +1189,10 @@ def build_delivery_report(
         arguments = [str(item) for item in (plist.get("ProgramArguments") or [])]
         classified = classify_delivery(arguments)
         identity = in_force_identity(classified)
-        sealed = classified["delivery"] == "sealed-bundle"
+        # A v2 lane is a stable app running the pointer's generation, which an
+        # install repoints, so it updates like a generation lane.
+        sealed = (classified["delivery"] == "sealed-bundle"
+                  and identity.get("layout") != "v2")
         lanes.append({
             "label": label,
             "delivery": classified["delivery"],
@@ -1168,12 +1205,15 @@ def build_delivery_report(
             "how_to_update": (
                 "rebuild and re-sign the launcher bundle "
                 "(scripts/build_macos_launcher.sh), then re-approve and reinstall; "
-                "`tartci fleet-macos install --apply` stages a generation this "
+                "tartci fleet-macos install --apply stages a generation this "
                 "lane never execs"
                 if sealed else
-                "`tartci fleet-macos install --apply <profile>` stages a new "
+                "tartci fleet-macos install --apply <profile> stages a new "
                 "generation and repoints this lane at it"
                 if classified["delivery"] == "generation" else
+                "tartci fleet-macos install --apply <profile> stages a new "
+                "generation and moves the launcher v2 pointer to its signed launch set"
+                if identity.get("layout") == "v2" else
                 "unrecognised launch entrypoint; inspect ProgramArguments"
             ),
         })

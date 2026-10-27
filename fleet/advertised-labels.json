@@ -8,28 +8,10 @@
       "profiles/m3-macos-fleet.toml",
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
-    ]
+    ],
+    "profiles_sha256": "3fcf37ca490246188869d42dc4664eca7eafc6594b522c97bd7728e68bfc2047"
   },
   "registrations": [
-    {
-      "profile": "m1-macos-fleet",
-      "host_id": "m1",
-      "lane": "pulp-gate",
-      "repo": "Generous-Corp/pulp",
-      "assignment_mode": "event-class-v2",
-      "class_label": "pulp-build-merge-group",
-      "labels": [
-        "self-hosted",
-        "macOS",
-        "ARM64",
-        "pulp-build",
-        "pulp-build-vm",
-        "pulp-build-merge-group"
-      ],
-      "workflows": [
-        "Build and Test"
-      ]
-    },
     {
       "profile": "m1-macos-fleet",
       "host_id": "m1",
@@ -142,8 +124,7 @@
         "vellum-host-m1"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -277,8 +258,7 @@
         "vellum-host-m3"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -449,8 +429,7 @@
         "vellum-host-m5"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -584,8 +563,7 @@
         "vellum-host-m5studio"
       ],
       "workflows": [
-        "Locked macOS GPU proof",
-        "README clean release proof"
+        "Locked macOS GPU proof"
       ]
     }
   ],

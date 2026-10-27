@@ -36,22 +36,31 @@ import support_agents
 import debug_hold
 import reuse_canary
 import power_status
+import fleet_source
+import launch_set
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-# launchd.plist(5) documents exactly these ProcessType values. A supervisor
-# left Background is throttled by the system for latency-insensitive work,
-# which lengthens every GitHub API call its queue scan makes.
+# launchd.plist(5) documents exactly these ProcessType values.
 PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
-DEFAULT_PROCESS_TYPE = "Background"
+# Every fleet supervisor takes the host-global queue observation lock, so a
+# supervisor in the darwinbg band is a priority inversion for the whole host:
+# its GitHub calls run several times slower (confined to efficiency cores and
+# throttled) while it holds the lock every other lane waits on. Background
+# puts a job in that band unconditionally and Adaptive does so whenever the
+# job holds no XPC transaction, which a supervisor never does. Measured on a
+# loaded host, the same exhaustive scan held the lock for 154 s in the band
+# and 18 s out of it, past the 120 s lock wait, so every lane went blind.
+SUPERVISOR_PROCESS_TYPES = ("Standard", "Interactive")
+DEFAULT_PROCESS_TYPE = "Standard"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary", "debug_hold", "launchd_watchdog",
+    "reuse_canary", "debug_hold", "launchd_watchdog", "mise", "rustup",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -67,11 +76,11 @@ BUILD_DISAGREEMENT_KEYS = {
     "timeout_seconds", "realert_hours",
 }
 HOST_KEYS = {
-    "id", "home", "tart_home", "cache_root", "log_root",
+    "id", "home", "tart_home", "cache_root", "log_root", "published",
     "github_api_timeout_seconds", "persistent_runner_labels",
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
-    "ssh",
+    "ssh", "python",
     "agent_floor_cores", "agent_floor_pool_cores", "agent_floor_qos",
     "job_claim_max_age_seconds",
     "home_volume_floor_mode",
@@ -93,8 +102,9 @@ WORKTREE_CLEANUP_KEYS = {
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
-    "jit_github_cli", "chrome_app_dir", "assignment_mode",
+    "jit_github_cli", "chrome_app_dir", "assignment_mode", "cache_root",
     "ccache_write_isolation",
+    "runtime_measure", "runtime_gh_enrich", "runtime_tags",
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
@@ -239,6 +249,55 @@ def interpreter_changed_by_os(receipt_path: Path, recorded: object, current: dic
     return None
 
 
+# The reviewed merged-main-v1 authority. Paths come from the (private) profile;
+# these are the limits any profile's values must stay within.
+WORKTREE_CLEANUP_FIXED = {"provider": "merged-main-v1", "repo": "Generous-Corp/pulp",
+                          "main_ref": "origin/main"}
+WORKTREE_CLEANUP_CAPS = {"max_trees": 8, "max_gib": 512, "timeout_seconds": 300}
+WORKTREE_CLEANUP_COOLDOWN = (3600, 86400)
+WORKTREE_CLEANUP_HOST = "studio"
+
+
+def _canonical_volume_path(value: object, depth: int) -> PurePosixPath | None:
+    """value as /Volumes/<volume>/... at least `depth` parts deep, or None."""
+    if not isinstance(value, str) or not value.startswith("/Volumes/"):
+        return None
+    path = PurePosixPath(value)
+    if (str(path) != value or ".." in path.parts or "." in path.parts
+            or len(path.parts) < depth):
+        return None
+    return path
+
+
+def worktree_cleanup_problem(cleanup: object, host: dict) -> str | None:
+    """Why a profile's worktree_cleanup table is outside the reviewed limits."""
+    if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
+        return "worktree_cleanup must declare the complete strict contract"
+    if (any(cleanup.get(key) != value for key, value in WORKTREE_CLEANUP_FIXED.items())
+            or type(cleanup.get("apply")) is not bool):
+        return "worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract"
+    for key, cap in WORKTREE_CLEANUP_CAPS.items():
+        if type(cleanup.get(key)) is not int or not 1 <= cleanup[key] <= cap:
+            return f"worktree_cleanup.{key} must be an integer from 1 to {cap}"
+    low, high = WORKTREE_CLEANUP_COOLDOWN
+    if type(cleanup.get("cooldown_seconds")) is not int or not low <= cleanup["cooldown_seconds"] <= high:
+        return f"worktree_cleanup.cooldown_seconds must be an integer from {low} to {high}"
+    # prefix: /Volumes/<volume>/<dir> at least; primary strictly inside it.
+    prefix = _canonical_volume_path(cleanup.get("prefix"), 4)
+    primary = _canonical_volume_path(cleanup.get("primary"), 5)
+    if prefix is None or primary is None:
+        return ("worktree_cleanup.prefix and .primary must be canonical absolute paths "
+                "below an external volume root (/Volumes/<volume>/<dir>)")
+    if prefix not in primary.parents:
+        return "worktree_cleanup.primary must be inside worktree_cleanup.prefix"
+    tart_home = _canonical_volume_path(host.get("tart_home"), 4)
+    if host.get("id") != WORKTREE_CLEANUP_HOST or tart_home is None:
+        return "worktree_cleanup is restricted to the private M3 profile"
+    if tart_home.parts[:3] != prefix.parts[:3]:
+        return "worktree_cleanup.prefix must be on the same volume as host.tart_home"
+    return None
+
+
 def fail(message: str) -> None:
     raise ValueError(message)
 
@@ -309,6 +368,87 @@ def _verified_network_overlay(
     return body
 
 
+def _symlinked_component(path: PurePosixPath) -> str | None:
+    """The first existing component of ``path`` that is a symlink, if any."""
+    current = PurePosixPath("/")
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(mode):
+            return current.as_posix()
+    return None
+
+
+def validate_lane_cache_roots(host: dict, lanes: list) -> None:
+    """A lane-owned cache root is mounted only into that lane's runner group.
+
+    The host ``cache_root`` backs the ccache that every lane's VM mounts
+    writable, so any job on any lane can plant an object a later job links. A
+    lane that signs or publishes sets its own ``cache_root``: only VMs booted
+    for runner groups that list it mount it, so only their jobs write it. It
+    must not nest with the host root or another root (one ``--dir`` would
+    expose the other), and every lane sharing it must share its repository
+    and runner group, or an untrusted lane would write the trusted cache.
+
+    The trust boundary is the runner group, so the lane must register into an
+    organization group (never the repository-wide group 1, which any
+    workflow on any branch can target) and every tier must stay in that
+    group. Restricting that group to the protected workflows and refs is a
+    GitHub-side setting this file cannot see; the group's policy verifier
+    owns it.
+    """
+    host_root = PurePosixPath(host["cache_root"])
+    owners: dict[str, tuple] = {}
+    for lane in lanes:
+        if not isinstance(lane, dict) or "cache_root" not in lane:
+            continue
+        lane_id = lane.get("id", "")
+        value = lane["cache_root"]
+        if not isinstance(value, str):
+            fail(f"lane {lane_id}: cache_root must be an absolute path")
+        root = PurePosixPath(posixpath.normpath(value))
+        if (not root.is_absolute() or root.as_posix() != value
+                or any(char in value for char in ":,\r\n")):
+            fail(f"lane {lane_id}: cache_root must be a normalized absolute path "
+                 "without ':' or ','")
+        home = PurePosixPath(host["home"])
+        on_volume = (len(root.parts) >= 4 and root.parts[1] == "Volumes")
+        if not ((root != home and root.is_relative_to(home)) or on_volume):
+            fail(f"lane {lane_id}: cache_root must sit below host.home or a "
+                 "/Volumes/<volume>/ mount, where every component is created "
+                 "without following links")
+        linked = _symlinked_component(root)
+        if linked is not None:
+            fail(f"lane {lane_id}: cache_root component {linked} is a symlink; "
+                 "the VM would mount whatever it points at")
+        if root == host_root or root.is_relative_to(host_root) or host_root.is_relative_to(root):
+            fail(f"lane {lane_id}: cache_root must not be, contain or sit inside "
+                 "host.cache_root, which every lane mounts")
+        group = lane.get("runner_group_id")
+        if group == 1 or lane.get("registration_scope") == "repository":
+            fail(f"lane {lane_id}: a lane-owned cache_root needs an organization "
+                 "runner group restricted to protected workflows, not the "
+                 "repository-wide group 1")
+        for tier in lane.get("tier") or []:
+            if isinstance(tier, dict) and tier.get("runner_group_id", group) != group:
+                fail(f"lane {lane_id}: tier {tier.get('label')!r} leaves runner group "
+                     f"{group}, so its jobs would write the lane's cache_root")
+        owner = (lane.get("repo"), group)
+        for other, other_owner in owners.items():
+            other_root = PurePosixPath(other)
+            if other_root == root and other_owner != owner:
+                fail(f"lane {lane_id}: cache_root {value} is shared with a lane of "
+                     "another repository or runner group")
+            if other_root != root and (root.is_relative_to(other_root)
+                                       or other_root.is_relative_to(root)):
+                fail(f"lane {lane_id}: cache_root must not nest with another "
+                     "lane's cache_root")
+        owners[root.as_posix()] = owner
+
+
 def load(path: Path) -> dict:
     with path.open("rb") as handle:
         data = tomllib.load(handle)
@@ -342,6 +482,12 @@ def load(path: Path) -> dict:
     if ssh is not None and (not isinstance(ssh, str)
                             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}", ssh)):
         fail("host.ssh must be an SSH host alias or user@host other fleet hosts use to reach this one")
+    python = host.get("python")
+    if python is not None and (not isinstance(python, str) or not python.startswith("/")
+                               or '"' in python or "\n" in python):
+        fail("host.python must be the absolute path of this host's pinned interpreter")
+    if "published" in host and type(host["published"]) is not bool:
+        fail("host.published must be a boolean")
     github_api_timeout = host.get("github_api_timeout_seconds")
     if github_api_timeout is not None and (
             type(github_api_timeout) is not int
@@ -452,20 +598,24 @@ def load(path: Path) -> dict:
         fail("launch_helper is reserved for an external-volume Tart home")
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None:
-        expected = {
-            "provider": "merged-main-v1", "repo": "Generous-Corp/pulp",
-            "primary": "/Volumes/Workshop/Code/pulp",
-            "prefix": "/Volumes/Workshop/Code", "main_ref": "origin/main",
-            "apply": False, "max_trees": 8,
-            "max_gib": 512, "timeout_seconds": 300, "cooldown_seconds": 3600,
-        }
-        if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
-            fail("worktree_cleanup must declare the complete strict contract")
-        expected["apply"]=cleanup.get("apply")
-        if cleanup != expected or type(cleanup.get("apply")) is not bool:
-            fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
-        if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
-            fail("worktree_cleanup is restricted to the private M3 profile")
+        problem = worktree_cleanup_problem(cleanup, host)
+        if problem:
+            fail(problem)
+    if "mise" in data:
+        # The pinned mise binary (scripts/mise_pin.py); the installer verifies
+        # the binary itself before writing any LaunchAgent.
+        import mise_pin  # noqa: PLC0415 - sibling script, loaded only when declared
+
+        errors = mise_pin.table_errors(data["mise"])
+        if errors:
+            fail("; ".join(errors))
+    if "rustup" in data:
+        # The host's rustup never self-updates (scripts/rustup_settings.py).
+        import rustup_settings  # noqa: PLC0415 - sibling script, loaded only when declared
+
+        errors = rustup_settings.table_errors(data["rustup"])
+        if errors:
+            fail("; ".join(errors))
     watchdog = data.get("launchd_watchdog")
     if watchdog is not None:
         # The watchdog's frozen-lane threshold, rendered into its plist by the
@@ -485,7 +635,7 @@ def load(path: Path) -> dict:
             fail(f"unknown build_disagreement keys: {sorted(unknown)}")
         if type(disagreement.get("enabled", False)) is not bool:
             fail("build_disagreement.enabled must be a boolean")
-    # Opt-in: run Pulp's own build-directory reapers from `tartci reclaim`
+    # Opt-in: run Pulp's own build-directory reapers from tartci reclaim
     # (scripts/pulp_reapers.py). One validator for install time and run time,
     # so a profile that installs is a profile the reclaim pass acts on.
     reclaim = data.get("reclaim")
@@ -620,6 +770,7 @@ def load(path: Path) -> dict:
                 f"{host['id']}.{lane.get('id', '')}"
                 f"{'' if slot == 1 else f'.slot{slot}'}"
             )
+    validate_lane_cache_roots(host, lanes)
     seen: set[str] = set()
     replaced: set[str] = set()
     for lane in lanes:
@@ -684,6 +835,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: process_type must be one of "
                 f"{list(PROCESS_TYPES)}"
+            )
+        if process_type is not None and process_type not in SUPERVISOR_PROCESS_TYPES:
+            fail(
+                f"lane {lane_id}: process_type {process_type!r} runs the "
+                "supervisor in the darwinbg band while it holds the host "
+                "queue observation lock; use one of "
+                f"{list(SUPERVISOR_PROCESS_TYPES)}"
             )
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
@@ -843,6 +1001,20 @@ def load(path: Path) -> dict:
         ccache_isolation = lane.get("ccache_write_isolation")
         if ccache_isolation is not None and type(ccache_isolation) is not bool:
             fail(f"lane {lane_id}: ccache_write_isolation must be a boolean")
+        runtime_measure = lane.get("runtime_measure")
+        if runtime_measure is not None and type(runtime_measure) is not bool:
+            fail(f"lane {lane_id}: runtime_measure must be a boolean")
+        runtime_gh_enrich = lane.get("runtime_gh_enrich")
+        if runtime_gh_enrich is not None and type(runtime_gh_enrich) is not bool:
+            fail(f"lane {lane_id}: runtime_gh_enrich must be a boolean")
+        if runtime_gh_enrich and runtime_measure is not True:
+            fail(f"lane {lane_id}: runtime_gh_enrich requires runtime_measure = true")
+        runtime_tags = lane.get("runtime_tags")
+        if runtime_tags is not None and (
+                not isinstance(runtime_tags, str)
+                or not runtime_tags.strip()
+                or any(char in runtime_tags for char in "\r\n")):
+            fail(f"lane {lane_id}: runtime_tags must be a non-empty single line")
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
                 or not all(isinstance(value, str) and LABEL.fullmatch(value)
@@ -1082,7 +1254,8 @@ def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
 
 
 def rendered_plists(
-    data: dict, *, launch_entrypoint: Path | None = None
+    data: dict, *, launch_entrypoint: Path | None = None,
+    source: fleet_source.FleetSource | None = None,
 ) -> dict[str, bytes]:
     host_id = data["host"]["id"]
     result: dict[str, bytes] = {}
@@ -1095,7 +1268,8 @@ def rendered_plists(
             )
             result[name] = plistlib.dumps(
                 lane_plist(
-                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint
+                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint,
+                    source=source,
                 ),
                 sort_keys=False,
             )
@@ -1201,6 +1375,11 @@ def assert_executed_generation(
                 f"install_ineffective: launcher execs {program} which is not the "
                 f"installed generation {launch_entrypoint} ({name})"
             )
+        v2_policy = _launcher_v2_policy(bundle)
+        if v2_policy is not None:
+            records[name] = _launch_set_execution(
+                v2_policy, name, launch_entrypoint, source_commit, manifest_sha256)
+            continue
         sealed_launch = bundle / SEALED_SUPPORT / support_manifest.LAUNCH_NAME
         if sealed_launch.is_symlink() or not sealed_launch.is_file():
             fail(
@@ -1242,6 +1421,90 @@ def assert_executed_generation(
     return records
 
 
+def _launcher_v2_policy(bundle: Path) -> dict | None:
+    """A v2 app's policy.json (schema 2), or None for any other bundle."""
+    try:
+        value = json.loads((bundle / "Contents/Resources/policy.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) and value.get("schema") == 2 else None
+
+
+def _launch_set_execution(
+    policy: dict, name: str, launch_entrypoint: Path, source_commit: str, manifest_sha256: str,
+) -> dict:
+    """What a v2 lane executes: the pointer's generation, which must be this install's."""
+    pointer = launch_set.read_pointer(Path(str(policy.get("pointer", ""))))
+    generation = Path((pointer or {}).get("generation") or "")
+    if not pointer or generation.resolve() != launch_entrypoint.parent:
+        fail(
+            f"install_ineffective: launcher v2 points at {generation or '<no pointer>'}, "
+            f"not the installed generation {launch_entrypoint.parent} ({name})"
+        )
+    try:
+        value = json.loads((generation / launch_set.SET_NAME).read_text())
+    except (OSError, ValueError) as exc:
+        fail(f"install_ineffective: launcher v2 launch set is unreadable: {exc} ({name})")
+    if (not isinstance(value, dict) or value.get("source_commit") != source_commit
+            or value.get("manifest_sha256") != manifest_sha256):
+        fail(
+            f"install_ineffective: launcher v2 launch set in {generation} is not the "
+            f"installed cohort {source_commit}/{manifest_sha256} ({name})"
+        )
+    return {"kind": "launch-set", "executes": str(generation / launch_set.ENTRYPOINT)}
+
+
+def launch_helper_record(
+    helper: dict, config: Path, data: dict, support_root: Path, source_commit: str,
+    layout: str = "v1",
+) -> dict:
+    """The installed launch helper, verified for its layout.
+
+    v1: the sealed app, bound to the support commit. v2: the stable app, built
+    from this support tree's launcher inputs, plus the signed launch set of
+    the generation the pointer names, which must be this support root.
+    """
+    if layout == "v2":
+        record = macos_launcher_identity.verify_v2(
+            Path(helper["path"]), identifier=helper["identifier"],
+            team_id=helper["team_id"], profile=tomllib.loads(config.read_text()),
+            support_root=support_root,
+        )
+        record["launch_set"] = launch_set_record(Path(data["host"]["home"]), support_root)
+        return record
+    return macos_launcher_identity.verify(
+        Path(helper["path"]), identifier=helper["identifier"],
+        team_id=helper["team_id"],
+        profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
+        source_commit=source_commit,
+        tart_home=data["host"]["tart_home"],
+    )
+
+
+def launch_set_record(home: Path, support_root: Path) -> dict:
+    """The pointer and launch set a v2 host runs, checked as the launcher does
+    (the signature is the launcher's to check on every lane start)."""
+    pointer = home / ".config/tartci/launcher-generation.json"
+    value = launch_set.read_pointer(pointer)
+    generation = Path((value or {}).get("generation") or "")
+    if not value or generation.resolve() != support_root.resolve():
+        fail(f"launcher v2 pointer {pointer} does not name the installed generation {support_root}")
+    root = (home / ".local/share/tartci-generations").resolve()
+    problem = launch_set.verify_contents(support_root.resolve(), root)
+    if problem:
+        fail(f"launcher v2 launch set does not verify: {problem}")
+    set_path = support_root / launch_set.SET_NAME
+    set_bytes = set_path.read_bytes()
+    return {
+        "pointer": str(pointer),
+        "generation": str(support_root),
+        "sequence": json.loads(set_bytes)["sequence"],
+        "set_sha256": hashlib.sha256(set_bytes).hexdigest(),
+        "signature_sha256": hashlib.sha256(
+            (support_root / launch_set.SIG_NAME).read_bytes()).hexdigest(),
+    }
+
+
 def write_receipt(
     config: Path,
     agents_dir: Path,
@@ -1252,11 +1515,29 @@ def write_receipt(
     entrypoint_source: Path,
     launch_entrypoint: Path,
     source_authority_commit: str,
+    launcher_layout: str = "v1",
 ) -> None:
     data = load(config)
     support_root = support_root.resolve()
     launch_entrypoint = launch_entrypoint.resolve()
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                installed_env = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {})
+            except (OSError, plistlib.InvalidFileException):
+                continue
+            pinned = installed_env.get("TARTCI_PYTHON")
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     digests: dict[str, str] = {}
     for name, body in expected.items():
         installed = agents_dir / name
@@ -1285,8 +1566,14 @@ def write_receipt(
         entrypoint_source, entrypoint, support_root
     )
     launch = support_manifest.launch_record(launch_entrypoint, support_root)
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    interpreter = Path(os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3"))
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter must be a regular non-symlink file")
     interpreter_record = {
@@ -1298,15 +1585,17 @@ def write_receipt(
     helper = data.get("launch_helper")
     helper_record = None
     if helper is not None:
-        helper_record = macos_launcher_identity.verify(
-            Path(helper["path"]), identifier=helper["identifier"],
-            team_id=helper["team_id"],
-            profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
-            source_commit=source_authority_commit,
-            tart_home=data["host"]["tart_home"],
-        )
+        helper_record = launch_helper_record(
+            helper, config, data, support_root, source_authority_commit, launcher_layout)
     persistent_records = persistent_plist_records(data, agents_dir)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    fleet_source_state = fleet_source.resolve(TARTCI_ROOT)
+    # The public source is copied into the immutable support generation before
+    # this receipt is written. Record that installed root so a later `pool on`
+    # validates the same files it will execute. A configured private source is
+    # intentionally kept as the external authority and retains its provenance.
+    if not fleet_source_state.configured:
+        fleet_source_state = fleet_source.resolve(support_root, allow_environment=False)
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
@@ -1341,6 +1630,16 @@ def write_receipt(
                 "commit": source_authority_commit,
             },
         },
+        "fleet_source": {
+            "root": str(fleet_source_state.root),
+            "configured": fleet_source_state.configured,
+            "commit": fleet_source_state.source_commit,
+            "repository": fleet_source_state.repository,
+            "tree_sha256": fleet_source_state.tree_sha256,
+            "published_supply_sha256": fleet_source_state.published_supply_sha256,
+            "profiles_dir": str(fleet_source_state.profiles_dir),
+            "published_supply": str(fleet_source_state.published_supply),
+        },
     }
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
@@ -1369,6 +1668,40 @@ def verify_receipt(
         fail("install receipt paths do not match the canonical installed paths")
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
+    recorded_source = receipt.get("fleet_source")
+    source_keys = {
+        "root", "configured", "commit", "repository", "tree_sha256",
+        "published_supply_sha256", "profiles_dir", "published_supply",
+    }
+    if recorded_source is None:
+        # Older public receipts predate source provenance. They always verify
+        # against the immutable support cohort, never ambient environment.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
+    elif not isinstance(recorded_source, dict) or set(recorded_source) != source_keys:
+        fail("install receipt fleet source is missing or malformed")
+    elif recorded_source.get("configured") is True:
+        # Standalone self-update verification does not inherit the environment
+        # used by the installer. Reconstruct the selected source from the
+        # receipt so it does not falsely compare against public profiles.
+        active_source = fleet_source.resolve_recorded(recorded_source, TARTCI_ROOT)
+    else:
+        # Public installs execute from the immutable support generation. Use
+        # that same root while verifying the receipt, including during the
+        # install transaction before the staged wrapper becomes active.
+        active_source = fleet_source.resolve(support_root, allow_environment=False)
+    if isinstance(recorded_source, dict):
+        expected_source = {
+            "root": str(active_source.root),
+            "configured": active_source.configured,
+            "commit": active_source.source_commit,
+            "repository": active_source.repository,
+            "tree_sha256": active_source.tree_sha256,
+            "published_supply_sha256": active_source.published_supply_sha256,
+            "profiles_dir": str(active_source.profiles_dir),
+            "published_supply": str(active_source.published_supply),
+        }
+        if recorded_source != expected_source:
+            fail("installed fleet source does not match its receipt")
     support = receipt.get("support")
     support_keys = {
         "root", "manifest_path", "manifest_sha256", "repository", "source_commit",
@@ -1404,13 +1737,10 @@ def verify_receipt(
         if receipt.get("launch_helper") is not None:
             fail("install receipt unexpectedly records a launch helper")
     else:
-        helper_record = macos_launcher_identity.verify(
-            Path(helper["path"]), identifier=helper["identifier"],
-            team_id=helper["team_id"],
-            profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
-            source_commit=verified_support["source_commit"],
-            tart_home=data["host"]["tart_home"],
-        )
+        # The receipt names the layout; each layout's checks refuse the other's app.
+        layout = "v2" if (receipt.get("launch_helper") or {}).get("layout") == "v2" else "v1"
+        helper_record = launch_helper_record(
+            helper, config, data, support_root, verified_support["source_commit"], layout)
         if helper_record != receipt.get("launch_helper"):
             fail("installed launch helper does not match its receipt")
     expected_entrypoint = Path(data["host"]["home"]) / ".local/bin/tartci"
@@ -1425,8 +1755,19 @@ def verify_receipt(
         != support.get("launch_entrypoint")
     ):
         fail("installed TartCI launch entrypoint does not match its receipt")
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    recorded_interpreter = support.get("interpreter")
+    interpreter = Path(
+        recorded_interpreter["path"]
+        if isinstance(recorded_interpreter, dict) and recorded_interpreter.get("path")
+        else os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3")
+    )
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     interpreter_record = {
         "path": str(interpreter),
         "mode": stat.S_IMODE(interpreter_info.st_mode),
@@ -1442,7 +1783,7 @@ def verify_receipt(
                 f"{INTERPRETER_CHANGED_BY_OS_UPDATE}: the OS-managed {interpreter} changed "
                 f"with a macOS update ({evidence}), so the receipt no longer describes it; "
                 "remedy: reinstall the same generation to refresh the receipt "
-                "(`tartci fleet-macos self-update --apply` does this at the next idle window)")
+                "(tartci fleet-macos self-update --apply does this at the next idle window)")
         fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
@@ -1450,7 +1791,28 @@ def verify_receipt(
     recorded_persistent = receipt.get("persistent_plists", {})
     if recorded_persistent != expected_persistent:
         fail("installed persistent runner plist set does not match the profile receipt")
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    # Render with the same rule as write_receipt: pin only when the installed
+    # plist cohort carries TARTCI_PYTHON. Unpinned source renders must verify
+    # as unpinned rather than being silently rewritten during verification.
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                pinned = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {}).get("TARTCI_PYTHON")
+            except (OSError, plistlib.InvalidFileException):
+                pinned = None
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(
+            data, launch_entrypoint=launch_entrypoint, source=active_source
+        )
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
         fail("install receipt plist set does not match the profile")
@@ -1471,18 +1833,18 @@ def verify_receipt(
             installed_body = _verified_network_overlay(installed, body, config)
         if recorded.get(name) != digest or installed_body is None:
             fail(f"installed fleet plist failed receipt verification: {installed}")
-    expected_retired = replacements(data)
-    if receipt.get("retired_launchd_labels") != expected_retired:
-        fail("install receipt retired-label set does not match the profile")
-    for label in expected_retired:
-        if (agents_dir / f"{label}.plist").exists():
-            fail(f"declared legacy LaunchAgent became installable again: {label}")
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
         source_commit=verified_support["source_commit"],
         manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     )
+    expected_retired = replacements(data)
+    if receipt.get("retired_launchd_labels") != expected_retired:
+        fail("install receipt retired-label set does not match the profile")
+    for label in expected_retired:
+        if (agents_dir / f"{label}.plist").exists():
+            fail(f"declared legacy LaunchAgent became installable again: {label}")
     return receipt
 
 
@@ -1923,6 +2285,38 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
     return rows
 
 
+def _vm_reservation_owners(home: str) -> set[int]:
+    """Supervisor pids that hold a macOS VM reservation (macos-vm-cap.lib.sh)."""
+    owners: set[int] = set()
+    directory = Path(home or Path.home()) / ".config/tartci/macos-vm-reservations"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return owners
+    for name in names:
+        if not name.startswith("resv."):
+            continue
+        try:
+            first = (directory / name).read_text().split()[0]
+        except (OSError, IndexError):
+            continue
+        if first.isdigit():
+            owners.add(int(first))
+    return owners
+
+
+def _state_writers(state_dir: Path) -> list[int]:
+    """The supervisor pids recorded in a lane's heartbeat state files."""
+    writers: list[int] = []
+    for state_path in sorted(state_dir.glob("*.state.json")):
+        try:
+            writer = int(str(json.loads(state_path.read_text()).get("supervisor_pid")))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+        writers.append(writer)
+    return writers
+
+
 def fleet_readiness(
     receipt_path: Path,
     config: Path,
@@ -1958,8 +2352,37 @@ def fleet_readiness(
                 "blocked_seconds_threshold": blocked_serving_seconds,
             },
             "problems": [{"code": INTERPRETER_CHANGED_BY_OS_UPDATE
-                          if isinstance(exc, InterpreterChangedByOSUpdate) else "receipt_mismatch",
+                          if isinstance(exc, InterpreterChangedByOSUpdate)
+                          else ("lane_python_unavailable"
+                                if "interpreter unavailable" in str(exc)
+                                else "receipt_mismatch"),
                           "detail": str(exc)}],
+            "config": config_verdicts(config, support_root),
+        }
+
+    recorded_source = receipt.get("fleet_source")
+    try:
+        if isinstance(recorded_source, dict):
+            active_source = fleet_source.resolve_recorded(recorded_source, support_root)
+        else:
+            active_source = fleet_source.resolve(support_root, allow_environment=False)
+    except (OSError, ValueError) as exc:
+        # The source can disappear or change between receipt verification and
+        # this second resolution. Keep readiness fail-closed and observable;
+        # do not let a transient source race escape as an operator traceback.
+        return {
+            "managed": True,
+            "fleet_ready": False,
+            "verified_running_supervisors": None,
+            "expected_supervisors": None,
+            "serving": {
+                "blocked": None,
+                "blocked_lanes": [],
+                "unmeasurable_lanes": [],
+                "streak_threshold": blocked_serving_streak,
+                "blocked_seconds_threshold": blocked_serving_seconds,
+            },
+            "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
             "config": config_verdicts(config, support_root),
         }
 
@@ -2040,6 +2463,7 @@ def fleet_readiness(
     process_starts: dict[int, str] = {}
     process_parents: dict[int, int] = {}
     managed_supervisor_pids: set[int] = set()
+    orphan_pids: set[int] = set()
     try:
         process_table = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,lstart=,command="],
@@ -2052,7 +2476,14 @@ def fleet_readiness(
             problems.append({"code": "process_table_probe_error"})
         else:
             home = next(iter(fleet_homes), "")
-            generation_prefix = f"{home}/.local/share/tartci-generations/"
+            # A sealed-launcher host runs its supervisors from inside the app
+            # (TartCILauncher.app/Contents/Resources/support), not from a
+            # generation directory. Matching only generations made this check
+            # blind there: m5studio, 2026-10-22, ran an orphaned slot2
+            # supervisor beside its replacement for hours, reported only as
+            # heartbeat_missing.
+            generation_prefixes = (f"{home}/.local/share/tartci-generations/",
+                                   f"{home}/.local/libexec/TartCILauncher.app/")
             provider_suffix = "/providers/tart-macos/runner.sh --loop"
             for line in process_table.stdout.splitlines():
                 match = re.match(
@@ -2067,18 +2498,27 @@ def fleet_readiness(
                 command = match.group(4)
                 if (
                     ppid == 1
-                    and generation_prefix in command
+                    and any(prefix in command for prefix in generation_prefixes)
                     and provider_suffix in command
                 ):
                     managed_supervisor_pids.add(pid)
             candidates = managed_supervisor_pids - expected_pids
             if candidates:
                 candidates -= launchd_managed_pids()
-            for orphan_pid in sorted(candidates):
-                problems.append({
-                    "code": "orphaned_supervisor", "label": str(orphan_pid),
-                    "detail": process_starts[orphan_pid],
-                })
+            # Reported after the lanes, against the lane an orphan still
+            # writes for when there is one (see orphan_problem below).
+            orphan_pids = set(candidates)
+    reservation_owners = _vm_reservation_owners(next(iter(fleet_homes), ""))
+    reported_orphans: set[int] = set()
+
+    def orphan_problem(pid: int, label: str) -> dict[str, str]:
+        reported_orphans.add(pid)
+        holds = "; it holds a VM reservation" if pid in reservation_owners else ""
+        lane = f" serving {label}" if label != str(pid) else ""
+        return {"code": "orphaned_supervisor", "label": label,
+                "detail": f"orphaned supervisor pid {pid} (started {process_starts.get(pid, '?')})"
+                          f"{lane}; its launcher exited{holds}. It steps aside between jobs; "
+                          f"if it does not, stop it after its job: kill -TERM {pid}"}
 
     verified_running = 0
     persistent_verified = 0
@@ -2123,7 +2563,22 @@ def fleet_readiness(
                         matching_state = candidate
                         break
                 if matching_state is None:
-                    problems.append({"code": "heartbeat_missing", "label": label})
+                    # Name the process that is writing this lane's heartbeat
+                    # instead, when it is not this lane's supervisor.
+                    writers = _state_writers(state_dir)
+                    orphan_writer = next((w for w in writers if w in orphan_pids), None)
+                    if orphan_writer is not None:
+                        problems.append(orphan_problem(orphan_writer, label))
+                    elif state_dir.is_dir() and any(state_dir.glob("*.handoff")):
+                        writer = writers[0] if writers else None
+                        problems.append({"code": "supervisor_handoff_pending", "label": label,
+                                         "detail": f"supervisor pid {writer} still serves "
+                                                   "this lane; its replacement takes over "
+                                                   "when it exits after its current job. If "
+                                                   "that job is stuck: kill -TERM "
+                                                   f"{writer} (tears down its VM)"})
+                    else:
+                        problems.append({"code": "heartbeat_missing", "label": label})
                     continue
                 try:
                     heartbeat_at = dt.datetime.fromisoformat(
@@ -2196,6 +2651,21 @@ def fleet_readiness(
                     # disk inside the current blocked streak, the lane is
                     # blocked now. Without this, a full disk read as
                     # "serving: ok" for the first 90 minutes of an outage.
+                    blocked_cause = str(matching_state.get("serving_blocked_cause", "") or "")
+                    # DHCP breaker open is a host-local hard stop: report the
+                    # lane NOT SERVING immediately, without waiting for the
+                    # generic transient streak threshold.
+                    if blocked_cause == "dhcp_breaker":
+                        serving_blocked_lanes.append({
+                            "label": label,
+                            "blocked_seconds": int(blocked_for),
+                            "streak": streak,
+                            "last_phase": str(matching_state.get("serving_blocked_last_phase", "") or ""),
+                            "cause": "dhcp_breaker",
+                            "reason": "DHCP breaker open",
+                        })
+                        verified_running += 1
+                        continue
                     disk_reason = disk_denial_during_streak(
                         (plist.get("EnvironmentVariables") or {}).get(
                             "TARTCI_DISK_DENIAL_RECEIPT_DIR", ""),
@@ -2222,9 +2692,14 @@ def fleet_readiness(
                     # TRANSIENCE gate, so an upstream blip cannot raise a
                     # fleet-wide alarm. A pre-streak generation has only the
                     # duration gate, which is the behaviour it already had.
-                    if blocked_for > blocked_serving_seconds and (
+                    admission_block = blocked_cause == "admission failing" and (
+                        (streak is not None and streak >= blocked_serving_streak)
+                        or blocked_for > blocked_serving_seconds
+                    )
+                    generic_block = blocked_for > blocked_serving_seconds and (
                         streak is None or streak >= blocked_serving_streak
-                    ):
+                    )
+                    if admission_block or generic_block:
                         serving_blocked_lanes.append({
                             "label": label,
                             "blocked_seconds": int(blocked_for),
@@ -2232,9 +2707,13 @@ def fleet_readiness(
                             "last_phase": str(
                                 matching_state.get("serving_blocked_last_phase", "") or ""
                             ),
-                            "cause": "unserved",
+                            "cause": blocked_cause or "unserved",
+                            "reason": ("admission failing" if blocked_cause == "admission failing" else ""),
                         })
                 verified_running += 1
+
+    for orphan_pid in sorted(orphan_pids - reported_orphans):
+        problems.append(orphan_problem(orphan_pid, str(orphan_pid)))
 
     if admission_open and len(persistent_loaded_outputs) == len(persistent_labels):
         for label, output in persistent_loaded_outputs.items():
@@ -2298,6 +2777,8 @@ def fleet_readiness(
             and verified_running == len(labels)
             and persistent_verified == len(persistent_labels)
             and not problems
+            and not any(lane.get("cause") in {"dhcp_breaker", "admission failing"}
+                        for lane in serving_blocked_lanes)
         ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),
@@ -2313,7 +2794,7 @@ def fleet_readiness(
         "disk": disks,
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.
-        "config": config_verdicts(config, support_root),
+        "config": config_verdicts(config, support_root, source=active_source),
     }
 
 
@@ -2336,7 +2817,7 @@ def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
     """The SSH target a fallback lane reaches a preferred host by.
 
     The same rule self-update uses for its peers: the host's published
-    `host.ssh` from its checked-in profile, else the `tartci-<host_id>` alias
+    host.ssh from its checked-in profile, else the tartci-<host_id> alias
     convention. Resolved at render time, so the LaunchAgent carries the exact
     target and the supervisor never re-reads profiles.
     """
@@ -2356,6 +2837,7 @@ def lane_plist(
     *,
     slot: int = 1,
     launch_entrypoint: Path | None = None,
+    source: fleet_source.FleetSource | None = None,
 ) -> dict:
     host = data["host"]
     lane_id = lane["id"]
@@ -2382,7 +2864,7 @@ def lane_plist(
         "TARTCI_RUNNER_GROUP_ID": str(lane["runner_group_id"]),
         "TARTCI_RUNNER_LABELS": ",".join(lane["labels"]),
         "TARTCI_MACOS_GOLDEN": lane["golden"],
-        "TARTCI_CI_CACHE": host["cache_root"],
+        "TARTCI_CI_CACHE": lane.get("cache_root", host["cache_root"]),
         "TARTCI_STATE_DIR": state,
         "TARTCI_DISK_DENIAL_RECEIPT_DIR": f"{host['home']}/.tartci/state/disk-admission",
         "TARTCI_RECEIPT_HOST_ID": host["id"],
@@ -2393,8 +2875,36 @@ def lane_plist(
         "TARTCI_RUNNER_NAME_PREFIX": f"{host['id']}-{identity}",
         "TARTCI_RUNNER_SLOT": str(slot),
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
+        # Marks a LaunchAgent run: the interpreter picker refuses to search
+        # PATH under it (providers/common/toml-python.lib.sh).
+        "TARTCI_LAUNCHD": "1",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    if lane.get("runtime_measure"):
+        env["TARTCI_RUNTIME_MEASURE"] = "1"
+        env["TARTCI_RUNTIME_STORE"] = f"{host['home']}/.tartci/runtime"
+        env["TARTCI_RUNTIME_TAGS"] = lane.get("runtime_tags") or host["id"]
+        if lane.get("runtime_gh_enrich"):
+            env["TARTCI_RUNTIME_GH_ENRICH"] = "1"
+    configured_source = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
+    if source is None and configured_source:
+        source = fleet_source.resolve(TARTCI_ROOT)
+    if source is not None and source.configured:
+        env.update({
+            "TARTCI_FLEET_SOURCE_ROOT": str(source.root),
+            "TARTCI_FLEET_SOURCE_COMMIT": source.source_commit or "",
+            "TARTCI_FLEET_SOURCE_REPOSITORY": source.repository or "",
+            "TARTCI_ADVERTISED_LABELS": str(source.published_supply),
+            "TARTCI_JOB_CLAIM_SUPPLY": str(source.published_supply),
+        })
+    # The installer resolves and probes one interpreter before rendering. Keep
+    # that exact path in every LaunchAgent so TartCILauncher and ghapp cannot
+    # follow a later PATH relink.
+    pinned_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if pinned_python:
+        env["TARTCI_PYTHON"] = pinned_python
+        env["SHIPYARD_GHAPP_PYTHON_BINARY"] = pinned_python
+        env["PATH"] = f"{Path(pinned_python).parent}:{env['PATH']}"
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"] and lane["id"] == "pulp-gate":
         env.update({
@@ -2408,6 +2918,7 @@ def lane_plist(
             "TARTCI_WORKTREE_CLEANUP_MAX_GIB": str(cleanup["max_gib"]),
             "TARTCI_WORKTREE_CLEANUP_TIMEOUT_SECS": str(cleanup["timeout_seconds"]),
             "TARTCI_WORKTREE_CLEANUP_COOLDOWN_SECS": str(cleanup["cooldown_seconds"]),
+            "TARTCI_WORKTREE_CLEANUP_TART_HOME": host["tart_home"],
         })
     github_app = data.get("github_app")
     if github_app is not None:
@@ -2462,6 +2973,10 @@ def lane_plist(
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])
     if "jit_github_cli" in lane:
         env["TARTCI_JIT_GH_CLI"] = lane["jit_github_cli"]
+    if "cache_root" in lane:
+        # runner.sh refuses to boot when the lane root resolves into or around
+        # this one (lane-cache-root.lib.sh).
+        env["TARTCI_HOST_CI_CACHE"] = host["cache_root"]
     if "chrome_app_dir" in lane:
         env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
     if "assignment_mode" in lane:
@@ -2651,6 +3166,8 @@ def registrations_from_env(env: dict[str, str]) -> list[dict]:
 
 def advertised_registrations(data: dict) -> list[dict]:
     """Every JIT registration a loaded profile's lanes can mint."""
+    if data["host"].get("published", True) is False:
+        return []
     host_id = data["host"]["id"]
     profile = data.get("name") or host_id
     rows: list[dict] = []
@@ -2689,18 +3206,16 @@ def _display_path(path: Path, root: Path | None = None) -> str:
 
 
 TARTCI_ROOT = Path(__file__).resolve().parents[1]
-PUBLISHED_SUPPLY = TARTCI_ROOT / "fleet" / "advertised-labels.json"
-PUBLISHED_SUPPLY_URL = (
-    "https://raw.githubusercontent.com/danielraffel/tartci/main/fleet/advertised-labels.json"
-)
+PUBLISHED_SUPPLY = fleet_source.resolve(TARTCI_ROOT, allow_environment=False).published_supply
 FLEET_PROFILE_GLOB = "*-macos-fleet.toml"
 _PERSISTENT_RUNNER_NAME = re.compile(
     r"^actions\.runner\.[A-Za-z0-9_.-]+\.(?P<name>[A-Za-z0-9_.-]+)$")
 
 
-def fleet_profiles(root: Path = TARTCI_ROOT) -> list[Path]:
+def fleet_profiles(root: Path | None = None) -> list[Path]:
     """Every checked-in macOS fleet profile. Discovery is the glob: no host list."""
-    return sorted((root / "profiles").glob(FLEET_PROFILE_GLOB))
+    source = fleet_source.resolve(root or TARTCI_ROOT, allow_environment=root is None)
+    return sorted(source.profiles_dir.glob(FLEET_PROFILE_GLOB))
 
 
 def persistent_runners(data: dict) -> list[dict]:
@@ -2710,6 +3225,8 @@ def persistent_runners(data: dict) -> list[dict]:
     are set at registration outside tartci, so only the name is declared.
     """
     host_id = data["host"]["id"]
+    if data["host"].get("published", True) is False:
+        return []
     rows = []
     for label in data["host"].get("persistent_runner_labels", []) or []:
         match = _PERSISTENT_RUNNER_NAME.fullmatch(label)
@@ -2723,7 +3240,8 @@ def persistent_runners(data: dict) -> list[dict]:
 
 
 def advertised_labels_snapshot(paths: list[Path], commit: str | None,
-                               root: Path | None = None) -> dict:
+                               root: Path | None = None,
+                               repository: str = ADVERTISED_LABELS_REPO) -> dict:
     registrations: list[dict] = []
     persistent: list[dict] = []
     hosts: list[dict] = []
@@ -2731,47 +3249,65 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         data = load(path)
         registrations.extend(advertised_registrations(data))
         persistent.extend(persistent_runners(data))
-        hosts.append({"profile": data.get("name") or data["host"]["id"],
-                      "host_id": data["host"]["id"],
-                      "ssh": data["host"].get("ssh")})
+        if data["host"].get("published", True):
+            hosts.append({"profile": data.get("name") or data["host"]["id"],
+                          "host_id": data["host"]["id"],
+                          "ssh": data["host"].get("ssh")})
     return {
         "schema": ADVERTISED_LABELS_SCHEMA,
         "generated_from": {
-            "repo": ADVERTISED_LABELS_REPO,
+            "repo": repository,
             "commit": commit,
             "profiles": [_display_path(path, root) for path in paths],
+            "profiles_sha256": fleet_source.FleetSource(
+                root or TARTCI_ROOT,
+                (root or TARTCI_ROOT) / "profiles",
+                (root or TARTCI_ROOT) / "fleet" / "advertised-labels.json",
+                bool(commit),
+            ).profiles_sha256,
         },
         "registrations": registrations,
         # Additive to v1: runners a host owns whose labels tartci does not set.
         "persistent_runners": persistent,
         # Additive to v1: how fleet hosts reach each other (self-update's
-        # one-at-a-time check). ssh null means the alias `tartci-<host_id>`.
+        # one-at-a-time check). ssh null means the alias tartci-<host_id>.
         "hosts": hosts,
     }
 
 
-def published_snapshot(root: Path = TARTCI_ROOT) -> dict:
-    """The committed form: every fleet profile, commit null.
+def published_snapshot(root: Path | None = None) -> dict:
+    """The committed form containing every fleet profile.
 
-    A file cannot name the commit that contains it, so the published copy
-    carries no commit; its provenance is the git ref it was read from.
+    Public checkouts keep the historical null commit. An explicitly configured
+    private source carries its pinned source commit and repository.
     """
-    return advertised_labels_snapshot(fleet_profiles(root), None, root)
+    root = root or TARTCI_ROOT
+    source = fleet_source.resolve(root, allow_environment=root == TARTCI_ROOT)
+    paths = sorted(source.profiles_dir.glob(FLEET_PROFILE_GLOB))
+    if not paths:
+        raise ValueError(f"no macOS fleet profiles found under {source.profiles_dir}")
+    snapshot = advertised_labels_snapshot(
+        paths, source.source_commit if source.configured else None, source.root,
+        source.repository or ADVERTISED_LABELS_REPO)
+    if not snapshot["registrations"] and not snapshot["hosts"]:
+        raise ValueError("fleet source publishes no registrations or hosts")
+    return snapshot
 
 
 def render_published(snapshot: dict) -> str:
     return json.dumps(snapshot, indent=2) + "\n"
 
 
-def read_published(source: str | Path, timeout: float = 15.0) -> dict:
-    text: str
-    if isinstance(source, str) and source.startswith(("https://", "http://")):
-        import urllib.request
-        with urllib.request.urlopen(source, timeout=timeout) as response:  # noqa: S310
-            text = response.read().decode("utf-8")
-    else:
-        text = Path(source).read_text()
-    value = json.loads(text)
+def read_published(source: str | Path) -> dict:
+    """A published supply read from a local file.
+
+    URLs are refused: the supply a host checks comes from its selected fleet
+    source (fleet_source), never from a network fetch of the public copy.
+    """
+    if str(source).startswith(("https://", "http://")):
+        raise ValueError("a published supply is read from a file, not a URL; "
+                         "the default is the selected fleet source's")
+    value = json.loads(Path(source).read_text())
     if not isinstance(value, dict) or value.get("schema") != ADVERTISED_LABELS_SCHEMA:
         raise ValueError(f"not a {ADVERTISED_LABELS_SCHEMA} document")
     if not isinstance(value.get("registrations"), list):
@@ -2809,24 +3345,21 @@ def published_commit(source: str | Path) -> str | None:
     """The tartci commit a published supply was generated at, when knowable.
 
     A file inside an installed generation takes that generation's manifest
-    source_commit; a file in a git checkout takes its HEAD; the raw URL asks
-    GitHub for main's head (best effort). The committed file itself carries
+    source_commit; a file in a git checkout takes its HEAD; a configured
+    fleet source takes its pinned commit. The committed file itself carries
     no commit, so this is always read from where the file came from.
     """
     text = str(source)
+    configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
+    configured_commit = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT", "").strip()
+    configured_supply = (Path(configured_root).expanduser().resolve()
+                         / "fleet" / "advertised-labels.json") if configured_root else None
+    if (configured_supply is not None and configured_commit
+            and _SHA.fullmatch(configured_commit)
+            and Path(text).expanduser().resolve() == configured_supply):
+        return configured_commit
     if text.startswith(("https://", "http://")):
-        if text != PUBLISHED_SUPPLY_URL:
-            return None
-        try:
-            import urllib.request
-            request = urllib.request.Request(
-                "https://api.github.com/repos/danielraffel/tartci/commits/main",
-                headers={"Accept": "application/vnd.github.sha"})
-            with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
-                value = response.read().decode().strip()
-            return value if _SHA.fullmatch(value) else None
-        except Exception:  # noqa: BLE001 - provenance is best effort
-            return None
+        return None
     root = Path(text).resolve().parent.parent
     manifest = root / support_manifest.MANIFEST_NAME
     if manifest.is_file():
@@ -2904,12 +3437,27 @@ def verify_supply(installed: Path, published: dict | None,
 
 
 def config_verdicts(config: Path, support_root: Path,
-                    receipt: Path = DEFAULT_INSTALL_RECEIPT) -> dict:
+                    receipt: Path = DEFAULT_INSTALL_RECEIPT,
+                    source: fleet_source.FleetSource | None = None) -> dict:
     """Profile drift and supply verdicts for status surfaces. Never raises.
 
     Reported, never enforced: a status or admission path that refused on
     these would turn configuration drift into a capacity outage.
     """
+    if source is None:
+        try:
+            source = fleet_source.resolve(support_root)
+        except Exception as exc:  # noqa: BLE001 - a broken check reads as unknown
+            reason = f"{type(exc).__name__}: {exc}"
+            return {
+                "profile_drift": {"state": "unknown", "reason": reason},
+                "supply": {"state": "unknown", "reason": reason},
+                "self_update": self_update_summary(),
+                "gate_reserve": {"lines": ["gate reserve: unknown (source unavailable)"],
+                                 "problem": "source_unavailable"},
+                "tool_freshness": tool_freshness_summary(),
+                "host_vitals": host_vitals_summary(),
+            }
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
                 "supply": {"state": "not_applicable", "reason": "no installed profile"},
@@ -2920,7 +3468,7 @@ def config_verdicts(config: Path, support_root: Path,
                 "host_vitals": host_vitals_summary()}
     value: dict = {}
     try:
-        drift = profile_drift(config, support_root / "profiles")
+        drift = profile_drift(config, source.profiles_dir)
         value["profile_drift"] = {
             "state": drift["state"], "reason": drift["reason"],
             "checked_in": drift["checked_in"],
@@ -2929,14 +3477,15 @@ def config_verdicts(config: Path, support_root: Path,
         }
     except Exception as exc:  # noqa: BLE001 - a broken check reads as unknown
         value["profile_drift"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
-    source = support_root / "fleet" / "advertised-labels.json"
+    source_path = source.published_supply
     try:
         try:
-            published, error = read_published(source), ""
+            published, error = read_published(source_path), ""
         except Exception as exc:  # noqa: BLE001
-            published, error = None, f"{source}: {exc}"
+            published, error = None, f"{source_path}: {exc}"
         supply = verify_supply(config, published, error,
-                               published_from=published_commit(source),
+                               published_from=(source.source_commit
+                                               or published_commit(source_path)),
                                host_commit=host_tartci_commit(receipt))
         value["supply"] = {
             "state": supply["state"], "reason": supply["reason"],
@@ -3180,7 +3729,7 @@ def reachable(registration: dict, repo: str, workflow: str,
 # copy to itself. This compares the two semantically, by key path.
 
 DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
-DEFAULT_PROFILES_DIR = Path(__file__).resolve().parents[1] / "profiles"
+DEFAULT_PROFILES_DIR = fleet_source.resolve(TARTCI_ROOT, allow_environment=False).profiles_dir
 
 
 def _flatten(value: object, prefix: str = "") -> dict[str, object]:
@@ -3326,6 +3875,7 @@ def main(argv: list[str] | None = None) -> int:
     receipt.add_argument("--entrypoint-source", required=True, type=Path)
     receipt.add_argument("--launch-entrypoint", required=True, type=Path)
     receipt.add_argument("--source-authority-commit", required=True)
+    receipt.add_argument("--launcher-layout", choices=("v1", "v2"), default="v1")
     verify = sub.add_parser("verify-installed")
     verify.add_argument("receipt", type=Path)
     verify.add_argument("--config", required=True, type=Path)
@@ -3369,8 +3919,8 @@ def main(argv: list[str] | None = None) -> int:
         "verify-supply",
         help="read-only: installed profile's registrations vs the published supply")
     supply.add_argument("--installed", type=Path, default=None)
-    supply.add_argument("--published", default=str(PUBLISHED_SUPPLY),
-                        help=f"file or URL (default: repo copy; main: {PUBLISHED_SUPPLY_URL})")
+    supply.add_argument("--published", default=None,
+                        help="file (default: the selected fleet source's)")
     supply.add_argument("--receipt", type=Path, default=DEFAULT_INSTALL_RECEIPT,
                         help="installed fleet receipt naming this host's tartci commit")
     supply.add_argument("--json", action="store_true")
@@ -3385,12 +3935,17 @@ def main(argv: list[str] | None = None) -> int:
         "profile-drift",
         help="read-only: installed profile vs its checked-in source (by name)")
     drift.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE)
-    drift.add_argument("--profiles-dir", type=Path, default=DEFAULT_PROFILES_DIR)
+    drift.add_argument("--profiles-dir", type=Path, default=None)
     drift.add_argument("--strict", action="store_true",
                        help="exit 1 on drift (exit 2 on unknown in every mode)")
     drift.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        active_source = fleet_source.resolve(TARTCI_ROOT)
+        if args.command == "verify-supply" and args.published is None:
+            args.published = str(active_source.published_supply)
+        if args.command == "profile-drift" and args.profiles_dir is None:
+            args.profiles_dir = active_source.profiles_dir
         if args.command == "advertised-labels":
             if args.publish or args.check:
                 if args.profiles:
@@ -3404,7 +3959,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     if current != body:
                         print(f"fleet-macos: {args.check} is stale; regenerate with "
-                              "`tartci fleet-macos advertised-labels --publish > "
+                              "tartci fleet-macos advertised-labels --publish > "
                               "fleet/advertised-labels.json`", file=sys.stderr)
                         return 1
                     print(f"up to date: {args.check}")
@@ -3416,7 +3971,10 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("--all takes no profile arguments")
             if not paths:
                 parser.error("name profile files or pass --all")
-            snapshot = advertised_labels_snapshot(paths, git_head(TARTCI_ROOT))
+            source = fleet_source.resolve(TARTCI_ROOT)
+            snapshot = advertised_labels_snapshot(
+                paths, source.source_commit or git_head(source.root), source.root,
+                source.repository or ADVERTISED_LABELS_REPO)
             print(json.dumps(snapshot, indent=2) if args.json else render_advertised(snapshot))
             return 0
         if args.command == "verify-supply":
@@ -3495,6 +4053,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.entrypoint_source,
                 args.launch_entrypoint,
                 args.source_authority_commit,
+                args.launcher_layout,
             )
             print(args.output)
             return 0

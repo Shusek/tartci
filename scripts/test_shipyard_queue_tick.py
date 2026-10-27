@@ -32,6 +32,7 @@ class QueueTickControlTests(unittest.TestCase):
         ledger_seed: object | None = None,
         extra_env: dict[str, str] | None = None,
         invalid_tmpdir: bool = False,
+        reap_opt_in: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], str, object | None]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -59,6 +60,12 @@ elif [ "$1 $2" = "auth export" ]; then
   printf '{"schema_version":1,"command":"auth.export","bundle":{"version":2}}\\n'
 elif [ "$1 $2" = "merge-queue status" ]; then
   printf '{"held":%s,"authority_matches":false}\\n' "$HELD"
+elif [ "$1" = "rescue" ]; then
+  pwd -P > "$CALLS.rescue-cwd"
+  [ -z "$RESCUE_SLEEP" ] || sleep "$RESCUE_SLEEP"
+  [ -z "$RESCUE_ERROR" ] || printf '%s\\n' "$RESCUE_ERROR" >&2
+  printf '%s\\n' "$RESCUE_JSON"
+  exit "$RESCUE_RC"
 elif [ "$1 $2" = "ship-state list" ]; then
   printf '%s\\n' "$STATES"
 elif [ "$1 $2" = "ship-state discard" ]; then
@@ -120,6 +127,10 @@ exit 98
                     "GH_REPO_RC": "0",
                     "FAKE_NO_REPO_FLAG": "0",
                     "GH_MERGED_REPO": "",
+                    "RESCUE_JSON": json.dumps({"runs": []}),
+                    "RESCUE_RC": "0",
+                    "RESCUE_ERROR": "",
+                    "RESCUE_SLEEP": "",
                 }
             )
             if legacy_full_live:
@@ -144,6 +155,10 @@ exit 98
                 ledger_path.write_text(json.dumps(ledger_seed), encoding="utf-8")
             if repo_root:
                 env["SHIPYARD_QUEUE_REPO_ROOT"] = str(root)
+            if reap_opt_in:
+                opt_in = root / ".config/tartci/reap-superseded-merge-groups.enabled"
+                opt_in.parent.mkdir(parents=True, exist_ok=True)
+                opt_in.write_text("", encoding="utf-8")
             result = subprocess.run(
                 ["/bin/bash", str(SCRIPT)],
                 env=env,
@@ -156,6 +171,14 @@ exit 98
                 if ledger_path.exists()
                 else None
             )
+            rescue_cwd = Path(f"{calls}.rescue-cwd")
+            self.last_rescue_cwd = (
+                rescue_cwd.read_text(encoding="utf-8").strip() if rescue_cwd.exists() else None
+            )
+            reap_log = root / "Library/Logs/tartci/superseded-merge-groups.log"
+            self.last_reap_log = (
+                reap_log.read_text(encoding="utf-8") if reap_log.exists() else ""
+            )
             health_path = root / "Library/Logs/shipyard-queue-tick.health.json"
             self.last_health = (
                 health_path.read_text(encoding="utf-8") if health_path.exists() else "{}"
@@ -165,6 +188,121 @@ exit 98
                 calls.read_text(encoding="utf-8") if calls.exists() else "",
                 ledger,
             )
+
+    SUPERSEDED = {
+        "runs": [
+            {"run_id": 38849842963, "branch": "gh-readonly-queue/main/pr-10377-66ffb1a6",
+             "status": "cancelled", "decision": "cancel",
+             "evidence": "queue ref absent from ls-remote; 1 active job(s) still hold capacity"},
+            {"run_id": 38850408818, "branch": "gh-readonly-queue/main/pr-10398-8000be88",
+             "status": "keep", "decision": "keep", "evidence": "queue ref is live"},
+        ]
+    }
+
+    @staticmethod
+    def rescue_calls(calls: str) -> list[str]:
+        return [line for line in calls.splitlines() if line.startswith("rescue ")]
+
+    def test_reaper_opt_in_cancels_with_apply_and_logs_each_cancel(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True,
+            extra_env={"RESCUE_JSON": json.dumps(self.SUPERSEDED)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.rescue_calls(calls),
+            ["rescue --superseded-merge-group --repo Generous-Corp/pulp --json --apply"],
+        )
+        self.assertIn("reap-superseded Generous-Corp/pulp: mode=apply exit 0 cancelled=1 keep=1",
+                      result.stdout)
+        rows = [line.split("\t") for line in self.last_reap_log.splitlines()]
+        self.assertEqual(len(rows), 1, self.last_reap_log)
+        self.assertEqual(rows[0][2:6], ["Generous-Corp/pulp", "38849842963",
+                                        "gh-readonly-queue/main/pr-10377-66ffb1a6", "cancelled"])
+        self.assertIn("queue ref absent", rows[0][6])
+
+    def test_reaper_without_opt_in_only_reports(self) -> None:
+        report = {"runs": [dict(self.SUPERSEDED["runs"][0], status="would-cancel")]}
+        result, calls, _ = self.run_tick(
+            held=False, extra_env={"RESCUE_JSON": json.dumps(report)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.rescue_calls(calls),
+            ["rescue --superseded-merge-group --repo Generous-Corp/pulp --json"],
+        )
+        self.assertIn("mode=dry-run exit 0 would-cancel=1", result.stdout)
+        self.assertIn("\twould-cancel\t", self.last_reap_log)
+
+    def test_a_failing_reaper_never_fails_the_tick(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True, states=self.stale_open_state(), gh_state="OPEN",
+            extra_env={"RESCUE_RC": "1", "RESCUE_JSON": "not json",
+                       "RESCUE_ERROR": "github: HTTP 502 Bad Gateway"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unreadable output (github: HTTP 502 Bad Gateway); skipped", result.stdout)
+        # The rest of the tick still ran.
+        self.assertIn("ghapp pr view 42", calls)
+        self.assertIn("mode=reap reaped=0 open=1", result.stdout)
+        self.assertEqual(self.last_reap_log, "")
+
+    def test_a_hung_reaper_is_cut_off_and_the_tick_goes_on(self) -> None:
+        started = time.monotonic()
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True, states=self.stale_open_state(), gh_state="OPEN",
+            extra_env={"RESCUE_SLEEP": "30", "SHIPYARD_QUEUE_REAP_TIMEOUT_SECS": "1"},
+        )
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode=apply timed out after 1.0s; skipped", result.stdout)
+        self.assertIn("ghapp pr view 42", calls)
+
+    def test_without_a_repo_root_the_reaper_is_skipped_and_shipyard_never_called(self) -> None:
+        # Run from $HOME, Shipyard cannot resolve its token from a git remote.
+        result, calls, _ = self.run_tick(held=False, reap_opt_in=True, repo_root=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
+        self.assertIn("reap-superseded Generous-Corp/pulp: skipped: no repo root configured",
+                      result.stdout)
+        self.assertIn("mode=reap", result.stdout)
+
+    def test_a_configured_root_that_does_not_exist_skips_the_reaper(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True, repo_root=False,
+            extra_env={"SHIPYARD_QUEUE_REPO_ROOT": "/nonexistent/tartci-reaper-root"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
+        self.assertIn("skipped: no repo root configured", result.stdout)
+
+    def test_one_repo_root_never_serves_several_repositories(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, reap_opt_in=True,
+            extra_env={"SHIPYARD_QUEUE_REAP_REPOS": "Generous-Corp/pulp danielraffel/tartci"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
+        self.assertIn("skipped: one repo root cannot serve 2 repositories", result.stdout)
+        self.assertIn("(Generous-Corp/pulp danielraffel/tartci)", result.stdout)
+        self.assertIn("mode=reap", result.stdout)
+
+    def test_the_reaper_runs_from_the_repo_root(self) -> None:
+        # A checkout apart from HOME, so running from HOME cannot pass.
+        with tempfile.TemporaryDirectory() as checkout:
+            result, calls, _ = self.run_tick(
+                held=False, reap_opt_in=True, repo_root=False,
+                extra_env={"RESCUE_JSON": json.dumps(self.SUPERSEDED),
+                           "SHIPYARD_QUEUE_REPO_ROOT": checkout},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(self.rescue_calls(calls)), 1)
+            self.assertEqual(self.last_rescue_cwd, os.path.realpath(checkout))
+
+    def test_a_held_queue_skips_the_reaper(self) -> None:
+        result, calls, _ = self.run_tick(held=True, reap_opt_in=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rescue_calls(calls), [])
 
     def test_central_hold_exits_before_ship_state_or_github_reads(self) -> None:
         result, calls, _ = self.run_tick(held=True)

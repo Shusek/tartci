@@ -32,7 +32,36 @@ The driver mode is optional; existing provider bootstrap remains available.
 Queue admission is separate from GitHub's eventual job assignment. A live lane
 still needs a real GitHub job, drain and restart-recovery check before activation.
 
-## Upstream changes reviewed for this update
+## Upstream synchronization, 2026-10-27
+
+This generation merges upstream through
+`ef47962c1475bc5bd8b967744887a25d0b98675d` (PR #712), retaining all Suvio
+extensions and the October 26 shared-assignment authorization repair.
+It includes storage-health admission for external VM stores, bounded queue
+observations, the pre-mint demand hold, shared-cache configuration isolation,
+pinned Windows EFI variables and verified private Windows backing snapshots.
+
+Prepared macOS/Linux guests continue using their protected driver transport,
+without host cache mounts or native DHCP/SSH probes. Legacy cache mounts keep
+the read-only isolation knobs alongside the new cache validation and private
+guest ccache configuration. Shared-group observation and policy checks apply
+to every explicitly declared repository. Retargeting revalidates the new
+class and retains its capacity lease if VM teardown fails.
+
+Windows prepared-driver lifecycle tests also cover the verified backing
+snapshot path. The Windows cleanup probes tolerate an already-exited QEMU PID
+under `set -e`, so teardown can remove the job directory and release its lease.
+Host installations must provision a reviewed SHA-256 sidecar for their Windows
+golden before activating this generation; a custom EFI template also needs its
+SHA-256 pin. Missing or changed bytes refuse admission before JIT minting.
+
+The upstream review-verdict workflow runs only in its upstream repository.
+Its signer configuration does not govern this fork. Upstream fleet self-update
+also accepts only upstream repository identities; Suvio keeps its protected
+deployment through platform-infra. Source synchronization does not enable its
+automatic launcher update or replace Suvio's qualified FDA service app.
+
+## Earlier upstream synchronization
 
 The 2026-10-07 synchronization includes upstream through
 `09e70b721dd7f5f9fcd76d021e04140d0acec06c` (PR #425): 207 commits and 169 changed
@@ -52,9 +81,8 @@ and they do not publish native DHCP probe receipts. Regression tests prove that
 both local and JIT jobs still complete and dispose their VM when a native DHCP
 probe is occupied, without changing its state or issuing direct SSH commands.
 
-This synchronization changes the fork source. The installed Suvio service
-remains pinned to `ac966b479e926e0cdb5133c52be884c19a2ab7db`; deployment of a newer
-generation requires a separate private-host canary, job drain and teardown check.
+The installed Suvio generation is recorded independently in platform-infra.
+Deployment requires a private-host canary, job drain and teardown check.
 
 ### Initial review
 
@@ -80,8 +108,9 @@ None of those 41 files overlaps the original 17-file extension patch.
 Keep `origin` pointing at this fork and `upstream` at danielraffel/tartci.
 Merge reviewed upstream changes into `main`, retaining separate extension
 commits. Pin installations to a tested commit and update them explicitly.
-Upstream's fleet self-update currently binds danielraffel/tartci; leave that
-automation disabled for this fork until fork-aware update support is added.
+Upstream's fleet self-update accepts only upstream repository identities;
+leave that automation disabled for this fork until fork-aware update support
+is added.
 
 Run the repository's existing CI checks:
 

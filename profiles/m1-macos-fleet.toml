@@ -29,6 +29,26 @@ job_claim_max_age_seconds = 1800
 # below its computed floor. `refuse` denies the new clone instead; flip it only
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
+# The pinned mise binary (runbook: Pinned mise). Built from source at mise
+# v2026.10.17 and copied between hosts by digest. The previous pin
+# (2026.10.11) stays installed beside it as the rollback: restore this table's
+# three values to it. The install refuses a missing or different binary and records
+# ~/.config/tartci/mise.pin. It changes no PATH and no lane: lanes keep their
+# tools until one is moved to the pinned toolchain on purpose. m1 first; the
+# other hosts get this table after m1's rollout step. Deleting the table
+# unpins mise entirely.
+[mise]
+version = "2026.10.17"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.17/bin/mise"
+sha256 = "284869e5b5f57211377f026309910bea91ef65b3a71b934295fa8bd712436dfc"
+
+# The host's rustup never checks for or installs its own updates (runbook:
+# Pinned mise). Rollback: delete this table and run
+# `rustup set auto-self-update enable`.
+[rustup]
+path = "/Users/danielraffel/.cargo/bin/rustup"
+auto_self_update = "disable"
+
 [github_app]
 id = "3878000"
 private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
@@ -87,21 +107,18 @@ gate_ccache_trim = true
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
+runtime_measure = true
+runtime_tags = "pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
 min_queued_age_seconds = 600
-# Fallback lane (docs/assignment-v2-rollout.md): for queued work younger than
-# the 600 s rule, boot now when m3 ("studio") has no free, leasable gate slot
-# for that class. The 600 s rule stays the upper bound; an unreadable peer
-# keeps it. Over 2026-09-26/28, 55 of 287 macOS gate jobs that queued >= 120 s
-# met that condition while an m1 slot was free (about 1,060 job-minutes, median
-# 8.6 min earlier). m5 is deliberately NOT a preferred host: its supply report
-# counts lease fit, not host load, so while m5 is starved (load 179, swap
-# 31.5/32 GB) deferring to it would leave young work on the starved host; and
-# m5 is unreachable over SSH, which would make every decision "unknown" (hold).
-# Rollback: delete this key, re-render, reload.
-fallback_preferred_hosts = ["studio"]
+# Overflow only (2026-10-16): m1 takes a PR-head job only once it has queued
+# for 600 s. The young-work fallback (fallback_preferred_hosts) is removed:
+# over 2026-10-12..16, 40 of m1's 56 gate jobs had waited under 10 min when it
+# took them, so a faster host would have started them within minutes, and m1's
+# 32.7 min median gate (m3 17.9, m5s 18.7, m5 21.9) made each of them slower.
+# Rollback: restore `fallback_preferred_hosts = ["studio"]`.
 assignment_mode = "event-class-v2"
 # Pre-clone demand check: before cloning, re-ask the pre-mint question live and
 # skip the clone when the selected class is proven empty or a preferred class
@@ -137,12 +154,12 @@ replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
 guest_heartbeat_stale_seconds = 600
-# The queue scan this supervisor runs is latency-sensitive: a Background
-# supervisor's GitHub API calls measured materially slower than the same calls
-# at normal priority, and every observed scan failure on this lane is a
-# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
-# promote the supervisor out of the background band. Gate lanes only.
-process_type = "Adaptive"
+# Standard, never Background or Adaptive: every lane's queue scan holds the
+# host-global observation lock, and a supervisor launchd leaves in the
+# darwinbg band (Adaptive without an XPC transaction is in that band) makes
+# each GitHub call several times slower while it holds the lock, starving
+# every other lane on the host. The validator refuses both values.
+process_type = "Standard"
 # Release-first slot (docs/assignment-v2-rollout.md, "Release event classes").
 # Slot 2 consults both release classes before the gate classes and falls back
 # to gate work whenever no release waits; slot 1 keeps gate-first order with
@@ -150,18 +167,18 @@ process_type = "Adaptive"
 # The release tiers below serve only jobs carrying a release class label, which
 # Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in. Rollback: delete this key
 # and the release tiers, re-render, reload slot 2 at an idle boundary.
-assignment_slot_tier_order = { 1 = ["pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-tagged", "pulp-release-pr-gate"], 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
-v2_gate_classes = ["pulp-build-merge-group", "pulp-build-pr-head"]
-# M1 rejoins merge-group service (2026-10-11): Daniel's reversal of #439
-# follows the fleet-wide slowdown in which merge-group became the scarce
-# resource. Slot 1 prefers merge-group so a waiting queue entry wins; slot 2
-# remains release-first, then merge-group, then PR-head. The gate guest size
-# is unchanged and remains governed by vm_cores_from.
-
-[[lane.tier]]
-label = "pulp-build-merge-group"
-workflow = "Build and Test"
-runner_group_id = 1
+assignment_slot_tier_order = { 1 = ["pulp-build-pr-head", "pulp-release-tagged", "pulp-release-pr-gate"], 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-pr-head"] }
+v2_gate_classes = ["pulp-build-pr-head"]
+# No pulp-build-merge-group tier (2026-10-16). Over 546 native macOS gate jobs
+# (2026-10-12..16) m1's success median was 32.7 min, about 1.7x the other hosts,
+# and running two jobs at once did not slow either (alone 34.7, paired 31.0):
+# the gap is the host, not the second slot. Each merge-group batch m1 took held
+# the whole queue about 13 min longer, and a replay of the same arrivals without
+# m1 leaves median and p90 total time unchanged and merge-group p90 slightly
+# better. m1 keeps both slots, PR-head work queued 600 s or more, and release
+# work; merge-group goes to m3, m5 and m5studio.
+# Rollback: restore the merge-group tier, both classes in v2_gate_classes, and
+# merge-group in both slot orders, then regenerate fleet/advertised-labels.json.
 
 [[lane.tier]]
 label = "pulp-build-pr-head"
@@ -222,10 +239,14 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
-priority = "gate"
+# Vellum is advisory to Pulp's required gate: vm=60, while Pulp
+# event-class leases derive 100 (PR head) / 110 (merge group).
+priority = "vm"
+supervisors = 1
 min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
-workflows = ["Locked macOS GPU proof", "README clean release proof"]
+workflows = ["Locked macOS GPU proof"]
+runner_idle_timeout_seconds = 60
 replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
@@ -242,8 +263,9 @@ stale_log_seconds = 4500
 
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "reuse-canary", "launchd-watchdog", "reap"]
-# Converge only the VM janitor; every other declared agent stays plan-only.
-bootstrap = ["reap"]
+# Converge the VM janitor and the disk reclaimer (so reclaim fixes such as the
+# 90%-used pressure trigger reach the host); every other declared agent stays plan-only.
+bootstrap = ["reap", "reclaim"]
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
 # shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse

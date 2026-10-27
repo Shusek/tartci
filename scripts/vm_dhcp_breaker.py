@@ -491,7 +491,7 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         value = load(path)
         events: list[list[str]] = []
         if value.get("_source") == "corrupt":
-            return {"action": "clone", "events": events}
+            return {"action": "clone", "breaker_open": False, "events": events}
         booted = boot_time()
         recorded = value.get("boot_time")
         if booted is not None and (recorded is None or abs(float(recorded) - booted) > 1):
@@ -500,11 +500,11 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if value["state"] == "verifying":
             action, more = verifying_check(value, args.lane, now)
             save(path, value)
-            return {"action": action, "events": events + more}
+            return {"action": action, "breaker_open": False, "events": events + more}
         if value["state"] != "open":
             if events:
                 save(path, value)
-            return {"action": "clone", "events": events}
+            return {"action": "clone", "breaker_open": False, "events": events}
         last = value.get("last_probe_at")
         if last is None:
             last = value.get("opened_at")
@@ -520,9 +520,11 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if not (due or moved or asked):
             if not isinstance(seen, dict) or moved:
                 save(path, value)
-            return {"action": "backoff", "events": events}
+            return {"action": "backoff", "breaker_open": True, "events": events}
         if value.get("probe_lane"):
             value["consecutive_unreported"] = int(value.get("consecutive_unreported") or 0) + 1
+        value["probe_prev_probes"] = int(value.get("probes") or 0)
+        value["probe_prev_last_probe_at"] = value.get("last_probe_at")
         value["last_probe_at"] = now
         value["probe_lane"] = args.lane
         value["probes"] = int(value.get("probes") or 0) + 1
@@ -531,8 +533,34 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
             "lane": args.lane,
             "trigger": "operator" if asked else "chain_changed" if moved else "cadence",
             "probe": value["probes"]})])
-        return {"action": "probe", "events": events}
+        return {"action": "probe", "breaker_open": True, "events": events}
 
+
+def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
+    """Release a probe that never cloned or reached the DHCP address wait."""
+    now = time.time() if now is None else now
+    with locked(breaker_dir()) as path:
+        value = load(path)
+        lane = value.get("probe_lane")
+        if lane != args.lane or value.get("state") not in ("open", "verifying"):
+            return {"action": "noop", "events": []}
+        if value.get("state") == "open":
+            value["probes"] = int(value.get("probe_prev_probes") or 0)
+            previous_last = value.get("probe_prev_last_probe_at")
+            if previous_last is None:
+                value.pop("last_probe_at", None)
+            else:
+                value["last_probe_at"] = previous_last
+        value["probe_lane"] = None
+        value["probe_started_at"] = None
+        value.pop("probe_prev_probes", None)
+        value.pop("probe_prev_last_probe_at", None)
+        # A cancelled admission/lease turn never cloned a VM and therefore is
+        # not an unanswered DHCP probe. Preserve any earlier unreported streak.
+        save(path, value)
+        return {"action": "cancelled", "events": [["vm_dhcp_probe_cancelled", fmt({
+            "lane": args.lane, "reason": getattr(args, "reason", "pre_clone"),
+        })]]}
 
 def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
@@ -550,6 +578,8 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
                                                  "result": args.outcome})])
             value["probe_lane"] = None
             value["consecutive_unreported"] = 0
+            value.pop("probe_prev_probes", None)
+            value.pop("probe_prev_last_probe_at", None)
         if args.outcome == "ip":
             if verifying:
                 events.append(verified(value, now, args.lane, late=False))
@@ -621,7 +651,7 @@ def probe_now(now: float | None = None) -> dict[str, Any]:
 
 
 def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
-    """(state, code, detail) for `tartci doctor fleet` and the outage alert:
+    """(state, code, detail) for tartci doctor fleet and the outage alert:
     "ok" | "problem" | "unknown", most fundamental failing layer first."""
     if value.get("state") == "open":
         opened = value.get("opened_at")
@@ -810,7 +840,7 @@ def boot_times(root: pathlib.Path, since: float) -> dict[str, Any]:
 
 
 def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
-    """For `tartci doctor fleet`: never a write, never a lock.
+    """For tartci doctor fleet: never a write, never a lock.
 
     An open breaker also carries bootpd's launchd state read now, so the
     doctor can tell a job that is not loaded from one that is loaded but
@@ -840,6 +870,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--outcome", choices=["ip", "no_ip"], required=True)
     r.add_argument("--lane", required=True)
     r.add_argument("--vm", default="")
+    x = sub.add_parser("cancel")
+    x.add_argument("--lane", required=True)
+    x.add_argument("--reason", default="pre_clone")
     sub.add_parser("probe-now")
     v = sub.add_parser("verify")
     v.add_argument("--reason", default="operator")
@@ -861,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
             result = probe_now()
         elif args.command == "verify":
             result = verify(args.reason)
+        elif args.command == "cancel":
+            result = cancel(args)
         else:
             result = check(args) if args.command == "check" else record(args)
     except Exception as exc:  # noqa: BLE001 - the caller fails open

@@ -72,6 +72,8 @@ class Harness:
             "runner_api_root_for_group(){ printf 'repos/o/r'; }\n"
             "jit_admission_denied(){ return 1; }\n"
             "tartci_pool_lock_absent(){ return 0; }\n"
+            "tartci_lifecycle_reset(){ :; }\n"
+            "tartci_storage_health_check(){ STORAGE_HEALTH_STATE=ok; return 0; }\n"
             "tartci_job_claim_acquire(){ return 0; }\n"
             "tartci_vm_dhcp_check(){ return 0; }\n"
             "tartci_vm_dhcp_record(){ :; }\n"

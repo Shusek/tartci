@@ -112,6 +112,45 @@ DEFAULT_BOOT_FLOOR_GB = 30.0
 # silent is indistinguishable from one that is wedged, so emit a bounded
 # heartbeat instead of leaving the log frozen for the whole run.
 PROGRESS_INTERVAL_S = 300.0
+# Metadata and free-space calls can block in the kernel when an external APFS
+# volume is wedged. Keep root admission and the post-pass receipt bounded too.
+ROOT_PROBE_TIMEOUT_S = 15.0
+PASS_TIMEOUT_S = 900.0
+PASS_DEADLINE: float | None = None
+
+
+def bounded_fs_call(operation: Any, *, description: str,
+                    timeout: float = ROOT_PROBE_TIMEOUT_S,
+                    pass_deadline: bool = True) -> Any:
+    """Run one filesystem metadata call with a fail-closed deadline.
+
+    `pass_deadline=False` gives the call its own `timeout` even once the pass
+    deadline is spent; it is for the single statfs that measures free space
+    after the pass, which must not inherit what the walk used up.
+    """
+    result: dict[str, Any] = {}
+    error: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            result["value"] = operation()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
+            error.append(exc)
+
+    remaining = (None if PASS_DEADLINE is None or not pass_deadline
+                 else PASS_DEADLINE - time.monotonic())
+    if remaining is not None and remaining <= 0:
+        raise OSError(errno.ETIMEDOUT, f"reclaim pass deadline reached before {description}")
+    effective_timeout = timeout if remaining is None else min(timeout, remaining)
+    worker = threading.Thread(target=invoke, name=f"fs probe {description}", daemon=True)
+    worker.start()
+    worker.join(effective_timeout)
+    if worker.is_alive():
+        raise OSError(errno.ETIMEDOUT,
+                      f"{description} timed out after {effective_timeout:.0f}s")
+    if error:
+        raise error[0]
+    return result.get("value")
 
 
 class Progress:
@@ -163,6 +202,12 @@ def has_marker(path: pathlib.Path, markers: Iterable[str]) -> str | None:
 #: developer parking a worktree inside one puts it at depth one, so a bound of
 #: four covers both with a sub-directory to spare.
 NESTED_SOURCE_MAXDEPTH = 4
+# Subdirectories of a build tree that a test suite writes its own projects
+# into. Pulp: ${CMAKE_BINARY_DIR}/test-tmp/<name>/ (tools/cli/CMakeLists.txt).
+# Below one, only a `.git` marks a checkout; a CMakeLists.txt there is the
+# test's output, and read as source it kept m3's 55 GiB
+# pulp-p0a-failure-proof/build from ever being reclaimed.
+GENERATED_SCRATCH_DIRS = ("test-tmp",)
 
 #: How far below a candidate the pre-delete age re-read looks. Deeper than the
 #: scan pass on purpose: the process guard only sees an ABSOLUTE path in a
@@ -188,9 +233,9 @@ def nested_source_marker(
     the process scan make. A subtree we were refused could hold a checkout, so
     "could not look" must never render as "nothing there".
     """
-    stack: list[tuple[pathlib.Path, int]] = [(path, 0)]
+    stack: list[tuple[pathlib.Path, int, bool]] = [(path, 0, False)]
     while stack:
-        current, depth = stack.pop()
+        current, depth, generated = stack.pop()
         if depth >= maxdepth:
             continue
         try:
@@ -201,7 +246,8 @@ def nested_source_marker(
             continue
         for entry in entries:
             child = pathlib.Path(entry.path)
-            if depth > 0 and entry.name in SOURCE_MARKERS:
+            if depth > 0 and entry.name in SOURCE_MARKERS and \
+                    (not generated or entry.name == ".git"):
                 # A linked worktree's `.git` is a regular file, and a
                 # `CMakeLists.txt` is never a directory, so this deliberately
                 # does not test the entry's type.
@@ -211,7 +257,8 @@ def nested_source_marker(
                     continue
             except OSError:
                 continue
-            stack.append((child, depth + 1))
+            stack.append((child, depth + 1,
+                          generated or (depth == 0 and entry.name in GENERATED_SCRATCH_DIRS)))
     return None, True
 
 
@@ -305,6 +352,11 @@ def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry
         APP_CONTAINERS_SKIPPED.append(str(path))
         raise OSError(errno.EPERM, "another app's data container is never listed", str(path))
     limit = SCANDIR_TIMEOUT_S if timeout is None else timeout
+    if PASS_DEADLINE is not None:
+        remaining = PASS_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            raise OSError(errno.ETIMEDOUT, "reclaim pass deadline reached")
+        limit = min(limit, remaining)
     result: dict[str, Any] = {}
 
     def listing() -> None:
@@ -423,14 +475,30 @@ def free_bytes(path: pathlib.Path) -> int | None:
     root before any measurement is taken. It is not: the post-fix re-measure
     runs after a whole pass has walked and deleted, which on a loaded host is
     minutes after that check, and the volume it re-measures is a mount point
-    (m3 scans /Volumes/Workshop). An unmount inside that window, or an EIO off
+    (m3 scans /Volumes/<data-volume>). An unmount inside that window, or an EIO off
     a failing disk, reaches here. Deleting this branch would turn that into a
     traceback out of the janitor instead of an honest "unknown".
+
+    Bounded by its own timeout, never by the pass deadline: on m3
+    (2026-10-22) the walk spent the whole 900 s pass, the re-measure was
+    refused without a statfs, and every pass exited 4 while the volume sat
+    at 92%. One statfs is cheap; the walk is what the deadline bounds.
     """
     try:
-        return shutil.disk_usage(path).free
+        return bounded_fs_call(lambda: shutil.disk_usage(path).free,
+                               description=f"disk usage {path}", pass_deadline=False)
     except OSError:
         return None
+
+
+def used_percent(path: pathlib.Path) -> float | None:
+    """Percent of `path`'s volume in use, or None when it cannot be read."""
+    try:
+        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
+                                description=f"disk usage {path}", pass_deadline=False)
+    except OSError:
+        return None
+    return 100.0 * usage.used / usage.total if usage.total else None
 
 
 def path_spellings(path: pathlib.Path) -> set[str]:
@@ -637,7 +705,8 @@ def device_id(path: pathlib.Path) -> int | None:
     measurement rather than take one.
     """
     try:
-        return os.stat(path).st_dev
+        return bounded_fs_call(lambda: os.stat(path).st_dev,
+                               description=f"stat {path}")
     except OSError:
         return None
 
@@ -657,8 +726,10 @@ def volumes_free_bytes(roots: list[pathlib.Path]) -> list[dict[str, Any]]:
             if device in seen:
                 continue
             seen.add(device)
-        out.append({"root": str(root), "device": device,
-                    "free_bytes": free_bytes(root)})
+        free = free_bytes(root)
+        out.append({"root": str(root), "device": device, "free_bytes": free,
+                    # Only alongside a known free figure: unknown stays unknown.
+                    "used_percent": None if free is None else used_percent(root)})
     return out
 
 
@@ -690,7 +761,12 @@ def resolve_boot_volume(explicit: str | None) -> pathlib.Path:
     if explicit:
         return pathlib.Path(os.path.expanduser(explicit))
     data = pathlib.Path(DEFAULT_BOOT_VOLUME)
-    return data if data.is_dir() else pathlib.Path("/")
+    try:
+        return data if bounded_fs_call(data.is_dir, description=f"is_dir {data}") else pathlib.Path("/")
+    except OSError:
+        # Keep the authoritative path so its later free-space check remains
+        # unknown; never substitute another volume after a stall.
+        return data
 
 
 def boot_volume_report(path: pathlib.Path, before: dict[str, Any],
@@ -1026,6 +1102,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pressure-free-gb", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_FREE_GB", "200")),
                         help="free space below which the shorter age gate applies (default 200)")
+    parser.add_argument("--pressure-used-percent", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_USED_PERCENT", "0")),
+                        help="also apply the shorter age gate on a volume at least this "
+                             "percent used (default 0: off; the installed agent sets it "
+                             "below the readiness disk_pressure limit)")
     parser.add_argument("--pressure-min-age-days", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS", "7")),
                         help="age gate used under disk pressure (default 7)")
@@ -1065,7 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
 
     The receipt is what makes a dead janitor visible. m3's reclaim agent was
     shadowed by a leaked registration for a day and exited 127 every hour
-    without writing a line anywhere tartci looks; `tartci status` kept printing
+    without writing a line anywhere tartci looks; tartci status kept printing
     "installed and loaded" because a job with that label WAS loaded. A pass
     that does not leave a fresh receipt is now the signal, whatever launchd
     believes.
@@ -1081,6 +1162,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
+    global PASS_DEADLINE
+    PASS_DEADLINE = time.monotonic() + PASS_TIMEOUT_S
     # Every other knob widens or narrows what is examined. These two decide
     # whether anything is examined at all: a zero age gate deletes every
     # generated tree the scan reaches the moment it reaches it, and a
@@ -1113,10 +1196,17 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     for root in roots:
         if refused_root(root):
             unusable.append(f"{root} (refused: {refused_root(root)})")
-        elif not root.is_dir():
-            unusable.append(f"{root} (not a directory)")
-        elif not os.access(root, os.R_OK | os.X_OK):
-            unusable.append(f"{root} (not readable)")
+        else:
+            try:
+                if not bounded_fs_call(root.is_dir, description=f"is_dir {root}"):
+                    unusable.append(f"{root} (not a directory)")
+                elif not bounded_fs_call(
+                    lambda: os.access(root, os.R_OK | os.X_OK),
+                    description=f"access {root}",
+                ):
+                    unusable.append(f"{root} (not readable)")
+            except OSError as exc:
+                unusable.append(f"{root} (probe failed: {exc})")
     if unusable:
         print("disk_reclaim: unusable scan root(s): " + ", ".join(unusable),
               file=sys.stderr)
@@ -1156,8 +1246,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     pressured_devices = {
         volume["device"] for volume in volumes_before
         if volume["device"] is not None
-        and volume["free_bytes"] is not None
-        and volume["free_bytes"] < args.pressure_free_gb * GIB
+        # The same test the Pulp worktree reaper runs under (see its
+        # docstring for why the percent arm exists).
+        and pulp_reapers.under_pressure(
+            volume["free_bytes"], volume.get("used_percent"),
+            pressure_free_gb=args.pressure_free_gb,
+            pressure_used_percent=args.pressure_used_percent)
     }
     pressure = bool(pressured_devices)
 
@@ -1245,7 +1339,11 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # before the re-measure, so the floor below is judged on what both freed.
     # Their gates are theirs; nothing here narrows or widens them.
     progress.emit("pulp reapers: checking the fleet profile", force=True)
-    pulp = pulp_reapers.run(fix=args.fix, state_dir=state_dir(args), discovered_roots=roots)
+    pulp_skip = pulp_reapers.skip_reason_for_scan_timeouts(SCAN_TIMEOUTS)
+    pulp = pulp_reapers.run(
+        fix=args.fix, state_dir=state_dir(args), discovered_roots=roots,
+        deadline=PASS_DEADLINE, skip_reason=pulp_skip,
+        pressure_used_percent=args.pressure_used_percent)
     receipt["pulp_reapers"] = pulp
     # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
     # gates). A live build naming one protects it, exactly as for build dirs;

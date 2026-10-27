@@ -68,7 +68,7 @@ class ApprovalTests(unittest.TestCase):
             q=QueueScanner.__new__(QueueScanner);q.policy=p
             q.args=SimpleNamespace(repo='owner/repo',force_refresh=True,discovery_ttl=100,max_job_fetches=5,
                                    assignment_approval_dir=str(root/'approvals'))
-            q.discovery_path=root/'discovery.json';q.now=int(time.time())
+            q.discovery_path=root/'discovery.json';q.discovery_fetch_path=root/'discovery.fetch';q.now=int(time.time())
             q._discovery_lock=lambda:nullcontext();q._observation_lock=lambda:nullcontext()
             q._preflight_identity=lambda:None;q._runs=lambda state:[value]
             q._candidate_runs=lambda runs,state:(runs,[]);q._gh=lambda path:{'jobs':[]}

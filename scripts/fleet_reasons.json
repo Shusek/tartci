@@ -130,6 +130,12 @@
       "remedy": "Nothing to do.",
       "do_not": "Do not read one refusal as a problem; a refusal is the floor working."
     },
+    "host_agents_failing": {
+      "summary": "A loaded watchdog or self-update agent last exited nonzero.",
+      "why": "Loaded is not running: an agent refused by the interpreter pin (exit 127) stays loaded and fails every start, so the host stops healing and updating while launchctl list still shows it.",
+      "remedy": "Read the agent's log under ~/Library/Logs/tartci; for exit 127 read ~/.tartci/state/interpreter-refused and ~/.config/tartci/python.pin, fix host.python and reinstall.",
+      "do_not": "Do not kickstart it in a loop; the next start fails the same way until the cause is fixed."
+    },
     "host_agents_missing": {
       "summary": "This managed fleet host is missing the launchd watchdog or the self-update agent.",
       "why": "A host brought up without them serves jobs but never heals lanes, never refreshes skew or tool freshness, and never updates tartci, Shipyard or the pulp CLI, so it drifts unnoticed (m5studio ran with no watchdog).",
@@ -235,6 +241,42 @@
       "why": "An unparseable receipt is not evidence that launchd is healthy.",
       "remedy": "Inspect ~/.tartci/state/launchd-interval-guard/status.json; the next pass rewrites it atomically."
     },
+    "launcher_layout_not_applicable": {
+      "summary": "No launch helper is installed on this host.",
+      "why": "Only a host whose Tart store is on an external volume runs a sealed launcher, v1 or v2.",
+      "remedy": "Nothing to do. A v2 opt-in file here has no effect.",
+      "do_not": "Do not create the v2 opt-in file to make a host sealed; the profile's launch_helper decides that."
+    },
+    "launcher_layout_unreadable": {
+      "summary": "The install receipt or the v2 opt-in file could not be read.",
+      "why": "The layout comes from the receipt and the opt-in file; without them the doctor cannot say which launcher runs.",
+      "remedy": "Run `tartci pool status` and read ~/.config/tartci/macos-fleet-install.json by hand.",
+      "do_not": "Do not read unreadable as v1."
+    },
+    "launcher_layout_v1": {
+      "summary": "The host runs launcher v1: the support tree and lanes are sealed in the app.",
+      "why": "v1 is the default; a host moves to v2 only through its opt-in file and a reinstall.",
+      "remedy": "Nothing to do. With the opt-in present, the next install moves the host to v2.",
+      "do_not": "Do not create the opt-in file before the install dry run for the move has been reviewed."
+    },
+    "launcher_layout_v2": {
+      "summary": "The host runs launcher v2: a stable app running the signed launch set the pointer names.",
+      "why": "v2 keeps the app's bytes, and so its Removable Volumes grant, across ordinary updates.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not edit the pointer or the launch set by hand; an install publishes both."
+    },
+    "launcher_opt_in_missing": {
+      "summary": "The host runs launcher v2 but its opt-in file is gone.",
+      "why": "A layout never flips back silently, so the next install refuses rather than reinstalling v1.",
+      "remedy": "Restore the file (touch it, mode 600) to keep v2, or install with --launcher-layout v1 to go back deliberately; that is a launcher change and needs its approval and the Removable Volumes grant.",
+      "do_not": "Do not reinstall without deciding which layout the host should run."
+    },
+    "launcher_opt_in_refused": {
+      "summary": "The v2 opt-in file is not a regular file owned by this user, or is group- or world-writable.",
+      "why": "Anything else could be planted by another account; it is refused rather than read as either answer.",
+      "remedy": "Remove it and create it again as this user with mode 600.",
+      "do_not": "Do not loosen the check; fix the file."
+    },
     "lease_fit_ok": {
       "summary": "Every measured lane can lease its VM, and identical lanes can run together.",
       "why": "Each lane records its own lease-fit verdict against the lease store's capacity model."
@@ -330,6 +372,30 @@
       "summary": "The executed cohort could not be resolved for some agent.",
       "why": "The executed cohort is read from ProgramArguments and, for a signed launcher, from the bundle's sealed metadata. When neither can be read the agent's identity is unknown, which must not be reported as agreement.",
       "remedy": "Inspect the named LaunchAgent and its program before trusting any generation claim for this host."
+    },
+    "python_pin_missing": {
+      "summary": "This managed fleet host has no ~/.config/tartci/python.pin.",
+      "why": "Every tartci LaunchAgent then runs the interpreter the fleet lanes carry, by bootstrap. That is meant for one cycle, until an install writes the pin; a host that stays on it never completed an install with the pinned-interpreter generation.",
+      "remedy": "Set host.python in the fleet profile and reinstall (tartci fleet-macos install <profile> --apply), which writes the pin.",
+      "do_not": "Do not write the pin by hand to a path the lanes do not run; macOS grants follow the binary."
+    },
+    "python_pin_not_applicable": {
+      "summary": "No installed fleet profile, so no interpreter pin is expected.",
+      "why": "Only managed fleet hosts run tartci LaunchAgents that resolve through the pin.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not write a pin on a host that is not in the fleet."
+    },
+    "python_pin_ok": {
+      "summary": "The interpreter pin names an executable absolute path.",
+      "why": "LaunchAgents rendered without their own TARTCI_PYTHON run exactly that binary, never a PATH search.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read executable as granted; the lanes' privacy grants are proven by the install preflight, not here."
+    },
+    "python_pin_unusable": {
+      "summary": "The interpreter pin is unreadable or names something that is not an executable absolute path.",
+      "why": "Every tartci LaunchAgent that resolves through the pin refuses to run (exit 127), so the host stops healing and updating.",
+      "remedy": "Fix host.python in the fleet profile and reinstall; tartci launchd heal still runs the refusal alert.",
+      "do_not": "Do not delete the pin to make agents run; under launchd that falls back only to the lanes' interpreter or a refusal."
     },
     "readiness_not_managed": {
       "summary": "This host carries no managed fleet profile.",
@@ -481,6 +547,24 @@
       "summary": "tartci's skew against main was never measured here.",
       "why": "The launchd watchdog re-measures it every 30 minutes on a managed host; until then the answer is unknown, not current.",
       "remedy": "Run `tartci fleet-macos self-update --plan` (read-only)."
+    },
+    "store_ok": {
+      "summary": "Every store volume the profile names answered its probe in time.",
+      "why": "A directory listing, tart list and git rev-parse on the VM store and repository volumes each finished within the probe timeout.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read ok as fast: the probe proves the volume answers, not that it is quick."
+    },
+    "store_stalled": {
+      "summary": "A store volume did not answer: a listing, tart list or git on it hung past the probe timeout.",
+      "why": "Usually a system-wide sandbox or TCC stall (a wedged sandboxd or tccd): every process touching the volume hangs, lanes stay loaded, and the reclaim agent only reads STALE hours later. It does not clear on its own.",
+      "remedy": "Drain the host (`tartci pool drain`), let running jobs finish, then reboot it; a reboot clears it. Verify with `tartci doctor fleet` (store_ok).",
+      "do_not": "Do not kill the hung processes one by one and call it fixed: new ones hang the same way until the reboot."
+    },
+    "store_unprobed": {
+      "summary": "The store volumes were not probed.",
+      "why": "No installed fleet profile, no TOML parser in this interpreter, or the probe itself failed to start.",
+      "remedy": "Run `tartci doctor fleet` with the pinned interpreter on a managed host.",
+      "do_not": "Do not read unprobed as healthy."
     },
     "supply_match": {
       "summary": "Every registration this host's installed profile mints matches the published declared supply.",
@@ -659,6 +743,11 @@
       "summary": "The host's VM DHCP breaker file could not be read.",
       "why": "Lanes read an unreadable breaker as closed and clone as usual; the doctor reports it so the cause is fixed.",
       "remedy": "Inspect ~/.tartci/state/vm-dhcp/breaker.json; the next breaker write replaces it atomically."
+    },
+    "lane_python_unavailable": {
+      "summary": "A lane pins an interpreter path that no longer exists.",
+      "why": "The sealed or managed lane cannot start its verified helper interpreter, so GitHub reads and fleet supervision are unavailable.",
+      "remedy": "Restore the pinned interpreter at the recorded path or reinstall the generation with a verified interpreter, then rerun fleet doctor."
     }
   }
 }

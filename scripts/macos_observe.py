@@ -12,6 +12,7 @@ import sys
 from typing import Any
 
 from bounded_subprocess import DESCENDANT_LEAK_EXIT_CODE, TIMEOUT_EXIT_CODE, run_bounded
+from python_child import child_python
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -41,7 +42,7 @@ def unreadable_digest(problem: str) -> dict[str, Any]:
 
 def load_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     argv = [
-        sys.executable,
+        child_python(),
         str(HERE / "vm_reap.py"),
         "--json",
         "--repo",

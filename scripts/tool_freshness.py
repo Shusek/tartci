@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Installed-vs-released freshness for the host tools a fleet host runs.
 
-tartci measures its own skew against main (`fleet_self_update.py`). The other
+tartci measures its own skew against main (fleet_self_update.py). The other
 tools every gate and agent session on the host depends on, Shipyard and the
 pulp CLI, had no equivalent, and an installed pulp CLI sat ~2,800 hours behind
 its releases before anyone looked. This module gives each of them one line in
-`tartci pool status`, a finding in `tartci doctor fleet`, and a WARN in the
+tartci pool status, a finding in tartci doctor fleet, and a WARN in the
 launchd watchdog, and optionally applies the update itself:
 
   refresh   (the watchdog, at most every 30 minutes) reads the installed
@@ -49,6 +49,19 @@ Settings (optional) live in ~/.config/tartci/tool-freshness.toml:
 
 `{home}`, `{tag}` and `{host_class}` are substituted in commands. A tool whose binary is
 absent is `not_installed`, which is reported but is never a problem.
+
+A tool with a `pin_file` is measured against the version pinned in this
+TartCI generation, not against the project's releases: the pin is what the
+fleet is meant to run, and moving it is a reviewed commit. Tart is pinned in
+fleet/tart.toml (scripts/tart_pin.py). A pin has no publish time; a host
+behind it is timed from when it first saw it.
+
+Tart is measured only. Replacing it while a VM runs is unsafe, so
+tool-freshness never applies it; `fleet_self_update` moves it to the pin in
+its drained window when self-update.toml opts in (`[tart] upgrade = true`,
+off by default; the canary first). Tart behind its pin is information only,
+never a problem, unless self-update's tart-gate.json says this host is due to
+run that pin (opted in and past the canary gate).
 """
 
 from __future__ import annotations
@@ -122,6 +135,19 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
         # only when the release archive is not downloadable and only when its
         # sha256 matches the release's own SHA256SUMS.
         "local_archive_dir": None,
+    },
+    "tart": {
+        "repo": "openai/tart",
+        "version_command": ["/opt/homebrew/bin/tart", "--version"],
+        # The fleet's pin, not the newest release or what the tap offers.
+        "pin_file": "fleet/tart.toml",
+        # Behind the pin is a problem only where self-update says this host
+        # is due to run it ([tart] upgrade = true and past the canary gate);
+        # everywhere else it is information.
+        "gate_file": "self-update/tart-gate.json",
+        # Never applied here: a VM may be running. fleet_self_update moves it
+        # to the pin after `pool off`, when no VM can be.
+        "auto_apply": False,
     },
 }
 
@@ -332,6 +358,27 @@ def read_versions(tool: dict, home: Path,
     return value
 
 
+# The generation this code runs from; its fleet/ holds the pins.
+SUPPORT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def pin_releases(tool: dict, now: float, previous: dict | None
+                 ) -> list[tuple[tuple[int, int, int], str, float]]:
+    """The pinned version as the one release, timed from when this host first
+    saw it (a pin has no publish time). Raises ValueError."""
+    import tart_pin  # noqa: PLC0415 - sibling module; parses pin files without tomllib
+    path = SUPPORT_ROOT / str(tool["pin_file"])
+    data = tart_pin.parse_pin(path.read_text())
+    name = str(tool.get("pin_table") or Path(str(tool["version_command"][0])).name)
+    version = _version(str((data.get(name) or {}).get("version", "")))
+    if version is None:
+        raise ValueError(f"{path}: no [{name}] version")
+    first_seen = now
+    if previous and previous.get("latest") == _vstr(version):
+        first_seen = _epoch(previous.get("latest_published_at")) or now
+    return [(version, _vstr(version) or "", first_seen)]
+
+
 def run_command(argv: list[str], timeout: float) -> tuple[int, str]:
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
@@ -389,7 +436,8 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     installed = min(installed, versions["generation"] or installed)
     row["effective"] = _vstr(installed)
     try:
-        releases = parse_releases(feed(str(tool["repo"])))
+        releases = (pin_releases(tool, now, previous) if tool.get("pin_file")
+                    else parse_releases(feed(str(tool["repo"]))))
     except Exception as exc:  # noqa: BLE001 - an unreadable feed is unknown, never current
         row.update(state="unknown", reason=f"releases unreadable: {type(exc).__name__}: {exc}")
         return row
@@ -420,6 +468,12 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
                # takes the newest one that has finished its soak.
                candidates=[{"version": _vstr(version), "tag": tag, "published_at": _iso(at)}
                            for version, tag, at in newer])
+    if tool.get("gate_file"):
+        gate = _read_json(state_dir_for(home).parent / str(tool["gate_file"]))
+        if not (isinstance(gate, dict) and gate.get("upgrade") is True and gate.get("due") is True
+                and gate.get("pin") == _vstr(latest)):
+            row["stale"] = False
+            row["info_only"] = "not due on this host (opt-in off, or waiting for the canary)"
     return row
 
 
@@ -688,7 +742,8 @@ def render_row(row: dict) -> str:
         bound = ">=" if row.get("behind_since_lower_bound") else ""
         text = (f"{name}: {installed} behind latest {row['latest_tag']} by "
                 f"{row['releases_behind']} release(s) for {bound}{row['behind_hours']:g} h "
-                f"(since {row['behind_since']})" + (" STALE" if row.get("stale") else ""))
+                f"(since {row['behind_since']})" + (" STALE" if row.get("stale") else "")
+                + (f"; information only: {row['info_only']}" if row.get("info_only") else ""))
     elif state == "not_installed":
         text = f"{name}: not installed"
     else:

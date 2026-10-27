@@ -42,8 +42,8 @@ GUI to toggle them.
 
 The macOS lane must not point launchd at a `/Volumes` checkout or VM store. On
 2026-06-09 the Studio proof showed the existing Pulp plist crash-looping with
-exit 126 because launchd could not `getcwd` under `/Volumes/Workshop/Code/pulp`
-or read `/Volumes/Workshop/Code/pulp/tools/ci/tart-runner.sh`. The green proof
+exit 126 because launchd could not `getcwd` under `/Volumes/<data-volume>/Code/pulp`
+or read `/Volumes/<data-volume>/Code/pulp/tools/ci/tart-runner.sh`. The green proof
 used `WorkingDirectory=$HOME`, a wrapper under `$HOME/.local/bin`, and
 `TART_HOME=$HOME/VMs`; launchd booted a macOS clone and exited 0.
 
@@ -63,8 +63,8 @@ capacity and supervisor health will be read from different Tart homes.
 ### External-volume responsible process (Daniel's M3 and m5studio profiles)
 
 `profiles/m3-macos-fleet.toml` deliberately keeps its 4 TiB Tart store at
-`/Volumes/Workshop/VMs`, and `profiles/m5studio-macos-fleet.toml` keeps its
-store at `/Volumes/Atelier/VMs`. The volume name is the profile's, not the
+`/Volumes/<data-volume>/VMs`, and `profiles/m5studio-macos-fleet.toml` keeps its
+store at `/Volumes/<data-volume>/VMs`. The volume name is the profile's, not the
 code's: the build seals the profile's own `tart_home` into the bundle
 (`bundle.json`), the launcher probes and enforces that store, and each host has
 its own approval digest (`~/.config/tartci/<host>-launcher-approved.sha256`).
@@ -78,7 +78,8 @@ bounds TERM-to-KILL cleanup inside launchd's 30-second exit window. It contains
 no scheduler, queue, GitHub, listener, or capacity policy.
 
 Build/sign the artifact on a controlled signing surface, never during fleet
-installation:
+installation. Set `TARTCI_PYTHON` to the pinned Python 3.11+ interpreter; the
+explicit option keeps this manual build aligned with the installed launchd path:
 
 ```sh
 scripts/build_macos_launcher.sh \
@@ -86,7 +87,9 @@ scripts/build_macos_launcher.sh \
   --approval-output /absolute/staging/TartCILauncher.sha256 \
   --identity '<Developer ID Application identity>' \
   --support-root /absolute/immutable/tartci-generation \
-  --profile profiles/m3-macos-fleet.toml   # or profiles/m5studio-macos-fleet.toml
+  --profile profiles/m3-macos-fleet.toml \
+  --python "${TARTCI_PYTHON:?set TARTCI_PYTHON to a Python 3.11+ interpreter}"
+# Use `profiles/m5studio-macos-fleet.toml` in both profile arguments when signing m5studio.
 scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
   --identifier com.danielraffel.tartci.launcher \
   --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256> \
@@ -412,6 +415,84 @@ Use the GitHub App wrapper for API and registration-token calls so a stripped
 SSH shell or personal-token quota cannot create a false diagnosis. If GitHub
 reports busy or returns unknown state, stop; do not replace the registration.
 
+## Disk write-latency watchdog
+
+`com.danielraffel.tartci.disk-watchdog.plist.template` runs `tartci disk watch`
+every 60 s. On m5studio on 2026-10-12 every create on `/Volumes/<data-volume>`
+stalled about 6 s for hours while reads stayed instant, and the kernel log
+had rotated before anyone looked (outage O10). Each pass:
+
+- probes every watched path (`TARTCI_DISK_WATCH_PATHS`, rendered from the
+  profile's `host.tart_home` and `host.cache_root`) with a create, a one-byte
+  write, `fsync` and `unlink`, in a child process it waits on for at most
+  10 s. The pass itself never touches the volume. A probe that outlives
+  SIGKILL is in the kernel; it is recorded as outstanding, and no second probe
+  starts on that path while it lives;
+- treats a write over 1 s, or one that does not finish, as the start or
+  continuation of an episode. Once per episode it saves
+  `~/.tartci/state/disk-watchdog/evidence/<path>-<start>/`: `log-show.txt`
+  (`/usr/bin/log show --last 5m`, APFS and kernel), `ps-blocked.txt`
+  (processes in state D or U), `sample-<pid>.txt` for the stuck probe and up
+  to five blocked processes, and `evidence.json` naming the ones whose stack
+  is in `open()`. Every capture is bounded and abandoned, never waited on;
+- reports through the host-off alert path: a `disk_latency_slow` event in
+  `~/.tartci/state/disk-watchdog/events.jsonl` and one GitHub issue per
+  episode, closed with `disk_latency_recovered` after three fast probes in a
+  row. `TARTCI_DISK_WATCH_ISSUE=0` keeps the evidence and the event but opens
+  no issue.
+
+The same pass checks Xcode's device filesystem. CoreDevice mounts a
+network-paired iPhone at `~/Library/Developer/CoreDevice/DeviceFS` (type
+`devicefs`); when its DeviceFS helper wedges, every stat of the mount blocks in
+the kernel for good, so `rg`/`find` over `$HOME`, `lsof` with a path and `du`
+leak unkillable processes (m3 from 2026-10-18; m5studio on 2026-10-22, where it
+read as an external-volume failure). Each pass lists devicefs mounts from the
+kernel mount table and stats each in a bounded child probe. A wedge is
+confirmed by a probe the kernel keeps past SIGKILL, or by no answer on two
+passes in a row; one slow listing is never acted on. On a confirmed wedge the
+pass saves evidence first, then SIGKILLs only the DeviceFS helpers `ps` shows
+stuck in the kernel (state U), force-unmounts the wedged mount (never starting
+a second `umount -f` while an earlier one is stuck), and opens one
+`devicefs_wedged` episode, closed after three healthy passes. Processes
+blocked on the mount are released once the stuck helper is killed (a SIGKILL
+to its pid freed a 19 h `rg` on m5studio with no reboot); any still stuck after
+that need a reboot, and the issue counts them. Once three probes
+are stuck the pass stops probing: it takes no action, keeps the episode open
+and says a reboot is needed. A `mount` that does not answer counts as unknown,
+never healthy. `TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
+
+`tartci disk status [--json]` prints each path's last probe stamped with its
+own time, its open episode and its evidence directory, and the device
+filesystem's last check. A last probe older than 10 minutes
+(`TARTCI_DISK_STALE_S`) is marked STALE: the agent is not running, and the
+reading is history, not a current fault. The agent is a support agent: declare
+`disk-watchdog` in the host profile's `[support_agents] declared` list to
+install it through `support_agents`.
+
+## Pool-status log
+
+`com.danielraffel.tartci.pool-log.plist.template` runs `tartci pool log` every
+300 s. `tartci pool status` says what a host is doing now and keeps no
+history, so a watcher that reads it could only be judged live; this log lets
+host signals be scored against what actually happened. Each pass:
+
+- reads this generation's `tartci pool status --json` in a child it waits on
+  for at most 60 s, and nothing else (no ssh, no GitHub);
+- condenses it to what a host reader classifies: `host`, `state`,
+  `participating` and `problems` (each `fleet.config` section's problem, first
+  500 characters);
+- appends one record to `~/.tartci/state/pool-log/events.jsonl` when that
+  changed, a `"heartbeat": true` record once an hour when it did not (so a gap
+  means the agent was down), and `{"at", "error"}` once per distinct read
+  failure;
+- rotates the log at 2 MiB (`TARTCI_POOL_LOG_MAX_BYTES`) to `events.jsonl.1`,
+  so a host keeps at most two files.
+
+`tartci pool log --status [--json]` prints the log's sizes, its last record and
+the age of the last write. Declare `pool-log` in the host profile's
+`[support_agents] declared` list to install it through `support_agents`;
+dropping the declaration boots it out and keeps the log.
+
 ## GitHub-hosted queue-saturation detector
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
@@ -588,6 +669,12 @@ the other agents. `tartci doctor fleet` reports `vm_janitor_missing` (PROBLEM)
 while the janitor is undeclared, missing or not loaded, and `vm_janitor_loaded`
 once it is.
 
+Taking an agent out of a `bootstrap` list does not unload it: the agent goes
+back to plan-only, and a host that already has it keeps it loaded and running
+the plist it was last given. To remove it from a host, drop it from `declared`
+(the next apply boots it out and retires its plist, as above), or `launchctl
+bootout gui/$(id -u)/<label>` by hand.
+
 The step never fails the update: a failure is a receipt step with `ok=false`
 and a `tartci doctor fleet` finding (`support_agents_pending`,
 `support_agents_drift`, `undeclared_fleet_agent`). Before draining, self-update
@@ -631,8 +718,8 @@ It is enabled per host by the fleet profile:
 ```toml
 [reuse_canary]
 enabled = true
-repo = "/Volumes/Workshop/Code/pulp"
-worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+repo = "/Volumes/<data-volume>/Code/pulp"
+worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
 ```
 
 Only the m3 and m1 profiles enable it, and declare `reuse-canary` in their
@@ -875,8 +962,8 @@ the same figure is what was freed.
 
 Scan roots are discovered rather than declared: the janitor keeps whichever of
 `~/Code` and the installed fleet profile's `[reclaim]` code root (the parent
-of `repo` / `worktrees_root`, e.g. `/Volumes/Workshop/Code` on m3,
-`/Volumes/Atelier/Code` on m5studio) the host actually has, and measures free
+of `repo` / `worktrees_root`, e.g. `/Volumes/<data-volume>/Code` on m3,
+`/Volumes/<data-volume>/Code` on m5studio) the host actually has, and measures free
 space on every volume those roots span. The `TARTCI_RECLAIM_FAIL_BELOW_GB`
 floor is judged against the tightest of those volumes, so a healthy disk cannot
 certify a full one. Pressure is scoped per volume instead: only candidates on a
@@ -1044,8 +1131,10 @@ without a tick in silence. The launchd watchdog reinstalls a loaded tick
 whose copy differs from the running tartci (`scripts/queue_tick_refresh.py`),
 and never switches an unloaded one back on. Every mode
 requires `--gh-cli` pointing to an executable GitHub App wrapper; unattended
-operation never falls back to ambient `gh`. `--repo-root` is optional and only
-sets the directory the merge-queue hold check runs from. `--mode live` and
+operation never falls back to ambient `gh`. `--repo-root` sets the checkout
+the merge-queue hold check and the superseded merge-group reaper run from. The
+reaper needs it (Shipyard resolves its GitHub credential from that checkout's
+remote), so without it the reaper is skipped and says so. `--mode live` and
 `--authority` are retired and refused. Never hand-edit the installed plist;
 re-run the installer.
 
@@ -1061,6 +1150,43 @@ control and ship-state observations are unhealthy rather than successful
 no-ops. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
+
+### Superseded merge-group runs
+
+Each tick also runs `shipyard rescue --superseded-merge-group --repo <repo>
+--json` for every repository in `SHIPYARD_QUEUE_REAP_REPOS` (default
+`Generous-Corp/pulp`). A `merge_group` run whose `gh-readonly-queue/*` ref no
+longer exists validates a batch the queue already dropped, and holds a gate VM
+until it ends. Shipyard decides which runs those are: it trusts only a ref
+listing that includes `HEAD`, keeps any run whose ref is live, and skips runs
+that hold no runner. The tick only runs it.
+
+- It cancels only while `~/.config/tartci/reap-superseded-merge-groups.enabled`
+  exists (`SHIPYARD_QUEUE_REAP_OPT_IN` names another path). Without the file
+  it only reports. Remove the file to roll back.
+- Each cancelled run (or, when reporting, each run it would cancel) is one
+  tab-separated line in `~/Library/Logs/tartci/superseded-merge-groups.log`:
+  time, host, repository, run id, ref, status and reason.
+- It never fails the tick. A Shipyard error, unreadable output or a run past
+  `SHIPYARD_QUEUE_REAP_TIMEOUT_SECS` (default 60) is one line in the tick log,
+  and the rest of the tick goes on. A held merge queue skips it with the rest
+  of the tick.
+
+Enable it on the host whose queue tick runs, with the tick installed from
+a checkout of the reaped repository:
+
+```sh
+scripts/install_shipyard_queue_tick.sh --gh-cli "$HOME/.local/bin/ghapp" \
+  --mode reap --repo-root <checkout of Generous-Corp/pulp> --install
+touch ~/.config/tartci/reap-superseded-merge-groups.enabled
+```
+
+Without `--repo-root`, each tick logs `reap-superseded <repo>: skipped: no
+repo root configured` and never runs Shipyard. An install from before the
+reaper ran from the repo root has none, so it skips every tick until the
+operator reinstalls it with `--repo-root`; that reinstall is a required step,
+not something self-update does. One root serves one repository: with more than
+one in `SHIPYARD_QUEUE_REAP_REPOS` the tick skips the reaper and says so.
 
 ## Retire Orchard on upgrades
 

@@ -91,7 +91,7 @@ tartci_apply_guest_dns(){
     return 0
   fi
   # shellcheck disable=SC2086 # servers is a validated, space-separated list
-  guest_dns_guest_script | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  guest_dns_guest_script | ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     bash -s -- "$TARTCI_GUEST_DNS_PROBE_NAME" $servers >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     event guest_dns "result=applied servers=${servers// /,}"

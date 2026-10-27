@@ -35,6 +35,15 @@
 #   SHIPYARD_QUEUE_MIN_VERSION=<semver>       default 0.80.0. The tick requires
 #       Shipyard's fail-closed merge-queue control surface.
 #   SHIPYARD_TICK_HEARTBEAT_FRESH_SECS=N    default 300 (skip live workers)
+#   SHIPYARD_QUEUE_REAP_REPOS="owner/repo ..." default Generous-Corp/pulp;
+#       the repositories whose superseded merge-group runs each tick reaps.
+#   SHIPYARD_QUEUE_REAP_OPT_IN=<file>          default
+#       ~/.config/tartci/reap-superseded-merge-groups.enabled. While it exists
+#       the reaper cancels (`--apply`); without it the reaper only reports.
+#   SHIPYARD_QUEUE_REAP_LOG=<file>             default
+#       ~/Library/Logs/tartci/superseded-merge-groups.log, one line per run
+#       cancelled (or, in a report-only tick, that would be).
+#   SHIPYARD_QUEUE_REAP_TIMEOUT_SECS=N         default 60, per repository.
 #
 # Retired settings: SHIPYARD_TICK_REAP_ONLY, SHIPYARD_QUEUE_AUTHORITY,
 # SHIPYARD_TICK_MERGE_METHOD and SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS configured
@@ -52,6 +61,10 @@ INVALID_THRESHOLD="${SHIPYARD_QUEUE_INVALID_THRESHOLD:-3}"
 MIN_VERSION="${SHIPYARD_QUEUE_MIN_VERSION:-0.80.0}"
 FRESH="${SHIPYARD_TICK_HEARTBEAT_FRESH_SECS:-300}"
 GH="${SHIPYARD_QUEUE_GH_CLI:-}"
+REAP_REPOS="${SHIPYARD_QUEUE_REAP_REPOS:-Generous-Corp/pulp}"
+REAP_OPT_IN="${SHIPYARD_QUEUE_REAP_OPT_IN:-$HOME/.config/tartci/reap-superseded-merge-groups.enabled}"
+REAP_LOG="${SHIPYARD_QUEUE_REAP_LOG:-$HOME/Library/Logs/tartci/superseded-merge-groups.log}"
+REAP_TIMEOUT="${SHIPYARD_QUEUE_REAP_TIMEOUT_SECS:-60}"
 # Retired merge-path settings (see header).
 LEGACY_REAP_ONLY="${SHIPYARD_TICK_REAP_ONLY:-}"
 LEGACY_AUTHORITY="${SHIPYARD_QUEUE_AUTHORITY:-}"
@@ -170,6 +183,35 @@ command -v "$GH" >/dev/null 2>&1 \
 # Installation readiness is distinct from completion: publish it after all
 # local/configuration checks, before queue-size-dependent network I/O.
 health "starting" "local_prerequisites_validated" || exit 2
+
+# Superseded merge-group runs: a `merge_group` run whose gh-readonly-queue ref
+# is gone validates a dequeued batch and only holds a gate VM. Shipyard's own
+# reaper decides (it trusts only a ref listing that carries HEAD, and skips
+# runs that hold no runner); this tick only runs it. It never fails the tick,
+# and the support helper bounds it to REAP_TIMEOUT seconds per repository.
+# Shipyard resolves its GitHub credential from the checkout it runs in, so the
+# reaper runs from SHIPYARD_QUEUE_REPO_ROOT; from $HOME it fails with
+# "token_command placeholder requires remote.origin.url to be a GitHub remote".
+REAP_APPLY=0; [ -e "$REAP_OPT_IN" ] && REAP_APPLY=1
+# One checkout resolves one repository's credential, so a root cannot serve
+# several reaped repositories.
+reap_count=0
+for reap_repo in $REAP_REPOS; do reap_count=$((reap_count+1)); done
+if [ "$reap_count" -gt 1 ]; then
+  log "$HOST: reap-superseded: skipped: one repo root cannot serve $reap_count repositories" \
+      "($REAP_REPOS); set SHIPYARD_QUEUE_REAP_REPOS to the root's repository"
+  REAP_REPOS=""
+fi
+for reap_repo in $REAP_REPOS; do
+  if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
+    log "$HOST: reap-superseded $reap_repo: skipped: no repo root configured" \
+        "(install the tick with --repo-root <checkout>)"
+    continue
+  fi
+  reap_line="$(cd "$REPO_ROOT" && python3 "$SUPPORT" reap-superseded "$SY" "$reap_repo" "$REAP_APPLY" \
+    "$REAP_LOG" "$HOST" "$(ts)" --timeout "$REAP_TIMEOUT" 2>&1 | head -n 1)"
+  log "$HOST: ${reap_line:-reap-superseded $reap_repo: no output}"
+done
 
 LIST_ERROR="$TMP/ship-state-list.err"
 "$SY" ship-state list --json 2>"$LIST_ERROR" > "$SS" \

@@ -29,8 +29,8 @@
 
   Scan roots are DISCOVERED, not declared. This template deliberately does not
   set TARTCI_RECLAIM_ROOTS: the janitor keeps whichever of ~/Code and the
-  installed fleet profile's [reclaim] code root (m3: /Volumes/Workshop/Code,
-  m5studio: /Volumes/Atelier/Code) the host actually has. A hand-tuned root is the one
+  installed fleet profile's [reclaim] code root (m3: /Volumes/<data-volume>/Code,
+  m5studio: /Volumes/<data-volume>/Code) the host actually has. A hand-tuned root is the one
   failure the guards cannot catch, because a root that EXISTS but sits on the
   wrong volume passes every check and reports a clean exit 0 forever while the
   volume it was installed to protect fills up. m3 is exactly that shape: it
@@ -40,7 +40,10 @@
   a healthy disk cannot certify a full one. Pressure is scoped the other way,
   per volume: only build directories that live on a volume under
   TARTCI_RECLAIM_PRESSURE_FREE_GB get the shorter
-  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate. Failing more is the safe
+  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate, and so do those on a volume at
+  least TARTCI_RECLAIM_PRESSURE_USED_PERCENT used (90, under readiness's 92%
+  disk_pressure limit, so a large volume reclaims before the host leaves the
+  fleet). Failing more is the safe
   direction; deleting more is not, and a boot disk dipping below the threshold
   is not a reason to reclaim week-old builds off a volume with terabytes free.
 
@@ -135,6 +138,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>HOME</key>
         <string>$HOME</string>
         <key>PATH</key>
@@ -147,6 +152,8 @@
         <string>200</string>
         <key>TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS</key>
         <string>7</string>
+        <key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>
+        <string>90</string>
         <key>TARTCI_RECLAIM_FAIL_BELOW_GB</key>
         <string>60</string>
         <key>TARTCI_RECLAIM_LOG</key>

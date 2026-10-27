@@ -853,6 +853,160 @@ class FailClosedTests(unittest.TestCase):
         self.assertEqual(code, 4)
 
 
+class SpentPassDeadlineTests(unittest.TestCase):
+    """m3, 2026-10-22: two git calls timed out at 300 s each and a listing at
+    120 s, so the 900 s pass deadline was spent before the post-pass
+    re-measure. That re-measure went through the same deadline and refused
+    without calling statfs, free space read as unknown, and every pass
+    exited 4 while the volume sat at 92%."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, dr, "PASS_DEADLINE", dr.PASS_DEADLINE)
+
+    def test_free_space_is_read_after_the_pass_deadline(self):
+        dr.PASS_DEADLINE = time.monotonic() - 1
+        self.assertIsNotNone(dr.free_bytes(self.root))
+        # Control, same instrument: the budget that remains for a listing
+        # is still spent, so only the one statfs is exempt.
+        with self.assertRaises(OSError):
+            dr.bounded_scandir(self.root)
+
+    def test_a_pass_that_outruns_its_deadline_still_checks_the_floor(self):
+        make_build_tree(self.root / "wt" / "build", age_days=400)
+        real = dr.find_candidates
+
+        def slow_scan(roots, maxdepth):
+            found = real(roots, maxdepth)
+            dr.PASS_DEADLINE = time.monotonic() - 1   # the scan used it all
+            return found
+        buffer = io.StringIO()
+        with unittest.mock.patch.object(dr, "find_candidates", slow_scan), \
+                redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(self.root), "--json", "--fix",
+                            "--min-age-days", "7", "--pressure-free-gb", "0",
+                            "--fail-below-gb", "1"])
+        report = json.loads(buffer.getvalue())
+        self.assertIsNotNone(report["free_bytes_after"])
+        self.assertEqual(code, 0)
+
+
+class UsedPercentPressureTests(unittest.TestCase):
+    """Pressure by percent used, not only by free GiB.
+
+    m3's 3.6 TiB volume reached TartCI's 92% readiness limit with ~290 GiB
+    free, above the 200 GiB pressure threshold, so reclaim kept its 30-day
+    gate while readiness had already taken the host out of the fleet."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_json(self, *argv):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(self.root), "--json", *argv])
+        return code, json.loads(buffer.getvalue())
+
+    BASE = ("--min-age-days", "30", "--pressure-min-age-days", "7",
+            "--pressure-free-gb", "0")
+
+    def test_a_volume_over_the_used_percent_takes_the_short_gate(self):
+        path = make_build_tree(self.root / "wt" / "build", age_days=10)
+        # Any real volume is more than 0.0001% used.
+        code, report = self.run_json(*self.BASE, "--pressure-used-percent", "0.0001")
+        self.assertEqual(code, 0)
+        self.assertTrue(report["pressure"])
+        self.assertEqual([d["path"] for d in report["deleted"]], [str(path)])
+        # Control: the percent trigger off, the same tree is too recent.
+        code, report = self.run_json(*self.BASE, "--pressure-used-percent", "0")
+        self.assertFalse(report["pressure"])
+        self.assertEqual([k["reason"] for k in report["kept"]], ["too_recent"])
+
+    def test_the_percent_threshold_reaches_the_pulp_worktree_reaper(self):
+        # The Pulp worktree reaper judges pressure with the same helper, but
+        # only if the pass hands it the threshold: without it a 92%-full
+        # volume with ~280 GiB free never ran clean_worktree_builds.
+        seen: list = []
+
+        def fake_run(**kwargs):
+            seen.append(kwargs.get("pressure_used_percent"))
+            return {"enabled": False, "reason": "stub"}
+
+        with unittest.mock.patch.object(dr.pulp_reapers, "run", fake_run):
+            code, _ = self.run_json("--pressure-used-percent", "90")
+            self.assertEqual(code, 0)
+            with unittest.mock.patch.dict(os.environ,
+                                          {"TARTCI_RECLAIM_PRESSURE_USED_PERCENT": "87.5"}):
+                code, _ = self.run_json()
+            self.assertEqual(code, 0)
+        self.assertEqual(seen, [90.0, 87.5])
+
+    def test_unknown_free_space_never_selects_pressure_by_percent(self):
+        make_build_tree(self.root / "wt" / "build", age_days=10)
+        with unittest.mock.patch.object(dr, "free_bytes", return_value=None):
+            code, report = self.run_json(*self.BASE, "--pressure-used-percent", "0.0001")
+        self.assertFalse(report["pressure"])
+        self.assertEqual(report["min_age_days"], 30)
+
+    def test_the_installed_agent_sets_the_percent_below_readiness(self):
+        try:
+            import macos_fleet_lanes
+        except ImportError as exc:  # tomllib: the launchd python is 3.9
+            self.skipTest(f"macos_fleet_lanes needs Python 3.11+: {exc}")
+        text = (pathlib.Path(__file__).resolve().parent.parent / "launchd"
+                / "com.danielraffel.tartci.reclaim.plist.template").read_text()
+        import re
+        match = re.search(r"<key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>\s*"
+                          r"<string>([0-9.]+)</string>", text)
+        self.assertIsNotNone(match, "the agent must set the percent trigger")
+        value = float(match.group(1))
+        self.assertLess(value, macos_fleet_lanes.DISK_PROBLEM_PERCENT)
+        self.assertGreater(value, macos_fleet_lanes.DISK_WARN_PERCENT)
+
+
+class GeneratedTestScratchTests(unittest.TestCase):
+    """Pulp writes test projects to ${CMAKE_BINARY_DIR}/test-tmp/<name>/
+    (tools/cli/CMakeLists.txt). Their CMakeLists.txt read as a parked source
+    tree and kept m3's 55 GiB pulp-p0a-failure-proof/build forever."""
+
+    setUp = MainTests.setUp
+    run_main = MainTests.run_main
+
+    def build_with(self, *rel):
+        tree = self.root / "wt" / "build"
+        tree.mkdir(parents=True)
+        (tree / "CMakeCache.txt").write_text("x")
+        for name in rel:
+            target = tree / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if name.endswith(".git"):
+                target.mkdir()
+            else:
+                target.write_text("project(t)")
+        age(tree, 400)
+        return tree
+
+    def test_a_generated_test_project_does_not_protect_the_tree(self):
+        tree = self.build_with("test-tmp/cli-dsp-capabilities-write/CMakeLists.txt")
+        code, _ = self.run_main("--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertFalse(tree.exists())
+
+    def test_a_checkout_inside_test_tmp_still_protects_it(self):
+        tree = self.build_with("test-tmp/parked/.git", "test-tmp/parked/CMakeLists.txt")
+        self.run_main("--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertTrue(tree.is_dir())
+
+    def test_a_project_elsewhere_in_the_tree_still_protects_it(self):
+        tree = self.build_with("scratch/proj/CMakeLists.txt")
+        self.run_main("--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertTrue(tree.is_dir())
+
+
 class ProgressTests(unittest.TestCase):
     """The heartbeat that keeps a working pass distinguishable from a wedged one."""
 
@@ -1211,7 +1365,7 @@ class RootDiscoveryTests(unittest.TestCase):
     def test_profile_reclaim_paths_add_the_external_volume_root(self):
         """A host whose external volume is not named Workshop is still scanned.
 
-        m5studio keeps code on /Volumes/Atelier; the root comes from the
+        m5studio keeps code on /Volumes/Store; the root comes from the
         installed profile's [reclaim] repo/worktrees_root, not a volume name.
         """
         code = self.base / "atelier" / "Code"
@@ -1243,6 +1397,18 @@ class RootDiscoveryTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code_ctl = dr.main(["--roots", str(self.present_a), "--json"])
         self.assertEqual(code_ctl, 0)
+
+    def test_stalled_root_metadata_probe_fails_closed(self):
+        """A wedged root probe must not leave reclaim orphaned in os.access."""
+        def stalled(_operation, *, description, timeout=dr.ROOT_PROBE_TIMEOUT_S):
+            raise OSError(errno.ETIMEDOUT, f"{description} timed out")
+
+        buffer = io.StringIO()
+        with unittest.mock.patch.object(dr, "bounded_fs_call", side_effect=stalled), \
+                redirect_stdout(io.StringIO()), redirect_stderr(buffer):
+            code = dr.main(["--roots", str(self.present_a), "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("probe failed", buffer.getvalue())
 
     def test_a_host_matching_no_candidate_exits_two(self):
         with unittest.mock.patch.object(
@@ -1578,7 +1744,7 @@ class HomeRootGuardTests(unittest.TestCase):
                 self.assertNotIn("REFUSED", err)
 
     def test_a_whole_volume_root_is_refused(self) -> None:
-        self.assertIn("whole volume", dr.refused_root(pathlib.Path("/Volumes/Workshop")))
+        self.assertIn("whole volume", dr.refused_root(pathlib.Path("/Volumes/Example")))
 
     def test_a_refused_listing_is_named_never_silent(self) -> None:
         code = self.home / "Code"

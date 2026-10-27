@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDENS_SH = os.path.join(HERE, "goldens.sh")
@@ -165,6 +166,98 @@ class ApplySnippetReload(unittest.TestCase):
         proc, _, tartci_calls = self._apply(0)
         self.assertIn("reloaded runner via 'tartci launchd reload'", proc.stdout)
         self.assertIn(self.LABEL, tartci_calls)
+
+class PeerDiscoveryPinning(unittest.TestCase):
+    """`sync --to HOST --dry-run` over fake ssh/arp/rsync: a raw-IP link is a
+    bridge0 neighbour only, and is pinned to HOST's known host key."""
+
+    FAKE_SSH = r"""#!/bin/bash
+printf '%s\n' "$*" >> "$CALLS"
+if [ "$1" = "-G" ]; then
+  printf 'user ci\nidentityfile /keys/fleet\nhostname 100.64.0.5\n'
+  [ -n "${HKA:-}" ] && printf 'hostkeyalias %s\n' "$HKA"
+  exit 0
+fi
+for a in "$@"; do last2="$last"; last="$a"; done
+case "$last2" in
+  m5) case "$last" in *PlistBuddy*) echo /r/goldens ;; *) echo M5-Studio ;; esac ;;
+  ci@169.254.*) echo m5-studio ;;   # every link-local peer claims to be HOST
+esac
+"""
+    FAKE_ARP = """#!/bin/sh
+echo '? (169.254.9.9) at aa:bb:cc:dd:ee:01 on bridge0 [ethernet]'
+echo '? (169.254.6.6) at aa:bb:cc:dd:ee:02 on en0 [ethernet]'
+echo '? (169.254.7.7) at aa:bb:cc:dd:ee:03 on bridge01 [ethernet]'
+"""
+
+    def setUp(self):
+        import shutil
+        self.dir = tempfile.mkdtemp(prefix="tartci-goldens-pin-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        bindir = os.path.join(self.dir, "bin")
+        os.makedirs(bindir)
+        self.calls = os.path.join(self.dir, "ssh.log")
+        self.rsync = os.path.join(self.dir, "rsync.log")
+        for name, body in (("ssh", self.FAKE_SSH), ("arp", self.FAKE_ARP),
+                           ("ipconfig", "#!/bin/sh\necho 169.254.1.1\n"),
+                           ("rsync", f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{self.rsync}"\n')):
+            path = os.path.join(bindir, name)
+            with open(path, "w") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+        self.goldens = os.path.join(self.dir, "goldens")
+        os.makedirs(self.goldens)
+        with open(os.path.join(self.goldens, "pulp-windows-build-x.qcow2"), "w") as fh:
+            fh.write("stub")
+        self.env = dict(os.environ, TARTCI_GOLDENS=self.goldens, CALLS=self.calls,
+                        PATH=f"{bindir}:{os.environ['PATH']}")
+
+    def sync(self, *extra, hka="m5"):
+        env = dict(self.env, HKA=hka)
+        proc = subprocess.run(["bash", GOLDENS_SH, "sync", "--to", "m5", "--dry-run", *extra],
+                              env=env, capture_output=True, text=True)
+        calls = Path(self.calls).read_text() if os.path.exists(self.calls) else ""
+        rsync = Path(self.rsync).read_text() if os.path.exists(self.rsync) else ""
+        return proc, calls, rsync
+
+    def test_only_bridge0_neighbours_are_probed_and_pinned(self):
+        proc, calls, rsync = self.sync()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Negative: a link-local neighbour on another interface is never dialled.
+        self.assertNotIn("169.254.6.6", calls)
+        self.assertNotIn("169.254.7.7", calls)
+        self.assertNotIn("accept-new", calls + rsync)
+        # Positive: the bridge0 peer is probed and used, pinned to HOST's key.
+        probe = [line for line in calls.splitlines() if "169.254.9.9" in line]
+        self.assertTrue(probe, calls)
+        self.assertIn("-o HostKeyAlias=m5 -o StrictHostKeyChecking=yes", probe[0])
+        self.assertIn("-o HostKeyAlias=m5 -o StrictHostKeyChecking=yes", rsync)
+        self.assertIn("ci@169.254.9.9:/r/goldens/", rsync)
+
+    def test_without_a_host_key_alias_the_host_name_entry_is_pinned(self):
+        proc, _, rsync = self.sync(hka="")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("-o HostKeyAlias=100.64.0.5 -o StrictHostKeyChecking=yes", rsync)
+
+    def test_via_still_works_and_is_pinned(self):
+        proc, calls, rsync = self.sync("--via", "169.254.42.42")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ci@169.254.42.42:/r/goldens/", rsync)
+        self.assertIn("-o HostKeyAlias=m5 -o StrictHostKeyChecking=yes", rsync)
+        self.assertNotIn("accept-new", calls + rsync)
+
+    def test_a_via_that_is_not_an_address_is_refused(self):
+        proc, calls, rsync = self.sync("--via", "-oProxyCommand=x")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--via must be an IP address or host name", proc.stderr)
+        self.assertEqual("", calls + rsync)
+
+    def test_an_unusable_known_hosts_name_refuses_the_raw_ip_link(self):
+        proc, _, rsync = self.sync("--via", "169.254.42.42", hka="-oProxyCommand=x")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no usable known_hosts name", proc.stderr)
+        self.assertEqual("", rsync)
+
 
 if __name__ == "__main__":
     unittest.main()

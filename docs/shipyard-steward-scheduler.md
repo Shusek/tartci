@@ -29,7 +29,15 @@ and then:
    prints one plan per pull request. Every plan, and the facts behind every
    proposed action, is appended to the plan ledger
    `~/Library/Logs/shipyard-steward-scheduler.plans.jsonl`.
-3. In live mode only: collects the proposals whose class is enabled, writes
+3. Runs `shipyard --json base-health --repo OWNER/REPO` once per repository,
+   read-only (never `--act`). When the repository's base health detector names
+   a poisoned base and the fix pull request that owns it, Shipyard returns jump
+   advice, and the tick appends it to the plan ledger as a `base_health` line:
+   the dry-run receipt that a jump would have happened. The report lists each
+   repository's base status. Jumping the queue is not a scheduler class, so
+   nothing here mutates, and a Shipyard without `base-health` is reported per
+   repository without making the tick unhealthy.
+4. In live mode only: collects the proposals whose class is enabled, writes
    them atomically to the intent file
    `~/.local/state/tartci/shipyard-steward-scheduler.intent.json`, and then
    runs one `runner carrier --apply --class ... --intent FILE` per repository

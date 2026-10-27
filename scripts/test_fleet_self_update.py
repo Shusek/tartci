@@ -10,6 +10,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -22,9 +23,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_self_update as su
+import tart_pin
+import fleet_source
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLED = "1" * 40
+TART_SHA, SOFTNET_SHA = "a" * 64, "b" * 64
 T_OLD = "a" * 40      # first-parent commit older than the soak
 T_NEW = "b" * 40      # newer, still soaking
 NOW = 1_800_000_000.0
@@ -50,7 +54,35 @@ class FakeSystem(su.System):
         self.calls: list[tuple[list[str], str | None]] = []
         self.inputs: list[str | None] = []
         self.pool_state = "on"
+        self.store_result = {"ms": 4.0}  # the pre-drain write into the Tart store
+        self.store_writes: list[str] = []
+        # None: healthy, checked a minute before the fake clock (as idle
+        # lanes keep it); a test sets a tuple to pin the record.
+        self.store_health_result = None
+        # Tart: installed, what the tap offers, how `brew upgrade` ends, and
+        # whether a clone of the golden boots.
+        self.tart: str | None = "2.40.1"
+        self.softnet: str | None = "0.24.0"
+        self.tap = {"tart": ("2.40.1", TART_SHA), "softnet": ("0.24.0", SOFTNET_SHA)}
+        self.tap_ok = True
+        self.brew_upgrade_rc = 0
+        self.brew_upgrade_installs: str | None = None  # default: the tap version
+        self.tart_running = False                     # a `tart run` process exists
+        self.boot_ok = True                           # a booted clone reports an IP
+        self.boot_ip = "192.168.64.5\n"               # what `tart ip` prints when it boots
+        self.tart_stop_rc = self.tart_delete_rc = 0
+        self.peer_tart: dict[str, dict] = {}          # ssh target -> its tart-verified.json
+        self.peer_tart_clock: float | None = None     # the canary's clock, if not ours
+        self.peer_tart_rc = 0
+        # Installed kegs per formula, like the Cellar. `brew link` links the
+        # HIGHEST installed version (Homebrew 7 latest_kegs), whatever opt says.
+        self.kegs: dict[str, set[str]] = {"tart": set(), "softnet": set()}
+        self.uninstall_rc = 0
+        # sha256 of the archive `brew --cache` names, per formula.
+        self.archive_sha = {"tart": TART_SHA, "softnet": SOFTNET_SHA}
+        self.tart_delete_rcs: list[int] = []        # successive delete results, then tart_delete_rc
         self.offplan = [0]             # successive `pool off --plan` exit codes
+        self.offplan_text = "plan"     # its stdout
         self.install_rcs = [0]         # successive `install --apply` exit codes
         self.dry_run_rc = 0
         self.preflight_rc = 0
@@ -64,8 +96,11 @@ class FakeSystem(su.System):
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
         self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
+        self.peer_paused: set[str] = set()   # peers whose self-update an operator paused
+        self.peer_halted: set[str] = set()   # peers whose self-update halted on failures
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
+        self.workflow_runs: dict[str, list] = {}   # sha -> actions/runs entries
         self.signing_rc = 0
         self.locked = False          # dedicated keychain locked in this session
         self.unlocked = False
@@ -81,6 +116,8 @@ class FakeSystem(su.System):
         self.remote_url = su.REPO_URL + "\n"
         self.api_repository = su.DEFAULT_REPOSITORY
         self.unreadable_repositories: set[str] = set()
+        # repository -> results to return, one per read, before answering normally
+        self.repository_failures: dict[str, list] = {}
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -94,6 +131,9 @@ class FakeSystem(su.System):
 
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
+        self.off_main: set[str] = set()   # commits `merge-base --is-ancestor <c> origin/main` rejects
+        self.built_team: str | None = None  # a built launcher's TeamIdentifier, if not the live one's
+        self.cat_file_rc = 0
         self.relay = {"ok": True, "probe": "relay authenticated"}
         self.status_after_on = {"state": "on", "participating": True,
                                 "fleet": {"managed": True, "fleet_ready": True,
@@ -114,6 +154,13 @@ class FakeSystem(su.System):
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
         self.launchd_print = None
+        self.target_orchestrator_rc = 0
+        self.target_orchestrator_calls: list[list[str]] = []
+        self.v2_generation: Path | None = None   # launcher v2: the pointer's generation
+        self.live_team = "95CX6P84C4"            # the live app's TeamIdentifier
+        self.keychain_identities = [IDENTITY]    # Developer ID identities (or (id, team))
+        self.live_identity = None                # the live app's certificate (None: IDENTITY)
+        self.built_identity = None               # what the last launcher build signed with
 
     def now(self) -> float:
         return self.clock
@@ -121,6 +168,35 @@ class FakeSystem(su.System):
     def run_critical(self, argv, *, cwd=None, env=None, timeout=900, record=None):
         self.critical.append(list(argv))
         return self.run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def store_write(self, directory, timeout=10.0):
+        self.store_writes.append(directory)
+        if isinstance(self.store_result, list):  # successive results
+            return dict(self.store_result.pop(0) if len(self.store_result) > 1
+                        else self.store_result[0])
+        return dict(self.store_result)
+
+    def store_health(self, directory):
+        if self.store_health_result is None:
+            return "healthy", "directory_metadata_ok", su._iso(self.clock - 60)
+        return self.store_health_result
+
+    def set_tart(self, version: str) -> None:
+        """Install and link this Tart keg; earlier kegs stay in the Cellar."""
+        self.tart = version
+        self._link("tart", version)
+
+    def set_softnet(self, version: str) -> None:
+        self.softnet = version
+        self._link("softnet", version)
+
+    def _link(self, name: str, version: str, keep: bool = False) -> None:
+        assert tart_pin.OPT != Path("/opt/homebrew/opt"), "tart_pin.OPT is not patched"
+        self.kegs[name].add(version)
+        if tart_pin.OPT.is_dir():
+            link = tart_pin.OPT / name
+            link.unlink(missing_ok=True)
+            link.symlink_to(f"../Cellar/{name}/{version}")
 
     def process_start(self, pid):
         if pid in self.procs:
@@ -156,10 +232,79 @@ class FakeSystem(su.System):
             self.hook(a)
         if a[:2] == ["launchctl", "print"]:
             return self.launchd_print or su.Result(1, "", "not configured")
+        if a[0] in (tart_pin.TART, tart_pin.BREW, "/bin/ln"):
+            # A test must never reach the real /opt/homebrew/opt.
+            assert tart_pin.OPT != Path("/opt/homebrew/opt"), "tart_pin.OPT is not patched"
+        if a[0] == tart_pin.TART and a[1:] == ["--version"]:
+            return ok(self.tart + "\n") if self.tart else su.Result(127, "", "not installed")
+        if a[0] == tart_pin.TART and a[1] == "clone":
+            return ok()
+        if a[0] == tart_pin.TART and a[1] == "stop":
+            return su.Result(self.tart_stop_rc, "", "" if not self.tart_stop_rc else "stop failed")
+        if a[0] == tart_pin.TART and a[1] == "delete":
+            rc = self.tart_delete_rcs.pop(0) if self.tart_delete_rcs else self.tart_delete_rc
+            return su.Result(rc, "", "" if not rc else "busy")
+        if a[:2] == [tart_pin.BREW, "--cache"]:
+            return ok(f"/fake/Caches/Homebrew/downloads/{a[-1].rsplit('/', 1)[-1]}.tar.gz\n")
+        if a[:3] == ["/usr/bin/shasum", "-a", "256"]:
+            name = a[-1].rsplit("/", 1)[-1].split(".tar.gz")[0]
+            return ok(f"{self.archive_sha[name]}  {a[-1]}\n")
+        if a[0] == tart_pin.TART and a[1] == "ip":
+            return ok(self.boot_ip) if self.boot_ok else su.Result(1, "", "no IP")
+        if a[0] == "/bin/sh" and "--no-graphics" in joined:
+            return ok()
+        if a[:3] == [tart_pin.BREW, "info", "--json=v2"]:
+            if not self.tap_ok:
+                return su.Result(1, "", "Error: No available formula")
+            return ok(json.dumps({"casks": [], "formulae": [
+                {"full_name": f"openai/tools/{name}", "versions": {"stable": version},
+                 "urls": {"stable": {"checksum": sha}}}
+                for name, (version, sha) in self.tap.items()]}))
+        if a[:2] == [tart_pin.BREW, "upgrade"]:
+            if self.brew_upgrade_rc == 0:
+                self.set_tart(self.brew_upgrade_installs or self.tap["tart"][0])
+                self.set_softnet(self.tap["softnet"][0])
+            return su.Result(self.brew_upgrade_rc, "", "" if self.brew_upgrade_rc == 0
+                             else "Error: Failed to download resource")
+        if a[:2] == [tart_pin.BREW, "uninstall"]:
+            # Resolves the keg through opt (default_kegs) and removes only it.
+            name = a[-1].rsplit("/", 1)[-1]
+            if self.uninstall_rc:
+                return su.Result(self.uninstall_rc, "", "Error: uninstall failed")
+            keg = os.readlink(tart_pin.OPT / name).rsplit("/", 1)[-1]
+            self.kegs[name].discard(keg)
+            (tart_pin.OPT / name).unlink()
+            setattr(self, name, None)
+            return ok()
+        if a[:2] == [tart_pin.BREW, "link"]:
+            name = a[-1].rsplit("/", 1)[-1]
+            if not self.kegs[name]:
+                return su.Result(1, "", f"Error: No such keg: {name}")
+            latest = max(self.kegs[name], key=tart_pin.vkey)
+            self._link(name, latest, keep=True)
+            setattr(self, name, latest)
+            return ok()
+        if a[:2] == [tart_pin.BREW, "unlink"] or a[0] == "/bin/ln":
+            return ok()
+        if a[:2] == ["pgrep", "-f"] and a[2] == tart_pin.TART_RUN_PATTERN:
+            return su.Result(0, "4242 tart run m5-gate\n") if self.tart_running else su.Result(1)
+        if a[0] == "ssh" and a[-1] == su.TART_VERIFIED_SCRIPT:
+            if self.peer_tart_rc:
+                return su.Result(self.peer_tart_rc, "", "ssh: connect timed out")
+            value = self.peer_tart.get(a[-2])
+            clock = self.clock if self.peer_tart_clock is None else self.peer_tart_clock
+            return ok(f"{int(clock)}\n" + (json.dumps(value) if value else ""))
         if a[0] == FAKE_GH:
             repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if self.repository_failures.get(repository):
+                return self.repository_failures[repository].pop(0)
             if repository in self.unreadable_repositories:
                 return su.Result(1, "", "not found")
+            if "/actions/runs?head_sha=" in a[2]:
+                sha = a[2].split("head_sha=")[1].split("&")[0]
+                if sha not in self.workflow_runs:
+                    return su.Result(1, "", "not recorded")
+                return ok(json.dumps({"workflow_runs": self.workflow_runs[sha]}))
             if "check-runs" in a[2]:
                 sha = a[2].split("/commits/")[1].split("/")[0]
                 runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
@@ -192,8 +337,10 @@ class FakeSystem(su.System):
                 ref = a[-1].split("^")[0]
                 return ok((ref if su.SHA.fullmatch(ref) else T_NEW) + "\n")
             if "cat-file" in a:
-                return ok()
+                return su.Result(self.cat_file_rc, "", "missing commit" if self.cat_file_rc else "")
             if "merge-base" in a:
+                if a[-1] == "origin/main":
+                    return su.Result(1 if a[-2] in self.off_main else 0)
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
                 # Honour `base..main` the way git does: commits newer than base.
@@ -228,7 +375,11 @@ class FakeSystem(su.System):
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
                       + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
                       + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
-                         if pool_since is not None else ""))
+                         if pool_since is not None else "")
+                      + ("\n" + su.PAUSED_SEPARATOR + "\n"
+                         + ("paused\n" if peer in self.peer_paused else "")
+                         + ("halted\n" if peer in self.peer_halted else "")
+                         if peer in self.peer_paused | self.peer_halted else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -239,20 +390,28 @@ class FakeSystem(su.System):
             return su.Result(self.snapshot_verify_rc, "{}", "" if self.snapshot_verify_rc == 0
                              else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
-            return self._render(a)
+            return self._render(a, env)
         if a[:3] == ["python3", "scripts/support_agents.py", "check-templates"]:
             return su.Result(self.agents_check_rc, "4 declared agents render" if
                              self.agents_check_rc == 0 else "reclaim: missing template")
         if a[0] == "codesign" and "--extract-certificates" in joined:
             return ok()
+        if a[0] == "codesign" and "-d" in a and "--verbose=2" in a:
+            team = (self.built_team if self.built_team and "/builds/" in a[-1]
+                    else self.live_team)
+            return su.Result(0, "", f"Identifier=x\nTeamIdentifier={team}\n")
         if a[0] == "codesign" and "--verify" in a:
             return su.Result(self.codesign_verify_rc, "", "" if self.codesign_verify_rc == 0 else "invalid signature")
         if a[0] == "openssl":
-            return ok(f"SHA1 Fingerprint={FINGERPRINT}\n")
+            live = self.live_identity or IDENTITY
+            return ok("SHA1 Fingerprint=" + ":".join(live[i:i + 2] for i in range(0, 40, 2)) + "\n")
         if a[0] == "security":
-            return ok(f'  1) {IDENTITY} "Developer ID Application: X (95CX6P84C4)"\n')
+            rows = [(item, "95CX6P84C4") if isinstance(item, str) else item
+                    for item in self.keychain_identities]
+            return ok("".join(f'  {n}) {identity} "Developer ID Application: X ({team})"\n'
+                              for n, (identity, team) in enumerate(rows, 1)))
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
-            return self._build(a)
+            return self._build(a, env)
         if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
             if a[1:] == ["writer-domain-exec", "--help"]:
                 return ok() if self.writer_domain_exec else su.Result(2, "", "unrecognized subcommand")
@@ -271,6 +430,10 @@ class FakeSystem(su.System):
 
     # ── fakes for tartci subcommands ────────────────────────────────────
     def _tartci(self, args):
+        if args[:2] == ["fleet-macos", "self-update"]:
+            self.target_orchestrator_calls.append(list(args))
+            return su.Result(self.target_orchestrator_rc, "target orchestrator", ""
+                             if self.target_orchestrator_rc == 0 else "target refused")
         if args[:2] == ["support-manifest", "write"]:
             manifest = self.home / ".local/share/tartci/update-checkout/.tartci-support-manifest.json"
             (manifest.parent / "scripts").mkdir(parents=True, exist_ok=True)
@@ -281,6 +444,17 @@ class FakeSystem(su.System):
         if args[:2] == ["fleet-macos", "validate"]:
             return ok("valid")
         if args[:2] == ["fleet-macos", "install"]:
+            if "--apply" in args and self.v2_generation is not None:
+                # The installer records the layout it wrote in the receipt.
+                layout = ("v1" if "--launcher-layout" in args
+                          and args[args.index("--launcher-layout") + 1] == "v1"
+                          else "v2" if "--launch-set-identity" in args else None)
+                receipt = self.home / ".config/tartci/macos-fleet-install.json"
+                if layout:
+                    value = json.loads(receipt.read_text())
+                    value["launch_helper"] = {"schema": 2, "layout": "v2"} if layout == "v2" \
+                        else {"schema": 1}
+                    receipt.write_text(json.dumps(value))
             if "--apply" not in args:
                 if "--preflight" in args:
                     return su.Result(self.preflight_rc, "preflight ok" if self.preflight_rc == 0 else "preflight rejected",
@@ -294,6 +468,9 @@ class FakeSystem(su.System):
             rc = self.install_rcs.pop(0) if len(self.install_rcs) > 1 else self.install_rcs[0]
             if rc == 0:
                 self._set_installed(self.installed_after or self.checked_out)
+                if "--launch-helper-source" in args and self.built_identity:
+                    # The installed app is the one just built, signed by it.
+                    self.live_identity = self.built_identity
             return su.Result(rc, "", "" if rc == 0 else "agents still unloading")
         if args[:2] == ["pool", "undrain"]:
             if self.pool_state != "draining":
@@ -306,7 +483,11 @@ class FakeSystem(su.System):
             return ok("draining")
         if args[:3] == ["pool", "off", "--plan"]:
             rc = self.offplan.pop(0) if len(self.offplan) > 1 else self.offplan[0]
-            return su.Result(rc, "plan")
+            text = (self.offplan_text.pop(0) if isinstance(self.offplan_text, list)
+                    and len(self.offplan_text) > 1 else
+                    self.offplan_text[0] if isinstance(self.offplan_text, list)
+                    else self.offplan_text)
+            return su.Result(rc, text)
         if args[:2] == ["pool", "off"]:
             if self.off_rc:
                 return su.Result(self.off_rc, "", "refusing pool off: capacity for required label "
@@ -317,6 +498,9 @@ class FakeSystem(su.System):
         raise AssertionError(f"unexpected ./tartci {args}")
 
     def running(self):
+        if self.v2_generation is not None:
+            return json.loads((self.v2_generation / ".tartci-support-manifest.json")
+                              .read_text())["source_commit"]
         if self.sealed:
             meta = self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json"
             return json.loads(meta.read_text())["source_commit"]
@@ -331,7 +515,7 @@ class FakeSystem(su.System):
                 self.on_at = self.clock
             elif not self.refuse_keeps_state:
                 self.pool_state = "off"  # pool on's own rollback closes admission
-            return su.Result(rc, "on", "" if rc == 0 else
+            return su.Result(rc, "on", "" if rc == 0 else getattr(self, "on_text", None) or
                              "fleet-macos: loaded persistent LaunchAgent x is not running")
         if args[:2] == ["pool", "status"]:
             if self.pool_state != "on":
@@ -372,6 +556,10 @@ class FakeSystem(su.System):
         raise AssertionError(f"unexpected shim {args}")
 
     def _set_installed(self, commit):
+        if self.v2_generation is not None:
+            (self.v2_generation / ".tartci-support-manifest.json").write_text(
+                json.dumps({"source_commit": commit}))
+            return
         if self.sealed:
             meta = self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json"
             meta.write_text(json.dumps({"source_commit": commit}))
@@ -379,24 +567,35 @@ class FakeSystem(su.System):
             receipt = self.home / ".config/tartci/macos-fleet-install.json"
             receipt.write_text(json.dumps({"support": {"source_commit": commit}}))
 
-    def _render(self, a):
+    def _render(self, a, env=None):
         proc = subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), *a[2:]],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env={**os.environ, **(env or {})})
         return su.Result(proc.returncode, proc.stdout, proc.stderr)
 
-    def _build(self, a):
+    def _build(self, a, env=None):
+        self.built_identity = a[a.index("--identity") + 1]
         out = Path(a[a.index("--output") + 1])
         approval = Path(a[a.index("--approval-output") + 1])
         profile = Path(a[a.index("--profile") + 1])
         rendered = out.parent / "render"
+        render_env = {**os.environ, **(env or {})}
+        render_env["TARTCI_RENDER_PYTHON"] = a[a.index("--python") + 1]
         subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), "render",
-                        str(profile), "--output", str(rendered)], check=True, capture_output=True)
+                        str(profile), "--output", str(rendered)], check=True,
+                       capture_output=True, env=render_env)
         lanes = {}
         for plist in rendered.glob("*.plist"):
             env = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
+            expected = os.path.realpath(render_env["TARTCI_RENDER_PYTHON"])
+            assert env["TARTCI_PYTHON"] == expected
+            assert env["SHIPYARD_GHAPP_PYTHON_BINARY"] == expected
             lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
         res = out / "Contents" / "Resources"
         res.mkdir(parents=True)
+        if "--layout" in a and a[a.index("--layout") + 1] == "v2":
+            (res / "inputs.json").write_text(json.dumps({"schema": 1, "sha256": "f" * 64}))
+            approval.write_text("d" * 64 + "\n")
+            return su.Result(0, "", "")
         (res / "lanes.json").write_text(json.dumps({"schema": 1, "lanes": lanes}))
         (res / "bundle.json").write_text(json.dumps({"source_commit": self.bundle_commit or self.checked_out}))
         approval.write_text("c" * 64 + "\n")
@@ -432,6 +631,9 @@ def make_home(td: Path, *, sealed: bool = False, relay: bool = False) -> Path:
 class Base(unittest.TestCase):
     sealed = False
     relay = False
+    # Sealed-launcher tests about other gates treat the launcher change as
+    # acknowledged; LauncherConsentTests exercises the consent gate itself.
+    consent_gate = False
 
     def setUp(self) -> None:
         self.td = tempfile.TemporaryDirectory()
@@ -445,8 +647,12 @@ class Base(unittest.TestCase):
         # never call ghapp.
         import host_off
         self.issues: list[tuple[str, str]] = []
-        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t)) or (0, "77")),
-                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed"))):
+        self.bodies: list[str] = []
+        for name, fake in (("_open_issue", lambda t, b: self.issues.append(("open", t))
+                            or self.bodies.append(b) or (0, "77")),
+                           ("_close_issue", lambda n: self.issues.append(("close", n)) or (0, "closed")),
+                           ("_patch_issue_body", lambda n, b: self.issues.append(("patch", n))
+                            or self.bodies.append(b) or (0, n))):
             original = getattr(host_off, name)
             setattr(host_off, name, fake)
             self.addCleanup(setattr, host_off, name, original)
@@ -456,6 +662,10 @@ class Base(unittest.TestCase):
             original = su.launch_helper
             su.launch_helper = lambda cfg: helper
             self.addCleanup(setattr, su, "launch_helper", original)
+            if not self.consent_gate:
+                gate = mock.patch.object(su, "launcher_change_refusal", return_value=None)
+                gate.start()
+                self.addCleanup(gate.stop)
 
     def tearDown(self) -> None:
         os.environ.pop("TARTCI_HOME", None)
@@ -611,6 +821,115 @@ class OrchestratorGenerationTests(Base):
         self.assertIsNone(su.orchestrator_generation(Path(self.td.name) / "checkout/x.py"))
 
 
+class TargetOrchestratorHandoffTests(Base):
+    sealed = True
+
+    def test_handoff_executes_a_real_dispatcher_child(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            checkout = home / ".local/share/tartci/update-checkout"
+            checkout.mkdir(parents=True)
+            dispatcher = checkout / "tartci"
+            dispatcher.write_text("#!/bin/sh\nprintf 'HANDOFF_EXEC:%s\\n' \"$1\"\nexit 23\n")
+            dispatcher.chmod(0o755)
+            script = ("import fleet_self_update as su; from pathlib import Path; "
+                      f"cfg=su.Config(Path({str(home)!r})); "
+                      f"su.orchestrator_generation=lambda: {INSTALLED!r}; "
+                      "su.launch_helper=lambda cfg: {'path': 'sealed'}; "
+                      f"raise SystemExit(su.handoff_target_orchestrator(cfg, {T_OLD!r}, "
+                      "apply=True, scheduled=False, refresh=False) or 0)")
+            env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts")}
+            result = subprocess.run([sys.executable, "-c", script], env=env,
+                                    capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("HANDOFF_EXEC:fleet-macos", result.stdout)
+
+    def test_missing_dispatcher_is_a_refused_receipt(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("target dispatcher unavailable", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_non_executable_dispatcher_is_a_refused_receipt(self) -> None:
+        dispatcher = self.cfg.checkout / "tartci"
+        dispatcher.write_text("#!/bin/sh\nexit 0\n")
+        dispatcher.chmod(0o644)
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED):
+            rc = self.apply()
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        receipt = json.loads(next((self.cfg.state_dir / "attempts").glob("*.json")).read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertIn("PermissionError", receipt["error"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_installed_orchestrator_hands_off_to_the_target_checkout(self) -> None:
+        calls = []
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve", side_effect=lambda *args: calls.append(args)):
+            self.assertTrue(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=True, refresh=False))
+        self.assertEqual(calls[0][0], str(self.cfg.checkout / "tartci"))
+        self.assertEqual(calls[0][1], [
+            str(self.cfg.checkout / "tartci"), "fleet-macos", "self-update", "--apply",
+            "--target", T_OLD, "--home", str(self.home), "--scheduled"])
+        self.assertEqual(calls[0][2]["TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR"], "1")
+
+    def test_handoff_is_disabled_for_plan_unsealed_refresh_or_marker(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve") as execve:
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=False, scheduled=False, refresh=False))
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=False, refresh=True))
+            with mock.patch.dict(os.environ, {"TARTCI_SELF_UPDATE_TARGET_ORCHESTRATOR": "1"}):
+                self.assertFalse(su.handoff_target_orchestrator(
+                    self.cfg, T_OLD, apply=True, scheduled=False, refresh=False))
+        execve.assert_not_called()
+
+    def test_apply_calls_handoff_before_the_installed_builder(self) -> None:
+        with mock.patch.object(su, "handoff_target_orchestrator", return_value=True) as handoff:
+            self.assertEqual(self.apply(), su.EXIT_OK)
+        handoff.assert_called_once_with(self.cfg, T_OLD, apply=True, scheduled=False, refresh=False)
+
+
+class HandoffNegativeSelectionTests(Base):
+    def test_unsealed_hosts_never_handoff(self) -> None:
+        with mock.patch.object(su, "orchestrator_generation", return_value=INSTALLED), \
+                mock.patch.object(su.os, "execve") as execve:
+            self.assertFalse(su.handoff_target_orchestrator(
+                self.cfg, T_OLD, apply=True, scheduled=False, refresh=False))
+        execve.assert_not_called()
+
+    def test_soaking_target_never_reaches_handoff(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True),
+                su.EXIT_REFUSED)
+        handoff.assert_not_called()
+
+    def test_unverified_target_never_reaches_handoff(self) -> None:
+        self.sys.log_lines = f"{T_OLD} {int(NOW - 7200)}\n"
+        self.sys.checks[T_OLD] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_OLD, explicit=True),
+                su.EXIT_REFUSED)
+        handoff.assert_not_called()
+
+    def test_non_first_parent_target_never_reaches_handoff(self) -> None:
+        self.sys.ancestor = False
+        with mock.patch.object(su, "handoff_target_orchestrator") as handoff:
+            self.assertEqual(su.plan_or_apply(
+                self.cfg, self.sys, apply=True, target_ref=T_OLD, explicit=True),
+                su.EXIT_UNKNOWN)
+        handoff.assert_not_called()
+
+
 class ReserveCheckTests(Base):
     def test_the_target_is_validated_with_the_gate_reserve_ratchet(self) -> None:
         self.assertUpdated(self.apply())
@@ -625,8 +944,12 @@ class HappyPathTests(Base):
         joined = [" ".join(a) for a, _ in self.sys.calls]
         def first(pred):
             return next(i for i, c in enumerate(joined) if pred(c))
-        order = [first(lambda c, n=n: n in c) for n in (
-            "support-manifest write", "fleet-macos validate", "fleet-macos install", "ssh",
+        # Peer observation intentionally leads the procedure: a later gate
+        # may refuse before queue handling, but must not skip the unreadable
+        # streak that breaks a dead-peer deadlock.
+        order = [first(lambda c: c.startswith("ssh "))]
+        order += [first(lambda c, n=n: n in c) for n in (
+            "support-manifest write", "fleet-macos validate", "fleet-macos install",
             "capacity_floor.py", "pool drain", "pool off --plan")]
         order.append(first(lambda c: c.startswith("./tartci pool off") and "--plan" not in c))
         order += [first(lambda c, n=n: n in c) for n in ("--apply", "pool on")]
@@ -634,6 +957,8 @@ class HappyPathTests(Base):
         self.assertEqual(order, sorted(order))
         self.assertEqual(self.last()["status"], "succeeded")
         self.assertFalse((self.cfg.state_dir / "active.json").exists())
+        # No launch helper, no launcher change: the store is never written.
+        self.assertEqual([], self.sys.store_writes)
         # pool on and status go through the INSTALLED shim from $HOME.
         shim_calls = [(a, cwd) for a, cwd in self.sys.calls if a[0].endswith(".local/bin/tartci")]
         self.assertTrue(shim_calls and all(cwd == str(self.home) for _, cwd in shim_calls))
@@ -876,13 +1201,111 @@ class PeerTurnReplayTests(Base):
                       peers_step["detail"])
 
     def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
-        # Control, same instrument: only the drain's age changed.
+        # Control, same instrument: only the drain's age changed. Inside the
+        # grace a self-update's marker may have been written between the reads.
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
-        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.sys.peer_pool_since["m5"] = NOW - 600
         self.assertDeferred(self.apply())
         self.assertEqual(self.sys.mutations(), [])
-        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 10 min",
                       su.waiting_ticket(self.cfg)["reason"])
+
+    def test_an_operator_drain_past_the_grace_no_longer_holds_the_turn(self) -> None:
+        # No update marker at all: a self-update writes its marker before it
+        # drains, so this is an operator's drain (a containment drain).
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("an operator drain: no update marker for more than 15 min",
+                      peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_paused_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60       # inside the grace
+        self.sys.peer_paused.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is paused, so no update is in this drain",
+                      peer["evidence"])
+        self.assertUpdated(self.apply())
+
+    def test_a_halted_peer_that_is_draining_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 60
+        self.sys.peer_halted.add("m5")
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertEqual((False, True), (peer["busy"], peer["off"]))
+        self.assertIn("its self-update is halted, so no update is in this drain",
+                      peer["evidence"])
+
+    def test_the_evidence_names_the_rule_that_released_the_peer(self) -> None:
+        # The deferred host's log must say WHICH rule let it go, so an operator
+        # reading it knows whether to look for a pause, a halt or a drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        cases = (({"m5"}, set(), NOW - 60, "self-update is paused,"),
+                 (set(), {"m5"}, NOW - 60, "self-update is halted,"),
+                 ({"m5"}, {"m5"}, NOW - 60, "self-update is halted and paused,"),
+                 (set(), set(), NOW - su.PEER_DRAIN_GRACE_SECONDS - 60,
+                  "an operator drain: no update marker for more than 15 min"))
+        for paused, halted, since, rule in cases:
+            with self.subTest(rule=rule):
+                self.sys.peer_paused = {"m5"} if paused else set()
+                self.sys.peer_halted = set(halted)
+                self.sys.peer_pool_since["m5"] = since
+                evidence = su.read_peer(self.cfg, self.sys, "m5", "m5")["evidence"]
+                self.assertIn(rule, evidence)
+                self.assertIn("left to the capacity floor", evidence)
+
+    def test_the_peer_command_reports_a_pause_and_the_halt_rule_like_halt_reason(self) -> None:
+        # The real marker command, run in a shell against a fixture state dir:
+        # its halted verdict must agree with halt_reason on the same receipts.
+        import subprocess  # noqa: PLC0415
+        state = self.home / "peer" / ".tartci" / "state" / "self-update"
+        (state / "attempts").mkdir(parents=True)
+        env = {"HOME": str(self.home / "peer"), "TARTCI_HOME": str(self.home / "peer/.tartci"),
+               "PATH": "/usr/bin:/bin"}
+
+        def words() -> set[str]:
+            out = subprocess.run(["/bin/bash", "-c", su._PEER_MARKER], env=env,
+                                 capture_output=True, text=True, check=True).stdout
+            return set(out.partition(su.PAUSED_SEPARATOR)[2].split())
+        self.assertEqual(set(), words())
+        for n, status in enumerate(("failed", "rolled_back", "failed")):
+            (state / "attempts" / f"2027010{n}T000000Z.json").write_text(json.dumps(
+                {"mode": "apply", "status": status, "started_at": f"2027-01-0{n + 1}T00:00:00Z"}))
+        self.assertTrue(su.halt_reason(state))
+        self.assertEqual({"halted"}, words())
+        (state / "halt-cleared.json").write_text(json.dumps({"at": "2027-01-02T12:00:00Z"}))
+        self.assertIsNone(su.halt_reason(state))
+        self.assertEqual(set(), words())
+        (state / "scheduled-pause.json").write_text(json.dumps({"at": "x", "reason": "held"}))
+        self.assertEqual({"paused"}, words())
+
+    def test_a_peer_mid_update_still_holds_the_turn_even_paused(self) -> None:
+        # Control: a live update marker wins over the drain's age and the pause.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_NEW, "ts": NOW - 1800}
+        self.sys.peer_pool_since["m5"] = NOW - 2 * 3600
+        self.sys.peer_paused.add("m5")
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is self-updating", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_the_capacity_floor_still_gates_a_turn_past_an_operator_drain(self) -> None:
+        # Control: m5 no longer holds the turn, but this host is the last
+        # server of a required label, so it still may not drain.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_GRACE_SECONDS - 60
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"label": "pulp-build-pr-head", "verdict": "last_serving_host"}]}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        receipt = json.loads(receipts[-1].read_text())
+        self.assertIn("last server of pulp-build-pr-head", json.dumps(receipt))
+        self.assertIn("counted as serving nothing by the capacity floor: m5", json.dumps(receipt))
 
     def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
         # No pool-state time (an old peer, or stat failed): fail closed.
@@ -918,6 +1341,50 @@ class UpdateQueueTests(Base):
                  "reason": "peer m5 is draining"}
         value.update(fields)
         su._write_json(self.cfg.state_dir / "waiting.json", value)
+
+    def gate_queue(self, *, drop: tuple = (), fail: bool = False) -> list[str]:
+        """Serve the gate-demand read from the answers captured from
+        Generous-Corp/pulp at 2026-10-13 16:48 UTC
+        (scripts/fixtures/gate_job_demand/), with every time moved so that
+        capture time is the test clock. `drop` removes runs from both run
+        listings; `fail` makes every read fail. Returns the paths read."""
+        fixtures = Path(__file__).resolve().parent / "fixtures" / "gate_job_demand"
+        fleet = self.cfg.checkout / "fleet"
+        fleet.mkdir(parents=True, exist_ok=True)
+        shutil.copy(fixtures / "advertised-labels.json", fleet / "advertised-labels.json")
+        shift = NOW - su.gate_job_demand.epoch("2026-10-13T16:48:10Z")
+
+        def moved(value):
+            if isinstance(value, dict):
+                return {key: (su._iso(su.gate_job_demand.epoch(item) + shift)
+                              if key.endswith("_at") and isinstance(item, str) and item
+                              else moved(item)) for key, item in value.items()}
+            if isinstance(value, list):
+                return [moved(item) for item in value]
+            return value
+
+        paths: list[str] = []
+
+        def fetch(path: str) -> dict:
+            paths.append(path)
+            if fail:
+                raise RuntimeError("gh: Server Error (HTTP 502)")
+            if "/actions/runs?status=" in path:
+                if not path.startswith("repos/Generous-Corp/pulp/"):
+                    return {"total_count": 0, "workflow_runs": []}
+                status = path.split("status=", 1)[1].split("&", 1)[0]
+                answer = json.loads((fixtures / f"pulp-runs-{status}.json").read_text())
+                answer["workflow_runs"] = [run for run in answer["workflow_runs"]
+                                           if run["id"] not in drop]
+                answer["total_count"] = len(answer["workflow_runs"])
+                return moved(answer)
+            run = path.split("/actions/runs/", 1)[1].split("/", 1)[0]
+            return moved(json.loads((fixtures / f"pulp-jobs-{run}.json").read_text()))
+
+        original = su._demand_fetch
+        su._demand_fetch = lambda: fetch
+        self.addCleanup(setattr, su, "_demand_fetch", original)
+        return paths
 
     def test_a_peer_that_has_waited_longer_goes_first(self) -> None:
         # m3 on 2026-09-30: refused at every attempt while a peer took each turn.
@@ -991,6 +1458,7 @@ class UpdateQueueTests(Base):
 
     def test_deferral_past_the_bound_is_starvation_and_loud_once(self) -> None:
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -1002,6 +1470,7 @@ class UpdateQueueTests(Base):
     def test_starvation_opens_one_issue_and_the_next_turn_closes_it(self) -> None:
         # 2026-10-01: three hosts starved for 7-9 h and wrote events nobody read.
         self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
@@ -1012,15 +1481,270 @@ class UpdateQueueTests(Base):
         self.assertUpdated(self.apply())
         self.assertEqual(self.issues[-1], ("close", "77"))
 
+    def test_with_gate_demand_starvation_trips_an_hour_past_the_dark_peer_bound(self) -> None:
+        # Real apply entry point. A queued macOS job in a running Build and
+        # Test run is demand; the bound is one hour past the 3 h exclusion.
+        self.assertEqual(su.STARVED_AFTER_SECONDS, su.PEER_UNREACHABLE_EXCLUDE_SECONDS + 3600)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("self_update_starved", events)
+        self.assertIn("115420876725", events)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+
+    def test_a_dark_peer_does_not_trip_starvation_before_it_is_excluded(self) -> None:
+        # Past the old one-hour bound and past the 3 h exclusion, but inside
+        # the hour after it: quiet, with demand queued.
+        self.ticket(since=NOW - su.PEER_UNREACHABLE_EXCLUDE_SECONDS - 1800)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [])
+
+    def test_the_zombie_run_alone_is_not_demand(self) -> None:
+        # The 2026-08-19 merge_group run is still queued, with no jobs. With
+        # only it (and runs whose macOS jobs are running), the bound stays 6 h.
+        paths = self.gate_queue(drop=(38433042640,))
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [])
+        self.assertFalse(any("/runs/32218602754/" in path for path in paths), paths)
+        self.assertEqual(su.waiting_ticket(self.cfg)["demand"], [])
+
+    def test_a_failed_demand_read_falls_back_to_six_hours_and_says_so(self) -> None:
+        self.gate_queue(fail=True)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertIn("gate demand unread", out.getvalue())
+        self.assertIn("HTTP 502", su.waiting_ticket(self.cfg)["demand_error"])
+        self.assertEqual(self.issues, [])
+        # Past the fallback it still trips, and the event carries the failure.
+        self.ticket(since=NOW - su.STARVED_FALLBACK_SECONDS - 60)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertIn("HTTP 502", events)
+        # The issue says which bound applied and why, not "gate jobs queued".
+        self.assertIn("The bound without demand is 6 h", self.bodies[-1])
+        self.assertIn("(the demand read failed)", self.bodies[-1])
+        self.assertNotIn("while gate jobs it serves were queued", self.bodies[-1])
+
+    def test_the_starvation_issue_says_what_why_how_to_fix_and_verify(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        body = self.bodies[0]
+        for needle in ("**What happened.** m1 has had no tartci self-update turn",
+                       "Queued gate job 115420876725 (Generous-Corp/pulp Build and Test: macos)",
+                       "**Likely cause and fix.**", "is not serving normally",
+                       "`tartci pool status`", "Safe to auto-apply: no",
+                       "**Verify.**", "`tartci fleet-macos self-update --plan`"):
+            self.assertIn(needle, body)
+        self.assertIn("while gate jobs it serves were queued", body)
+        marker = su.tartci_incident.parse(body)
+        self.assertEqual(marker["host"], "m1")
+        self.assertEqual(marker["class"], "self_update_starved")
+        self.assertEqual(marker["symptom_at"], su._iso(NOW - su.STARVED_AFTER_SECONDS - 60))
+        self.assertEqual(marker["detected_at"], su._iso(NOW))
+        self.assertIsNone(marker["fixed_at"])
+
+    def test_the_turn_records_fixed_at_on_the_marker_then_closes(self) -> None:
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close"])
+        patched = self.bodies[-1]
+        self.assertEqual(patched.count("tartci-incident"), 1)
+        fixed = su.tartci_incident.parse(patched)["fixed_at"]
+        self.assertIsNotNone(fixed)
+        self.assertGreaterEqual(su.gate_job_demand.epoch(fixed), NOW)
+
+    def test_a_failed_patch_keeps_the_fix_time_and_retries_before_closing(self) -> None:
+        # A transient API error on the PATCH must not close the issue with a
+        # marker still saying fixed_at null: nothing would ever correct it.
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n, b: self.issues.append(("patch-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_patch_issue_body", failing):
+            self.assertUpdated(self.apply())
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed"])
+        pending = json.loads((self.cfg.state_dir / su.PENDING_FIX_NAME).read_text())["fixes"]
+        self.assertEqual([fix["issue"] for fix in pending], ["77"])
+        fixed_at = pending[0]["fixed_at"]
+        self.assertIn("HTTP 502", pending[0]["error"])
+        # The next run PATCHes the recorded fix time, then closes.
+        self.apply()
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch-failed", "patch", "close"])
+        self.assertEqual(su.tartci_incident.parse(self.bodies[-1])["fixed_at"], fixed_at)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def test_a_failed_close_is_retried_without_patching_again(self) -> None:
+        import host_off
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        failing = lambda n: self.issues.append(("close-failed", n)) or (1, "HTTP 502")
+        with mock.patch.object(host_off, "_close_issue", failing):
+            self.assertUpdated(self.apply())
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertTrue(su.finish_pending_fixes(self.cfg))
+        self.assertEqual([kind for kind, _ in self.issues], ["open", "patch", "close-failed", "close"])
+
+    def test_a_deferred_run_still_retries_a_pending_fix(self) -> None:
+        # A run that defers never clears a ticket, so the retry has to happen
+        # at entry: the fix recorded by an earlier run still lands.
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": "41", "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+        self.ticket(since=NOW - 1800)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.issues, [("patch", "41"), ("close", "41")])
+        self.assertEqual(self.bodies[-1], body)
+        self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+
+    def pending_fix(self, issue: str = "41") -> None:
+        body = su.tartci_incident.fixed(
+            "starved\n\n" + su.tartci_incident.marker("m1", "self_update_starved",
+                                                        su._iso(NOW - 9000), su._iso(NOW - 3600)),
+            su._iso(NOW - 600))
+        su._write_json(self.cfg.state_dir / su.PENDING_FIX_NAME, {"fixes": [
+            {"issue": issue, "issue_body": body, "fixed_at": su._iso(NOW - 600), "patched": False}]})
+
+    def test_a_deleted_issue_is_dropped_and_logged_once_not_retried_forever(self) -> None:
+        import host_off
+        answers = {
+            "patch 404": ("_patch_issue_body", lambda n, b: (1, "gh: Not Found (HTTP 404)")),
+            "close 410": ("_close_issue",
+                          lambda n: (1, '{"message":"This issue was deleted","status":"410"}')),
+        }
+        for name, (helper, answer) in answers.items():
+            with self.subTest(name=name):
+                self.pending_fix()
+                events = self.cfg.state_dir / "events.jsonl"
+                events.unlink(missing_ok=True)
+                with mock.patch.object(host_off, helper, answer), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertTrue(su.finish_pending_fixes(self.cfg))
+                self.assertFalse((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+                self.assertIn("#41 is gone", out.getvalue())
+                self.assertEqual(events.read_text().count("self_update_issue_gone"), 1)
+                # Nothing is left to retry: the next pass makes no calls.
+                before = len(self.issues)
+                self.assertTrue(su.finish_pending_fixes(self.cfg))
+                self.assertEqual(len(self.issues), before)
+                self.assertEqual(events.read_text().count("self_update_issue_gone"), 1)
+
+    def test_a_transient_error_is_still_retried(self) -> None:
+        # Control for the terminal case, same instrument: a 502 stays pending.
+        import host_off
+        self.pending_fix()
+        with mock.patch.object(host_off, "_patch_issue_body", lambda n, b: (1, "gh: Server Error (HTTP 502)")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(su.finish_pending_fixes(self.cfg))
+        self.assertTrue((self.cfg.state_dir / su.PENDING_FIX_NAME).exists())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists())
+
+    def fresh_demand(self, observed: float) -> None:
+        su._write_json(self.cfg.state_dir / "gate-queue.json", {
+            "observed_at": su._iso(observed), "host_id": "m1", "errors": [],
+            "jobs": [{"id": 1, "hosts": ["m1"], "repo": "Generous-Corp/pulp",
+                      "workflow": "Build and Test", "name": "macos",
+                      "created_at": su._iso(NOW - 600)}]})
+
+    def test_a_stale_demand_snapshot_is_no_demand(self) -> None:
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        jobs, errors = su.gate_demand(self.cfg, "m1", NOW)
+        self.assertEqual(jobs, [])
+        self.assertTrue(any("stale" in error for error in errors), errors)
+        # Control, same instrument: the same snapshot, fresh, is demand.
+        self.fresh_demand(NOW - 60)
+        self.assertEqual([job["id"] for job in su.gate_demand(self.cfg, "m1", NOW)[0]], [1])
+
+    def test_defer_on_a_stale_snapshot_keeps_the_six_hour_bound(self) -> None:
+        # A refresh that wrote nothing leaves an old snapshot behind; it is
+        # not demand, so 4 h in the queue is still only a deferral.
+        self.fresh_demand(NOW - su.GATE_DEMAND_FRESH_SECONDS - 60)
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        with mock.patch.object(su, "refresh_gate_demand", lambda *args: {}):
+            self.assertDeferred(self.apply())
+            self.assertEqual(self.issues, [])
+            # Control: a fresh snapshot of the same job trips the 4 h bound.
+            self.fresh_demand(NOW - 60)
+            self.assertEqual(self.apply(), su.EXIT_REFUSED)
+
+    def test_waiting_line_uses_the_demand_bound(self) -> None:
+        # 4.5 h in the queue: starved when gate jobs this host serves are
+        # queued, still only deferred without them.
+        self.ticket(since=NOW - 4.5 * 3600)
+        self.fresh_demand(NOW - 60)
+        self.assertIn("STARVED", su.waiting_line(self.cfg.state_dir, NOW))
+        (self.cfg.state_dir / "gate-queue.json").unlink()
+        self.assertIn("deferred", su.waiting_line(self.cfg.state_dir, NOW))
+
     def test_a_short_deferral_is_quiet(self) -> None:
-        # Control for the bound: the same deferral an hour in is not a problem.
-        self.ticket(since=NOW - 3600)
+        # Control for the bound: a deferral just under it, with demand queued,
+        # is not a problem.
+        self.gate_queue()
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS + 60)
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
         self.assertFalse((self.cfg.state_dir / "events.jsonl").exists()
                          and "self_update_starved" in (self.cfg.state_dir / "events.jsonl").read_text())
         self.assertIsNone(su.summary(self.home)["problem"])
         self.assertEqual(self.issues, [])
+
+
+class RefusedTurnTests(Base):
+    sealed = True
+
+    def test_a_pre_drain_refusal_releases_an_old_queue_ticket(self) -> None:
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "target": T_OLD, "since": NOW - 3 * 3600,
+            "ts": NOW - 60, "reason": "previous refusal",
+        })
+        self.sys.codesign_verify_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertIsNone(su.waiting_ticket(self.cfg))
+
+    def test_capacity_floor_refusal_keeps_the_ticket(self) -> None:
+        self.ticket = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600,
+                       "ts": NOW - 60, "reason": "capacity"}
+        su._write_json(self.cfg.state_dir / "waiting.json", self.ticket)
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], self.ticket["since"])
+
+    def test_recent_attempt_refusal_keeps_the_ticket(self) -> None:
+        ticket = {"host_id": "m1", "target": T_OLD, "since": NOW - 3600,
+                  "ts": NOW - 60, "reason": "recent attempt"}
+        su._write_json(self.cfg.state_dir / "waiting.json", ticket)
+        attempts = self.cfg.state_dir / "attempts"
+        su._write_json(attempts / "recent.json", {
+            "mode": "apply", "target": T_OLD, "status": "failed",
+            "started_at": su._iso(NOW - 60),
+        })
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], ticket["since"])
 
 
 class AnnounceOrderTests(Base):
@@ -1178,6 +1902,83 @@ class MidJobWaitTests(Base):
         self.assertFalse(any("--apply" in c for c in joined))
 
 
+FORGE = ("com.danielraffel.tartci.tart-runner-macos-fleet.m1.forge-gate: busy, would be KILLED "
+         "(supervisor pid 87749 owns tart run pid 11310)")
+
+
+def plan_text(*rows: str) -> str:
+    """`pool off --plan` output as the real command prints it (m1, 2026-10-16)."""
+    return "\n".join([
+        "pool off --plan on m1: nothing will be changed",
+        "  state: draining -> off; participation: 0 -> 0",
+        "  capacity floor: ok (pool off keeps every required label served)",
+        "  mid-job lanes:", *[f"    {row}" for row in rows],
+        "verdict: pool off would REFUSE (an owned lane is mid-job or unknown; use pool drain, "
+        "or --now)"])
+
+
+class DrainWaitVisibilityTests(Base):
+    def steps(self) -> list[dict]:
+        return json.loads(Path(self.last()["receipt"]).read_text())["steps"]
+
+    def test_the_wait_names_the_lane_once_per_change(self) -> None:
+        other = "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate: busy, x"
+        self.sys.offplan = [12, 12, 12, 0]
+        self.sys.offplan_text = [plan_text(FORGE), plan_text(FORGE), plan_text(FORGE, other),
+                                 "plan"]
+        self.assertUpdated(self.apply())
+        waits = [s["detail"] for s in self.steps() if s["step"] == "wait-idle"]
+        self.assertEqual(waits, [f"waiting on {FORGE}", f"waiting on {FORGE}; {other}",
+                                 "no owned lane mid-job"])
+
+    def test_a_long_unchanged_wait_still_writes_a_step_every_five_minutes(self) -> None:
+        # m1, 2026-10-22: steps at 08:00 then 08:55, nothing between.
+        self.sys.offplan = [12] * 12 + [0]
+        self.sys.offplan_text = [plan_text(FORGE)] * 12 + ["plan"]
+        self.assertUpdated(self.apply())
+        waits = [s["detail"] for s in self.steps() if s["step"] == "wait-idle"]
+        self.assertEqual(waits[0], f"waiting on {FORGE}")
+        self.assertEqual(waits[1], f"still waiting on {FORGE}, 5 min")
+        self.assertEqual(waits[-1], "no owned lane mid-job")
+        self.assertEqual(len(waits), 3)
+
+    def test_a_drain_timeout_opens_one_issue_naming_the_lane_and_a_clean_drain_closes_it(
+            self) -> None:
+        self.sys.offplan = [12]
+        self.sys.offplan_text = plan_text(FORGE)
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("m1.forge-gate", self.last()["error"])
+        opened = [t for kind, t in self.issues if kind == "open"]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("self-update drain timed out after 10 min waiting on a lane", opened[0])
+        self.assertIn("supervisor pid 87749 owns tart run pid 11310", self.bodies[0])
+        self.assertIn("a manual VM never blocks the drain", self.bodies[0])
+        import tartci_incident  # noqa: PLC0415
+        self.assertEqual(tartci_incident.parse(self.bodies[0])["class"],
+                         "self_update_drain_timeout")
+        self.assertNotIn(("close", "77"), self.issues)
+        # The next attempt drains cleanly: the issue closes.
+        self.sys.offplan = [0]
+        self.sys.offplan_text = "plan"
+        self.sys.clock += 3600
+        self.apply()
+        self.assertIn(("close", "77"), self.issues)
+
+    def test_the_issue_closes_when_a_later_drain_completes(self) -> None:
+        self.sys.offplan = [12]
+        self.sys.offplan_text = plan_text(FORGE)
+        su.drain_timeout_alert(self.cfg, "m1", [FORGE], 600, NOW)
+        self.assertEqual([k for k, _ in self.issues], ["open"])
+        su.drain_timeout_alert(self.cfg, "m1", [FORGE], 600, NOW + 3600)
+        self.assertEqual([k for k, _ in self.issues], ["open"])   # same episode
+        su.drain_timeout_alert(self.cfg, "m1", None, 30, NOW + 7200)
+        self.assertEqual(self.issues[-1], ("close", "77"))
+
+    def test_mid_job_rows_are_read_from_the_plan(self) -> None:
+        self.assertEqual(su.mid_job_lanes(plan_text(FORGE)), [FORGE])
+        self.assertEqual(su.mid_job_lanes("pool off --plan: nothing\nverdict: ok"), [])
+
+
 class ShipyardWriterLeaseTests(Base):
     """The install writes ~/.local/bin only under `shipyard writer-domain-exec`."""
 
@@ -1250,6 +2051,23 @@ class InstallFailureTests(Base):
         self.sys.clock += 7 * 3600
         self.sys.install_rcs = [0]
         self.assertUpdated(self.apply())
+
+    def test_source_move_has_a_separate_rate_limit_from_public_attempt(self) -> None:
+        """A source move must not wait six hours after a public install."""
+        attempts = self.cfg.state_dir / "attempts"
+        su._write_json(attempts / "public.json", {
+            "mode": "apply", "target": INSTALLED, "status": "succeeded",
+            "started_at": su._iso(NOW - 60), "fleet_source": None,
+        })
+        private = {"repository": "ORG/private-fleet-authority", "commit": "c" * 40}
+        self.assertIsNone(su.recent_attempt(self.cfg, INSTALLED, NOW, private))
+        su._write_json(attempts / "private.json", {
+            "mode": "apply", "target": INSTALLED, "status": "succeeded",
+            "started_at": su._iso(NOW - 60), "fleet_source": private,
+        })
+        self.assertIsNotNone(su.recent_attempt(self.cfg, INSTALLED, NOW, private))
+        newer_private = {"repository": private["repository"], "commit": "d" * 40}
+        self.assertIsNotNone(su.recent_attempt(self.cfg, INSTALLED, NOW, newer_private))
 
     def test_refusal_does_not_spend_the_attempt(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
@@ -1417,6 +2235,18 @@ class SealedTests(Base):
         self.assertTrue((snapshot / "profile.toml").is_file())
         # The checkout is writable again after the immutable build.
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
+
+    def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        pinned = self.home / "pinned-python"
+        pinned.symlink_to(sys.executable)
+        with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
+            self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        build_index = next(i for i, (args, _) in enumerate(self.sys.calls)
+                           if args[:2] == ["bash", "scripts/build_macos_launcher.sh"])
+        build_env = self.sys.env_calls[build_index]
+        self.assertEqual(build_env["TARTCI_RENDER_PYTHON"], os.path.realpath(pinned))
+        build = self.sys.calls[build_index][0]
+        self.assertEqual(build[build.index("--python") + 1], os.path.realpath(pinned))
 
     def test_install_failure_restores_the_pin(self) -> None:
         self.sys.install_rcs = [1]
@@ -1660,10 +2490,73 @@ class AgentTemplateTests(unittest.TestCase):
         self.assertEqual(value["ProgramArguments"][-4:],
                          ["fleet-macos", "self-update", "--apply", "--scheduled"])
 
+    def test_private_source_environment_can_be_rendered_into_agent(self) -> None:
+        rendered = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/render_launchd_template.py"),
+             str(ROOT / "launchd/com.danielraffel.tartci.self-update.plist.template"),
+             "--set", "HOME=/Users/x",
+             "--environment", "TARTCI_FLEET_SOURCE_ROOT=/private/fleet",
+             "--environment", "TARTCI_FLEET_SOURCE_COMMIT=" + "a" * 40,
+             "--environment", "TARTCI_FLEET_SOURCE_REPOSITORY=ORG/private-fleet-authority",
+             "--environment", "TARTCI_ADVERTISED_LABELS=/private/fleet/fleet/advertised-labels.json",
+             "--environment", "TARTCI_JOB_CLAIM_SUPPLY=/private/fleet/fleet/advertised-labels.json"],
+            capture_output=True, check=True)
+        environment = plistlib.loads(rendered.stdout)["EnvironmentVariables"]
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_ROOT"], "/private/fleet")
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_COMMIT"], "a" * 40)
+        self.assertEqual(environment["TARTCI_FLEET_SOURCE_REPOSITORY"], "ORG/private-fleet-authority")
+
     def test_watchdog_never_interrupts_the_agent(self) -> None:
         import tartci_launchd_watchdog as wd
         self.assertIn("com.danielraffel.tartci.self-update", wd.UNINTERRUPTIBLE_AGENTS)
         self.assertIn(3, wd.APPLICATION_EXIT_CODES["com.danielraffel.tartci.self-update"])
+
+
+class ProgressLineTests(Base):
+    """--status and pool status say which step a running update is in."""
+
+    def running(self, steps: list[tuple[str, str, str]], pid: int | None = None) -> None:
+        su._write_json(self.cfg.state_dir / "active.json",
+                       {"host_id": "m1", "pid": pid or os.getpid(), "target": T_NEW})
+        su._write_json(self.cfg.state_dir / "attempts" / "20270101T000000Z-x.json",
+                       {"mode": "apply", "status": "running", "target": T_NEW,
+                        "started_at": "2027-01-01T00:00:00Z",
+                        "steps": [{"at": at, "step": name, "ok": True, "detail": detail}
+                                  for at, name, detail in steps]})
+
+    def test_a_drain_waiting_on_a_job_says_so_and_what_is_left(self) -> None:
+        self.running([("2027-01-01T00:00:10Z", "snapshot", "snap"),
+                      ("2027-01-01T00:00:20Z", "drain", "keeps every label served"),
+                      ("2027-01-01T00:01:00Z", "wait-idle", "waiting on lane: busy"),
+                      ("2027-01-01T00:30:00Z", "wait-idle", "waiting on lane: busy")])
+        now = su._ts("2027-01-01T01:01:00Z")
+        self.assertEqual(
+            f"self-update: IN PROGRESS to {T_NEW[:12]} (started 2027-01-01T00:00:00Z, "
+            "61 min): wait-idle for 60 min: waiting on lane: busy; "
+            "then off, install, pool-on, verify",
+            su.progress_line(self.cfg.state_dir, now))
+
+    def test_the_line_reaches_status(self) -> None:
+        self.running([("2027-01-01T00:00:20Z", "install", "")])
+        self.assertTrue(any(line.startswith("self-update: IN PROGRESS")
+                            for line in su.status_lines(self.cfg.state_dir)))
+
+    def test_a_dead_update_is_reported_stale(self) -> None:
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.running([("2027-01-01T00:00:20Z", "drain", "")], pid=dead.pid)
+        self.assertIn("STALE active.json", su.progress_line(self.cfg.state_dir))
+
+    def test_no_update_running_adds_nothing(self) -> None:
+        self.assertIsNone(su.progress_line(self.cfg.state_dir))
+        self.assertFalse(any("IN PROGRESS" in line
+                             for line in su.status_lines(self.cfg.state_dir)))
+class HandoffSettlesTests(unittest.TestCase):
+    def test_a_handoff_in_progress_settles_instead_of_failing_verify(self) -> None:
+        # The previous supervisor finishing its job before it hands the lane
+        # over must be re-read, not rolled back.
+        self.assertIn("orphaned_supervisor", su.SETTLING_PROBLEM_CODES)
+        self.assertIn("supervisor_handoff_pending", su.SETTLING_PROBLEM_CODES)
 
 
 class VerifySettleTests(Base):
@@ -1731,6 +2624,19 @@ class SystemRunTests(unittest.TestCase):
 
 
 class CensusEnvTests(unittest.TestCase):
+    def test_census_env_preserves_private_source_binding(self) -> None:
+        values = {
+            "TARTCI_FLEET_SOURCE_ROOT": "/private/fleet",
+            "TARTCI_FLEET_SOURCE_COMMIT": "a" * 40,
+            "TARTCI_FLEET_SOURCE_REPOSITORY": "ORG/private-fleet-authority",
+            "TARTCI_ADVERTISED_LABELS": "/private/fleet/fleet/advertised-labels.json",
+            "TARTCI_JOB_CLAIM_SUPPLY": "/private/fleet/fleet/advertised-labels.json",
+        }
+        with mock.patch.dict(os.environ, values, clear=False):
+            env = su.census_env()
+        for name, value in values.items():
+            self.assertEqual(env[name], value)
+
     def test_tartci_calls_resolve_this_interpreter_even_from_a_minimal_path(self) -> None:
         with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False):
             os.environ.pop("TARTCI_PYTHON", None)
@@ -1841,6 +2747,587 @@ class RelayRollbackTests(Base):
         self.assertIn("relay", self.last()["error"])
 
 
+class StoreWriteChildTests(unittest.TestCase):
+    """System.store_write runs the write in a child it can abandon: a write
+    stuck in a wedged volume must never hold the self-update process."""
+
+    def test_the_write_is_made_by_a_child_not_this_process(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            child = ("import json, os, sys, time; t = time.monotonic(); "
+                     "open(os.path.join(sys.argv[1], 'pid'), 'w').write(str(os.getpid())); "
+                     "print(json.dumps({'ms': 1.0}))")
+            with mock.patch.object(su, "STORE_WRITE_CHILD", child):
+                self.assertEqual({"ms": 1.0}, su.System().store_write(store))
+            self.assertNotEqual(str(os.getpid()), Path(store, "pid").read_text())
+
+    def test_a_write_that_never_returns_is_abandoned_on_time(self) -> None:
+        children = []
+        real_popen = su.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            children.append(real_popen(*args, **kwargs))
+            return children[-1]
+        with tempfile.TemporaryDirectory() as store:
+            with mock.patch.object(su, "STORE_WRITE_CHILD", "import time; time.sleep(60)"), \
+                    mock.patch.object(su.subprocess, "Popen", popen):
+                started = time.monotonic()
+                result = su.System().store_write(store, timeout=0.5)
+            self.assertEqual({"timed_out": True, "timeout": 0.5}, result)
+            self.assertLess(time.monotonic() - started, 5)
+        # The child's whole process group is gone: nothing left sleeping.
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(children[0].pid, 0)
+
+    def test_a_child_that_cannot_start_is_an_error_not_an_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            with mock.patch.object(su, "child_python", side_effect=RuntimeError("no python")):
+                self.assertIn("could not start", su.System().store_write(store)["error"])
+            with mock.patch.object(su.subprocess, "Popen", side_effect=OSError("no fork")):
+                self.assertIn("could not start", su.System().store_write(store)["error"])
+
+    def test_the_child_runs_isolated(self) -> None:
+        argvs = []
+        real_popen = su.subprocess.Popen
+
+        def popen(argv, *args, **kwargs):
+            argvs.append(argv)
+            return real_popen(argv, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as store, \
+                mock.patch.object(su.subprocess, "Popen", popen):
+            su.System().store_write(store)
+        self.assertEqual("-I", argvs[0][1])
+
+    def test_a_real_write_reports_milliseconds_and_leaves_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as store:
+            result = su.System().store_write(store)
+            self.assertIn("ms", result)
+            self.assertEqual([], os.listdir(store))
+
+
+class StoreHealthRecordTests(unittest.TestCase):
+    """System.store_health reads the storage-health gate's real record."""
+
+    def setUp(self) -> None:
+        import storage_health
+        self.sh = storage_health
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = self.tmp / "home"
+        self.store = self.tmp / "store"
+        self.store.mkdir()
+        patch = mock.patch.object(Path, "home", classmethod(lambda cls: self.home))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.state = self.sh.default_state(self.store)
+        self.assertTrue(str(self.state).startswith(str(self.home)))
+
+    def record(self, status: str = "healthy") -> None:
+        self.sh.save_state(self.state, {
+            "schema": 1, "status": status, "reason": "directory_metadata_ok",
+            "path": str(self.store), "failure_streak": 0, "healthy_streak": 3,
+            "checked_at": "2026-10-22T15:04:23Z"})
+
+    def test_a_fresh_record_is_healthy_with_its_check_time(self) -> None:
+        self.record()
+        self.assertEqual(("healthy", "directory_metadata_ok", "2026-10-22T15:04:23Z"),
+                         su.System().store_health(str(self.store)))
+
+    def test_a_quarantine_marker_wins_over_a_healthy_record(self) -> None:
+        self.record()
+        Path(str(self.state) + ".quarantine").write_text("")
+        self.assertEqual("quarantined", su.System().store_health(str(self.store))[0])
+
+    def test_no_record_is_unknown(self) -> None:
+        status, reason, _ = su.System().store_health(str(self.store))
+        self.assertEqual("unknown", status)
+        self.assertIn("no storage-health record", reason)
+
+    def test_a_corrupt_record_is_unknown(self) -> None:
+        self.state.parent.mkdir(parents=True, exist_ok=True)
+        self.state.write_text("{not json")
+        self.assertEqual("unknown", su.System().store_health(str(self.store))[0])
+
+
+class LauncherProbeStopTests(Base):
+    """After installing a NEW sealed launcher, a failed volume probe stops the
+    update with the host OFF instead of rolling back: a rollback replaces the
+    launcher again, which can reset its Removable Volumes consent again."""
+    sealed = True
+    PROBE = ("fleet readiness: launch helper volume probe timed out after 60s (probe wait "
+             "elapsed 60.1s; its write to the store did not finish): helper blocked in open()")
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def test_a_failed_probe_after_a_new_launcher_stops_without_rollback(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = self.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("failed", last["status"])
+        self.assertIn("STOPPED and NOT rolled back", last["error"])
+        self.assertIn("Grant Removable Volumes to TartCI Launcher", last["error"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+        self.assertFalse(any(step["step"].startswith("rollback")
+                             for step in json.loads(Path(last["receipt"]).read_text())["steps"]))
+        self.assertEqual(T_OLD, self.sys.running(), "the new generation stays installed")
+        self.assertEqual("c" * 64 + "\n", self.pin().read_text(), "pin matches the live bundle")
+        self.assertIs(True, json.loads(Path(last["receipt"]).read_text())["host_off"])
+        self.assertIs(True, last["host_off"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn("[tartci] studio is OFF: grant Removable Volumes to TartCI Launcher, "
+                      "then pool on", opened)
+        body = next(b for b in self.bodies if "Files and Folders" in b)
+        self.assertIn("tartci pool on", body)
+        self.assertIn("## Safe to auto-apply\nNo.", body)
+
+    def test_a_slow_volume_stops_without_asking_for_the_grant(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = ("fleet readiness: launch helper volume probe timed out after 60s "
+                            "(probe wait elapsed 60.1s; its write to the store did not finish): "
+                            "volume I/O slow; same-dir write from parent took 4200 ms. "
+                            "Not an access denial")
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertIn("STOPPED and NOT rolled back", last["error"])
+        self.assertIn("The Tart store volume was slow", last["error"])
+        self.assertNotIn("Grant Removable Volumes", last["error"])
+        self.assertIs(True, last["host_off"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn("[tartci] studio is OFF: its Tart store volume was too slow for the "
+                      "launcher probe", opened)
+        body = next(b for b in self.bodies if "launcher_probe_slow_volume" in b)
+        self.assertNotIn("Removable Volumes to TartCI Launcher", body)
+        self.assertNotIn("Files and Folders", body)
+        self.assertIn("tartci pool on", body)
+
+    def test_a_slow_store_refuses_a_launcher_change_before_drain(self) -> None:
+        # m5studio, 2026-10-18: the probe failed after the install and the
+        # host stayed OFF for days. Checked first, nothing changes.
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.installs())
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertTrue(self.sys.store_writes, "the store was checked")
+        receipt = self.latest_receipt()
+        self.assertIn("Tart store volume slow before a launcher change", receipt["error"])
+        self.assertIn("4200 ms", receipt["error"])
+
+    def test_a_slow_store_on_apply_releases_the_queue_ticket(self) -> None:
+        # HostFault, not a plain refusal: the turn goes to the next host.
+        (self.cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        (self.cfg.state_dir / "waiting.json").write_text(json.dumps({"since": su.time.time() - 60}))
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+
+    def test_a_plan_never_writes_to_the_store(self) -> None:
+        self.plan()
+        self.assertEqual([], self.sys.store_writes)
+        steps = [s for s in self.latest_receipt()["steps"] if s["step"] == "store-volume"]
+        self.assertTrue(steps and "a plan writes nothing" in steps[-1]["detail"], steps)
+
+    def test_an_unhealthy_store_refuses_without_a_write(self) -> None:
+        for status in ("quarantined", "degraded", "unknown"):
+            self.sys.store_writes.clear()
+            self.sys.store_health_result = (status, "probe_timeout", su._iso(NOW - 60))
+            self.assertEqual(su.EXIT_REFUSED, self.apply(), status)
+            self.assertEqual([], self.sys.store_writes, status)
+            self.assertEqual([], self.sys.mutations(), status)
+            self.assertIn(f"storage health for", self.latest_receipt()["error"])
+            self.assertIn(status, self.latest_receipt()["error"])
+
+    def record_aged(self, minutes: float) -> None:
+        self.sys.store_health_result = ("healthy", "directory_metadata_ok",
+                                        su._iso(self.sys.clock - minutes * 60))
+
+    def a_store_write_timed_out_last_attempt(self) -> None:
+        self.sys.store_result = [{"timed_out": True, "timeout": 10.0}, {"ms": 4.0}]
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.sys.store_writes.clear()
+        self.sys.clock += 1800
+
+    def test_a_stale_healthy_record_on_a_busy_host_lets_the_write_decide(self) -> None:
+        # Lanes mid-job do not rewrite the record; that is not a refusal.
+        (self.cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        self.record_aged(180)
+        self.apply()
+        self.assertTrue(self.sys.store_writes)
+        self.assertNotIn("stale", str(self.latest_receipt().get("error")))
+        self.assertNotEqual("refused", self.latest_receipt()["status"])
+
+    def test_a_stale_record_after_a_timed_out_write_refuses_without_a_write(self) -> None:
+        self.a_store_write_timed_out_last_attempt()
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.store_writes)
+        self.assertEqual([], self.sys.mutations())
+        error = self.latest_receipt()["error"]
+        self.assertIn("is stale: its healthy record is 180 min old", error)
+        self.assertIn("the last store write timed out", error)
+
+    def test_a_wedged_store_is_written_once_however_many_attempts_follow(self) -> None:
+        # Re-review: the stale refusal ran no write and reset the guard, so a
+        # hanging write was retried every other attempt (writes 1,1,2,2,3),
+        # each stranding a child in an uninterruptible wait.
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        for attempt in range(3):
+            self.record_aged(180)
+            self.assertEqual(su.EXIT_REFUSED, self.apply(), attempt)
+            self.sys.clock += 1800
+        self.assertEqual(1, len(self.sys.store_writes))
+
+    def test_a_deferral_between_attempts_does_not_reset_the_guard(self) -> None:
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.sys.clock += 1800
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(su.EXIT_DEFERRED, self.apply())
+        self.assertTrue(self.latest_receipt().get("deferred"))
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.sys.clock += 1800
+        self.record_aged(180)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(1, len(self.sys.store_writes))
+        self.assertIn("the last store write timed out", self.latest_receipt()["error"])
+
+    def test_the_stale_bound_is_ten_minutes(self) -> None:
+        self.a_store_write_timed_out_last_attempt()
+        self.record_aged(11)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.store_writes, "11 min is stale")
+        self.record_aged(9)
+        self.apply()
+        self.assertTrue(self.sys.store_writes, "9 min is fresh: the write decides")
+
+    def test_a_store_that_turns_slow_during_the_drain_puts_the_pool_back(self) -> None:
+        self.sys.store_result = [{"ms": 4.0}, {"ms": 4200.0}]
+        self.apply()
+        self.assertEqual(2, len(self.sys.store_writes), "checked before and after the drain")
+        self.assertEqual([], self.installs(), "nothing installed")
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertIn("slow after the drain", self.latest_receipt()["error"])
+        self.assertEqual("refused", self.latest_receipt()["status"])
+
+    def test_a_store_write_that_hangs_also_refuses_before_drain(self) -> None:
+        self.sys.store_result = {"timed_out": True, "timeout": 10.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("did not finish within 10s", self.latest_receipt()["error"])
+
+    def latest_receipt(self) -> dict:
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(receipts[-1].read_text())
+
+    def test_any_other_pool_on_failure_still_rolls_back(self) -> None:
+        # pool on fails every attempt after the install, then serves the rollback.
+        self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"])
+        self.assertEqual(INSTALLED, self.sys.running())
+
+    def test_a_completed_update_closes_the_issue(self) -> None:
+        su._write_json(self.cfg.state_dir / "launcher-probe-alert.json",
+                       {"since": "2026-10-16T13:00:00Z", "evented": True, "issue": "91"})
+        self.assertUpdated(self.apply())
+        self.assertIn(("close", "91"), self.issues)
+        self.assertFalse((self.cfg.state_dir / "launcher-probe-alert.json").exists())
+
+    def pin(self) -> Path:
+        return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+
+class UnsealedProbeTests(Base):
+    def test_without_a_new_launcher_the_probe_text_does_not_stop_a_rollback(self) -> None:
+        self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"])
+
+
+class LauncherConsentTests(Base):
+    """A sealed launcher is not replaced on an external-volume host until an
+    operator has acknowledged the change: replacing TartCILauncher.app can
+    reset its Removable Volumes consent, and then no lane starts."""
+    sealed = True
+    consent_gate = True
+
+    def ack(self) -> Path:
+        return self.home / ".config/tartci/launcher-change-ack"
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The owner's override ([launcher] auto_apply = false): every change
+        # waits for the ack. LauncherAutoApplyTests covers the default.
+        self.cfg.launcher_auto_apply = False
+        self.ack().write_text(T_OLD + "\n")
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def test_an_unacknowledged_change_refuses_and_alerts_before_any_drain(self) -> None:
+        self.ack().unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(any(a[:2] == ["bash", "scripts/build_macos_launcher.sh"]
+                             for a, _ in self.sys.calls), "no signing build for a refused run")
+        self.assertFalse(any("codesign" in a[0] for a, _ in self.sys.calls))
+        self.assertEqual("refused", self.latest()["status"])
+        self.assertIn("launcher change needs consent", self.latest()["error"])
+        self.assertIn(f"echo {T_OLD} > {self.ack()}", self.latest()["error"])
+        self.assertEqual([("open", f"[tartci] studio: grant Removable Volumes to TartCI Launcher "
+                                   f"before self-update installs {T_OLD[:12]}")], self.issues)
+        body = self.bodies[0]
+        self.assertIn(f"echo {T_OLD} > {self.ack()}", body)
+        self.assertIn("Files and Folders", body)
+        self.assertIn("## Safe to auto-apply\nNo.", body)
+        # A refusal does not spend the attempt: once acknowledged it updates.
+        self.ack().write_text(T_OLD + "\n")
+        self.assertUpdated(self.apply())
+        self.assertIn(("close", "77"), self.issues)
+
+    def test_an_acknowledgement_for_another_commit_still_refuses(self) -> None:
+        self.ack().write_text(T_NEW + "\n")
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_plan_reports_the_refusal_and_opens_nothing(self) -> None:
+        self.ack().unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.plan())
+        self.assertEqual([], self.issues)
+        self.assertEqual([], self.sys.mutations())
+
+    def test_no_change_to_the_launcher_needs_no_consent(self) -> None:
+        self.ack().unlink()
+        self.assertIsNone(su.launcher_change_refusal(self.cfg, INSTALLED, INSTALLED, False))
+        self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, True))
+        self.assertIsNotNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
+
+    def test_an_acknowledged_change_whose_probe_fails_stops_without_rollback(self) -> None:
+        # Both guards in one run: the gate lets the acknowledged change in,
+        # and the failed volume probe then stops it instead of rolling back.
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("STOPPED and NOT rolled back", self.last()["error"])
+        installs = [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+        self.assertEqual(1, len(installs))
+        self.assertEqual(T_OLD, self.sys.running())
+
+    def test_a_host_without_a_sealed_launcher_is_not_gated(self) -> None:
+        self.ack().unlink()
+        with mock.patch.object(su, "launch_helper", return_value=None):
+            self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
+
+
+# danielraffel/agent-skills .fleet/fleet-liveness.sh alerts on the first
+# `tartci pool status` line this matches and posts it as the remedy.
+LIVENESS_SELF_UPDATE_FAIL = re.compile(
+    r"^self-update.*(HALTED|STARVED|WAS LEFT|LAUNCHER CONSENT LOST|"
+    r"LAST ATTEMPT (FAILED|ROLLED BACK))")
+
+
+class LauncherAutoApplyTests(Base):
+    """Plan item 12: a launcher change applies without launcher-change-ack
+    when the target is on tartci main and the new launcher keeps the
+    installed Team ID; a lost Removable Volumes grant rolls back, holds the
+    target and alerts with the remedy."""
+    sealed = True
+    consent_gate = True
+
+    def ack(self) -> Path:
+        return self.home / ".config/tartci/launcher-change-ack"
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def builds(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]]
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def hold(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / su.LAUNCHER_AUTO_APPLY_NAME)
+
+    def fail_probe_until_rollback(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+
+        def recover(argv):
+            if "--apply" in argv and "rollback" in " ".join(argv):
+                self.sys.on_rc = 0
+        self.sys.hook = recover
+
+    def test_on_main_with_the_same_team_it_applies_and_records_the_ack(self) -> None:
+        self.assertFalse(self.ack().exists())
+        self.assertUpdated(self.apply())
+        ack = self.latest()["launcher_ack"]
+        self.assertEqual("automatic", ack["mode"])
+        self.assertEqual(T_OLD, ack["target"])
+        self.assertEqual(T_OLD, ack["key"])
+        self.assertEqual(self.sys.live_team, ack["team_id"])
+        self.assertEqual(self.sys.live_team, ack["installed_team_id"])
+        self.assertIn("on tartci main", ack["reason"])
+        self.assertIn("--launch-helper-source", self.installs()[0])
+        self.assertFalse(self.ack().exists(), "no ack file is written")
+        self.assertEqual([], [i for i in self.issues if i[0] == "open"])
+        self.assertIsNone(self.hold())
+
+    def test_an_off_main_target_waits_for_the_ack(self) -> None:
+        self.sys.off_main = {T_OLD}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.builds())
+        self.assertIn("launcher change needs consent", self.latest()["error"])
+        self.assertIn(f"echo {T_OLD} > {self.ack()}", self.latest()["error"])
+        self.assertIn("not on tartci origin/main", self.latest()["launcher_ack"]["auto_refused"])
+        # Control: the same run on main applies.
+        self.sys.off_main = set()
+        self.assertUpdated(self.apply())
+
+    def test_a_built_launcher_for_another_team_is_refused_before_drain_and_held(self) -> None:
+        self.sys.built_team = "ZZZZZZZZZZ"
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations(), "refused before any drain")
+        error = self.latest()["error"]
+        self.assertIn(f"is for team ZZZZZZZZZZ, the installed one for {self.sys.live_team}", error)
+        self.assertIn(f"acknowledge with: echo '{T_OLD}' > {self.ack()}", error)
+        self.assertEqual("team_mismatch", self.hold()["outcome"])
+        # Held: the next turn neither auto-acknowledges nor builds again.
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(1, len(self.builds()))
+        self.assertIn("held until the target changes",
+                      self.latest()["launcher_ack"]["auto_refused"])
+        # The printed ack is the owner's way through.
+        self.ack().write_text(T_OLD + "\n")
+        self.assertUpdated(self.apply())
+
+    def test_the_owner_override_requires_the_ack_again(self) -> None:
+        settings = self.home / ".config/tartci/self-update.toml"
+        settings.write_text("[launcher]\nauto_apply = false\n")
+        self.cfg = su.load_config(self.home)
+        self.cfg.poll_seconds, self.cfg.wait_seconds = 45, 600
+        self.assertFalse(self.cfg.launcher_auto_apply)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("auto_apply = false", self.latest()["launcher_ack"]["auto_refused"])
+        settings.write_text("[launcher]\nauto_apply = \"no\"\n")
+        with self.assertRaisesRegex(su.ConfigError, "auto_apply = true\\|false"):
+            su.load_config(self.home)
+
+    def test_a_lost_grant_rolls_back_holds_the_target_and_alerts(self) -> None:
+        self.fail_probe_until_rollback()
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("rolled_back", last["status"], last)
+        self.assertTrue(last["error"].startswith("launcher consent lost"), last["error"])
+        self.assertIn("grant Removable Volumes to TartCI Launcher", last["error"])
+        self.assertEqual(INSTALLED, self.sys.running())
+        self.assertEqual(2, len(self.installs()), "forward install, then the rollback")
+        receipt = json.loads(Path(last["receipt"]).read_text())
+        self.assertIs(True, receipt["launcher_consent_lost"])
+        self.assertEqual("probe_failed_rolled_back", receipt["launcher_ack"]["outcome"])
+        hold = self.hold()
+        self.assertEqual((T_OLD, "probe_failed"), (hold["target"], hold["outcome"]))
+        self.assertEqual(f"echo '{T_OLD}' > {self.ack()}", hold["acknowledge"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn(f"[tartci] studio: launcher auto-apply rolled back; grant Removable "
+                      f"Volumes to TartCI Launcher for {T_OLD[:12]}", opened)
+        # The liveness check's first matching status line carries the remedy
+        # and the exact command.
+        lines = su.status_lines(self.cfg.state_dir, self.sys)
+        alert = next(line for line in lines if LIVENESS_SELF_UPDATE_FAIL.search(line))
+        self.assertIn("LAUNCHER CONSENT LOST", alert)
+        self.assertIn("System Settings > Privacy & Security > Files and Folders", alert)
+        self.assertIn(f"echo '{T_OLD}' > {self.ack()}", alert)
+        # No loop: past the attempt window the same target waits for the ack
+        # (main has not moved; a newer target would be tried once).
+        self.sys.log_lines = f"{T_OLD} {int(NOW - 7200)}\n"
+        self.sys.clock += self.cfg.rate_hours * 3600 + 60
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(2, len(self.installs()))
+        self.assertIn("held until the target changes",
+                      self.latest()["launcher_ack"]["auto_refused"])
+        self.assertTrue(any(LIVENESS_SELF_UPDATE_FAIL.search(line)
+                            for line in su.status_lines(self.cfg.state_dir, self.sys)))
+
+    def test_a_new_target_after_a_hold_is_tried_automatically(self) -> None:
+        su.hold_launcher_auto_apply(self.cfg, self.sys, "c" * 40, "probe_failed", "x", "c" * 40)
+        self.assertUpdated(self.apply())
+        self.assertEqual("automatic", self.latest()["launcher_ack"]["mode"])
+        self.assertIsNone(self.hold(), "a completed update clears the hold")
+
+    def test_a_slow_volume_after_an_auto_ack_still_stops_without_rollback(self) -> None:
+        # A slow store is not a lost grant, and a rollback would not help.
+        self.sys.on_rc = 1
+        self.sys.on_text = ("fleet readiness: launch helper volume probe timed out after 60s: "
+                            "volume I/O slow; same-dir write from parent took 4200 ms")
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("STOPPED and NOT rolled back", self.last()["error"])
+        self.assertEqual(1, len(self.installs()))
+        self.assertIsNone(self.hold())
+
+    def test_a_failed_rollback_still_names_the_lost_grant(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("failed", last["status"])
+        self.assertTrue(last["error"].startswith("launcher consent lost"), last["error"])
+        self.assertIn("ROLLBACK FAILED", last["error"])
+
+    def test_a_plan_reports_the_automatic_ack_and_changes_nothing(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.plan())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual("automatic", self.latest()["launcher_ack"]["mode"])
+
+
+class ChildPythonCallSiteTests(unittest.TestCase):
+    """self-update starts every Python child with python_child.child_python():
+    under launcher v2 sys.executable is the bare pin, not the lane's shim."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.shim = Path(td.name) / "python3"
+        self.shim.write_text("#!/bin/sh\nexec true\n")
+        self.shim.chmod(0o755)
+        os.environ["TARTCI_PYTHON"] = str(self.shim)
+        su._PYTHON_SHIM_DIR = None
+        self.addCleanup(setattr, su, "_PYTHON_SHIM_DIR", None)
+
+    def test_system_run_the_path_shim_and_census_use_the_child_interpreter(self) -> None:
+        seen = []
+        with mock.patch.object(su.subprocess, "run",
+                               side_effect=lambda argv, **kw: seen.append(argv) or
+                               subprocess.CompletedProcess(argv, 0, "", "")):
+            su.System().run(["python3", "scripts/x.py"])
+        self.assertEqual(str(self.shim), seen[0][0])
+        directory = su.python_shim_dir()
+        self.assertEqual(str(self.shim), os.readlink(os.path.join(directory, "python3")))
+        self.assertEqual(str(self.shim), su.census_env()["TARTCI_PYTHON"])
+
+    def test_v1_keeps_the_interpreter_it_ran_before(self) -> None:
+        os.environ.pop("TARTCI_PYTHON")
+        seen = []
+        with mock.patch.object(su.subprocess, "run",
+                               side_effect=lambda argv, **kw: seen.append(argv) or
+                               subprocess.CompletedProcess(argv, 0, "", "")):
+            su.System().run(["python3", "scripts/x.py"])
+        self.assertEqual(sys.executable, seen[0][0])
+        self.assertEqual(sys.executable, os.readlink(os.path.join(su.python_shim_dir(), "python3")))
+        self.assertEqual(sys.executable, su.census_env()["TARTCI_PYTHON"])
+
+
 class SealedRollbackTests(Base):
     sealed = True
 
@@ -1863,6 +3350,82 @@ class SealedRollbackTests(Base):
         rollback = [a for a, _ in self.sys.calls if "--apply" in a][-1]
         source = rollback[rollback.index("--launch-helper-source") + 1]
         self.assertIn("rollback", source)
+
+    def test_rollback_reinstalls_with_the_previous_interpreter_and_pin(self) -> None:
+        # m5s, 2026-10-15: the update switched the lanes to a new interpreter
+        # and its pin; the rollback rendered the old launcher against the new
+        # pin, refused, and left the host off.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/python3.15\n")
+
+        seen = {"installs": 0}
+
+        def switch_on_install(argv):
+            if "--apply" in argv and "install" in argv:
+                seen["installs"] += 1
+                if seen["installs"] == 1:  # the new generation's install writes its pin
+                    pin.write_text("/new/python3.12\n")
+        self.sys.hook = switch_on_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "rolled_back")
+        installs = [(a, e) for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertGreaterEqual(len(installs), 2)
+        rollback_argv, rollback_env = installs[-1]
+        self.assertIn("rollback", " ".join(rollback_argv))
+        self.assertEqual(rollback_env.get("TARTCI_PYTHON"), "/old/python3.15")
+        # It must outrank the snapshot profile's host.python in the installer.
+        self.assertEqual(rollback_env.get("TARTCI_ROLLBACK_PYTHON"), "/old/python3.15")
+        self.assertNotIn("TARTCI_ROLLBACK_PYTHON", installs[0][1] or {})
+        self.assertEqual(pin.read_text().strip(), "/old/python3.15")
+
+    def test_rollback_pins_what_the_lanes_ran_when_the_old_pin_disagrees(self) -> None:
+        # The installer honours TARTCI_ROLLBACK_PYTHON only when it equals the
+        # pin or a lane's, so the pin must name the interpreter reinstalled.
+        import plistlib  # noqa: PLC0415
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        lane = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.plist"
+        lane.write_bytes(plistlib.dumps({"Label": lane.stem, "EnvironmentVariables": {
+            "TARTCI_PYTHON": "/old/lane-python3.15"}}))
+        pin = self.home / ".config" / "tartci" / "python.pin"
+        pin.write_text("/old/pin-python3.15\n")
+
+        def new_pin_on_first_install(argv):
+            if "--apply" in argv and "install" in argv and pin.read_text().startswith("/old/pin"):
+                pin.write_text("/new/python3.12\n")
+        self.sys.hook = new_pin_on_first_install
+        self.sys.broken_target = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        installs = [e for (a, _), e in zip(self.sys.calls, self.sys.env_calls)
+                    if "--apply" in a and "install" in a]
+        self.assertEqual(installs[-1].get("TARTCI_ROLLBACK_PYTHON"), "/old/lane-python3.15")
+        self.assertEqual(pin.read_text().strip(), "/old/lane-python3.15")
+
+    def test_a_running_update_shows_in_status_with_its_step(self) -> None:
+        # m1, 2026-10-22: a 20 min drain wait was invisible in --status.
+        receipt = self.cfg.state_dir / "attempts" / "20261022T074900Z-afd9b8171459.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({
+            "mode": "apply", "status": "running", "target": "afd9b817" * 5,
+            "started_at": "2026-10-22T07:49:00Z", "pid": 4242, "pid_start": "Thu 07:49",
+            "steps": [{"at": "2026-10-22T07:50:00Z", "step": "drain", "ok": True,
+                       "detail": "waiting for 2 VMs"}]}))
+        self.sys.procs[4242] = "Thu 07:49"
+        line = su.running_line(self.cfg.state_dir, self.sys)
+        self.assertIn("IN PROGRESS to afd9b817afd9", line)
+        self.assertIn("pid 4242", line)
+        self.assertIn("last step drain at 2026-10-22T07:50:00Z: waiting for 2 VMs", line)
+        self.assertIn(line, su.status_lines(self.cfg.state_dir, self.sys))
+        del self.sys.procs[4242]
+        self.assertIn("INTERRUPTED", su.running_line(self.cfg.state_dir, self.sys))
 
     def test_signing_probe_failure_refuses_before_drain(self) -> None:
         self.sys.signing_rc = 1
@@ -1921,6 +3484,45 @@ class RecordTests(Base):
 
 
 class ChecksAndTargetTests(Base):
+    def test_explicit_target_recovers_an_off_history_install(self) -> None:
+        self.sys.cat_file_rc = 1
+        scheduled = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW)
+        self.assertEqual(scheduled["state"], "unknown")
+        self.assertIn("not in the tartci history", scheduled["reason"])
+        explicit = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_OLD, explicit=True)
+        self.assertEqual((explicit["state"], explicit["behind"], explicit["target"],
+                          explicit["selected_target"]), ("behind", None, T_OLD, T_OLD))
+        self.assertIn("not in the tartci history", explicit["reason"])
+        self.assertIsNone(explicit["oldest_undeployed"])
+        self.assertNotIn("stale", explicit)
+        self.assertIn("skew UNKNOWN", su.render_skew(explicit))
+
+    def test_off_history_explicit_target_still_soaking_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_red_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 9000)}\n{T_OLD} {int(NOW - 10000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed",
+                                   "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIsNone(skew["behind"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                          target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+
+    def test_off_history_explicit_off_chain_target_is_refused(self) -> None:
+        self.sys.cat_file_rc = 1
+        skew = su.measure_skew(self.cfg, self.sys, "d" * 40, NOW, "d" * 40, explicit=True)
+        self.assertEqual(skew["state"], "unknown")
+        self.assertIn("first-parent", skew["reason"])
+
     def test_red_newest_soaked_commit_falls_back_to_an_older_green_one(self) -> None:
         older = "c" * 40
         self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
@@ -1953,6 +3555,33 @@ class ChecksAndTargetTests(Base):
         self.assertIn("not green: ", skew["selection_reason"])
         self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
         self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_pull_request_judgement_on_mains_tip_is_not_its_check(self) -> None:
+        # tartci 0b651d9b, 2026-10-22: a pull-request comment ran the
+        # review-verdict workflow on main's tip, and its in-progress check run
+        # held m5s's self-update as "not green: review-verdict=in_progress".
+        lint = {"name": "lint", "status": "completed", "conclusion": "success",
+                "check_suite": {"id": 1}}
+        verdict = {"name": "review-verdict", "status": "in_progress", "conclusion": None,
+                   "check_suite": {"id": 7}}
+        self.sys.checks[T_OLD] = [lint, verdict]
+        self.sys.workflow_runs[T_OLD] = [
+            {"event": "push", "check_suite_id": 1},
+            {"event": "issue_comment", "check_suite_id": 7},
+        ]
+        self.assertEqual(su.checks_green(self.cfg, self.sys, T_OLD), (True, "all checks green"))
+        # The same run from a push is the commit's own check, and holds it.
+        self.sys.workflow_runs[T_OLD][1]["event"] = "push"
+        self.assertEqual(su.checks_green(self.cfg, self.sys, T_OLD),
+                         (False, "not green: review-verdict=in_progress"))
+        # When the workflow runs cannot be read, every check run counts.
+        del self.sys.workflow_runs[T_OLD]
+        self.assertFalse(su.checks_green(self.cfg, self.sys, T_OLD)[0])
+        # Only pull-request judgements on a commit is not a green commit.
+        self.sys.checks[T_OLD] = [verdict]
+        self.sys.workflow_runs[T_OLD] = [{"event": "issue_comment", "check_suite_id": 7}]
+        self.assertEqual(su.checks_green(self.cfg, self.sys, T_OLD),
+                         (False, "no check runs recorded"))
 
     def test_default_path_falls_back_to_soaked_green_and_records_skipped(self) -> None:
         self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
@@ -2022,7 +3651,13 @@ class ScaleTests(Base):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shutil.copytree(ROOT / "profiles", root / "profiles")
-            text = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            original = (ROOT / "profiles/m1-macos-fleet.toml").read_text()
+            # This test exercises profile-to-publication alias derivation for
+            # every profile.  Keep its fixture published even when production
+            # temporarily withdraws a host from the fleet.
+            (root / "profiles/m1-macos-fleet.toml").write_text(
+                original.replace("published = false", "published = true", 1))
+            text = original.replace("published = false", "published = true", 1)
             text = text.replace('name = "m1-macos-fleet"', 'name = "x9-macos-fleet"')
             text = text.replace('id = "m1"', 'id = "x9"', 1).replace('ssh = "m1"\n', "")
             (root / "profiles/x9-macos-fleet.toml").write_text(text)
@@ -2032,6 +3667,125 @@ class ScaleTests(Base):
                 text.replace('id = "x9"', 'id = "x9"\nssh = "bad alias!"', 1))
             with self.assertRaises(ValueError):
                 fleet.load(root / "profiles/x9-macos-fleet.toml")
+
+
+
+class PeerSshDestinationTests(Base):
+    """A published hosts[].ssh is not bound by profiles_sha256: a value ssh
+    would read as an option is refused at every peer SSH site, the peer reads
+    as unreadable (fail closed), and every ssh argv ends options with "--"."""
+
+    HOSTILE = "-oProxyCommand=touch /tmp/x"
+
+    def publish_hostile_studio(self) -> None:
+        for row in self.sys.published["hosts"]:
+            if row["host_id"] == "studio":
+                row["ssh"] = self.HOSTILE
+
+    def ssh_calls(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:1] == ["ssh"]]
+
+    def assertNoHostileSsh(self) -> None:
+        self.assertFalse([a for a in self.ssh_calls() if any("ProxyCommand" in x for x in a)])
+
+    def test_peer_ssh_refuses_options_and_ends_options_before_the_destination(self) -> None:
+        for bad in (self.HOSTILE, "-p22", "", None, 7, "a b", "m3;id"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(su.peer_ssh(bad))
+        for good in ("m3", "tartci-x9", "admin@m5s.lan"):
+            with self.subTest(good=good):
+                argv = su.peer_ssh(good)
+                self.assertEqual(argv[-2:], ["--", good])
+
+    def test_published_peers_keeps_a_refused_host_so_it_still_counts(self) -> None:
+        self.publish_hostile_studio()
+        peers = su.published_peers(self.cfg, self.sys)
+        self.assertEqual(peers["studio"], self.HOSTILE)
+        self.assertEqual(peers["m5"], "m5")
+
+    def test_read_peer_refuses_a_hostile_destination_and_fails_closed(self) -> None:
+        peer = su.read_peer(self.cfg, self.sys, "studio", self.HOSTILE)
+        self.assertTrue(peer["busy"])
+        self.assertFalse(peer["readable"])
+        self.assertIn("ssh destination", peer["evidence"])
+        self.assertIn("refused", peer["evidence"])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_read_peer_still_reads_a_normal_alias_after_double_dash(self) -> None:
+        peer = su.read_peer(self.cfg, self.sys, "studio", "m3")
+        self.assertTrue(peer["readable"])
+        self.assertTrue(self.ssh_calls())
+        for argv in self.ssh_calls():
+            self.assertEqual(argv[argv.index("--") + 1], "m3")
+
+    def test_a_hostile_published_peer_never_lets_an_update_proceed(self) -> None:
+        self.publish_hostile_studio()
+        self.assertNotEqual(self.last_status_after_apply(), "succeeded")
+        self.assertNoHostileSsh()
+        for argv in self.ssh_calls():
+            self.assertIn("--", argv)
+
+    def last_status_after_apply(self) -> str | None:
+        self.apply()
+        path = self.cfg.state_dir / "last.json"
+        return json.loads(path.read_text()).get("status") if path.exists() else None
+
+    def test_a_normal_published_alias_still_updates(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertTrue(self.ssh_calls())
+        for argv in self.ssh_calls():
+            self.assertIn("--", argv)
+
+    def test_read_canary_verified_refuses_a_hostile_destination(self) -> None:
+        with mock.patch.object(su, "published_peers", return_value={"studio": self.HOSTILE}), \
+                mock.patch.object(self.sys, "run", side_effect=AssertionError("ssh ran")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertIsNone(su.read_canary_verified(self.cfg, self.sys, "studio"))
+        self.assertIn("refused", err.getvalue())
+
+    def test_read_canary_verified_reads_a_normal_alias_after_double_dash(self) -> None:
+        record = {"repository": "ORG/fleet", "commit": "a" * 40, "verified_at": 1000}
+        seen: list[list[str]] = []
+
+        def run(argv, **kw):
+            seen.append(argv)
+            return su.Result(0, "1600\n" + json.dumps(record) + "\n")
+        with mock.patch.object(su, "published_peers", return_value={"studio": "m3"}), \
+                mock.patch.object(self.sys, "run", side_effect=run):
+            self.assertEqual(su.read_canary_verified(self.cfg, self.sys, "studio")["age"], 600.0)
+        self.assertEqual(seen[0][seen[0].index("--") + 1], "m3")
+
+    def test_read_tart_verified_refuses_a_hostile_destination(self) -> None:
+        with mock.patch.object(su, "published_peers", return_value={"studio": self.HOSTILE}), \
+                mock.patch.object(self.sys, "run", side_effect=AssertionError("ssh ran")):
+            value = su.read_tart_verified(self.cfg, self.sys, "studio")
+        self.assertIn("refused", value["unreachable"])
+
+    def test_read_tart_verified_reads_a_normal_alias_after_double_dash(self) -> None:
+        self.sys.peer_tart["m3"] = {"version": "2.40.1", "sha256": TART_SHA, "verified_at": NOW}
+        value = su.read_tart_verified(self.cfg, self.sys, "studio")
+        self.assertNotIn("unreachable", value or {})
+        argv = [a for a in self.ssh_calls() if a[-1] == su.TART_VERIFIED_SCRIPT][0]
+        self.assertEqual(argv[argv.index("--") + 1], "m3")
+
+    def coverage(self, target: str) -> tuple[dict, list]:
+        supply = {"registrations": [{"host_id": "studio", "labels": ["mac"]}], "hosts": []}
+        with mock.patch.object(su, "published_supply", return_value=supply), \
+                mock.patch.object(su, "published_peers", return_value={"studio": target}), \
+                mock.patch.object(su, "peer_mints_on_demand", return_value=None):
+            return su.on_demand_supply(self.cfg, self.sys, "m1", [("mac", None)])
+
+    def test_coverage_probe_refuses_a_hostile_destination(self) -> None:
+        covered, missing = self.coverage(self.HOSTILE)
+        self.assertEqual(covered, {})
+        self.assertIn("refused", missing[0])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_coverage_probe_reads_a_normal_alias_after_double_dash(self) -> None:
+        covered, missing = self.coverage("m3")
+        self.assertEqual((covered, missing), ({"mac": ["studio"]}, []))
+        argv = self.ssh_calls()[0]
+        self.assertEqual(argv[argv.index("--") + 1], "m3")
 
 
 class AtomicCloneTests(Base):
@@ -2316,6 +4070,8 @@ class IncidentTests(Base):
         self.sys.on_rc = 7
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertTrue(self.last()["host_off"])
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("left OFF", self.issues[0][1])
         self.assertIn("LEFT THIS HOST OFF", su.summary(self.home)["problem"])
         self.assertTrue(any("WAS LEFT OFF" in line for line in su.status_lines(self.cfg.state_dir)))
 
@@ -2367,6 +4123,75 @@ class RepositoryIdentityTests(Base):
         self.assertEqual(receipt["steps"][-1]["step"], "refused")
         self.assertEqual(json.loads((self.cfg.state_dir / "skew.json").read_text())["state"],
                          "unknown")
+
+    HUNG = "TimeoutExpired: Command '['ghapp', 'api', 'repos/x']' timed out after 60 seconds"
+
+    def reads(self) -> list[str]:
+        return [a[2] for a, _ in self.sys.calls if a and a[0] == FAKE_GH]
+
+    def test_a_read_that_timed_out_is_retried_once_and_then_succeeds(self):
+        # m1, 2026-10-16: one hung read refused the whole self-update.
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.repository_failures[su.LEGACY_REPOSITORY] = [su.Result(127, "", self.HUNG)]
+        before = self.sys.clock
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.configured_repository(self.cfg, self.sys), su.LEGACY_REPOSITORY)
+        self.assertEqual(self.reads(), [f"repos/{su.LEGACY_REPOSITORY}"] * 2)
+        self.assertEqual(self.sys.clock - before, su.REPOSITORY_READ_RETRY_SECONDS)
+
+    def test_reads_that_keep_hanging_refuse_naming_each_failure(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.repository_failures[repository] = [su.Result(127, "", self.HUNG)] * 2
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            with self.assertRaises(su.Refused) as caught:
+                su.configured_repository(self.cfg, self.sys)
+        message = str(caught.exception)
+        self.assertIn("no accepted TartCI repository is readable", message)
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.assertIn(f"{repository}: exit 127: TimeoutExpired", message)
+        self.assertEqual(message.count("(after one retry)"), 2)
+        self.assertEqual(len(self.reads()), 4)
+
+    def test_gh_network_errors_are_retried_once(self):
+        for text in ("error connecting to api.github.com",
+                     "Get \"https://api.github.com/repos/x\": dial tcp: lookup api.github.com: "
+                     "no such host"):
+            with self.subTest(text=text):
+                self.sys.calls.clear()
+                self.sys.api_repository = su.LEGACY_REPOSITORY
+                self.sys.repository_failures[su.LEGACY_REPOSITORY] = [su.Result(1, "", text)]
+                before = self.sys.clock
+                with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+                    self.assertEqual(su.LEGACY_REPOSITORY,
+                                     su.configured_repository(self.cfg, self.sys))
+                self.assertEqual([f"repos/{su.LEGACY_REPOSITORY}"] * 2, self.reads())
+                self.assertEqual(su.REPOSITORY_READ_RETRY_SECONDS, self.sys.clock - before)
+
+    def test_a_successful_read_is_never_retried_whatever_its_json_says(self):
+        # rc 0 with the wrong full_name is an answer; "network_count" in the
+        # JSON must not look like a transport error.
+        answer = su.Result(0, json.dumps({"full_name": "example/other", "network_count": 3,
+                                          "description": "timed out connection reset"}), "")
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.repository_failures[repository] = [answer]
+        before = self.sys.clock
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            with self.assertRaises(su.Refused) as caught:
+                su.configured_repository(self.cfg, self.sys)
+        self.assertEqual(2, len(self.reads()))
+        self.assertEqual(before, self.sys.clock)
+        self.assertIn("answered example/other", str(caught.exception))
+
+    def test_a_definite_answer_is_not_retried(self):
+        # Control: a 404 is an answer, not a transport failure.
+        self.sys.unreadable_repositories.update({su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY})
+        before = self.sys.clock
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            with self.assertRaises(su.Refused) as caught:
+                su.configured_repository(self.cfg, self.sys)
+        self.assertEqual(len(self.reads()), 2)
+        self.assertEqual(self.sys.clock, before)
+        self.assertIn(f"{su.LEGACY_REPOSITORY}: exit 1: not found", str(caught.exception))
 
     def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
         self.sys.api_repository = su.LEGACY_REPOSITORY
@@ -2426,6 +4251,1343 @@ class OsInterpreterRefreshTests(Base):
         self.sys.status_problems = [{"code": "receipt_mismatch", "detail": "x"}]
         self.assertEqual(self.apply(), su.EXIT_NOTHING)
         self.assertEqual(self.sys.mutations(), [])
+
+    def test_os_interpreter_refresh_does_not_bypass_code_soak(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        self.sys.status_problems = [{"code": "interpreter_changed_by_os_update",
+                                     "detail": "macOS build changed"}]
+        self.assertEqual(self.apply(), su.EXIT_NOTHING)
+        self.assertEqual(self.sys.mutations(), [])
+
+
+class TartUpgradeTests(Base):
+    """fleet/tart.toml pins Tart; a host that opts in moves to it while its pool
+    is off, the canary first, proven by booting a clone of the golden. On a
+    failure the new kegs are removed so the previous ones are linked again,
+    the pin is not retried here, and a rollback that does not bring the
+    previous Tart back leaves the host OFF."""
+
+    PIN = ('[tart]\nversion = "2.40.1"\nsha256 = "' + TART_SHA + '"\n'
+           '[softnet]\nversion = "0.24.0"\nsha256 = "' + SOFTNET_SHA + '"\n')
+    SOAK = 4 * 3600
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The commit this turn installs (checkout) and the installed generation
+        # (refresh_reason reads it) carry the same pin unless a test moves one.
+        self.installed_root = self.home / "installed-generation"
+        for root in (self.cfg.checkout, self.installed_root):
+            (root / "fleet").mkdir(parents=True, exist_ok=True)
+            (root / "fleet" / "tart.toml").write_text(self.PIN)
+        opt = self.home / "opt"
+        opt.mkdir()
+        for name, value in (("OPT", opt), ("REPO_ROOT", self.installed_root)):
+            patcher = mock.patch.object(tart_pin, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.sys.set_tart("2.36.0")
+        self.sys.set_softnet("0.23.0")
+        self.cfg.tart_upgrade, self.cfg.tart_canary = True, "m1"   # this host is m1
+
+    def receipt(self) -> dict:
+        return json.loads(Path(self.last()["receipt"]).read_text())
+
+    def steps(self, name: str) -> list[dict]:
+        return [step for step in self.receipt()["steps"] if step["step"] == name]
+
+    def index_of(self, predicate) -> int:
+        return next(i for i, (argv, _) in enumerate(self.sys.calls) if predicate(argv))
+
+    def calls(self, *prefix: str) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:len(prefix)] == list(prefix)]
+
+    def upgrades(self) -> list[list[str]]:
+        return self.calls(tart_pin.BREW, "upgrade")
+
+    def verified(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / tart_pin.VERIFIED)
+
+    def failed(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / tart_pin.FAILED)
+
+    def gate(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / tart_pin.GATE)
+
+    def decide(self):
+        return su.tart_decision(self.cfg, self.sys)
+
+    # ── off by default, canary first ────────────────────────────────────
+
+    def test_off_by_default(self) -> None:
+        self.cfg.tart_upgrade = False
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertEqual([], self.steps("tart-upgrade"))
+        self.assertIs(False, self.gate()["due"])
+
+    def test_the_canary_upgrades_while_off_boots_a_clone_and_publishes(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual(("2.40.1", "0.24.0"), (self.sys.tart, self.sys.softnet))
+        self.assertIn("Tart 2.36.0 -> 2.40.1, Softnet 0.24.0; a clone of pulp-build-runner:latest "
+                      "booted", self.steps("tart-upgrade")[0]["detail"])
+        upgrade = self.index_of(lambda a: a[:2] == [tart_pin.BREW, "upgrade"])
+        off = self.index_of(lambda a: a[:3] == ["./tartci", "pool", "off"] and "--plan" not in a)
+        install = self.index_of(lambda a: "install" in a and "--apply" in a)
+        boot = self.index_of(lambda a: a[:2] == [tart_pin.TART, "ip"])
+        self.assertLess(off, upgrade)
+        self.assertLess(upgrade, boot)
+        self.assertLess(boot, install)
+        env = self.sys.env_calls[upgrade]
+        self.assertEqual("1", env["HOMEBREW_NO_AUTO_UPDATE"])
+        self.assertEqual("1", env["HOMEBREW_NO_INSTALL_CLEANUP"])
+        self.assertEqual({"version": "2.40.1", "sha256": TART_SHA},
+                         {k: self.verified()[k] for k in ("version", "sha256")})
+        published = [s["step"] for s in self.receipt()["steps"]]
+        self.assertLess(published.index("verify"), published.index("tart-verified"))
+        self.assertEqual([], list((self.cfg.state_dir.parent / "scratch-vms").glob("*.json")),
+                         "the clone's scratch record goes once it is deleted")
+
+    def test_the_boot_check_runs_with_the_store_s_tart_home_and_stops_the_clone(self) -> None:
+        self.assertUpdated(self.apply())
+        profile_home = su.tart_boot_target(self.cfg)[1]
+        for verb in ("clone", "ip", "stop", "delete"):
+            index = self.index_of(lambda a, v=verb: a[:2] == [tart_pin.TART, v])
+            self.assertEqual(profile_home, self.sys.env_calls[index]["TART_HOME"], verb)
+
+    def test_another_host_waits_for_the_canary(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("waiting for canary studio to boot and serve Tart 2.40.1",
+                      self.steps("tart-upgrade")[0]["detail"])
+        self.assertIsNone(self.verified())
+        self.assertIs(False, self.gate()["due"], "waiting for the canary is not a problem")
+
+    def test_an_unreachable_canary_is_named_as_such(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.peer_tart_rc = 255
+        self.assertIn("waiting for canary studio: unreachable or unknown (ssh m3 exit 255)",
+                      self.decide().refusal)
+
+    def test_a_canary_record_for_another_version_or_sha_is_not_adoption(self) -> None:
+        self.cfg.tart_canary = "studio"
+        for record in ({"version": "2.39.0", "sha256": TART_SHA, "verified_at": NOW - 9 * 3600},
+                       {"version": "2.40.1", "sha256": "c" * 64, "verified_at": NOW - 9 * 3600},
+                       {"version": "2.40.1", "verified_at": NOW - 9 * 3600}):
+            with self.subTest(record=record):
+                self.sys.peer_tart["m3"] = record
+                self.assertIn("waiting for canary studio to boot", self.decide().refusal)
+
+    def test_adoption_waits_exactly_the_soak_on_the_canary_s_clock(self) -> None:
+        self.cfg.tart_canary = "studio"
+        # The canary's clock is 2 h ahead: its record is aged on its clock.
+        self.sys.peer_tart_clock = NOW + 7200
+        record = {"version": "2.40.1", "sha256": TART_SHA}
+        self.sys.peer_tart["m3"] = dict(record, verified_at=NOW + 7200 - (self.SOAK - 1))
+        self.assertIn("soaking for 240 min", self.decide().refusal)
+        self.sys.peer_tart["m3"] = dict(record, verified_at=NOW + 7200 - self.SOAK)
+        self.assertIsNone(self.decide().refusal)
+
+    def test_another_host_adopts_after_the_soak(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.peer_tart["m3"] = {"version": "2.40.1", "sha256": TART_SHA,
+                                    "verified_at": NOW - 5 * 3600}
+        self.assertUpdated(self.apply())
+        self.assertEqual("2.40.1", self.sys.tart)
+        self.assertIsNone(self.verified(), "only the canary publishes")
+
+    def test_a_non_canary_already_on_the_pin_does_nothing(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.set_tart("2.40.1")
+        self.assertIsNone(self.decide())
+
+    def test_a_newer_tart_than_the_pin_is_never_touched_and_never_drains(self) -> None:
+        self.sys.set_tart("2.41.1")
+        self.assertIn("Tart 2.41.1 is newer than the pin 2.40.1", self.decide().refusal)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    # ── the tap ─────────────────────────────────────────────────────────
+
+    def test_a_tap_that_does_not_offer_exactly_the_pin_is_refused(self) -> None:
+        for tap in ({"tart": ("2.41.1", TART_SHA), "softnet": ("0.24.0", SOFTNET_SHA)},
+                    {"tart": ("2.40.1", "c" * 64), "softnet": ("0.24.0", SOFTNET_SHA)},
+                    {"tart": ("2.40.1", TART_SHA), "softnet": ("0.25.0", SOFTNET_SHA)}):
+            with self.subTest(tap=tap):
+                (self.cfg.state_dir / tart_pin.TAP_CACHE).unlink(missing_ok=True)
+                self.sys.tap = tap
+                self.assertIn("the tap offers", self.decide().refusal)
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+
+    def test_the_tap_cache_is_per_pin_and_never_from_the_future(self) -> None:
+        self.assertIsNone(self.decide().refusal)
+        infos = lambda: len(self.calls(tart_pin.BREW, "info", "--json=v2"))  # noqa: E731
+        self.assertIsNone(self.decide().refusal)
+        self.assertEqual(1, infos(), "cached for an hour")
+        cache = su._read_json(self.cfg.state_dir / tart_pin.TAP_CACHE)
+        su._write_json(self.cfg.state_dir / tart_pin.TAP_CACHE, dict(cache, at=NOW + 600))
+        self.decide()
+        self.assertEqual(2, infos(), "a cache dated in the future is not trusted")
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(
+            self.PIN.replace("2.40.1", "2.40.2"))
+        self.sys.tap["tart"] = ("2.40.2", TART_SHA)
+        self.assertIsNone(self.decide().refusal, "a moved pin never reads the old answer")
+        self.assertEqual(3, infos())
+
+    # ── failure, rollback and memory ────────────────────────────────────
+
+    def test_a_clone_that_does_not_boot_restores_the_previous_kegs(self) -> None:
+        self.sys.boot_ok = False
+        self.assertUpdated(self.apply())
+        self.assertEqual(("2.36.0", "0.23.0"), (self.sys.tart, self.sys.softnet))
+        self.assertEqual("../Cellar/tart/2.36.0", os.readlink(tart_pin.OPT / "tart"))
+        self.assertEqual("../Cellar/softnet/0.23.0", os.readlink(tart_pin.OPT / "softnet"))
+        self.assertEqual({"2.36.0"}, self.sys.kegs["tart"], "only the new keg was removed")
+        uninstalls = self.calls(tart_pin.BREW, "uninstall")
+        self.assertEqual(["openai/tools/tart", "openai/tools/softnet"], [a[-1] for a in uninstalls])
+        self.assertIn("--ignore-dependencies", uninstalls[0])
+        failed = self.steps("tart-upgrade")[0]
+        self.assertFalse(failed["ok"])
+        self.assertIn("did not report an IP", failed["detail"])
+        rollback = self.steps("tart-rollback")[0]
+        self.assertTrue(rollback["ok"], rollback)
+        self.assertIn("restored tart ../Cellar/tart/2.36.0, softnet ../Cellar/softnet/0.23.0; "
+                      "Tart 2.36.0 answers", rollback["detail"])
+        self.assertEqual("on", self.sys.pool_state)
+        self.assertIsNone(self.verified())
+
+    def test_an_empty_ip_is_not_a_boot(self) -> None:
+        self.sys.boot_ip = "\n"
+        self.assertUpdated(self.apply())
+        self.assertIn("did not report an IP", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.36.0", self.sys.tart)
+
+    def test_an_upgrade_that_lands_another_version_is_rolled_back(self) -> None:
+        self.sys.brew_upgrade_installs = "2.38.0"
+        self.assertUpdated(self.apply())
+        self.assertIn("brew installed Tart 2.38.0, not 2.40.1", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertTrue(self.steps("tart-rollback")[0]["ok"])
+
+    def test_a_softnet_left_on_another_version_is_rolled_back(self) -> None:
+        self.sys.tap["softnet"] = ("0.24.0", SOFTNET_SHA)
+        original = self.sys.set_softnet
+        self.sys.set_softnet = lambda version: original("0.23.5")
+        self.assertUpdated(self.apply())
+        self.assertIn("Softnet links ../Cellar/softnet/0.23.5, not 0.24.0",
+                      self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.36.0", self.sys.tart)
+
+    def test_a_failed_brew_upgrade_never_stops_the_update(self) -> None:
+        self.sys.brew_upgrade_rc = 1
+        self.assertUpdated(self.apply())
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertIn("brew upgrade exit 1", self.steps("tart-upgrade")[0]["detail"])
+        self.assertIn("nothing was relinked; Tart 2.36.0 answers",
+                      self.steps("tart-rollback")[0]["detail"])
+        self.assertEqual([], self.calls(tart_pin.BREW, "uninstall"),
+                         "the previous keg is never uninstalled")
+
+    def test_a_rollback_that_fails_leaves_the_host_off_and_counts(self) -> None:
+        self.sys.boot_ok = False
+        self.sys.uninstall_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("failed", last["status"])
+        self.assertIs(True, last["host_off"])
+        self.assertIn("Tart rollback failed", last["error"])
+        self.assertNotEqual("on", self.sys.pool_state)
+        self.assertFalse(self.steps("tart-rollback")[0]["ok"])
+        self.assertFalse(any("install" in a and "--apply" in a for a, _ in self.sys.calls),
+                         "nothing is installed after a broken Tart")
+
+    def test_a_rollback_whose_tart_does_not_answer_leaves_the_host_off(self) -> None:
+        self.sys.boot_ok = False
+        original = self.sys.run
+
+        def silent_after_rollback(argv, **kw):
+            if argv[:2] == [tart_pin.TART, "--version"] and self.calls(tart_pin.BREW, "link"):
+                return su.Result(127, "", "dyld: Library not loaded")
+            return original(argv, **kw)
+        self.sys.run = silent_after_rollback
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("Tart is NOT runnable now, expected 2.36.0", self.last()["error"])
+        self.assertIs(True, self.last()["host_off"])
+
+    def test_a_failed_pin_is_not_retried_until_the_pin_moves_or_is_cleared(self) -> None:
+        self.sys.boot_ok = False
+        self.assertUpdated(self.apply())
+        self.assertEqual({"version": "2.40.1", "sha256": TART_SHA},
+                         {k: self.failed()[k] for k in ("version", "sha256")})
+        self.sys.boot_ok = True
+        self.assertIn("failed here at", self.decide().refusal)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply(), "no drain every 6 h for a failed pin")
+        self.assertIs(True, self.gate()["due"], "a stuck pin past its gate stays a problem")
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(
+            self.PIN.replace(TART_SHA, "d" * 64))
+        self.sys.tap["tart"] = ("2.40.1", "d" * 64)
+        self.assertIsNone(self.decide().refusal, "a moved pin is tried")
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(self.PIN)
+        self.sys.tap["tart"] = ("2.40.1", TART_SHA)
+        (self.cfg.state_dir / tart_pin.FAILED).unlink()
+        self.assertIsNone(self.decide().refusal, "an operator clears it by removing the record")
+
+    def pool_ons(self) -> list[int]:
+        return [i for i, (a, _) in enumerate(self.sys.calls)
+                if a[-2:] == ["pool", "on"] or a[1:3] == ["pool", "on"]
+                or (a[-3:-1] == ["pool", "on"])]
+
+    def test_sigterm_mid_upgrade_holds_the_host_off_without_a_slow_rollback(self) -> None:
+        import signal
+
+        def term_during_boot(argv):
+            if argv[:2] == [tart_pin.TART, "ip"]:
+                self.sys.hook = None
+                os.kill(os.getpid(), signal.SIGTERM)
+        self.sys.hook = term_during_boot
+        before = len(self.sys.calls)
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIs(True, self.last()["host_off"])
+        self.assertIn("interrupted mid Tart upgrade, not rolled back", self.last()["error"])
+        self.assertEqual([], self.calls(tart_pin.BREW, "uninstall"), "no brew under a SIGTERM")
+        on_after = [i for i in self.pool_ons() if i >= before
+                    and self.index_of(lambda a: a[:2] == [tart_pin.TART, "ip"]) < i]
+        self.assertEqual([], on_after, "no pool on after the SIGTERM")
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).is_file())
+        self.assertFalse((self.cfg.state_dir / tart_pin.PENDING).exists(),
+                         "the hold takes over from the pending record")
+
+    def held_off(self) -> None:
+        """A TartBroken stop: the rollback's uninstall fails."""
+        self.sys.boot_ok = False
+        self.sys.uninstall_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIs(True, self.last()["host_off"])
+        self.sys.pool_state = "off"
+
+    def test_a_held_host_is_not_turned_on_by_the_next_self_update(self) -> None:
+        self.held_off()
+        ons = len(self.pool_ons())
+        outcome = su.recover_left_off(self.cfg, self.sys)
+        self.assertIs(False, outcome["attempted"])
+        self.assertIn("held OFF on purpose", outcome["reason"])
+        self.assertEqual(ons, len(self.pool_ons()))
+        self.assertEqual("off", self.sys.pool_state)
+
+    def test_a_held_host_is_not_turned_on_by_the_watchdog_and_keeps_alerting(self) -> None:
+        import host_off
+        self.held_off()
+        calls: list[str] = []
+        pool = host_off.pool_state_file(self.home)
+        pool.parent.mkdir(parents=True, exist_ok=True)
+        pool.write_text("off\n")
+        os.utime(pool, (NOW - 3600, NOW - 3600))
+        outcome = host_off.recover(self.cfg.state_dir, pool, lambda: calls.append("on") or (0, ""),
+                                   now=NOW + 600, who="launchd-watchdog")
+        self.assertEqual([], calls)
+        self.assertIs(False, outcome["attempted"])
+        current = host_off.status(self.cfg.state_dir, pool, NOW + 600)
+        self.assertIs(True, current["unexpected"], "it still alerts")
+        self.assertIn("HELD OFF on purpose", current["detail"])
+        import tartci_launchd_watchdog as watchdog
+        with mock.patch.object(watchdog, "_pool_on", lambda: calls.append("on") or (0, "")), \
+                mock.patch.object(host_off, "state_dir", lambda home=None: self.cfg.state_dir), \
+                mock.patch.object(host_off, "pool_state_file", lambda home=None: pool), \
+                mock.patch.object(host_off, "alert", lambda *a, **k: None):
+            line = watchdog.host_off_pass(now=NOW + 900)
+        self.assertEqual([], calls, "host_off_pass never turns a held host on")
+        self.assertIn("WARN", line)
+
+    def test_a_held_host_refuses_every_update_until_tart_is_fixed(self) -> None:
+        self.held_off()
+        self.sys.boot_ok, self.sys.uninstall_rc = True, 0
+        self.sys.clock += (self.cfg.rate_hours + 1) * 3600   # past the same-target guard
+        installs = len([a for a, _ in self.sys.calls if "install" in a and "--apply" in a])
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual("off", self.sys.pool_state)
+        self.assertEqual(installs, len([a for a, _ in self.sys.calls
+                                        if "install" in a and "--apply" in a]))
+        self.assertIs(True, self.last()["host_off"], "nothing cleared the OFF record")
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        error = json.loads(receipts[-1].read_text())["error"]
+        self.assertIn("host HELD OFF for Tart", error)
+        self.assertIn("brew uninstall --ignore-dependencies openai/tools/tart", error)
+
+    def test_a_hold_from_an_earlier_episode_is_ignored_and_removed(self) -> None:
+        import host_off
+        self.held_off()
+        # Months later an unrelated update leaves the host OFF: a new episode.
+        last = self.last()
+        su._write_json(self.cfg.state_dir / "last.json",
+                       dict(last, at="2027-06-01T00:00:00Z", error="pool on failed"))
+        self.assertIsNone(host_off.held(self.cfg.state_dir))
+        calls: list[str] = []
+        pool = host_off.pool_state_file(self.home)
+        pool.parent.mkdir(parents=True, exist_ok=True)
+        pool.write_text("off\n")
+        os.utime(pool, (NOW - 3600, NOW - 3600))
+        outcome = host_off.recover(self.cfg.state_dir, pool, lambda: calls.append("on") or (0, ""),
+                                   now=su._ts("2027-06-01T00:10:00Z"),
+                                   who="launchd-watchdog")
+        self.assertEqual(["on"], calls, "the unrelated OFF is recovered")
+        self.assertTrue(outcome["attempted"])
+        self.assertIsNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertFalse((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_hold_is_cleared_once_the_pool_is_on_with_a_working_tart(self) -> None:
+        self.held_off()
+        self.assertIsNotNone(su.tart_hold_refusal(self.cfg, self.sys))
+        # The operator relinked 2.36.0 by hand and turned the pool on.
+        self.sys.kegs["tart"].discard("2.40.1")
+        self.sys.set_tart("2.36.0")
+        self.sys.pool_state = "on"
+        self.assertIsNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertFalse((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_hold_stays_while_the_pool_is_off_whatever_tart_answers(self) -> None:
+        self.held_off()
+        self.sys.kegs["tart"].discard("2.40.1")
+        self.sys.set_tart("2.36.0")          # Tart fixed by hand, pool not on yet
+        self.assertEqual("off", self.sys.pool_state)
+        self.assertIsNotNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_hold_stays_while_the_pool_is_on_with_the_failed_tart(self) -> None:
+        self.held_off()
+        self.sys.pool_state = "on"           # someone forced the pool on
+        self.assertEqual("2.40.1", self.sys.tart)
+        self.assertIsNotNone(su.tart_hold_refusal(self.cfg, self.sys))
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).exists())
+
+    def test_a_run_killed_mid_tart_upgrade_is_held_off_by_the_next_run(self) -> None:
+        def kill_during_boot(argv):
+            if argv[:2] == [tart_pin.TART, "ip"]:
+                raise SystemExit("SIGKILL stand-in")
+        self.sys.hook = kill_during_boot
+        with self.assertRaises(SystemExit):
+            self.apply()
+        self.sys.hook = None
+        self.assertTrue((self.cfg.state_dir / tart_pin.PENDING).is_file())
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        value = json.loads(receipts[-1].read_text())
+        value.update(status="running", pid=999999)
+        receipts[-1].write_text(json.dumps(value))
+        ons = len(self.pool_ons())
+        su.recover_interrupted(self.cfg, self.sys, [receipts[-1]])
+        self.assertEqual(ons, len(self.pool_ons()), "no pool on for a killed Tart upgrade")
+        self.assertIs(True, self.last()["host_off"])
+        self.assertIn("HOST HELD OFF: killed mid Tart upgrade", self.last()["error"])
+        self.assertTrue((self.cfg.state_dir / tart_pin.HOLD).is_file())
+        self.assertFalse((self.cfg.state_dir / tart_pin.PENDING).exists())
+
+    def test_the_recovery_text_removes_the_failed_keg_before_linking(self) -> None:
+        self.held_off()
+        error = self.last()["error"]
+        self.assertLess(error.index("brew uninstall --ignore-dependencies openai/tools/tart"),
+                        error.index("brew link --overwrite openai/tools/tart"))
+        self.assertIn("tart-broken.json", error)
+
+    def test_brew_never_autoremoves_in_a_rollback(self) -> None:
+        self.sys.boot_ok = False
+        self.assertUpdated(self.apply())
+        index = self.index_of(lambda a: a[:2] == [tart_pin.BREW, "uninstall"])
+        self.assertEqual("1", self.sys.env_calls[index]["HOMEBREW_NO_AUTOREMOVE"])
+
+    def test_a_link_that_lands_on_another_keg_is_a_failed_rollback(self) -> None:
+        # A stray newer keg in the Cellar: `brew link` picks it, not 2.36.0.
+        self.sys.kegs["tart"].add("2.39.0")
+        self.sys.boot_ok = False
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("tart links ../Cellar/tart/2.39.0 after the rollback, not "
+                      "../Cellar/tart/2.36.0", self.last()["error"])
+
+    def test_a_failed_canary_boot_check_is_remembered(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.set_tart("2.40.1")
+        self.sys.boot_ok = False
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertFalse(self.steps("tart-upgrade")[0]["ok"])
+        self.assertEqual("2.40.1", self.failed()["version"])
+        self.assertIsNone(self.verified())
+
+    def test_the_canary_s_own_record_must_match_the_pin_s_sha(self) -> None:
+        self.sys.set_tart("2.40.1")
+        su._write_json(self.cfg.state_dir / tart_pin.VERIFIED,
+                       {"version": "2.40.1", "sha256": "c" * 64, "verified_at": NOW - 99999})
+        self.assertTrue(self.decide().prove_only)
+        su._write_json(self.cfg.state_dir / tart_pin.VERIFIED,
+                       {"version": "2.40.1", "sha256": TART_SHA, "verified_at": NOW - 99999})
+        self.assertIsNone(self.decide())
+
+    def test_a_host_without_a_golden_refuses_before_the_drain(self) -> None:
+        self.sys.log_lines = ""
+        with mock.patch.object(su, "tart_boot_target", return_value=None):
+            self.assertIn("names no golden", self.decide().refusal)
+            self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_vm_left_after_pool_off_defers_the_pin_instead_of_draining_again(self) -> None:
+        self.sys.tart_running = True
+        self.assertUpdated(self.apply())
+        self.assertIn("deferred for 24 h", self.steps("tart-upgrade")[0]["detail"])
+        self.sys.tart_running = False
+        self.assertIn("deferred until", self.decide().refusal)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.sys.clock += tart_pin.DEFER_SECONDS
+        (self.cfg.state_dir / tart_pin.TAP_CACHE).unlink(missing_ok=True)
+        self.assertIsNone(self.decide().refusal, "tried again after the deferral")
+
+    def test_refresh_reads_the_installed_generation_s_pin(self) -> None:
+        self.sys.log_lines = ""
+        (self.cfg.checkout / "fleet" / "tart.toml").write_text(self.PIN.replace("2.40.1", "9.9.9"))
+        self.assertIn("upgrade Tart 2.36.0 -> 2.40.1", str(su.refresh_reason(self.cfg, self.sys)))
+
+    def test_a_running_tart_vm_is_never_replaced(self) -> None:
+        self.sys.tart_running = True
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("a Tart VM process was still running after pool off",
+                      self.steps("tart-upgrade")[0]["detail"])
+
+    def test_the_vm_process_pattern_matches_tart_itself_only(self) -> None:
+        import re
+        pattern = re.compile(tart_pin.TART_RUN_PATTERN)
+        for line in ("/opt/homebrew/Cellar/tart/2.38.0/tart.app/Contents/MacOS/tart run --no-graphics x",
+                     "tart run x"):
+            self.assertTrue(pattern.search(line), line)
+        for line in ("bash -c echo tart run", "/usr/bin/grep tart run", "vim notes-on-tart run"):
+            self.assertFalse(pattern.search(line), line)
+
+    def test_a_clone_that_cannot_be_deleted_fails_the_tart_step(self) -> None:
+        # A good boot whose clone survives three stop/delete tries must not
+        # end in a quiet pool on beside it: it is a failed Tart step.
+        self.sys.tart_delete_rc = 1
+        self.assertUpdated(self.apply())
+        cleanup = self.steps("tart-check-cleanup")[0]
+        self.assertFalse(cleanup["ok"])
+        self.assertIn("still there after 3 tries; the watchdog deletes it after", cleanup["detail"])
+        self.assertEqual(3, len(self.calls(tart_pin.TART, "delete")))
+        failed = self.steps("tart-upgrade")[0]
+        self.assertFalse(failed["ok"])
+        self.assertIn("could not be removed", failed["detail"])
+        self.assertEqual("2.36.0", self.sys.tart, "rolled back")
+        self.assertEqual("2.40.1", self.failed()["version"])
+        self.assertIsNone(self.verified())
+        import scratch_vm_ttl
+        names = [r["name"] for r in scratch_vm_ttl.records()]
+        self.assertEqual([f"{tart_pin.CHECK_PREFIX}{os.getpid()}"], names)
+        self.assertTrue(self.calls(tart_pin.TART, "stop"), "the clone is stopped")
+
+    def test_a_cleanup_that_succeeds_on_a_retry_is_fine(self) -> None:
+        self.sys.tart_delete_rcs = [1]
+        self.assertUpdated(self.apply())
+        self.assertEqual(2, len(self.calls(tart_pin.TART, "delete")))
+        self.assertEqual([], self.steps("tart-check-cleanup"))
+        self.assertTrue(self.steps("tart-upgrade")[0]["ok"])
+        self.assertEqual("2.40.1", self.sys.tart)
+
+    # ── the pinned bytes ────────────────────────────────────────────────
+
+    def test_the_downloaded_archives_are_checked_against_the_pin(self) -> None:
+        self.assertUpdated(self.apply())
+        hashed = [a[-1] for a in self.calls("/usr/bin/shasum", "-a", "256")]
+        self.assertEqual(2, len(hashed), "Tart and the Softnet that moved with it")
+        self.assertTrue(self.steps("tart-upgrade")[0]["ok"])
+
+    def test_a_re_cut_archive_under_the_pinned_version_is_rolled_back(self) -> None:
+        self.sys.archive_sha["tart"] = "e" * 64
+        self.assertUpdated(self.apply())
+        detail = self.steps("tart-upgrade")[0]["detail"]
+        self.assertIn("the downloaded openai/tools/tart archive", detail)
+        self.assertIn("has sha256 eeeeeeeeeeee, the pin is aaaaaaaaaaaa", detail)
+        self.assertEqual("2.36.0", self.sys.tart)
+        self.assertTrue(self.steps("tart-rollback")[0]["ok"])
+        self.assertEqual([], self.calls(tart_pin.TART, "clone"), "no boot of unpinned bytes")
+
+    def test_a_re_cut_softnet_archive_is_rolled_back(self) -> None:
+        self.sys.archive_sha["softnet"] = "f" * 64
+        self.assertUpdated(self.apply())
+        self.assertIn("openai/tools/softnet archive", self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual(("2.36.0", "0.23.0"), (self.sys.tart, self.sys.softnet))
+
+    def test_a_stale_cached_tap_is_reread_before_the_upgrade(self) -> None:
+        self.assertIsNone(self.decide().refusal)       # caches the matching answer
+        self.sys.tap["tart"] = ("2.40.1", "c" * 64)    # the tap re-cut the release since
+        self.assertIsNone(self.decide().refusal, "a plan may use the cached answer")
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("the tap offers tart 2.40.1 (cccccccccccc)",
+                      self.steps("tart-upgrade")[0]["detail"])
+
+    def test_a_stale_cached_tap_never_starts_a_tart_only_drain(self) -> None:
+        self.assertIsNone(self.decide().refusal)
+        self.sys.tap["tart"] = ("2.40.1", "c" * 64)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    # ── turns of their own ──────────────────────────────────────────────
+
+    def test_a_current_tartci_takes_a_drained_turn_for_the_pinned_tart(self) -> None:
+        self.sys.log_lines = ""   # TartCI current with main
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertIn("upgrade Tart 2.36.0 -> 2.40.1", str(self.receipt().get("refresh")))
+        self.assertEqual("2.40.1", self.sys.tart)
+        self.assertEqual("on", self.sys.pool_state)
+
+    def test_a_host_waiting_for_the_canary_does_not_drain_for_tart(self) -> None:
+        self.sys.log_lines = ""
+        self.cfg.tart_canary = "studio"
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_an_unreadable_tap_never_starts_a_drain(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.tap_ok = False
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_canary_already_on_the_pin_boot_checks_it_once_and_publishes(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.set_tart("2.40.1")
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual([], self.upgrades())
+        self.assertIn("canary boot check of Tart 2.40.1: booted",
+                      self.steps("tart-upgrade")[0]["detail"])
+        self.assertEqual("2.40.1", self.verified()["version"])
+        self.assertEqual(su.EXIT_NOTHING, self.apply(), "proven once, then nothing to do")
+
+    def test_the_plan_names_the_tart_upgrade(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.plan())
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        plan = json.loads(attempts[-1].read_text())
+        self.assertIn("upgrade Tart 2.36.0 -> 2.40.1 (boot-checked)", plan["steps"][-1]["detail"])
+        self.assertEqual([], self.upgrades())
+
+    def test_tart_settings_are_validated(self) -> None:
+        settings = self.home / "self-update.toml"
+        settings.write_text('[tart]\nupgrade = "yes"\n')
+        with self.assertRaises(su.ConfigError):
+            su.load_config(self.home, settings)
+        settings.write_text('[tart]\nupgrade = true\ncanary = "studio"\nsoak_seconds = 60\n')
+        cfg = su.load_config(self.home, settings)
+        self.assertEqual((True, "studio", 60), (cfg.tart_upgrade, cfg.tart_canary,
+                                                cfg.tart_soak_seconds))
+        self.assertFalse(su.load_config(self.home, self.home / "absent.toml").tart_upgrade)
+
+    def test_status_says_when_tart_is_behind_its_pin(self) -> None:
+        state = self.cfg.state_dir.parent / "tool-freshness" / "state.json"
+        su._write_json(state, {"tools": {"tart": {"state": "behind", "installed": "2.36.0",
+                                                  "latest_tag": "2.40.1", "stale": True}}})
+        self.assertIn("self-update: Tart 2.36.0 is behind its pin 2.40.1 (fleet/tart.toml); with "
+                      "[tart] upgrade = true a drained self-update moves it (STALE)",
+                      su.status_lines(self.cfg.state_dir))
+        su._write_json(state, {"tools": {"tart": {"state": "current"}}})
+        self.assertFalse(any("Tart" in line for line in su.status_lines(self.cfg.state_dir)))
+
+
+class PrivateSourceSystem(FakeSystem):
+    """FakeSystem plus GitHub API reads of one private fleet repository."""
+
+    def __init__(self, home: Path, repository) -> None:
+        super().__init__(home)
+        self.private = repository
+
+    def run(self, argv, *, cwd=None, env=None, timeout=900):
+        if argv[:2] == [FAKE_GH, "api"] and argv[2].startswith(f"repos/{self.private.repository}/"):
+            self.calls.append((list(argv), cwd))
+            return su.Result(*self.private(argv[2]))
+        return super().run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def _set_installed(self, commit):
+        # The installer records the selected source in its receipt.
+        super()._set_installed(commit)
+        selected = os.environ.get("TARTCI_FLEET_SOURCE_COMMIT")
+        if getattr(self, "records_source", True) is False:
+            selected = None
+        self.installed_sources = getattr(self, "installed_sources", []) + [selected]
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": bool(selected),
+            "commit": selected,
+            "repository": os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY") if selected else None,
+            "root": os.environ.get("TARTCI_FLEET_SOURCE_ROOT") if selected else None,
+        }
+        receipt_path.write_text(json.dumps(receipt))
+
+
+class TwoCommits:
+    """One private repository at two commits: `head` is main, `older` is not."""
+
+    def __init__(self, head, older) -> None:
+        self.head, self.older = head, older
+        self.repository = head.repository
+        self.calls: list[str] = []
+
+    @property
+    def unreadable(self) -> bool:
+        return self.head.unreadable
+
+    @unreadable.setter
+    def unreadable(self, value: bool) -> None:
+        self.head.unreadable = self.older.unreadable = value
+
+    @property
+    def corrupt(self) -> set:
+        return self.head.corrupt
+
+    def __call__(self, path: str):
+        self.calls.append(path)
+        if path.endswith("/commits/main"):
+            return self.head(path)
+        for repo in (self.head, self.older):
+            rc, out, err = repo(path)
+            if rc == 0:
+                return rc, out, err
+        return 1, "", f"HTTP 404: {path}"
+
+
+class FleetSourceFixture(Base):
+    """A private fleet source served by a fake GitHub; no tests of its own."""
+    OLDER = "a1" * 20      # a private-source commit installed before main moved
+
+    def setUp(self) -> None:
+        super().setUp()
+        import test_fleet_source_sync as fixture
+        self.fixture = fixture
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        profiles = {path.name: path.read_text()
+                    for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))}
+        files = fixture.source_files(profiles)
+        self.repo = TwoCommits(fixture.FakeRepository(files),
+                               fixture.FakeRepository(files, commit=self.OLDER, tree="b1" * 20))
+        self.sys = PrivateSourceSystem(self.home, self.repo)
+        self.cfg.fleet_source_repository = fixture.PRIVATE
+        self.cfg.fleet_source_canary = "m1"     # this host
+
+
+class FleetSourceSyncTests(FleetSourceFixture):
+
+    def test_settings_name_the_private_repository(self) -> None:
+        self.cfg.settings.write_text('[fleet_source]\nrepository = "ORG/private-fleet-authority"\n')
+        self.assertEqual("ORG/private-fleet-authority",
+                         su.load_config(self.home).fleet_source_repository)
+        self.cfg.settings.unlink()
+        self.assertIsNone(su.load_config(self.home).fleet_source_repository)
+
+    def test_a_malformed_setting_is_a_clean_refusal(self) -> None:
+        for body in ('fleet_source = "ORG/x"\n', '[fleet_source]\nrepository = 3\n',
+                     '[fleet_source]\nrepo = "ORG/x"\n', '[fleet_source]\ncanary = ""\n'):
+            with self.subTest(body=body):
+                self.cfg.settings.write_text(body)
+                with self.assertRaisesRegex(su.ConfigError, r"\[fleet_source\]"):
+                    su.load_config(self.home)
+                out = io.StringIO()
+                with contextlib.redirect_stderr(out):
+                    self.assertEqual(su.EXIT_REFUSED, su.main(["--home", str(self.home)]))
+                self.assertIn("self-update: REFUSED", out.getvalue())
+        self.cfg.settings.write_text('[fleet_source]\nrepository = "ORG/x"\ncanary = "m1"\n')
+        loaded = su.load_config(self.home)
+        self.assertEqual(("ORG/x", "m1"), (loaded.fleet_source_repository, loaded.fleet_source_canary))
+
+    def test_pruning_keeps_the_commit_the_running_generation_reads(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": True, "commit": self.OLDER}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        store = self.cfg.fleet_source_store
+        (store / self.OLDER).mkdir(parents=True)
+        os.utime(store / self.OLDER, (1, 1))                  # the oldest export
+        newer = [f"{i}" * 40 for i in range(2, 7)]
+        for i, commit in enumerate(newer):
+            (store / commit).mkdir()
+            os.utime(store / commit, (NOW - 100 + i, NOW - 100 + i))
+        su.sync_fleet_source(self.cfg, self.sys)
+        self.assertTrue((store / self.OLDER).is_dir(), "the installed generation's export was pruned")
+        self.assertTrue((store / self.fixture.COMMIT).is_dir())
+        # Control: the same store with nothing installed from it loses that export.
+        receipt["fleet_source"] = {"configured": False, "commit": None}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        su.sync_fleet_source(self.cfg, self.sys)
+        self.assertFalse((store / self.OLDER).exists())
+
+    def test_a_plan_writes_and_prunes_nothing(self) -> None:
+        store = self.cfg.fleet_source_store
+        with self.assertRaisesRegex(su.Refused, "not exported yet"):
+            su.sync_fleet_source(self.cfg, self.sys, write=False)
+        self.assertFalse(store.exists())
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        self.assertFalse(store.exists())
+        root = Path(su.sync_fleet_source(self.cfg, self.sys)["root"])
+        stale = [f"{i}" * 40 for i in range(2, 7)]
+        for commit in stale:
+            (store / commit).mkdir()
+            os.utime(store / commit, (1, 1))
+        before = {p.name: p.stat().st_mtime for p in store.iterdir()}
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        selected = su.sync_fleet_source(self.cfg, self.sys, write=False)
+        self.assertEqual(str(root), selected["root"])
+        self.assertEqual(before, {p.name: p.stat().st_mtime for p in store.iterdir()})
+
+    def test_without_the_setting_nothing_is_read_or_selected(self) -> None:
+        self.cfg.fleet_source_repository = None
+        self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+        self.assertEqual([], self.repo.calls)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_the_configured_source_is_exported_and_selected(self) -> None:
+        selected = su.sync_fleet_source(self.cfg, self.sys)
+        root = self.cfg.fleet_source_store / self.fixture.COMMIT
+        source = fleet_source.FleetSource(
+            root, root / "profiles", root / fleet_source.PUBLISHED_SUPPLY, True)
+        self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                          "root": str(root), "why": "canary: main's head",
+                          **source.provenance}, selected)
+        self.assertEqual(str(root), os.environ["TARTCI_FLEET_SOURCE_ROOT"])
+        self.assertEqual(self.fixture.COMMIT, os.environ["TARTCI_FLEET_SOURCE_COMMIT"])
+        self.assertEqual(self.fixture.PRIVATE, os.environ["TARTCI_FLEET_SOURCE_REPOSITORY"])
+        # The profile self-update installs now comes from the private export.
+        self.assertEqual(root.resolve() / "profiles" / "m1-macos-fleet.toml",
+                         su.checked_in_profile(self.cfg))
+        # And the installer it runs inherits the selection.
+        self.assertEqual(self.fixture.COMMIT, su.census_env()["TARTCI_FLEET_SOURCE_COMMIT"])
+
+    def test_an_unreadable_source_refuses_and_never_falls_back(self) -> None:
+        self.repo.unreadable = True
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual("unknown", skew["state"])
+        self.assertIn("fleet source ORG/private-fleet-authority", skew["reason"])
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_tampered_source_refuses(self) -> None:
+        self.repo.corrupt.add(fleet_source_supply())
+        with self.assertRaisesRegex(su.Refused, "does not match blob"):
+            su.sync_fleet_source(self.cfg, self.sys)
+
+    def test_a_moved_source_is_a_refresh_reason(self) -> None:
+        su.sync_fleet_source(self.cfg, self.sys)
+        receipt = {"support": {"source_commit": INSTALLED}}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIn("fleet source moved to cccccccccccc (installed from the public profiles)",
+                      su.refresh_reason(self.cfg, self.sys))
+        receipt["fleet_source"] = {"configured": True, "commit": "9" * 40}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIn("installed from 999999999999", su.refresh_reason(self.cfg, self.sys))
+        receipt["fleet_source"]["commit"] = self.fixture.COMMIT
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_source_move_ignores_the_previous_generation_rate_limit(self) -> None:
+        # A source-only refresh keeps the TartCI generation unchanged. A recent
+        # attempt of that generation must not strand the new private profiles.
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        (attempts / "recent.json").write_text(json.dumps({
+            "mode": "apply", "target": INSTALLED, "status": "succeeded",
+            "started_at": su._iso(NOW - 60),
+            "fleet_source": {"repository": self.fixture.PRIVATE,
+                             "commit": self.OLDER},
+        }))
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def test_a_current_host_reinstalls_from_a_moved_source(self) -> None:
+        self.sys.log_lines = ""   # current with main
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(self.fixture.COMMIT, receipt["fleet_source"]["commit"])
+        # Installed from that commit, the next run has nothing to do.
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+
+
+class FleetSourceCanaryTests(FleetSourceFixture):
+    """A private-source move is one host first: the canary installs and verifies
+    it; every other host adopts only that commit, after it has served there."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.fleet_source_canary = "studio"   # another host
+
+    def installed_from(self, commit: str | None) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {
+            "configured": commit is not None, "commit": commit,
+            "repository": self.fixture.PRIVATE if commit else None,
+            "root": str(self.cfg.fleet_source_store / commit) if commit else None,
+        }
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+
+    def canary(self, record: dict | None):
+        return mock.patch.object(su, "read_canary_verified", return_value=record)
+
+    def test_a_mistyped_canary_refuses_loudly(self) -> None:
+        self.cfg.fleet_source_canary = "stuido"
+        with self.canary(None), self.assertRaisesRegex(
+                su.Refused, r"canary 'stuido' is not a published host id \(.*studio.*\)"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual([], self.repo.calls)
+        # The same mistake reaches the run's status: UNKNOWN, with the reason.
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertIn("is not a published host id", skew["reason"])
+
+    def test_without_a_canary_the_setting_refuses(self) -> None:
+        self.cfg.fleet_source_canary = None
+        with self.assertRaisesRegex(su.Refused, "no canary"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual([], self.repo.calls)
+
+    def test_a_host_stays_public_until_the_canary_has_verified_a_commit(self) -> None:
+        with self.canary(None):
+            self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+        self.assertEqual([], self.repo.calls)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_a_host_stays_on_its_installed_commit_while_the_canary_soaks(self) -> None:
+        self.installed_from(self.OLDER)
+        young = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                 "age": su.FLEET_SOURCE_SOAK_SECONDS - 60}
+        with self.canary(young):
+            selected = su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual(self.OLDER, selected["commit"])
+        self.assertIn("only 29 min ago", selected["why"])
+        self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
+        self.assertFalse(any(call.endswith("/commits/main") for call in self.repo.calls))
+
+    def test_a_host_adopts_the_canary_commit_after_the_soak(self) -> None:
+        self.installed_from(self.OLDER)
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        with self.canary(soaked):
+            selected = su.sync_fleet_source(self.cfg, self.sys)
+        self.assertEqual(self.fixture.COMMIT, selected["commit"])
+        self.assertIn("fleet source moved to cccccccccccc", su.refresh_reason(self.cfg, self.sys))
+
+    def test_a_malformed_installed_source_receipt_refuses_before_source_sync(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": True, "commit": self.OLDER}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.repo.calls)
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(self.cfg.fleet_source_store.exists())
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+        self.assertIn("lacks the source root and repository",
+                      json.loads((self.cfg.state_dir / "skew.json").read_text())["reason"])
+
+    def test_a_non_boolean_configured_marker_also_refuses_before_source_sync(self) -> None:
+        receipt = json.loads(self.cfg.install_receipt.read_text())
+        receipt["fleet_source"] = {"configured": "true", "commit": self.OLDER,
+                                    "repository": self.fixture.PRIVATE,
+                                    "root": str(self.cfg.fleet_source_store / self.OLDER)}
+        self.cfg.install_receipt.write_text(json.dumps(receipt))
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.repo.calls)
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(self.cfg.fleet_source_store.exists())
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_adopted_source_reinstalls_while_tartci_commit_is_still_soaking(self) -> None:
+        """A source move must not wait for unrelated TartCI code to soak."""
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n"
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        with self.canary(soaked):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def _assert_adopted_source_reinstalls_for_skew_state(self, state: str) -> None:
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = ""
+        soaked = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "age": su.FLEET_SOURCE_SOAK_SECONDS}
+        skew = {"state": state, "target": None, "explicit": False}
+        with self.canary(soaked), mock.patch.object(su, "measure_skew", return_value=skew):
+            self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
+    def test_adopted_source_reinstalls_while_tartci_is_behind(self) -> None:
+        self._assert_adopted_source_reinstalls_for_skew_state("behind")
+
+    def test_adopted_source_reinstalls_while_tartci_is_unverified(self) -> None:
+        self._assert_adopted_source_reinstalls_for_skew_state("unverified")
+
+    def test_a_record_for_another_repository_is_not_adopted(self) -> None:
+        self.installed_from(self.OLDER)
+        other = {"repository": "ORG/other", "commit": self.fixture.COMMIT, "age": 99999}
+        with self.canary(other):
+            self.assertEqual(self.OLDER, su.sync_fleet_source(self.cfg, self.sys)["commit"])
+
+    def test_the_canary_record_is_read_on_its_own_clock(self) -> None:
+        record = {"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                  "verified_at": 1000}
+        def ssh(argv):
+            if argv[0] == "ssh" and su.FLEET_SOURCE_VERIFIED in argv[-1]:
+                return su.Result(0, "1600\n" + json.dumps(record) + "\n")
+            return None
+        with mock.patch.object(su, "published_peers", return_value={"studio": "m3"}), \
+                mock.patch.object(self.sys, "run", side_effect=lambda argv, **kw: ssh(argv)
+                                  or su.Result(255, "", "unreachable")):
+            self.assertEqual({"repository": self.fixture.PRIVATE, "commit": self.fixture.COMMIT,
+                              "age": 600.0}, su.read_canary_verified(self.cfg, self.sys, "studio"))
+            record["commit"] = "not-a-commit"
+            self.assertIsNone(su.read_canary_verified(self.cfg, self.sys, "studio"))
+        with mock.patch.object(su, "published_peers", return_value={"studio": "m3"}), \
+                mock.patch.object(self.sys, "run", return_value=su.Result(255, "", "timed out")):
+            self.assertIsNone(su.read_canary_verified(self.cfg, self.sys, "studio"))
+
+    def test_a_host_whose_canary_failed_does_not_move(self) -> None:
+        # The canary never published the new commit: this host stays put and
+        # its apply has nothing to do.
+        self.installed_from(self.OLDER)
+        self.sys.log_lines = ""   # current with main
+        with self.canary({"repository": self.fixture.PRIVATE, "commit": self.OLDER,
+                          "age": 99999}):
+            self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+
+
+class ReinstallCurrentTests(FleetSourceFixture):
+    """--reinstall-current: apply a settings change (here a removed
+    [fleet_source]) to the generation already installed, in one command."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        receipt = self.home / ".config/tartci/macos-fleet-install.json"
+        value = json.loads(receipt.read_text())
+        value["fleet_source"] = {"configured": True, "repository": self.fixture.PRIVATE,
+                                 "commit": self.OLDER,
+                                 "root": str(self.cfg.fleet_source_store / self.OLDER)}
+        receipt.write_text(json.dumps(value))
+        self.cfg.fleet_source_repository = None      # the operator removed it
+        self.sys.log_lines = ""                      # the installed commit is current
+
+    def reinstall(self, apply: bool = True) -> int:
+        return su.plan_or_apply(self.cfg, self.sys, apply=apply, target_ref="origin/main",
+                                reinstall=True)
+
+    def test_without_it_a_removed_source_waits_for_a_new_commit(self) -> None:
+        # The gap: nothing to do, and the receipt keeps the stale source.
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_it_reinstalls_the_running_generation_and_clears_the_stale_source(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+        self.assertEqual(INSTALLED, self.last()["target"])
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+        receipt = json.loads((self.home / ".config/tartci/macos-fleet-install.json").read_text())
+        self.assertIs(False, receipt["fleet_source"]["configured"])
+        joined = [" ".join(m) if isinstance(m, list) else m for m in self.sys.mutations()]
+        self.assertTrue(any("pool drain" in m for m in joined), "the normal drain path")
+        self.assertTrue(any("pool on" in m for m in joined))
+        attempt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertIn("--reinstall-current", attempt["refresh"])
+
+    def test_an_inherited_source_does_not_survive_a_removed_setting(self) -> None:
+        # The caller's shell (or an agent plist) still exports the old source.
+        os.environ.update({
+            "TARTCI_FLEET_SOURCE_ROOT": str(self.cfg.fleet_source_store / self.OLDER),
+            "TARTCI_FLEET_SOURCE_COMMIT": self.OLDER,
+            "TARTCI_FLEET_SOURCE_REPOSITORY": self.fixture.PRIVATE,
+        })
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual([None], self.sys.installed_sources)
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_plan_changes_nothing(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.reinstall(apply=False))
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_recent_install_of_the_same_commit_does_not_hold_it_back(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.sys.clock += 600
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+
+    def configured_source(self, recorded: str, repository: str | None = None) -> None:
+        """[fleet_source] configured (this host is its canary); the receipt
+        records `recorded` as the installed private-source commit."""
+        self.cfg.fleet_source_repository = self.fixture.PRIVATE
+        receipt = self.home / ".config/tartci/macos-fleet-install.json"
+        value = json.loads(receipt.read_text())
+        value["fleet_source"] = {"configured": True,
+                                 "repository": repository or self.fixture.PRIVATE,
+                                 "commit": recorded,
+                                 "root": str(self.cfg.fleet_source_store / recorded)}
+        receipt.write_text(json.dumps(value))
+
+    def test_the_same_commit_from_another_repository_is_a_new_source(self) -> None:
+        self.configured_source(self.fixture.COMMIT, repository="ORG/another-fleet-authority")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("installed from ORG/another-fleet-authority@", out.getvalue())
+
+    def test_it_never_installs_a_new_private_source(self) -> None:
+        # The canary would select main's head, newer than the installed source:
+        # only the canary-gated update path may take it.
+        self.configured_source(self.OLDER)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("--reinstall-current refused: it would install private source "
+                      f"{self.fixture.PRIVATE}@{self.fixture.COMMIT[:12]}", out.getvalue())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_it_reinstalls_on_the_installed_private_source(self) -> None:
+        # Control: the selected source is the one already installed.
+        self.configured_source(self.fixture.COMMIT)
+        self.assertEqual(su.EXIT_OK, self.reinstall(), self.last())
+        self.assertEqual("succeeded", self.last()["status"])
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_halt_still_holds_an_operator_reinstall(self) -> None:
+        for n in range(su.MAX_CONSECUTIVE_FAILURES):
+            su._write_json(self.cfg.state_dir / "attempts" / f"2027010{n}T000000Z-x.json",
+                           {"mode": "apply", "status": "failed", "target": INSTALLED,
+                            "started_at": f"2027-01-0{n + 1}T00:00:00Z"})
+        self.assertTrue(su.halt_reason(self.cfg.state_dir))
+        self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+
+    def test_a_pause_still_holds_an_operator_reinstall(self) -> None:
+        su._write_json(self.cfg.state_dir / "scheduled-pause.json",
+                       {"at": su._iso(self.sys.now()), "reason": "held"})
+        self.assertEqual(su.EXIT_REFUSED, self.reinstall())
+        self.assertEqual([], self.sys.mutations())
+
+    # Base's pause test needs an update to refuse; on this current host there is
+    # none without the flag. The test above covers the pause for a reinstall.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
+
+    def test_the_command_takes_no_target_and_is_never_scheduled(self) -> None:
+        for extra in (["--target", T_OLD], ["--scheduled"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SystemExit) as caught, \
+                        mock.patch("sys.stderr", new=io.StringIO()):
+                    su.main(["--apply", "--reinstall-current", "--home", str(self.home),
+                             *extra])
+                self.assertEqual(2, caught.exception.code)
+
+
+class FleetSourceCanaryHostTests(FleetSourceFixture):
+    """On the canary itself (this host is m1)."""
+
+    def verified(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / su.FLEET_SOURCE_VERIFIED)
+
+    def test_a_verified_install_is_published_for_the_fleet(self) -> None:
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        record = self.verified()
+        self.assertEqual((self.fixture.PRIVATE, self.fixture.COMMIT),
+                         (record["repository"], record["commit"]))
+        self.assertEqual(self.sys.now(), record["verified_at"])
+
+    def test_an_install_that_fails_verification_publishes_nothing(self) -> None:
+        # The installer recorded the new commit, but pool on refused it.
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1               # pool on keeps refusing
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        # The failed source move rolled back to the public source the host was
+        # running before the attempt.
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+        self.assertIsNone(self.verified())
+
+    def test_failed_install_restores_previous_source_before_pool_on(self) -> None:
+        """An installer self-rollback must not serve old code with new profiles."""
+        self.sys.log_lines = ""
+        self.sys.install_rcs = [1]
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertIsNone(os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(step["step"] == "source-restore" for step in receipt["steps"]))
+
+    def test_failed_install_restores_previous_private_source_before_pool_on(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual(self.OLDER, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+
+    def test_rollback_restores_the_previous_private_source(self) -> None:
+        previous_root = self.cfg.fleet_source_store / self.OLDER
+        previous_root.mkdir(parents=True)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER,
+            "repository": self.fixture.PRIVATE, "root": str(previous_root),
+        }
+        receipt_path.write_text(json.dumps(receipt))
+        self.sys.log_lines = ""
+        # The target's pool on fails every attempt; the rollback's succeeds.
+        self.sys.on_rcs = [1] * su.Run.POOL_ON_ATTEMPTS
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual([self.fixture.COMMIT, self.OLDER], self.sys.installed_sources)
+        restored = json.loads(receipt_path.read_text())["fleet_source"]
+        self.assertEqual(self.OLDER, restored["commit"])
+        self.assertEqual(self.fixture.PRIVATE, restored["repository"])
+        self.assertEqual(str(previous_root), restored["root"])
+
+    def installed_from_older(self, tree_sha256: str) -> None:
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["fleet_source"] = {
+            "configured": True, "commit": self.OLDER, "repository": self.fixture.PRIVATE,
+            "root": str(self.cfg.fleet_source_store / self.OLDER), "tree_sha256": tree_sha256,
+        }
+        receipt_path.write_text(json.dumps(receipt))
+
+    def test_a_new_commit_with_the_installed_bytes_is_not_reinstalled(self) -> None:
+        # main moved (a backup, say) but its profiles and supply are the bytes
+        # the host already runs: no drain.
+        selected = su.sync_fleet_source(self.cfg, self.sys)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        self.installed_from_older(selected["tree_sha256"])
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_NOTHING, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual(self.OLDER, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_new_commit_with_other_bytes_is_reinstalled(self) -> None:
+        self.installed_from_older("0" * 64)
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+
+    def test_a_source_move_that_fails_verification_after_pool_on_is_rolled_back(self) -> None:
+        # Same generation, new source: pool on succeeds, then the host is not
+        # ready while the moved profiles are live.
+        def hook(argv: list[str]) -> None:
+            moved = su.installed_fleet_source_commit(self.cfg) == self.fixture.COMMIT
+            self.sys.status_problems = ["broken"] if moved else []
+        self.sys.hook = hook
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual([self.fixture.COMMIT, None], self.sys.installed_sources)
+        self.assertIsNone(su.installed_fleet_source_commit(self.cfg))
+        self.assertIsNone(self.verified())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(step["step"] == "rollback-install" for step in receipt["steps"]))
+
+    def test_failed_previous_reinstall_keeps_the_target_source_selected(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.on_rc = 1
+        self.sys.rollback_install_rc = 1
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertEqual(self.fixture.COMMIT, os.environ.get("TARTCI_FLEET_SOURCE_COMMIT"))
+        self.assertEqual(self.fixture.PRIVATE,
+                         os.environ.get("TARTCI_FLEET_SOURCE_REPOSITORY"))
+
+    def test_a_run_that_did_not_install_the_selected_commit_publishes_nothing(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.records_source = False
+        self.assertEqual(su.EXIT_OK, self.apply())
+        self.assertIsNone(self.verified())
+
+    def test_a_failed_install_publishes_nothing_and_backs_off(self) -> None:
+        self.sys.log_lines = ""
+        # A same-generation reinstall installs the running commit, which the
+        # fake installer treats like a rollback: make that install fail.
+        self.sys.rollback_install_rc = 1
+        self.assertNotEqual(su.EXIT_OK, self.apply())
+        self.assertNotEqual("succeeded", self.last()["status"])
+        self.assertIsNone(self.verified())
+        drained = len(self.sys.mutations())
+        self.sys.clock += 1800          # the next scheduled turn
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(drained, len(self.sys.mutations()), "no second drain within rate_hours")
+
+
+class SealedHostFleetSourceTests(Base):
+    """A sealed-launcher host refuses [fleet_source] before anything happens: a
+    source move would not rebuild the launcher, whose policy digest covers the
+    moved profile, so the install would fail after the drain every turn."""
+    sealed = True
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in su.FLEET_SOURCE_ENV:
+            os.environ.pop(name, None)
+        self.cfg.fleet_source_repository = "ORG/private-fleet-authority"
+        self.cfg.fleet_source_canary = "studio"
+        self.pin = self.home / ".config/tartci/m3-launcher-approved.sha256"
+        self.pin_before = self.pin.read_bytes()
+
+    def assertNothingMoved(self) -> None:
+        self.assertEqual([], self.sys.mutations())
+        self.assertFalse(any("drain" in a for a, _ in self.sys.calls), "no drain call")
+        self.assertFalse(any(len(a) > 2 and "private-fleet-authority" in a[2]
+                             for a, _ in self.sys.calls if a[:1] == [FAKE_GH]),
+                         "the private source is never read")
+        self.assertFalse(self.cfg.fleet_source_store.exists(), "nothing exported")
+        self.assertEqual(self.pin_before, self.pin.read_bytes(), "launcher pin unchanged")
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ, "no source selected")
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual("unknown", skew["state"])
+        self.assertIn("fleet source refused on a sealed-launcher host", skew["reason"])
+        self.assertIn("remove [fleet_source]", skew["reason"])
+
+    def test_an_apply_refuses_before_any_drain(self) -> None:
+        self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertNothingMoved()
+
+    def test_a_plan_refuses_the_same_way(self) -> None:
+        self.assertEqual(su.EXIT_UNKNOWN, self.plan())
+        self.assertNothingMoved()
+
+    def test_without_the_setting_a_sealed_host_is_unaffected(self) -> None:
+        self.cfg.fleet_source_repository = None
+        self.assertIsNone(su.sync_fleet_source(self.cfg, self.sys))
+
+    # Base's pause test runs with this class's [fleet_source], which now
+    # refuses first by design; Base covers it without the setting.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
+
+
+def fleet_source_supply() -> str:
+    import fleet_source
+    return fleet_source.PUBLISHED_SUPPLY
 
 
 class RecoveryBranchTests(Base):
@@ -2498,6 +5660,388 @@ class RecoveryBranchTests(Base):
         receipt = json.loads(Path(self.last()["receipt"]).read_text())
         self.assertTrue(any(s["step"] == "reinstall-for-pool-on"
                             and "FAILED verification" in s["detail"] for s in receipt["steps"]))
+
+
+def make_v2_host(test, team: str = "95CX6P84C4") -> None:
+    """A sealed host already on launcher v2: its stable app (inputs digest "f"*64,
+    which the fake measures for any target), its pointer at a generation of
+    INSTALLED, a v2 receipt, its opt-in file and the dedicated keychain."""
+    config = test.home / ".config/tartci"
+    app = test.home / "libexec/TartCILauncher.app"
+    (app / "Contents/Resources/bundle.json").unlink()
+    (app / "Contents/Resources/inputs.json").write_text(
+        json.dumps({"schema": 1, "sha256": "f" * 64}))
+    generation = test.home / ".local/share/tartci-generations" / f"{INSTALLED}-1"
+    generation.mkdir(parents=True)
+    (config / "launcher-generation.json").write_text(
+        json.dumps({"schema": 1, "generation": str(generation)}))
+    (config / "macos-fleet-install.json").write_text(json.dumps(
+        {"launch_helper": {"schema": 2, "layout": "v2"},
+         "support": {"source_commit": INSTALLED}}))
+    test.sys.v2_generation = generation
+    test.sys._set_installed(INSTALLED)
+    opt_in = config / "launcher-v2.enabled"
+    opt_in.write_text("")
+    opt_in.chmod(0o600)
+    secrets = test.home / ".config/pulp/secrets/keychain.env"
+    secrets.parent.mkdir(parents=True)
+    secrets.write_text('PULP_SIGN_KEYCHAIN="$HOME/Library/Keychains/pulp-signing.keychain-db"\n')
+    helper = {"path": str(app), "identifier": "com.danielraffel.tartci.launcher",
+              "team_id": team,
+              "approval_sha256_path": str(config / "m3-launcher-approved.sha256")}
+    patch = mock.patch.object(su, "launch_helper", return_value=helper)
+    patch.start()
+    test.addCleanup(patch.stop)
+
+
+class LauncherV2SelfUpdateTests(Base):
+    """Launcher v2: an update that leaves the stable app's inputs, signing
+    identity and team equal builds nothing and needs no consent; any
+    difference, or the move from v1, is a launcher change keyed on all three.
+    Rollback points back at the previous generation."""
+    sealed = True
+    TEAM = "95CX6P84C4"
+
+    def setUp(self) -> None:
+        super().setUp()
+        make_v2_host(self)
+        # The owner's override; LauncherV2AutoApplyTests covers the default.
+        self.cfg.launcher_auto_apply = False
+
+    def ack_path(self) -> Path:
+        return self.home / ".config/tartci/launcher-change-ack"
+
+    def installed_v1(self) -> None:
+        """The live app is v1: its receipt says so and its bundle.json names the commit."""
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 1}, "support": {"source_commit": INSTALLED}}))
+        (self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json").write_text(
+            json.dumps({"source_commit": INSTALLED}))
+
+    def fail_probe_until_rollback(self) -> None:
+        """pool on fails the volume probe until a rollback install has run."""
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+
+        def recover(argv):
+            if "--apply" in argv and "rollback" in " ".join(argv):
+                self.sys.on_rc = 0
+        self.sys.hook = recover
+
+    def pin(self) -> Path:
+        return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+    def builds(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]]
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def step(self, name: str) -> str:
+        return next(s["detail"] for s in self.latest()["steps"] if s["step"] == name)
+
+    def expected_ack(self, inputs: str = "f" * 64, identity: str = IDENTITY,
+                     team: str = TEAM) -> str:
+        return f"v2 inputs={inputs} identity={identity} team={team}"
+
+    def test_the_installed_commit_is_read_through_the_pointer(self) -> None:
+        self.assertEqual(INSTALLED, su.installed_commit(self.cfg)[0])
+
+    def test_no_launcher_change_builds_nothing_and_needs_no_consent(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual([], self.builds())
+        install = self.installs()[0]
+        self.assertNotIn("--launch-helper-source", install)
+        self.assertEqual(IDENTITY, install[install.index("--launch-set-identity") + 1])
+        self.assertTrue(install[install.index("--launch-set-keychain") + 1]
+                        .endswith("pulp-signing.keychain-db"))
+        self.assertEqual("0" * 64 + "\n", self.pin().read_text(), "the approval pin stays")
+        self.assertIn("no launcher change", self.step("launcher"))
+        # An unchanged v2 launcher has no volume probe to fail: no store write.
+        self.assertEqual([], self.sys.store_writes)
+
+    def test_changed_inputs_need_the_exact_ack_before_any_drain(self) -> None:
+        app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        app.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.builds())
+        error = self.latest()["error"]
+        self.assertIn(f"inputs {'e' * 12} -> {'f' * 12}", error)
+        self.assertIn(f"echo '{self.expected_ack()}' > {self.ack_path()}", error)
+        # The printed line, written as printed, lets the change through.
+        self.ack_path().write_text(self.expected_ack() + "\n")
+        self.assertUpdated(self.apply())
+        build = self.builds()[0]
+        self.assertEqual("v2", build[build.index("--layout") + 1])
+        install = self.installs()[0]
+        self.assertIn("--launch-helper-source", install)
+        self.assertEqual("d" * 64 + "\n", self.pin().read_text(), "the new app's approval")
+
+    def test_an_ack_for_any_other_inputs_identity_or_team_is_refused(self) -> None:
+        app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        app.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        for stale in (self.expected_ack(inputs="e" * 64),
+                      self.expected_ack(identity="A" * 40),
+                      self.expected_ack(team="ZZZZZZZZZZ"),
+                      T_OLD):     # a v1 commit ack never covers a v2 change
+            with self.subTest(stale=stale[:40]):
+                self.ack_path().write_text(stale + "\n")
+                self.assertEqual(su.EXIT_REFUSED, self.apply())
+                self.assertEqual([], self.sys.mutations())
+                self.assertIn("launcher change needs consent", self.latest()["error"])
+
+    def test_a_rotated_signing_certificate_is_a_launcher_change(self) -> None:
+        self.sys.keychain_identities = ["B" * 40]   # the live app's cert is gone
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        error = self.latest()["error"]
+        self.assertIn(f"identity {IDENTITY[:12]} -> {'B' * 12}", error)
+        self.assertIn(self.expected_ack(identity="B" * 40), error)
+
+    def test_the_turn_after_an_acked_rotation_sees_no_change(self) -> None:
+        self.sys.keychain_identities = ["B" * 40]   # the live app's cert is gone
+        self.ack_path().write_text(self.expected_ack(identity="B" * 40) + "\n")
+        self.assertUpdated(self.apply())
+        self.assertEqual("B" * 40, self.sys.built_identity)
+        # The next turn reads the new live app's certificate: no re-detection.
+        helper = su.launch_helper(self.cfg)
+        with tempfile.TemporaryDirectory() as scratch:
+            live = su.extract_signing_identity(self.sys, Path(helper["path"]), Path(scratch))
+        signer = su.choose_signer(self.sys, self.home, live)
+        change = su.v2_launcher_change(self.cfg, self.sys, helper, su.checked_in_profile(self.cfg),
+                                       signer, live)
+        self.assertEqual([], change.differs)
+
+    def test_the_ack_team_is_the_certificates_and_must_be_the_profiles(self) -> None:
+        # The chosen certificate is for another team: refuse, before any drain,
+        # rather than build a launcher its own policy would reject.
+        self.sys.keychain_identities = [(IDENTITY, "ZZZZZZZZZZ")]
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("is for team ZZZZZZZZZZ, not the profile's launch_helper.team_id "
+                      "95CX6P84C4", self.latest()["error"])
+
+    def test_a_new_v2_app_must_carry_the_measured_inputs(self) -> None:
+        app = Path(self.td.name) / "new.app"
+        resources = app / "Contents" / "Resources"
+        resources.mkdir(parents=True)
+        (resources / "inputs.json").write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        with self.assertRaisesRegex(su.Refused, "inputs e+ != the target's f+"):
+            su.verify_bundle_v2(self.sys, app, "f" * 64)
+        with self.assertRaisesRegex(su.Refused, "!= the target's None"):
+            su.verify_bundle_v2(self.sys, app, None)
+        (resources / "inputs.json").write_text(json.dumps({"schema": 1, "sha256": "f" * 64}))
+        su.verify_bundle_v2(self.sys, app, "f" * 64)        # control: matching inputs pass
+        (resources / "bundle.json").write_text("{}")
+        with self.assertRaisesRegex(su.Refused, "v1 bundle.json"):
+            su.verify_bundle_v2(self.sys, app, "f" * 64)
+        (resources / "bundle.json").unlink()
+        self.sys.codesign_verify_rc = 1
+        with self.assertRaisesRegex(su.Refused, "codesign --verify"):
+            su.verify_bundle_v2(self.sys, app, "f" * 64)
+
+    def test_a_different_team_is_a_launcher_change(self) -> None:
+        self.sys.live_team = "ZZZZZZZZZZ"
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn(f"team ZZZZZZZZZZ -> {self.TEAM}", self.latest()["error"])
+
+    def test_a_move_from_v1_is_a_launcher_change(self) -> None:
+        self.installed_v1()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("layout v1 -> v2", self.latest()["error"])
+
+    def test_the_plan_says_which_of_the_three_differed(self) -> None:
+        self.sys.live_team = "ZZZZZZZZZZ"
+        self.plan()
+        launcher = self.step("launcher")
+        self.assertIn("launcher change (team ZZZZZZZZZZ -> 95CX6P84C4)", launcher)
+        self.assertNotIn("inputs", launcher)
+        self.assertNotIn("identity", launcher)
+
+    def test_a_v2_host_whose_opt_in_is_gone_refuses_before_any_drain(self) -> None:
+        (self.home / ".config/tartci/launcher-v2.enabled").unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("--launcher-layout v1", self.latest()["error"])
+
+    def test_a_receiptless_v2_app_is_seen_by_the_plan_before_any_drain(self) -> None:
+        (self.home / ".config/tartci/macos-fleet-install.json").unlink()
+        (self.home / ".config/tartci/launcher-generation.json").unlink()
+        (self.home / ".config/tartci/launcher-v2.enabled").unlink()
+        policy = self.home / "libexec/TartCILauncher.app/Contents/Resources/policy.json"
+        policy.write_text(json.dumps({"schema": 2}))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(su.EXIT_REFUSED, self.plan())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("install receipt is missing but a launcher v2 app", output.getvalue())
+
+    def test_without_the_dedicated_keychain_v2_refuses_before_any_drain(self) -> None:
+        (self.home / ".config/pulp/secrets/keychain.env").unlink()
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("dedicated signing keychain", self.latest()["error"])
+
+    def test_a_failed_probe_without_a_launcher_change_rolls_back(self) -> None:
+        # No new app, so the probe failure cannot be a lost grant: roll back
+        # (the installer points the launcher back at the previous generation).
+        self.fail_probe_until_rollback()
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"], self.last())
+        self.assertEqual(INSTALLED, self.sys.running())
+        rollback = self.installs()[-1]
+        self.assertIn("rollback", " ".join(rollback))
+        self.assertEqual("v2", rollback[rollback.index("--launcher-layout") + 1])
+        self.assertEqual(IDENTITY, rollback[rollback.index("--launch-set-identity") + 1])
+
+    def test_a_failed_probe_after_a_launcher_change_stops_without_rollback(self) -> None:
+        # Control: with a new app the #579 stop still applies.
+        app = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        app.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        self.ack_path().write_text(self.expected_ack() + "\n")
+        self.fail_probe_until_rollback()
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("STOPPED and NOT rolled back", self.last()["error"])
+        self.assertEqual(1, len(self.installs()), "no rollback install")
+
+    def test_a_rollback_after_a_move_from_v1_reinstalls_v1_explicitly(self) -> None:
+        self.installed_v1()
+        self.ack_path().write_text(self.expected_ack() + "\n")
+        self.sys.broken_target = True
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        rollback = self.installs()[-1]
+        self.assertEqual("v1", rollback[rollback.index("--launcher-layout") + 1])
+        self.assertNotIn("--launch-set-identity", rollback)
+
+
+class LauncherV2AutoApplyTests(Base):
+    """Plan item 12 on a launcher v2 host: a launcher change keyed on inputs,
+    identity and team applies by itself when the team is the installed app's."""
+    sealed = True
+    TEAM = "95CX6P84C4"
+
+    def setUp(self) -> None:
+        super().setUp()
+        make_v2_host(self)
+        inputs = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        inputs.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def test_changed_inputs_with_the_same_team_apply_automatically(self) -> None:
+        self.assertUpdated(self.apply())
+        ack = self.latest()["launcher_ack"]
+        self.assertEqual(("automatic", self.TEAM, self.TEAM),
+                         (ack["mode"], ack["team_id"], ack["installed_team_id"]))
+        self.assertEqual(f"v2 inputs={'f' * 64} identity={IDENTITY} team={self.TEAM}", ack["key"])
+        self.assertIn("--launch-helper-source", self.installs()[0])
+
+    def test_a_team_change_waits_for_the_ack(self) -> None:
+        self.sys.live_team = "ZZZZZZZZZZ"
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn(f"the new launcher is for team {self.TEAM}, the installed one for "
+                      "ZZZZZZZZZZ", self.latest()["launcher_ack"]["auto_refused"])
+        self.assertIn("launcher change needs consent", self.latest()["error"])
+
+    def test_the_move_from_v1_waits_for_the_ack(self) -> None:
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 1}, "support": {"source_commit": INSTALLED}}))
+        (self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json").write_text(
+            json.dumps({"source_commit": INSTALLED}))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("v1 to v2", self.latest()["launcher_ack"]["auto_refused"])
+
+    def test_a_lost_grant_rolls_back_to_the_previous_generation(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+
+        def recover(argv):
+            if "--apply" in argv and "rollback" in " ".join(argv):
+                self.sys.on_rc = 0
+        self.sys.hook = recover
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"], self.last())
+        self.assertEqual(INSTALLED, self.sys.running())
+        rollback = self.installs()[-1]
+        self.assertEqual("v2", rollback[rollback.index("--launcher-layout") + 1])
+        hold = su._read_json(self.cfg.state_dir / su.LAUNCHER_AUTO_APPLY_NAME)
+        self.assertIn("v2 inputs=", hold["acknowledge"])
+
+
+class LauncherV2FleetSourceTests(FleetSourceFixture):
+    """On a launcher v2 host a [fleet_source] move is measured like any update:
+    a refresh when the stable app's inputs are unchanged, an acknowledged
+    launcher change when they are not. v1 sealed hosts keep refusing it."""
+    sealed = True
+
+    def setUp(self) -> None:
+        super().setUp()
+        make_v2_host(self)
+        self.cfg.fleet_source_canary = su.self_host_id(self.cfg)   # this sealed host
+        self.sys.log_lines = ""          # main has not moved: only the source has
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def builds(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]]
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def ack(self) -> str:
+        return f"v2 inputs={'f' * 64} identity={IDENTITY} team=95CX6P84C4"
+
+    def test_a_source_move_with_unchanged_inputs_is_a_refresh_that_keeps_the_app(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertIn("fleet source moved", self.latest()["refresh"])
+        self.assertEqual([], self.builds())
+        install = self.installs()[0]
+        self.assertNotIn("--launch-helper-source", install)
+        self.assertIn("--launch-set-identity", install)
+        self.assertEqual(self.fixture.COMMIT, su.installed_fleet_source_commit(self.cfg))
+        launcher = next(s["detail"] for s in self.latest()["steps"] if s["step"] == "launcher")
+        self.assertIn("no launcher change", launcher)
+
+    def test_a_source_move_that_changes_the_inputs_waits_for_the_ack(self) -> None:
+        inputs = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        inputs.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn(f"echo '{self.ack()}'", self.latest()["error"])
+        (self.home / ".config/tartci/launcher-change-ack").write_text(self.ack() + "\n")
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        build = self.builds()[0]
+        self.assertEqual("v2", build[build.index("--layout") + 1])
+        self.assertIn("--launch-helper-source", self.installs()[0])
+
+    def test_a_v1_sealed_host_still_refuses_the_source_even_with_the_opt_in(self) -> None:
+        # Control: #570's refusal stands until the host has installed v2.
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 1}, "support": {"source_commit": INSTALLED}}))
+        with self.assertRaisesRegex(su.Refused, "fleet source refused on a sealed-launcher host"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertNotIn("TARTCI_FLEET_SOURCE_ROOT", os.environ)
+
+    def test_a_v2_host_whose_opt_in_is_gone_refuses_the_source_before_reading_it(self) -> None:
+        (self.home / ".config/tartci/launcher-v2.enabled").unlink()
+        with self.assertRaisesRegex(su.Refused, "--launcher-layout v1"):
+            su.sync_fleet_source(self.cfg, self.sys)
+        self.assertFalse(any(len(a) > 2 and self.fixture.PRIVATE in a[2]
+                             for a, _ in self.sys.calls if a[:1] == [FAKE_GH]))
+
+    # Base's pause test does not configure a v2 host's source; Base covers it.
+    test_scheduled_pause_refuses_real_apply_before_any_mutation = None
 
 
 if __name__ == "__main__":

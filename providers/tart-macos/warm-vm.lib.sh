@@ -50,6 +50,7 @@ WARM_CORES=""
 WARM_MEM=""
 WARM_PIP=0
 WARM_ARTIFACT=0
+WARM_SHARED_CACHE=1
 WARM_PARKED_AT=0
 WARM_LAST_END=0
 WARM_DEFER_REPORTED=0
@@ -287,6 +288,7 @@ tartci_warm_try_park(){
   WARM_MEM="$CURRENT_GUEST_MEM_MB"
   WARM_PIP="$CURRENT_PIP_WHEELHOUSE"
   WARM_ARTIFACT="$CURRENT_ARTIFACT_CACHE"
+  WARM_SHARED_CACHE="${CURRENT_SHARED_CACHE:-1}"
   WARM_RESV="$resv"
   WARM_PARKED_AT="$(tartci_warm_now)"
   CURRENT_VM=""
@@ -361,6 +363,12 @@ tartci_warm_sibling_defer(){
 tartci_warm_handoff(){
   local i="$1" labels="$2" priority="$3" api_root="$4" now parked
   [ -n "$WARM_VM" ] || return 1
+  # The park happened before any class was known, so the VM mounts the shared
+  # cache; a class that must not see it (a release tier) boots cold instead.
+  if [ "${WARM_SHARED_CACHE:-1}" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
+    tartci_warm_discard release_tier_no_shared_cache
+    return 1
+  fi
   if [ -n "$WARM_RPID" ] && ! kill -0 "$WARM_RPID" 2>/dev/null; then
     tartci_warm_discard vm_died
     return 1
@@ -385,6 +393,7 @@ tartci_warm_handoff(){
   CURRENT_GUEST_MEM_MB="$WARM_MEM"
   CURRENT_PIP_WHEELHOUSE="$WARM_PIP"
   CURRENT_ARTIFACT_CACHE="$WARM_ARTIFACT"
+  CURRENT_SHARED_CACHE="${WARM_SHARED_CACHE:-1}"
   WARM_VM=""
   WARM_IP=""
   WARM_RPID=""

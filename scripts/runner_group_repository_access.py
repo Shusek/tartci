@@ -74,7 +74,7 @@ def _enabled(name: str) -> bool:
 
 def _require_untrusted_forks_gated(
     gh_cli: str, repo: str, repositories: list[str], timeout: int,
-    group_allows_public: bool,
+    group_allows_public: bool, repository_metadata: dict[str, Any] | None = None,
 ) -> list[str]:
     """Refuse public repositories that let fork pull requests run unapproved.
 
@@ -86,7 +86,8 @@ def _require_untrusted_forks_gated(
     """
     admitted: list[str] = []
     for candidate in repositories:
-        payload = api(gh_cli, f"repos/{candidate}", repo, timeout)
+        payload = (repository_metadata if candidate.lower() == repo.lower() and repository_metadata is not None
+                   else api(gh_cli, f"repos/{candidate}", repo, timeout))
         visibility = payload.get("visibility")
         private = payload.get("private")
         if visibility is None and isinstance(private, bool):
@@ -180,15 +181,26 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
     owner = repo.split("/", 1)[0]
     group_path = f"orgs/{owner}/actions/runner-groups/{runner_group_id}"
     group = api(gh_cli, group_path, repo, timeout)
-    visibility = group.get("visibility")
-    if visibility == "all":
+    allows_public = group.get("allows_public_repositories")
+    if not isinstance(allows_public, bool):
+        raise AccessError("runner group response has invalid allows_public_repositories")
+    repository = api(gh_cli, f"repos/{repo}", repo, timeout)
+    visibility = repository.get("visibility")
+    if visibility not in {"public", "private", "internal"}:
+        raise AccessError(f"repository response has unsupported visibility {visibility!r}")
+    if visibility == "public" and not allows_public:
+        raise RepositoryInaccessible(
+            f"runner group {runner_group_id} disallows public repositories; {repo} is public"
+        )
+    group_visibility = group.get("visibility")
+    if group_visibility == "all":
         raise RepositoryInaccessible(
             f"runner group {runner_group_id} is visible to multiple repositories; "
             "tartci assignment observation is repository-scoped"
         )
-    if visibility != "selected":
+    if group_visibility != "selected":
         raise AccessError(
-            f"runner group {runner_group_id} has unsupported visibility {visibility!r}"
+            f"runner group {runner_group_id} has unsupported visibility {group_visibility!r}"
         )
 
     seen = 0
@@ -241,14 +253,14 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
     )
     # Only an explicit false exempts public repositories from the fork gate.
     allows_public = group.get("allows_public_repositories") is not False
-    public = _require_untrusted_forks_gated(gh_cli, repo, reachable, timeout, allows_public)
+    public = _require_untrusted_forks_gated(gh_cli, repo, reachable, timeout, allows_public, repository)
     receipt: dict[str, Any] = {
         "schema": 1,
         "verdict": "admit",
         "repo": repo,
         "runner_group_id": runner_group_id,
         "registration_scope": scope,
-        "visibility": visibility,
+        "visibility": group_visibility,
         "allows_public_repositories": allows_public,
         "public_repositories": public,
         "restricted_to_workflows": group.get("restricted_to_workflows") is True,
